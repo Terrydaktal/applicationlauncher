@@ -409,6 +409,14 @@ fn parse_desktop_file(path: &Path, theme: &str) -> Option<AppInfo> {
     let mut comment = None;
     let mut no_display = false;
     let mut is_application = false;
+    let mut is_settings_module = false;
+
+    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+        let name_lower = file_name.to_lowercase();
+        if name_lower.starts_with("kcm_") || name_lower.contains("settings") {
+            is_settings_module = true;
+        }
+    }
 
     // Use current locale language code if available
     let lang = std::env::var("LANG").ok()
@@ -465,10 +473,16 @@ fn parse_desktop_file(path: &Path, theme: &str) -> Option<AppInfo> {
             if key == "Type" && val == "Application" {
                 is_application = true;
             }
+            if key == "Categories" && val.split(';').any(|c| c == "Settings" || c == "SettingsPanel" || c == "System") {
+                is_settings_module = true;
+            }
+            if key == "X-KDE-AliasFor" && val == "systemsettings" {
+                is_settings_module = true;
+            }
         }
     }
 
-    if no_display || !is_application {
+    if (no_display && !is_settings_module) || !is_application {
         return None;
     }
 
