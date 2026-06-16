@@ -21,6 +21,7 @@ struct AppInfo {
     icon_path: Option<PathBuf>,
     comment: Option<String>,
     desktop_file_path: PathBuf,
+    is_settings_module: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +53,8 @@ struct App {
     width: f32,
     height: f32,
     icon_only: bool,
+    show_settings_menu: bool,
+    show_system_settings_modules: bool,
 }
 
 fn print_help() {
@@ -163,6 +166,33 @@ fn load_window_size() -> (f32, f32) {
         }
     }
     (650.0, 480.0) // Default size
+}
+
+fn load_show_system_settings_modules() -> bool {
+    if let Ok(home) = std::env::var("HOME") {
+        let path = PathBuf::from(format!("{}/.config/applicationlauncher/settings.txt", home));
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                for line in content.lines() {
+                    let parts: Vec<&str> = line.split('=').collect();
+                    if parts.len() >= 2 && parts[0].trim() == "show_system_settings_modules" {
+                        return parts[1].trim().parse::<bool>().unwrap_or(true);
+                    }
+                }
+            }
+        }
+    }
+    true // Default is true
+}
+
+fn save_show_system_settings_modules(value: bool) {
+    if let Ok(home) = std::env::var("HOME") {
+        let dir = PathBuf::from(format!("{}/.config/applicationlauncher", home));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.txt");
+        let content = format!("show_system_settings_modules={}\n", value);
+        let _ = std::fs::write(path, content);
+    }
 }
 
 fn parse_icon_from_desktop(path: &Path) -> Option<String> {
@@ -503,6 +533,7 @@ fn parse_desktop_file(path: &Path, theme: &str) -> Option<AppInfo> {
         icon_path,
         comment,
         desktop_file_path: path.to_path_buf(),
+        is_settings_module,
     })
 }
 
@@ -918,6 +949,8 @@ impl App {
             width,
             height,
             icon_only,
+            show_settings_menu: false,
+            show_system_settings_modules: load_show_system_settings_modules(),
         };
 
         match app.mode {
@@ -1148,7 +1181,7 @@ impl eframe::App for App {
 
                     // Force focus on text edit at launch
                     if let Some(ref resp) = text_edit_response {
-                        if self.start_time.elapsed().as_millis() < 400 {
+                        if self.start_time.elapsed().as_millis() < 400 && !self.show_settings_menu {
                             resp.request_focus();
                         }
                     }
@@ -1163,6 +1196,7 @@ impl eframe::App for App {
                         LauncherMode::Apps => {
                             filtered_apps = self.apps
                                 .iter()
+                                .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
                                 .filter_map(|app| {
                                     let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
                                     if self.search_query.is_empty() {
@@ -1264,152 +1298,155 @@ impl eframe::App for App {
                         1
                     };
 
-                    // Keyboard navigation inputs
-                    if self.icon_only && self.mode == LauncherMode::Apps {
-                        if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) && total_items > 0 {
-                            self.selected_index = (self.selected_index + 1) % total_items;
-                            scroll_to_selected = true;
-                        }
-                        if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) && total_items > 0 {
-                            self.selected_index = if self.selected_index == 0 {
-                                total_items - 1
-                            } else {
-                                self.selected_index - 1
-                            };
-                            scroll_to_selected = true;
-                        }
-                        if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) && total_items > 0 {
-                            if self.selected_index + columns < total_items {
-                                self.selected_index += columns;
-                            } else {
-                                self.selected_index = (self.selected_index + columns) % total_items;
-                            }
-                            scroll_to_selected = true;
-                        }
-                        if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) && total_items > 0 {
-                            if self.selected_index >= columns {
-                                self.selected_index -= columns;
-                            } else {
-                                let mut target = self.selected_index;
-                                while target + columns < total_items {
-                                    target += columns;
-                                }
-                                self.selected_index = target;
-                            }
-                            scroll_to_selected = true;
-                        }
-                    } else {
-                        if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) && total_items > 0 {
-                            self.selected_index = (self.selected_index + 1) % total_items;
-                            scroll_to_selected = true;
-                        }
-                        if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) && total_items > 0 {
-                            self.selected_index = if self.selected_index == 0 {
-                                total_items - 1
-                            } else {
-                                self.selected_index - 1
-                            };
-                            scroll_to_selected = true;
-                        }
+                    if ctx.input(|i| i.key_pressed(egui::Key::F10)) {
+                        self.show_settings_menu = !self.show_settings_menu;
                     }
 
-                    if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && total_items > 0 {
-                        match self.mode {
-                            LauncherMode::Apps => {
-                                let app = &filtered_apps[self.selected_index].0;
-                                self.launch_app_and_exit(app.exec.clone(), ctx);
-                            }
-                            LauncherMode::Windows => {
-                                let win = &filtered_windows[self.selected_index].0;
-                                self.activate_and_exit(win.id.clone(), ctx);
-                            }
-                        }
-                    }
                     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
-                        match self.mode {
-                            LauncherMode::Apps => self.refresh_apps(),
-                            LauncherMode::Windows => self.refresh_windows(),
+                        if self.show_settings_menu {
+                            self.show_settings_menu = false;
+                        } else {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     }
-                    if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::P)) && total_items > 0 {
-                        if let LauncherMode::Apps = self.mode {
-                            let app = &filtered_apps[self.selected_index].0;
-                            let path = app.desktop_file_path.clone();
-                            if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
-                                self.pinned_apps.remove(pos);
-                            } else {
-                                self.pinned_apps.push(path);
+
+                    if !self.show_settings_menu {
+                        // Keyboard navigation inputs
+                        if self.icon_only && self.mode == LauncherMode::Apps {
+                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) && total_items > 0 {
+                                self.selected_index = (self.selected_index + 1) % total_items;
+                                scroll_to_selected = true;
                             }
-                            self.save_pinned_apps();
-                        }
-                    }
-                    if let LauncherMode::Apps = self.mode {
-                        if total_items > 0 {
-                            let app = &filtered_apps[self.selected_index].0;
-                            let path = app.desktop_file_path.clone();
-                            if self.pinned_apps.contains(&path) {
-                                if self.icon_only {
-                                    if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::ArrowLeft)) {
-                                        if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
-                                            if pos > 0 {
-                                                self.pinned_apps.swap(pos, pos - 1);
-                                                self.selected_index -= 1;
-                                                self.save_pinned_apps();
-                                                scroll_to_selected = true;
-                                            }
-                                        }
-                                    }
-                                    if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::ArrowRight)) {
-                                        if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
-                                            if pos + 1 < self.pinned_apps.len() {
-                                                self.pinned_apps.swap(pos, pos + 1);
-                                                self.selected_index += 1;
-                                                self.save_pinned_apps();
-                                                scroll_to_selected = true;
-                                            }
-                                        }
-                                    }
-                                    if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::ArrowUp)) {
-                                        if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
-                                            if pos >= columns {
-                                                self.pinned_apps.swap(pos, pos - columns);
-                                                self.selected_index -= columns;
-                                                self.save_pinned_apps();
-                                                scroll_to_selected = true;
-                                            }
-                                        }
-                                    }
-                                    if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::ArrowDown)) {
-                                        if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
-                                            if pos + columns < self.pinned_apps.len() {
-                                                self.pinned_apps.swap(pos, pos + columns);
-                                                self.selected_index += columns;
-                                                self.save_pinned_apps();
-                                                scroll_to_selected = true;
-                                            }
-                                        }
-                                    }
+                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) && total_items > 0 {
+                                self.selected_index = if self.selected_index == 0 {
+                                    total_items - 1
                                 } else {
-                                    if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::ArrowUp)) {
-                                        if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
-                                            if pos > 0 {
-                                                self.pinned_apps.swap(pos, pos - 1);
-                                                self.selected_index -= 1;
-                                                self.save_pinned_apps();
-                                                scroll_to_selected = true;
+                                    self.selected_index - 1
+                                };
+                                scroll_to_selected = true;
+                            }
+                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) && total_items > 0 {
+                                self.selected_index = (self.selected_index + columns) % total_items;
+                                scroll_to_selected = true;
+                            }
+                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) && total_items > 0 {
+                                self.selected_index = if self.selected_index < columns {
+                                    total_items - 1
+                                } else {
+                                    self.selected_index - columns
+                                };
+                                scroll_to_selected = true;
+                            }
+                        } else {
+                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) && total_items > 0 {
+                                self.selected_index = (self.selected_index + 1) % total_items;
+                                scroll_to_selected = true;
+                            }
+                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) && total_items > 0 {
+                                self.selected_index = if self.selected_index == 0 {
+                                    total_items - 1
+                                } else {
+                                    self.selected_index - 1
+                                };
+                                scroll_to_selected = true;
+                            }
+                        }
+
+                        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && total_items > 0 {
+                            match self.mode {
+                                LauncherMode::Apps => {
+                                    let app = &filtered_apps[self.selected_index].0;
+                                    self.launch_app_and_exit(app.exec.clone(), ctx);
+                                }
+                                LauncherMode::Windows => {
+                                    let win = &filtered_windows[self.selected_index].0;
+                                    self.activate_and_exit(win.id.clone(), ctx);
+                                }
+                            }
+                        }
+                        if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
+                            match self.mode {
+                                LauncherMode::Apps => self.refresh_apps(),
+                                LauncherMode::Windows => self.refresh_windows(),
+                            }
+                        }
+                        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::P)) && total_items > 0 {
+                            if let LauncherMode::Apps = self.mode {
+                                let app = &filtered_apps[self.selected_index].0;
+                                let path = app.desktop_file_path.clone();
+                                if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
+                                    self.pinned_apps.remove(pos);
+                                } else {
+                                    self.pinned_apps.push(path);
+                                }
+                                self.save_pinned_apps();
+                            }
+                        }
+                        if let LauncherMode::Apps = self.mode {
+                            if total_items > 0 {
+                                let app = &filtered_apps[self.selected_index].0;
+                                let path = app.desktop_file_path.clone();
+                                if self.pinned_apps.contains(&path) {
+                                    if self.icon_only {
+                                        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::ArrowLeft)) {
+                                            if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
+                                                if pos > 0 {
+                                                    self.pinned_apps.swap(pos, pos - 1);
+                                                    self.selected_index -= 1;
+                                                    self.save_pinned_apps();
+                                                    scroll_to_selected = true;
+                                                }
                                             }
                                         }
-                                    }
-                                    if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::ArrowDown)) {
-                                        if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
-                                            if pos + 1 < self.pinned_apps.len() {
-                                                self.pinned_apps.swap(pos, pos + 1);
-                                                self.selected_index += 1;
-                                                self.save_pinned_apps();
-                                                scroll_to_selected = true;
+                                        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::ArrowRight)) {
+                                            if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
+                                                if pos + 1 < self.pinned_apps.len() {
+                                                    self.pinned_apps.swap(pos, pos + 1);
+                                                    self.selected_index += 1;
+                                                    self.save_pinned_apps();
+                                                    scroll_to_selected = true;
+                                                }
+                                            }
+                                        }
+                                        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::ArrowUp)) {
+                                            if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
+                                                if pos >= columns {
+                                                    self.pinned_apps.swap(pos, pos - columns);
+                                                    self.selected_index -= columns;
+                                                    self.save_pinned_apps();
+                                                    scroll_to_selected = true;
+                                                }
+                                            }
+                                        }
+                                        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::ArrowDown)) {
+                                            if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
+                                                if pos + columns < self.pinned_apps.len() {
+                                                    self.pinned_apps.swap(pos, pos + columns);
+                                                    self.selected_index += columns;
+                                                    self.save_pinned_apps();
+                                                    scroll_to_selected = true;
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::ArrowUp)) {
+                                            if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
+                                                if pos > 0 {
+                                                    self.pinned_apps.swap(pos, pos - 1);
+                                                    self.selected_index -= 1;
+                                                    self.save_pinned_apps();
+                                                    scroll_to_selected = true;
+                                                }
+                                            }
+                                        }
+                                        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::ArrowDown)) {
+                                            if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
+                                                if pos + 1 < self.pinned_apps.len() {
+                                                    self.pinned_apps.swap(pos, pos + 1);
+                                                    self.selected_index += 1;
+                                                    self.save_pinned_apps();
+                                                    scroll_to_selected = true;
+                                                }
                                             }
                                         }
                                     }
@@ -1417,8 +1454,6 @@ impl eframe::App for App {
                             }
                         }
                     }
-
-
 
                     // 3. Render Items ScrollArea
                     let list_height = (ui.available_height() - 32.0).max(100.0);
@@ -1911,6 +1946,66 @@ impl eframe::App for App {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::BeginResize(
                             egui::ResizeDirection::SouthEast,
                         ));
+                    }
+
+                    if self.show_settings_menu {
+                        let area = egui::Area::new(egui::Id::new("settings_overlay"))
+                            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                            .order(egui::Order::Foreground);
+                        
+                        area.show(ctx, |ui| {
+                            let frame = egui::Frame::window(&ui.style())
+                                .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 240))
+                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)))
+                                .corner_radius(egui::CornerRadius::same(12));
+                            
+                            frame.show(ui, |ui| {
+                                ui.set_width(320.0);
+                                ui.vertical(|ui| {
+                                    ui.add_space(8.0);
+                                    ui.vertical_centered(|ui| {
+                                        ui.heading(
+                                            egui::RichText::new("Launcher Settings")
+                                                .color(egui::Color32::WHITE)
+                                                .strong(),
+                                        );
+                                    });
+                                    ui.add_space(8.0);
+                                    
+                                    ui.add(egui::Separator::default());
+                                    ui.add_space(12.0);
+
+                                    ui.horizontal(|ui| {
+                                        let mut show_val = self.show_system_settings_modules;
+                                        let checkbox_response = ui.checkbox(
+                                            &mut show_val,
+                                            egui::RichText::new("Show system settings modules (KCM)")
+                                                .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220))
+                                                .size(13.0),
+                                        );
+                                        if checkbox_response.changed() {
+                                            self.show_system_settings_modules = show_val;
+                                            save_show_system_settings_modules(show_val);
+                                        }
+                                    });
+                                    
+                                    ui.add_space(16.0);
+                                    ui.vertical_centered(|ui| {
+                                        if ui.add(
+                                            egui::Button::new(
+                                                egui::RichText::new("Close Settings (F10)")
+                                                    .color(egui::Color32::WHITE)
+                                                    .size(13.0)
+                                            )
+                                            .fill(egui::Color32::from_rgba_unmultiplied(61, 174, 233, 200))
+                                        ).clicked() {
+                                            self.show_settings_menu = false;
+                                        }
+                                    });
+                                    ui.add_space(8.0);
+                                });
+                            });
+                        });
                     }
                 });
             });
