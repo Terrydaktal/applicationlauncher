@@ -1443,7 +1443,7 @@ impl eframe::App for App {
                             .max_height(list_height)
                             .show(ui, |ui| {
                                 if scroll_delta.y != 0.0 {
-                                    ui.scroll_with_delta(egui::vec2(0.0, scroll_delta.y * 2.0));
+                                    ui.scroll_with_delta(egui::vec2(0.0, scroll_delta.y * 6.0));
                                 }
                                 
                                 ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
@@ -1597,7 +1597,7 @@ impl eframe::App for App {
                             .max_height(list_height)
                             .show(ui, |ui| {
                                 if scroll_delta.y != 0.0 {
-                                    ui.scroll_with_delta(egui::vec2(0.0, scroll_delta.y * 2.0));
+                                    ui.scroll_with_delta(egui::vec2(0.0, scroll_delta.y * 6.0));
                                 }
                                 for index in 0..total_items {
                                     let is_selected = index == self.selected_index;
