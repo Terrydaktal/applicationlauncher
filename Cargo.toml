@@ -1,0 +1,11 @@
+[package]
+name = "applicationlauncher"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.33.0"
+egui_extras = { version = "0.33.0", features = ["all_loaders"] }
+image = { version = "0.25.5", features = ["png", "jpeg"] }
+freedesktop-icons = "0.4.0"
+fuzzy-matcher = "0.3.7"
