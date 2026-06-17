@@ -1,0 +1,20 @@
+{
+  "KPackageStructure": "KWin/Script",
+  "KPlugin": {
+    "Authors": [
+      {
+        "Email": "9lewis9@gmail.com",
+        "Name": "Terrydaktal"
+      }
+    ],
+    "Category": "Window Management",
+    "Description": "Streams KWin window updates to applicationlauncher over D-Bus.",
+    "EnabledByDefault": true,
+    "Id": "applicationlauncher-window-feed",
+    "License": "MIT",
+    "Name": "Application Launcher Window Feed",
+    "Version": "1.0.0"
+  },
+  "X-Plasma-API": "javascript",
+  "X-Plasma-MainScript": "code/main.js"
+}

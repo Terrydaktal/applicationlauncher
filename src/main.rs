@@ -1,8 +1,20 @@
 use eframe::egui;
-use std::collections::HashMap;
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
+use zbus::interface;
+
+const WINDOW_REMOVAL_CONFIRMATION_POLLS: usize = 2;
+const KWIN_WINDOW_FEED_SERVICE: &str = "com.terrydaktal.ApplicationLauncher";
+const KWIN_WINDOW_FEED_PATH: &str = "/WindowFeed";
+const KWIN_WINDOW_FEED_SCRIPT_ID: &str = "applicationlauncher-window-feed";
+const KWIN_WINDOW_FEED_METADATA: &str =
+    include_str!("../kwin/applicationlauncher-window-feed/metadata.json");
+const KWIN_WINDOW_FEED_MAIN_JS: &str =
+    include_str!("../kwin/applicationlauncher-window-feed/contents/code/main.js");
 
 #[derive(Clone, Debug)]
 struct ProcessChainEntry {
@@ -51,6 +63,46 @@ enum UiEvent {
     FocusLauncher,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KWinWindowPayload {
+    id: String,
+    title: String,
+    class: String,
+    #[serde(default)]
+    pid: i32,
+    #[serde(default)]
+    desktop_file_name: String,
+}
+
+#[derive(Clone, Debug)]
+enum WindowFeedEvent {
+    Upsert(KWinWindowPayload),
+    Remove(String),
+}
+
+struct KWinWindowFeed {
+    tx: Sender<WindowFeedEvent>,
+    repaint_ctx: egui::Context,
+}
+
+#[interface(name = "com.terrydaktal.ApplicationLauncher.WindowFeed", spawn = false)]
+impl KWinWindowFeed {
+    #[zbus(name = "UpsertWindow")]
+    fn upsert_window(&self, payload: &str) {
+        if let Ok(window) = serde_json::from_str::<KWinWindowPayload>(payload) {
+            let _ = self.tx.send(WindowFeedEvent::Upsert(window));
+            self.repaint_ctx.request_repaint();
+        }
+    }
+
+    #[zbus(name = "RemoveWindow")]
+    fn remove_window(&self, id: &str) {
+        let _ = self.tx.send(WindowFeedEvent::Remove(id.to_string()));
+        self.repaint_ctx.request_repaint();
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ActivePane {
     Windows,
@@ -97,6 +149,12 @@ struct App {
     app_icon_name_size: f32,
     disable_ibeam: bool,
     process_chain_popup: Option<WindowInfo>,
+    window_receiver: Receiver<Vec<WindowInfo>>,
+    window_feed_receiver: Receiver<WindowFeedEvent>,
+    rapid_polling: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    last_selected_window_id: Option<String>,
+    missing_window_counts: HashMap<String, usize>,
+    use_kwin_window_feed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1148,7 +1206,250 @@ fn build_process_chain(
     chain
 }
 
-fn get_open_windows(kdotool_path: &Path, theme: &str) -> Vec<WindowInfo> {
+fn is_terminal_class(class_lower: &str) -> bool {
+    class_lower.contains("terminal")
+        || class_lower == "konsole"
+        || class_lower == "kitty"
+        || class_lower == "alacritty"
+        || class_lower == "wezterm"
+        || class_lower == "foot"
+}
+
+fn build_window_info(
+    id: String,
+    title: String,
+    class: String,
+    pid: Option<i32>,
+    theme: &str,
+    icon_cache: &mut HashMap<String, Option<PathBuf>>,
+    ppid_to_children: &HashMap<i32, Vec<i32>>,
+    pid_to_name: &HashMap<i32, String>,
+    pid_to_ppid: &HashMap<i32, i32>,
+) -> Option<WindowInfo> {
+    let class_lower = class.to_lowercase();
+    let my_pid = std::process::id() as i32;
+
+    if class_lower.contains("plasmashell")
+        || class_lower == "kwin_wayland"
+        || class_lower.is_empty()
+        || class_lower == "applicationlauncher"
+        || title == "Open Application Windows"
+        || pid == Some(my_pid)
+    {
+        return None;
+    }
+
+    let display_title = if title.is_empty() {
+        class.clone()
+    } else {
+        title
+    };
+
+    let mut active_process = None;
+    let mut exe_path = None;
+    let mut process_chain = Vec::new();
+    if let Some(pid) = pid {
+        let mut target_pid = pid;
+        if is_terminal_class(&class_lower) {
+            if let Some((leaf_pid, leaf_name)) =
+                find_terminal_leaf(pid, ppid_to_children, pid_to_name)
+            {
+                active_process = Some(leaf_name);
+                target_pid = leaf_pid;
+            }
+        }
+
+        if let Ok(path) = std::fs::read_link(format!("/proc/{}/exe", pid)) {
+            exe_path = Some(path);
+        }
+
+        process_chain = build_process_chain(target_pid, pid_to_name, pid_to_ppid);
+    }
+
+    let mut final_title = display_title;
+    if let Some(ref proc_name) = active_process {
+        let separators = [" - ", " — ", " – ", " : ", " | "];
+        let mut split_found = false;
+        for sep in separators {
+            if let Some(pos) = final_title.find(sep) {
+                let (left, right) = final_title.split_at(pos);
+                let right_clean = &right[sep.len()..];
+                final_title = format!(
+                    "{}{}{}{}{}",
+                    left.trim(),
+                    sep,
+                    proc_name,
+                    sep,
+                    right_clean.trim()
+                );
+                split_found = true;
+                break;
+            }
+        }
+        if !split_found {
+            final_title = format!("{} - {}", final_title, proc_name);
+        }
+    }
+
+    let icon_key = active_process.as_ref().unwrap_or(&class).clone();
+    let icon_path = icon_cache
+        .entry(icon_key.clone())
+        .or_insert_with(|| {
+            let mut path = None;
+            if let Some(ref proc_name) = active_process {
+                path = find_icon(theme, proc_name);
+            }
+            if path.is_none() {
+                path = find_icon(theme, &class);
+            }
+            path
+        })
+        .clone();
+
+    Some(WindowInfo {
+        id,
+        title: final_title,
+        class,
+        icon_path,
+        active_process,
+        exe_path,
+        process_chain,
+    })
+}
+
+fn kwin_window_script_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(
+        PathBuf::from(home)
+            .join(".local/share/kwin/scripts")
+            .join(KWIN_WINDOW_FEED_SCRIPT_ID),
+    )
+}
+
+fn install_kwin_window_feed_script() -> Result<(), String> {
+    let Some(script_dir) = kwin_window_script_dir() else {
+        return Err("HOME is not set; cannot install KWin window feed script.".to_string());
+    };
+
+    let code_dir = script_dir.join("contents/code");
+    std::fs::create_dir_all(&code_dir)
+        .map_err(|err| format!("Failed to create KWin script directory: {err}"))?;
+    std::fs::write(script_dir.join("metadata.json"), KWIN_WINDOW_FEED_METADATA)
+        .map_err(|err| format!("Failed to write KWin script metadata: {err}"))?;
+    std::fs::write(code_dir.join("main.js"), KWIN_WINDOW_FEED_MAIN_JS)
+        .map_err(|err| format!("Failed to write KWin script source: {err}"))?;
+    Ok(())
+}
+
+fn enable_kwin_window_feed_script() -> Result<(), String> {
+    let status = Command::new("kwriteconfig6")
+        .args([
+            "--file",
+            "kwinrc",
+            "--group",
+            "Plugins",
+            "--key",
+            &format!("{}Enabled", KWIN_WINDOW_FEED_SCRIPT_ID),
+            "true",
+        ])
+        .status()
+        .map_err(|err| format!("Failed to enable KWin window feed script: {err}"))?;
+
+    if !status.success() {
+        return Err("kwriteconfig6 failed while enabling the KWin window feed script.".to_string());
+    }
+
+    Ok(())
+}
+
+fn reload_kwin_config() -> Result<(), String> {
+    let status = Command::new("qdbus6")
+        .args(["org.kde.KWin", "/KWin", "reconfigure"])
+        .status()
+        .map_err(|err| format!("Failed to reload KWin configuration: {err}"))?;
+
+    if !status.success() {
+        return Err("qdbus6 returned a failure while reloading KWin.".to_string());
+    }
+
+    Ok(())
+}
+
+fn start_kwin_window_feed_service(
+    tx: Sender<WindowFeedEvent>,
+    repaint_ctx: egui::Context,
+) -> Result<(), String> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let ready_tx_success = ready_tx.clone();
+        let result = pollster::block_on(async move {
+            let connection = zbus::connection::Builder::session()
+                .map_err(|err| err.to_string())?
+                .name(KWIN_WINDOW_FEED_SERVICE)
+                .map_err(|err| err.to_string())?
+                .serve_at(KWIN_WINDOW_FEED_PATH, KWinWindowFeed { tx, repaint_ctx })
+                .map_err(|err| err.to_string())?
+                .build()
+                .await
+                .map_err(|err| err.to_string())?;
+
+            let _ = ready_tx_success.send(Ok(()));
+            let _connection = connection;
+            std::future::pending::<()>().await;
+            #[allow(unreachable_code)]
+            Ok::<(), String>(())
+        });
+
+        if let Err(err) = result {
+            let _ = ready_tx.send(Err(err));
+        }
+    });
+
+    ready_rx
+        .recv()
+        .map_err(|err| format!("Failed to start KWin window feed service: {err}"))?
+}
+
+fn setup_kwin_window_feed(
+    tx: Sender<WindowFeedEvent>,
+    repaint_ctx: egui::Context,
+) -> Result<(), String> {
+    start_kwin_window_feed_service(tx, repaint_ctx)?;
+    install_kwin_window_feed_script()?;
+    enable_kwin_window_feed_script()?;
+    reload_kwin_config()?;
+    Ok(())
+}
+
+fn window_info_from_kwin_payload(
+    payload: KWinWindowPayload,
+    theme: &str,
+    ppid_to_children: &HashMap<i32, Vec<i32>>,
+    pid_to_name: &HashMap<i32, String>,
+    pid_to_ppid: &HashMap<i32, i32>,
+) -> Option<WindowInfo> {
+    let mut icon_cache = HashMap::new();
+    let class = if payload.class.trim().is_empty() {
+        payload.desktop_file_name
+    } else {
+        payload.class
+    };
+    let pid = (payload.pid > 0).then_some(payload.pid);
+    build_window_info(
+        payload.id,
+        payload.title,
+        class,
+        pid,
+        theme,
+        &mut icon_cache,
+        ppid_to_children,
+        pid_to_name,
+        pid_to_ppid,
+    )
+}
+
+fn get_open_windows(kdotool_path: &Path, theme: &str) -> Option<Vec<WindowInfo>> {
     // 1. Fetch all window IDs using kdotool search
     let output = match Command::new(kdotool_path)
         .arg("search")
@@ -1159,11 +1460,15 @@ fn get_open_windows(kdotool_path: &Path, theme: &str) -> Vec<WindowInfo> {
         Ok(o) => o,
         Err(e) => {
             eprintln!("Failed to execute kdotool search: {:?}", e);
-            return Vec::new();
+            return None;
         }
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        return None;
+    }
+
     let mut ids = Vec::new();
     for line in stdout.lines() {
         let line = line.trim();
@@ -1173,7 +1478,7 @@ fn get_open_windows(kdotool_path: &Path, theme: &str) -> Vec<WindowInfo> {
     }
 
     if ids.is_empty() {
-        return Vec::new();
+        return None;
     }
 
     // 2. Query all window metadata in a single chained kdotool invocation!
@@ -1197,9 +1502,13 @@ fn get_open_windows(kdotool_path: &Path, theme: &str) -> Vec<WindowInfo> {
                 "Failed to execute chained kdotool metadata command: {:?}",
                 e
             );
-            return Vec::new();
+            return None;
         }
     };
+
+    if !meta_output.status.success() {
+        return None;
+    }
 
     let meta_stdout = String::from_utf8_lossy(&meta_output.stdout);
     let lines: Vec<&str> = meta_stdout.lines().collect();
@@ -1213,135 +1522,66 @@ fn get_open_windows(kdotool_path: &Path, theme: &str) -> Vec<WindowInfo> {
 
     // Parse blocks of metadata. Since invalid windows get skipped, we search for UUID patterns
     // to identify the start of each valid window's metadata block.
-    let mut idx = 0;
-    while idx < lines.len() {
-        let line = lines[idx].trim();
-        // Check if line matches window UUID format (enclosed in curly braces)
-        if line.starts_with('{') && line.ends_with('}') {
-            let id = line.to_string();
-            let title = lines
-                .get(idx + 1)
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
-            let class = lines
-                .get(idx + 2)
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
-            let pid_str = lines
-                .get(idx + 3)
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
-            let pid: Option<i32> = pid_str.parse().ok();
+    let mut window_blocks = Vec::new();
+    let mut current_block = Vec::new();
 
-            idx += 4; // Advance to the next expected block
-
-            let class_lower = class.to_lowercase();
-            let my_pid = std::process::id() as i32;
-
-            // Filter out system panels, desktops, window manager shells, and the launcher itself
-            if class_lower.contains("plasmashell")
-                || class_lower == "kwin_wayland"
-                || class_lower.is_empty()
-                || class_lower == "applicationlauncher"
-                || title == "Open Application Windows"
-                || pid == Some(my_pid)
-            {
-                continue;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.starts_with('{') && trimmed.ends_with('}') {
+            if !current_block.is_empty() {
+                window_blocks.push(current_block);
             }
-
-            // Fallback for empty title
-            let display_title = if title.is_empty() {
-                class.clone()
-            } else {
-                title
-            };
-
-            // Detect active process running in terminal and resolve binary exe path
-            let mut active_process = None;
-            let mut exe_path = None;
-            let mut process_chain = Vec::new();
-            if let Some(pid) = pid {
-                let is_terminal = class_lower.contains("terminal")
-                    || class_lower == "konsole"
-                    || class_lower == "kitty"
-                    || class_lower == "alacritty"
-                    || class_lower == "wezterm"
-                    || class_lower == "foot";
-
-                let mut target_pid = pid;
-                if is_terminal {
-                    if let Some((leaf_pid, leaf_name)) =
-                        find_terminal_leaf(pid, &ppid_to_children, &pid_to_name)
-                    {
-                        active_process = Some(leaf_name);
-                        target_pid = leaf_pid;
-                    }
-                }
-
-                if let Ok(path) = std::fs::read_link(format!("/proc/{}/exe", pid)) {
-                    exe_path = Some(path);
-                }
-
-                process_chain = build_process_chain(target_pid, &pid_to_name, &pid_to_ppid);
-            }
-
-            // Insert active process name between terminal name and working directory in the title
-            let mut final_title = display_title;
-            if let Some(ref proc_name) = active_process {
-                let separators = [" - ", " — ", " – ", " : ", " | "];
-                let mut split_found = false;
-                for sep in separators {
-                    if let Some(pos) = final_title.find(sep) {
-                        let (left, right) = final_title.split_at(pos);
-                        let right_clean = &right[sep.len()..];
-                        final_title = format!(
-                            "{}{}{}{}{}",
-                            left.trim(),
-                            sep,
-                            proc_name,
-                            sep,
-                            right_clean.trim()
-                        );
-                        split_found = true;
-                        break;
-                    }
-                }
-                if !split_found {
-                    final_title = format!("{} - {}", final_title, proc_name);
-                }
-            }
-
-            // Caching icon resolution to avoid repeated filesystem scans for identical applications
-            let icon_key = active_process.as_ref().unwrap_or(&class).clone();
-            let icon_path = icon_cache
-                .entry(icon_key.clone())
-                .or_insert_with(|| {
-                    let mut path = None;
-                    if let Some(ref proc_name) = active_process {
-                        path = find_icon(&theme_str, proc_name);
-                    }
-                    if path.is_none() {
-                        path = find_icon(&theme_str, &class);
-                    }
-                    path
-                })
-                .clone();
-
-            windows.push(WindowInfo {
-                id,
-                title: final_title,
-                class,
-                icon_path,
-                active_process,
-                exe_path,
-                process_chain,
-            });
+            current_block = vec![trimmed.to_string()];
         } else {
-            idx += 1;
+            current_block.push(line.to_string());
+        }
+    }
+    if !current_block.is_empty() {
+        window_blocks.push(current_block);
+    }
+
+    for block in window_blocks {
+        if block.is_empty() {
+            continue;
+        }
+        let id = block[0].clone();
+
+        let mut title = String::new();
+        let mut class = String::new();
+        let mut pid = None;
+
+        if block.len() >= 2 {
+            let last_line = block.last().unwrap().trim();
+            if let Ok(p) = last_line.parse::<i32>() {
+                pid = Some(p);
+                if block.len() >= 3 {
+                    class = block[block.len() - 2].trim().to_string();
+                    if block.len() > 3 {
+                        title = block[1..block.len() - 2].join(" ").trim().to_string();
+                    }
+                }
+            } else {
+                class = block.get(2).cloned().unwrap_or_default();
+                title = block.get(1).cloned().unwrap_or_default();
+            }
+        }
+
+        if let Some(window) = build_window_info(
+            id,
+            title,
+            class,
+            pid,
+            &theme_str,
+            &mut icon_cache,
+            &ppid_to_children,
+            &pid_to_name,
+            &pid_to_ppid,
+        ) {
+            windows.push(window);
         }
     }
 
-    windows
+    Some(windows)
 }
 
 fn load_pinned_apps() -> Vec<PathBuf> {
@@ -1435,6 +1675,14 @@ impl App {
         let (width, height) = load_window_size();
         let pinned_apps = load_pinned_apps();
         let settings = load_launcher_settings();
+
+        let (window_tx, window_rx) = std::sync::mpsc::channel();
+        let (window_feed_tx, window_feed_rx) = std::sync::mpsc::channel();
+        let rapid_polling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let kwin_window_feed_error =
+            setup_kwin_window_feed(window_feed_tx, cc.egui_ctx.clone()).err();
+        let use_kwin_window_feed = kwin_window_feed_error.is_none();
+
         let mut app = Self {
             mode,
             windows: Vec::new(),
@@ -1475,7 +1723,56 @@ impl App {
             app_icon_name_size: settings.app_icon_name_size,
             disable_ibeam: settings.disable_ibeam,
             process_chain_popup: None,
+            window_receiver: window_rx,
+            window_feed_receiver: window_feed_rx,
+            rapid_polling: std::sync::Arc::clone(&rapid_polling),
+            last_selected_window_id: None,
+            missing_window_counts: HashMap::new(),
+            use_kwin_window_feed,
         };
+
+        if !app.use_kwin_window_feed {
+            let kpath = app.kdotool_path.clone();
+            let theme = app
+                .force_theme
+                .as_deref()
+                .unwrap_or("breeze-dark")
+                .to_string();
+            let rapid_polling_thread = std::sync::Arc::clone(&rapid_polling);
+            let ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || {
+                let mut rapid_poll_count = 0;
+                if let Some(kpath) = kpath {
+                    loop {
+                        if rapid_polling_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                            rapid_polling_thread.store(false, std::sync::atomic::Ordering::SeqCst);
+                            rapid_poll_count = 15; // 15 * 300ms = 4.5 seconds of rapid polling
+                        }
+
+                        let sleep_dur = if rapid_poll_count > 0 {
+                            rapid_poll_count -= 1;
+                            std::time::Duration::from_millis(300)
+                        } else {
+                            std::time::Duration::from_millis(1000)
+                        };
+
+                        std::thread::sleep(sleep_dur);
+
+                        if let Some(windows) = get_open_windows(&kpath, &theme) {
+                            if window_tx.send(windows).is_ok() {
+                                ctx.request_repaint();
+                            } else {
+                                break; // channel disconnected
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        if let Some(err) = kwin_window_feed_error {
+            eprintln!("Falling back to kdotool window polling: {err}");
+        }
 
         match app.mode {
             LauncherMode::Apps => app.refresh_apps(),
@@ -1920,6 +2217,96 @@ impl App {
         }
     }
 
+    fn apply_window_snapshot(&mut self, new_windows: Vec<WindowInfo>) {
+        if self.windows.is_empty() {
+            self.windows = new_windows;
+            self.missing_window_counts.clear();
+            return;
+        }
+
+        let mut new_by_id: HashMap<String, WindowInfo> = new_windows
+            .iter()
+            .cloned()
+            .map(|window| (window.id.clone(), window))
+            .collect();
+        let old_ids: HashSet<String> = self
+            .windows
+            .iter()
+            .map(|window| window.id.clone())
+            .collect();
+        let mut merged = Vec::new();
+
+        for old_window in &self.windows {
+            if let Some(new_window) = new_by_id.remove(&old_window.id) {
+                self.missing_window_counts.remove(&old_window.id);
+                merged.push(new_window);
+                continue;
+            }
+
+            let missing_count = self
+                .missing_window_counts
+                .entry(old_window.id.clone())
+                .or_insert(0);
+            *missing_count += 1;
+
+            if *missing_count < WINDOW_REMOVAL_CONFIRMATION_POLLS {
+                merged.push(old_window.clone());
+            }
+        }
+
+        for new_window in new_windows {
+            if !old_ids.contains(&new_window.id) {
+                self.missing_window_counts.remove(&new_window.id);
+                merged.push(new_window);
+            }
+        }
+
+        let retained_ids: HashSet<String> = merged.iter().map(|window| window.id.clone()).collect();
+        self.missing_window_counts
+            .retain(|window_id, _| retained_ids.contains(window_id));
+        self.windows = merged;
+    }
+
+    fn apply_window_feed_events(&mut self, events: Vec<WindowFeedEvent>) {
+        if events.is_empty() {
+            return;
+        }
+
+        let theme = self
+            .force_theme
+            .as_deref()
+            .unwrap_or("breeze-dark")
+            .to_string();
+        let (ppid_to_children, pid_to_name, pid_to_ppid) = get_process_tree();
+
+        for event in events {
+            match event {
+                WindowFeedEvent::Upsert(payload) => {
+                    if let Some(window) = window_info_from_kwin_payload(
+                        payload,
+                        &theme,
+                        &ppid_to_children,
+                        &pid_to_name,
+                        &pid_to_ppid,
+                    ) {
+                        self.missing_window_counts.remove(&window.id);
+                        if let Some(existing) =
+                            self.windows.iter_mut().find(|item| item.id == window.id)
+                        {
+                            *existing = window;
+                        } else {
+                            self.windows.push(window);
+                        }
+                    }
+                }
+                WindowFeedEvent::Remove(id) => {
+                    self.missing_window_counts.remove(&id);
+                    self.windows.retain(|window| window.id != id);
+                }
+            }
+        }
+    }
+
     fn refresh_windows(&mut self) {
         if let Some(ref kpath) = self.kdotool_path {
             let kpath = kpath.clone();
@@ -1935,7 +2322,7 @@ impl App {
             std::thread::spawn(
                 move || match Command::new(&kpath).arg("--version").output() {
                     Ok(_) => {
-                        let windows = get_open_windows(&kpath, &theme);
+                        let windows = get_open_windows(&kpath, &theme).unwrap_or_default();
                         let apps = get_installed_apps(&theme);
                         let _ = tx.send(LoadResult::Content { windows, apps });
                     }
@@ -1966,6 +2353,8 @@ impl App {
     }
 
     fn launch_app_and_exit(&self, app: &AppInfo, ctx: &egui::Context) {
+        self.rapid_polling
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         if !launch_desktop_entry(&app.desktop_file_path) {
             launch_app(&app.exec);
         }
@@ -2006,6 +2395,8 @@ impl App {
     }
 
     fn launch_window_app_and_exit(&self, win: &WindowInfo, ctx: &egui::Context) {
+        self.rapid_polling
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(exe_path) = &win.exe_path {
             let exe = exe_path.clone();
             std::thread::spawn(move || {
@@ -2065,6 +2456,8 @@ impl App {
     }
 
     fn close_window_and_exit(&self, id: String, ctx: &egui::Context) {
+        self.rapid_polling
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(ref kpath) = self.kdotool_path {
             let kpath = kpath.clone();
             std::thread::spawn(move || {
@@ -2084,6 +2477,21 @@ impl eframe::App for App {
             self.height = current_size.y;
         }
 
+        if !self.loading && self.use_kwin_window_feed {
+            let mut pending_events = Vec::new();
+            while let Ok(event) = self.window_feed_receiver.try_recv() {
+                pending_events.push(event);
+            }
+            self.apply_window_feed_events(pending_events);
+        } else if !self.use_kwin_window_feed {
+            // Check background receiver for periodic window updates
+            while let Ok(new_windows) = self.window_receiver.try_recv() {
+                if !self.loading {
+                    self.apply_window_snapshot(new_windows);
+                }
+            }
+        }
+
         // Check background receiver for window query results
         if self.loading {
             ctx.request_repaint(); // Keep repainting until loaded to check channel promptly
@@ -2099,6 +2507,7 @@ impl eframe::App for App {
                         }
                         LoadResult::Content { windows, apps } => {
                             self.windows = windows;
+                            self.missing_window_counts.clear();
                             self.apps = apps;
                             self.selected_index = 0;
                             self.side_panel_selected_index = 0;
@@ -2395,7 +2804,15 @@ impl eframe::App for App {
                         }
                     }
 
-	                    let total_items = match self.mode {
+                    if self.mode == LauncherMode::Windows {
+                        if let Some(ref last_id) = self.last_selected_window_id {
+                            if let Some(pos) = filtered_windows.iter().position(|(w, _)| &w.id == last_id) {
+                                self.selected_index = pos;
+                            }
+                        }
+                    }
+
+                    let total_items = match self.mode {
                         LauncherMode::Apps => filtered_apps.len(),
                         LauncherMode::Windows => filtered_windows.len(),
                     };
@@ -3739,6 +4156,12 @@ impl eframe::App for App {
                     }
                     if self.process_chain_popup.is_some() {
                         self.show_process_chain_popup(ctx);
+                    }
+
+                    if self.mode == LauncherMode::Windows && !filtered_windows.is_empty() {
+                        self.last_selected_window_id = filtered_windows.get(self.selected_index).map(|(w, _)| w.id.clone());
+                    } else {
+                        self.last_selected_window_id = None;
                     }
                 });
             });
