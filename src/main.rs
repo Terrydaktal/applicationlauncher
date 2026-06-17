@@ -31,8 +31,11 @@ enum LauncherMode {
 }
 
 enum LoadResult {
-    Success(Vec<WindowInfo>),
     AppsSuccess(Vec<AppInfo>),
+    Content {
+        windows: Vec<WindowInfo>,
+        apps: Vec<AppInfo>,
+    },
     Error(String),
 }
 
@@ -55,6 +58,60 @@ struct App {
     icon_only: bool,
     show_settings_menu: bool,
     show_system_settings_modules: bool,
+    win_icon_size: f32,
+    win_padding: f32,
+    win_row_height: f32,
+    win_text_spacing: f32,
+    win_line_height: f32,
+    win_show_path: bool,
+    win_title_size: f32,
+    win_path_size: f32,
+    app_icon_size: f32,
+    app_icon_tile_size: f32,
+    app_icon_show_name: bool,
+    app_icon_name_size: f32,
+    disable_ibeam: bool,
+}
+
+#[derive(Clone, Copy)]
+struct LauncherSettings {
+    show_system_settings_modules: bool,
+    app_icon_mode: bool,
+    win_icon_size: f32,
+    win_padding: f32,
+    win_row_height: f32,
+    win_text_spacing: f32,
+    win_line_height: f32,
+    win_show_path: bool,
+    win_title_size: f32,
+    win_path_size: f32,
+    app_icon_size: f32,
+    app_icon_tile_size: f32,
+    app_icon_show_name: bool,
+    app_icon_name_size: f32,
+    disable_ibeam: bool,
+}
+
+impl Default for LauncherSettings {
+    fn default() -> Self {
+        Self {
+            show_system_settings_modules: true,
+            app_icon_mode: false,
+            win_icon_size: 32.0,
+            win_padding: 6.0,
+            win_row_height: 52.0,
+            win_text_spacing: 2.0,
+            win_line_height: 14.0,
+            win_show_path: true,
+            win_title_size: 13.0,
+            win_path_size: 10.5,
+            app_icon_size: 32.0,
+            app_icon_tile_size: 68.0,
+            app_icon_show_name: true,
+            app_icon_name_size: 10.5,
+            disable_ibeam: false,
+        }
+    }
 }
 
 fn print_help() {
@@ -75,14 +132,6 @@ OPTIONS
     -h, --help
         Print this help information and exit.
 
-    -a, --apps
-        Open the launcher in application mode to show and launch installed
-        desktop applications rather than active window objects.
-
-    -i, --icon-only
-        Show only application icons in a grid format without names (only
-        applicable in application launcher mode).
-
     --close-on-blur
         Close the launcher window automatically when it loses focus.
 
@@ -91,15 +140,17 @@ OPTIONS
 
 OPERATION
     When launched, the application retrieves a list of all open windows using
-    kdotool. It renders a frameless GUI window containing a search input.
-    As you type, the list is filtered using a fuzzy matcher.
-    
+    kdotool and installed desktop applications from the local system. It renders
+    a frameless GUI window containing a search input, a main window list, and an
+    application side panel. As you type, both lists are filtered using a fuzzy
+    matcher.
+
     Keyboard Navigation:
-        - Up/Down Arrows: Move selection.
-        - Enter: Activate selected window (or launch selected application).
+        - Up/Down Arrows: Move selected window.
+        - Enter: Activate selected window.
         - Escape: Close launcher.
         - F5: Refresh list.
-        - Ctrl+P: Toggle pin/unpin status for the selected application.
+        - F10: Open launcher settings.
 
 EXAMPLES
     applicationlauncher
@@ -151,12 +202,18 @@ fn get_kdotool_path() -> PathBuf {
 
 fn load_window_size() -> (f32, f32) {
     if let Ok(home) = std::env::var("HOME") {
-        let path = PathBuf::from(format!("{}/.config/applicationlauncher/window_size.txt", home));
+        let path = PathBuf::from(format!(
+            "{}/.config/applicationlauncher/window_size.txt",
+            home
+        ));
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(path) {
                 let lines: Vec<&str> = content.lines().collect();
                 if lines.len() >= 2 {
-                    if let (Ok(w), Ok(h)) = (lines[0].trim().parse::<f32>(), lines[1].trim().parse::<f32>()) {
+                    if let (Ok(w), Ok(h)) = (
+                        lines[0].trim().parse::<f32>(),
+                        lines[1].trim().parse::<f32>(),
+                    ) {
                         let w = w.clamp(300.0, 1920.0);
                         let h = h.clamp(200.0, 1080.0);
                         return (w, h);
@@ -165,32 +222,136 @@ fn load_window_size() -> (f32, f32) {
             }
         }
     }
-    (650.0, 480.0) // Default size
+    (980.0, 560.0) // Default size
 }
 
-fn load_show_system_settings_modules() -> bool {
+fn load_launcher_settings() -> LauncherSettings {
+    let mut settings = LauncherSettings::default();
+
     if let Ok(home) = std::env::var("HOME") {
         let path = PathBuf::from(format!("{}/.config/applicationlauncher/settings.txt", home));
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(path) {
                 for line in content.lines() {
-                    let parts: Vec<&str> = line.split('=').collect();
-                    if parts.len() >= 2 && parts[0].trim() == "show_system_settings_modules" {
-                        return parts[1].trim().parse::<bool>().unwrap_or(true);
+                    let mut parts = line.splitn(2, '=');
+                    let key = parts.next().unwrap_or("").trim();
+                    let value = parts.next().unwrap_or("").trim();
+
+                    match key {
+                        "show_system_settings_modules" => {
+                            settings.show_system_settings_modules = value
+                                .parse::<bool>()
+                                .unwrap_or(settings.show_system_settings_modules);
+                        }
+                        "app_icon_mode" => {
+                            settings.app_icon_mode =
+                                value.parse::<bool>().unwrap_or(settings.app_icon_mode);
+                        }
+                        "win_icon_size" => {
+                            settings.win_icon_size = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(16.0, 64.0))
+                                .unwrap_or(settings.win_icon_size);
+                        }
+                        "win_padding" => {
+                            settings.win_padding = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(0.0, 24.0))
+                                .unwrap_or(settings.win_padding);
+                        }
+                        "win_row_height" => {
+                            settings.win_row_height = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(30.0, 100.0))
+                                .unwrap_or(settings.win_row_height);
+                        }
+                        "win_text_spacing" => {
+                            settings.win_text_spacing = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(0.0, 12.0))
+                                .unwrap_or(settings.win_text_spacing);
+                        }
+                        "win_line_height" => {
+                            settings.win_line_height = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(8.0, 30.0))
+                                .unwrap_or(settings.win_line_height);
+                        }
+                        "win_show_path" => {
+                            settings.win_show_path =
+                                value.parse::<bool>().unwrap_or(settings.win_show_path);
+                        }
+                        "win_title_size" => {
+                            settings.win_title_size = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(8.0, 24.0))
+                                .unwrap_or(settings.win_title_size);
+                        }
+                        "win_path_size" => {
+                            settings.win_path_size = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(8.0, 20.0))
+                                .unwrap_or(settings.win_path_size);
+                        }
+                        "app_icon_size" => {
+                            settings.app_icon_size = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(16.0, 64.0))
+                                .unwrap_or(settings.app_icon_size);
+                        }
+                        "app_icon_tile_size" => {
+                            settings.app_icon_tile_size = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(48.0, 128.0))
+                                .unwrap_or(settings.app_icon_tile_size);
+                        }
+                        "app_icon_show_name" => {
+                            settings.app_icon_show_name =
+                                value.parse::<bool>().unwrap_or(settings.app_icon_show_name);
+                        }
+                        "app_icon_name_size" => {
+                            settings.app_icon_name_size = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(8.0, 20.0))
+                                .unwrap_or(settings.app_icon_name_size);
+                        }
+                        "disable_ibeam" => {
+                            settings.disable_ibeam =
+                                value.parse::<bool>().unwrap_or(settings.disable_ibeam);
+                        }
+                        _ => {}
                     }
                 }
             }
         }
     }
-    true // Default is true
+
+    settings
 }
 
-fn save_show_system_settings_modules(value: bool) {
+fn save_launcher_settings(settings: LauncherSettings) {
     if let Ok(home) = std::env::var("HOME") {
         let dir = PathBuf::from(format!("{}/.config/applicationlauncher", home));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("settings.txt");
-        let content = format!("show_system_settings_modules={}\n", value);
+        let content = format!(
+            "show_system_settings_modules={}\napp_icon_mode={}\nwin_icon_size={:.1}\nwin_padding={:.1}\nwin_row_height={:.1}\nwin_text_spacing={:.1}\nwin_line_height={:.1}\nwin_show_path={}\nwin_title_size={:.1}\nwin_path_size={:.1}\napp_icon_size={:.1}\napp_icon_tile_size={:.1}\napp_icon_show_name={}\napp_icon_name_size={:.1}\ndisable_ibeam={}\n",
+            settings.show_system_settings_modules,
+            settings.app_icon_mode,
+            settings.win_icon_size,
+            settings.win_padding,
+            settings.win_row_height,
+            settings.win_text_spacing,
+            settings.win_line_height,
+            settings.win_show_path,
+            settings.win_title_size,
+            settings.win_path_size,
+            settings.app_icon_size,
+            settings.app_icon_tile_size,
+            settings.app_icon_show_name,
+            settings.app_icon_name_size,
+            settings.disable_ibeam
+        );
         let _ = std::fs::write(path, content);
     }
 }
@@ -307,15 +468,13 @@ fn find_icon(theme: &str, class: &str) -> Option<PathBuf> {
     None
 }
 
-
-
-fn match_app(query: &str, target: &str) -> Option<i64> {
+fn fuzzy_match_details(query: &str, target: &str) -> Option<(usize, usize)> {
     let query_lower = query.to_lowercase();
     let target_lower = target.to_lowercase();
 
     let q_len = query_lower.chars().count();
     if q_len == 0 {
-        return Some(0);
+        return Some((0, 0));
     }
 
     let t_len = target_lower.chars().count();
@@ -345,7 +504,11 @@ fn match_app(query: &str, target: &str) -> Option<i64> {
             let substitution = prev[j - 1] + cost;
             let mut cell = deletion.min(insertion).min(substitution);
 
-            if i > 1 && j > 1 && query_chars[i - 1] == target_chars[j - 2] && query_chars[i - 2] == target_chars[j - 1] {
+            if i > 1
+                && j > 1
+                && query_chars[i - 1] == target_chars[j - 2]
+                && query_chars[i - 2] == target_chars[j - 1]
+            {
                 cell = cell.min(prev_prev[j - 2] + 1);
             }
 
@@ -376,27 +539,56 @@ fn match_app(query: &str, target: &str) -> Option<i64> {
 
     if min_distance <= limit {
         let start_idx = best_end_idx.saturating_sub(q_len);
-        
-        let is_word_boundary = start_idx == 0 || {
-            let prev_char = target_chars.get(start_idx - 1);
-            prev_char.map_or(true, |c| c.is_whitespace() || *c == '-' || *c == '_' || *c == '/' || *c == '.')
-        };
 
-        // Base score starts at 1000, drops by 300 per typo (distance), and 20 per character offset from start.
-        // A penalty of 150 is applied if it doesn't match at a word boundary.
-        let mut score = 1000 - (min_distance as i64 * 300) - (start_idx as i64 * 20) - (t_len as i64);
-        if !is_word_boundary {
-            score -= 150;
-        }
-        Some(score)
+        Some((min_distance, start_idx))
     } else {
         None
     }
 }
 
+fn match_app(query: &str, target: &str) -> Option<i64> {
+    let (min_distance, start_idx) = fuzzy_match_details(query, target)?;
+    let target_lower = target.to_lowercase();
+    let target_chars: Vec<char> = target_lower.chars().collect();
+    let t_len = target_chars.len();
+
+    let is_word_boundary = start_idx == 0 || {
+        let prev_char = target_chars.get(start_idx.saturating_sub(1));
+        prev_char.map_or(true, |c| {
+            c.is_whitespace() || *c == '-' || *c == '_' || *c == '/' || *c == '.'
+        })
+    };
+
+    let mut score = 1000 - (min_distance as i64 * 300) - (start_idx as i64 * 20) - (t_len as i64);
+    if !is_word_boundary {
+        score -= 150;
+    }
+    Some(score)
+}
+
+fn app_search_rank(query: &str, app: &AppInfo) -> Option<(usize, bool)> {
+    if let Some((distance, start_idx)) = fuzzy_match_details(query, &app.name) {
+        return Some((distance, start_idx == 0));
+    }
+
+    app.comment
+        .as_deref()
+        .and_then(|comment| fuzzy_match_details(query, comment))
+        .map(|(distance, _)| (distance.saturating_add(1000), false))
+}
+
+fn pinned_app_position(pinned_apps: &[PathBuf], app: &AppInfo) -> usize {
+    pinned_apps
+        .iter()
+        .position(|path| path == &app.desktop_file_path)
+        .unwrap_or(usize::MAX)
+}
+
 fn clean_exec_cmd(exec: &str) -> String {
     let mut cleaned = exec.to_string();
-    for placeholder in &["%f", "%F", "%u", "%U", "%d", "%D", "%n", "%N", "%i", "%c", "%k", "%v"] {
+    for placeholder in &[
+        "%f", "%F", "%u", "%U", "%d", "%D", "%n", "%N", "%i", "%c", "%k", "%v",
+    ] {
         cleaned = cleaned.replace(placeholder, "");
     }
     cleaned.trim().to_string()
@@ -429,9 +621,79 @@ fn launch_app(exec: &str) {
     });
 }
 
+fn launch_desktop_entry(desktop_file_path: &Path) -> bool {
+    let Some(desktop_id) = desktop_file_path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+
+    let desktop_id = desktop_id.to_string();
+    std::thread::spawn(move || {
+        let mut cmd = Command::new("gtk-launch");
+        cmd.arg(&desktop_id);
+        cmd.env_remove("PYTHONPATH");
+        cmd.env_remove("VIRTUAL_ENV");
+        cmd.env_remove("UV_ACTIVE");
+        let _ = cmd.spawn();
+    });
+    true
+}
+
+fn normalize_app_match_key(value: &str) -> String {
+    value
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn window_application_key(win: &WindowInfo) -> String {
+    let class = win.class.trim().to_lowercase();
+    if !class.is_empty() {
+        if let Some(last_segment) = class.rsplit('.').next() {
+            if !last_segment.is_empty() {
+                return last_segment.to_string();
+            }
+        }
+        return class;
+    }
+
+    if let Some(path) = &win.exe_path {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            return name.to_lowercase();
+        }
+    }
+
+    if let Some(proc_name) = &win.active_process {
+        return proc_name.to_lowercase();
+    }
+
+    String::new()
+}
+
+fn command_basename(exec: &str) -> Option<String> {
+    let cleaned = clean_exec_cmd(exec);
+    let command = cleaned.split_whitespace().next()?;
+    let name = Path::new(command).file_name()?.to_str()?;
+    Some(name.to_string())
+}
+
+fn truncate_tile_label(text: &str, tile_size: f32) -> String {
+    let max_chars = ((tile_size / 7.0).floor() as usize).clamp(6, 22);
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+
+    let keep = max_chars.saturating_sub(3);
+    let mut truncated: String = text.chars().take(keep).collect();
+    truncated.push_str("...");
+    truncated
+}
+
 fn parse_desktop_file(path: &Path, theme: &str) -> Option<AppInfo> {
     let content = std::fs::read_to_string(path).ok()?;
-    
+
     let mut in_desktop_entry = false;
     let mut name = None;
     let mut exec = None;
@@ -440,19 +702,22 @@ fn parse_desktop_file(path: &Path, theme: &str) -> Option<AppInfo> {
     let mut no_display = false;
     let mut is_application = false;
     let mut is_settings_module = false;
+    let mut exec_command = None;
+    let mut x_kde_alias_for = None;
 
     if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
         let name_lower = file_name.to_lowercase();
-        if name_lower.starts_with("kcm_") || name_lower.contains("settings") {
+        if name_lower.starts_with("kcm_") {
             is_settings_module = true;
         }
     }
 
     // Use current locale language code if available
-    let lang = std::env::var("LANG").ok()
+    let lang = std::env::var("LANG")
+        .ok()
         .and_then(|l| l.split('.').next().map(|s| s.to_string()))
         .and_then(|l| l.split('_').next().map(|s| s.to_string()));
-    
+
     let name_key = lang.as_ref().map(|l| format!("Name[{}]", l));
     let comment_key = lang.as_ref().map(|l| format!("Comment[{}]", l));
 
@@ -493,6 +758,7 @@ fn parse_desktop_file(path: &Path, theme: &str) -> Option<AppInfo> {
 
             if key == "Exec" {
                 exec = Some(val.to_string());
+                exec_command = Some(val.to_string());
             }
             if key == "Icon" {
                 icon = Some(val.to_string());
@@ -503,12 +769,26 @@ fn parse_desktop_file(path: &Path, theme: &str) -> Option<AppInfo> {
             if key == "Type" && val == "Application" {
                 is_application = true;
             }
-            if key == "Categories" && val.split(';').any(|c| c == "Settings" || c == "SettingsPanel" || c == "System") {
+            if key == "Categories" && val.split(';').any(|c| c == "SettingsPanel") {
                 is_settings_module = true;
             }
-            if key == "X-KDE-AliasFor" && val == "systemsettings" {
-                is_settings_module = true;
+            if key == "X-KDE-AliasFor" {
+                x_kde_alias_for = Some(val.to_string());
             }
+        }
+    }
+
+    if x_kde_alias_for.as_deref() == Some("systemsettings") && no_display {
+        is_settings_module = true;
+    }
+
+    if let Some(exec_cmd) = exec_command.as_deref() {
+        let exec_lower = exec_cmd.to_lowercase();
+        if exec_lower.starts_with("kcmshell")
+            || exec_lower.contains(" kcm_")
+            || exec_lower.starts_with("systemsettings kcm_")
+        {
+            is_settings_module = true;
         }
     }
 
@@ -548,7 +828,10 @@ fn get_installed_apps(theme: &str) -> Vec<AppInfo> {
         app_dirs.push(flatpak_dir);
     }
     let user_flatpak_dir = if let Ok(home) = std::env::var("HOME") {
-        Some(PathBuf::from(format!("{}/.local/share/flatpak/exports/share/applications", home)))
+        Some(PathBuf::from(format!(
+            "{}/.local/share/flatpak/exports/share/applications",
+            home
+        )))
     } else {
         None
     };
@@ -586,26 +869,26 @@ fn get_installed_apps(theme: &str) -> Vec<AppInfo> {
 fn parse_proc_stat(stat_content: &str) -> Option<(i32, String, i32)> {
     let last_paren = stat_content.rfind(')')?;
     let (left, right) = stat_content.split_at(last_paren);
-    
+
     let pid_part = left.split_whitespace().next()?;
     let pid: i32 = pid_part.parse().ok()?;
-    
+
     let name_start = left.find('(')? + 1;
     let name = left[name_start..].to_string();
-    
+
     let tokens: Vec<&str> = right[1..].split_whitespace().collect();
     if tokens.len() < 2 {
         return None;
     }
     let ppid: i32 = tokens[1].parse().ok()?;
-    
+
     Some((pid, name, ppid))
 }
 
 fn get_process_tree() -> (HashMap<i32, Vec<i32>>, HashMap<i32, String>) {
     let mut ppid_to_children = HashMap::new();
     let mut pid_to_name = HashMap::new();
-    
+
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for entry in entries {
             if let Ok(entry) = entry {
@@ -617,7 +900,10 @@ fn get_process_tree() -> (HashMap<i32, Vec<i32>>, HashMap<i32, String>) {
                             if let Ok(content) = std::fs::read_to_string(stat_path) {
                                 if let Some((pid, proc_name, ppid)) = parse_proc_stat(&content) {
                                     pid_to_name.insert(pid, proc_name);
-                                    ppid_to_children.entry(ppid).or_insert_with(Vec::new).push(pid);
+                                    ppid_to_children
+                                        .entry(ppid)
+                                        .or_insert_with(Vec::new)
+                                        .push(pid);
                                 }
                             }
                         }
@@ -626,13 +912,19 @@ fn get_process_tree() -> (HashMap<i32, Vec<i32>>, HashMap<i32, String>) {
             }
         }
     }
-    
+
     (ppid_to_children, pid_to_name)
 }
 
 fn is_shell(name: &str) -> bool {
     let n = name.to_lowercase();
-    n == "bash" || n == "fish" || n == "zsh" || n == "sh" || n == "dash" || n == "tcsh" || n == "ksh"
+    n == "bash"
+        || n == "fish"
+        || n == "zsh"
+        || n == "sh"
+        || n == "dash"
+        || n == "tcsh"
+        || n == "ksh"
 }
 
 fn find_terminal_leaf(
@@ -649,11 +941,11 @@ fn find_terminal_leaf(
                     valid_children.push((child, name.clone()));
                 }
             }
-            
+
             if valid_children.is_empty() {
                 break;
             }
-            
+
             valid_children.sort_by(|a, b| {
                 let a_is_shell = is_shell(&a.1);
                 let b_is_shell = is_shell(&b.1);
@@ -663,7 +955,7 @@ fn find_terminal_leaf(
                     _ => a.0.cmp(&b.0),
                 }
             });
-            
+
             if let Some(&(best_child, _)) = valid_children.last() {
                 current_pid = best_child;
             } else {
@@ -673,11 +965,13 @@ fn find_terminal_leaf(
             break;
         }
     }
-    
+
     if current_pid == terminal_pid {
         None
     } else {
-        pid_to_name.get(&current_pid).map(|name| (current_pid, name.clone()))
+        pid_to_name
+            .get(&current_pid)
+            .map(|name| (current_pid, name.clone()))
     }
 }
 
@@ -726,7 +1020,10 @@ fn get_open_windows(kdotool_path: &Path, theme: &str) -> Vec<WindowInfo> {
     let meta_output = match cmd.output() {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("Failed to execute chained kdotool metadata command: {:?}", e);
+            eprintln!(
+                "Failed to execute chained kdotool metadata command: {:?}",
+                e
+            );
             return Vec::new();
         }
     };
@@ -749,9 +1046,18 @@ fn get_open_windows(kdotool_path: &Path, theme: &str) -> Vec<WindowInfo> {
         // Check if line matches window UUID format (enclosed in curly braces)
         if line.starts_with('{') && line.ends_with('}') {
             let id = line.to_string();
-            let title = lines.get(idx + 1).map(|s| s.trim().to_string()).unwrap_or_default();
-            let class = lines.get(idx + 2).map(|s| s.trim().to_string()).unwrap_or_default();
-            let pid_str = lines.get(idx + 3).map(|s| s.trim().to_string()).unwrap_or_default();
+            let title = lines
+                .get(idx + 1)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            let class = lines
+                .get(idx + 2)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            let pid_str = lines
+                .get(idx + 3)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
             let pid: Option<i32> = pid_str.parse().ok();
 
             idx += 4; // Advance to the next expected block
@@ -790,7 +1096,9 @@ fn get_open_windows(kdotool_path: &Path, theme: &str) -> Vec<WindowInfo> {
 
                 let mut target_pid = pid;
                 if is_terminal {
-                    if let Some((leaf_pid, leaf_name)) = find_terminal_leaf(pid, &ppid_to_children, &pid_to_name) {
+                    if let Some((leaf_pid, leaf_name)) =
+                        find_terminal_leaf(pid, &ppid_to_children, &pid_to_name)
+                    {
                         active_process = Some(leaf_name);
                         target_pid = leaf_pid;
                     }
@@ -810,7 +1118,14 @@ fn get_open_windows(kdotool_path: &Path, theme: &str) -> Vec<WindowInfo> {
                     if let Some(pos) = final_title.find(sep) {
                         let (left, right) = final_title.split_at(pos);
                         let right_clean = &right[sep.len()..];
-                        final_title = format!("{}{}{}{}{}", left.trim(), sep, proc_name, sep, right_clean.trim());
+                        final_title = format!(
+                            "{}{}{}{}{}",
+                            left.trim(),
+                            sep,
+                            proc_name,
+                            sep,
+                            right_clean.trim()
+                        );
                         split_found = true;
                         break;
                     }
@@ -822,16 +1137,19 @@ fn get_open_windows(kdotool_path: &Path, theme: &str) -> Vec<WindowInfo> {
 
             // Caching icon resolution to avoid repeated filesystem scans for identical applications
             let icon_key = active_process.as_ref().unwrap_or(&class).clone();
-            let icon_path = icon_cache.entry(icon_key.clone()).or_insert_with(|| {
-                let mut path = None;
-                if let Some(ref proc_name) = active_process {
-                    path = find_icon(&theme_str, proc_name);
-                }
-                if path.is_none() {
-                    path = find_icon(&theme_str, &class);
-                }
-                path
-            }).clone();
+            let icon_path = icon_cache
+                .entry(icon_key.clone())
+                .or_insert_with(|| {
+                    let mut path = None;
+                    if let Some(ref proc_name) = active_process {
+                        path = find_icon(&theme_str, proc_name);
+                    }
+                    if path.is_none() {
+                        path = find_icon(&theme_str, &class);
+                    }
+                    path
+                })
+                .clone();
 
             windows.push(WindowInfo {
                 id,
@@ -852,7 +1170,10 @@ fn get_open_windows(kdotool_path: &Path, theme: &str) -> Vec<WindowInfo> {
 fn load_pinned_apps() -> Vec<PathBuf> {
     let mut pinned = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
-        let path = PathBuf::from(format!("{}/.config/applicationlauncher/pinned_apps.txt", home));
+        let path = PathBuf::from(format!(
+            "{}/.config/applicationlauncher/pinned_apps.txt",
+            home
+        ));
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(path) {
                 for line in content.lines() {
@@ -876,12 +1197,12 @@ fn get_window_geometry(kpath: &Path, id: &str) -> Option<(f32, f32, f32, f32)> {
         .output()
         .ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    
+
     let mut x = None;
     let mut y = None;
     let mut width = None;
     let mut height = None;
-    
+
     for line in stdout.lines() {
         let line = line.trim();
         if line.starts_with("Position:") {
@@ -900,7 +1221,7 @@ fn get_window_geometry(kpath: &Path, id: &str) -> Option<(f32, f32, f32, f32)> {
             }
         }
     }
-    
+
     Some((x?, y?, width?, height?))
 }
 
@@ -922,9 +1243,12 @@ impl App {
         visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(8);
         visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(8);
 
-        visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 6);
-        visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16);
-        visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30);
+        visuals.widgets.inactive.weak_bg_fill =
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 6);
+        visuals.widgets.hovered.weak_bg_fill =
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16);
+        visuals.widgets.active.weak_bg_fill =
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30);
         visuals.override_text_color = Some(egui::Color32::WHITE);
 
         cc.egui_ctx.set_visuals(visuals);
@@ -932,6 +1256,7 @@ impl App {
         let kdotool_path = get_kdotool_path();
         let (width, height) = load_window_size();
         let pinned_apps = load_pinned_apps();
+        let settings = load_launcher_settings();
         let mut app = Self {
             mode,
             windows: Vec::new(),
@@ -948,9 +1273,22 @@ impl App {
             receiver: None,
             width,
             height,
-            icon_only,
+            icon_only: icon_only || settings.app_icon_mode,
             show_settings_menu: false,
-            show_system_settings_modules: load_show_system_settings_modules(),
+            show_system_settings_modules: settings.show_system_settings_modules,
+            win_icon_size: settings.win_icon_size,
+            win_padding: settings.win_padding,
+            win_row_height: settings.win_row_height,
+            win_text_spacing: settings.win_text_spacing,
+            win_line_height: settings.win_line_height,
+            win_show_path: settings.win_show_path,
+            win_title_size: settings.win_title_size,
+            win_path_size: settings.win_path_size,
+            app_icon_size: settings.app_icon_size,
+            app_icon_tile_size: settings.app_icon_tile_size,
+            app_icon_show_name: settings.app_icon_show_name,
+            app_icon_name_size: settings.app_icon_name_size,
+            disable_ibeam: settings.disable_ibeam,
         };
 
         match app.mode {
@@ -971,6 +1309,26 @@ impl App {
         }
     }
 
+    fn save_settings(&self) {
+        save_launcher_settings(LauncherSettings {
+            show_system_settings_modules: self.show_system_settings_modules,
+            app_icon_mode: self.icon_only,
+            win_icon_size: self.win_icon_size,
+            win_padding: self.win_padding,
+            win_row_height: self.win_row_height,
+            win_text_spacing: self.win_text_spacing,
+            win_line_height: self.win_line_height,
+            win_show_path: self.win_show_path,
+            win_title_size: self.win_title_size,
+            win_path_size: self.win_path_size,
+            app_icon_size: self.app_icon_size,
+            app_icon_tile_size: self.app_icon_tile_size,
+            app_icon_show_name: self.app_icon_show_name,
+            app_icon_name_size: self.app_icon_name_size,
+            disable_ibeam: self.disable_ibeam,
+        });
+    }
+
     fn save_pinned_apps(&self) {
         if let Ok(home) = std::env::var("HOME") {
             let dir = PathBuf::from(format!("{}/.config/applicationlauncher", home));
@@ -985,32 +1343,353 @@ impl App {
         }
     }
 
+    fn render_settings_panel(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut close_requested = false;
+
+        ui.add_space(8.0);
+        ui.vertical_centered(|ui| {
+            ui.heading(
+                egui::RichText::new("Launcher Settings")
+                    .color(egui::Color32::WHITE)
+                    .strong(),
+            );
+        });
+        ui.add_space(8.0);
+
+        ui.add(egui::Separator::default());
+        ui.add_space(12.0);
+
+        ui.horizontal(|ui| {
+            let mut disable_ibeam = self.disable_ibeam;
+            let checkbox_response = ui.checkbox(
+                &mut disable_ibeam,
+                egui::RichText::new("Disable text select cursor (I-beam)")
+                    .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220))
+                    .size(13.0),
+            );
+            if checkbox_response.changed() {
+                self.disable_ibeam = disable_ibeam;
+                self.save_settings();
+            }
+        });
+
+        ui.add_space(14.0);
+        ui.add(egui::Separator::default());
+        ui.add_space(10.0);
+
+        ui.label(
+            egui::RichText::new("Application panel")
+                .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220))
+                .strong()
+                .size(13.0),
+        );
+        ui.add_space(6.0);
+
+        egui::Grid::new("app_panel_settings_grid")
+            .num_columns(2)
+            .spacing([12.0, 10.0])
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Show System Modules:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut show_val = self.show_system_settings_modules;
+                if ui.checkbox(&mut show_val, "").changed() {
+                    self.show_system_settings_modules = show_val;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Icon Grid Mode:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut icon_mode = self.icon_only;
+                if ui.checkbox(&mut icon_mode, "").changed() {
+                    self.icon_only = icon_mode;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Icon Size:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut app_icon_size = self.app_icon_size;
+                if ui
+                    .add(egui::Slider::new(&mut app_icon_size, 16.0..=64.0).show_value(true))
+                    .changed()
+                {
+                    self.app_icon_size = app_icon_size;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Tile Size:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut app_tile_size = self.app_icon_tile_size;
+                if ui
+                    .add(egui::Slider::new(&mut app_tile_size, 48.0..=128.0).show_value(true))
+                    .changed()
+                {
+                    self.app_icon_tile_size = app_tile_size;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Show Names:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut app_icon_show_name = self.app_icon_show_name;
+                if ui.checkbox(&mut app_icon_show_name, "").changed() {
+                    self.app_icon_show_name = app_icon_show_name;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Name Size:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut app_icon_name_size = self.app_icon_name_size;
+                if ui
+                    .add(egui::Slider::new(&mut app_icon_name_size, 8.0..=20.0).show_value(true))
+                    .changed()
+                {
+                    self.app_icon_name_size = app_icon_name_size;
+                    self.save_settings();
+                }
+                ui.end_row();
+            });
+
+        ui.add_space(14.0);
+        ui.add(egui::Separator::default());
+        ui.add_space(10.0);
+
+        ui.label(
+            egui::RichText::new("Open window view")
+                .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220))
+                .strong()
+                .size(13.0),
+        );
+        ui.add_space(6.0);
+
+        egui::Grid::new("win_settings_grid")
+            .num_columns(2)
+            .spacing([12.0, 10.0])
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Icon Size:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut icon_size = self.win_icon_size;
+                if ui
+                    .add(egui::Slider::new(&mut icon_size, 16.0..=64.0).show_value(true))
+                    .changed()
+                {
+                    self.win_icon_size = icon_size;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Padding:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut padding = self.win_padding;
+                if ui
+                    .add(egui::Slider::new(&mut padding, 0.0..=24.0).show_value(true))
+                    .changed()
+                {
+                    self.win_padding = padding;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Row Height:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut row_height = self.win_row_height;
+                if ui
+                    .add(egui::Slider::new(&mut row_height, 30.0..=100.0).show_value(true))
+                    .changed()
+                {
+                    self.win_row_height = row_height;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Text Spacing:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut text_spacing = self.win_text_spacing;
+                if ui
+                    .add(egui::Slider::new(&mut text_spacing, 0.0..=12.0).show_value(true))
+                    .changed()
+                {
+                    self.win_text_spacing = text_spacing;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Line Height:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut line_height = self.win_line_height;
+                if ui
+                    .add(egui::Slider::new(&mut line_height, 8.0..=30.0).show_value(true))
+                    .changed()
+                {
+                    self.win_line_height = line_height;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Show Path:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut show_path = self.win_show_path;
+                if ui.checkbox(&mut show_path, "").changed() {
+                    self.win_show_path = show_path;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Title Size:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut title_size = self.win_title_size;
+                if ui
+                    .add(egui::Slider::new(&mut title_size, 8.0..=24.0).show_value(true))
+                    .changed()
+                {
+                    self.win_title_size = title_size;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Path Size:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut path_size = self.win_path_size;
+                if ui
+                    .add(egui::Slider::new(&mut path_size, 8.0..=20.0).show_value(true))
+                    .changed()
+                {
+                    self.win_path_size = path_size;
+                    self.save_settings();
+                }
+                ui.end_row();
+            });
+
+        ui.add_space(16.0);
+        ui.vertical_centered(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new("Close Settings (F10)")
+                            .color(egui::Color32::WHITE)
+                            .size(13.0),
+                    )
+                    .fill(egui::Color32::from_rgba_unmultiplied(61, 174, 233, 200)),
+                )
+                .clicked()
+            {
+                close_requested = true;
+            }
+        });
+        ui.add_space(8.0);
+
+        close_requested
+    }
+
+    fn show_settings_popup(&mut self, ctx: &egui::Context) {
+        let viewport_id = egui::ViewportId::from_hash_of("launcher_settings_popup");
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Launcher Settings")
+            .with_inner_size([380.0, 760.0])
+            .with_min_inner_size([340.0, 500.0])
+            .with_resizable(true);
+
+        let mut should_close = false;
+        ctx.show_viewport_immediate(viewport_id, builder, |ctx, _class| {
+            if ctx.input(|i| i.viewport().close_requested()) {
+                should_close = true;
+                return;
+            }
+
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                should_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::window(&ctx.style())
+                        .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 240))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+                        ))
+                        .corner_radius(egui::CornerRadius::same(12)),
+                )
+                .show(ctx, |ui| {
+                    if self.render_settings_panel(ui) {
+                        should_close = true;
+                    }
+                });
+        });
+
+        if should_close {
+            self.show_settings_menu = false;
+        }
+    }
+
     fn refresh_windows(&mut self) {
         if let Some(ref kpath) = self.kdotool_path {
             let kpath = kpath.clone();
-            let theme = self.force_theme.as_deref().unwrap_or("breeze-dark").to_string();
+            let theme = self
+                .force_theme
+                .as_deref()
+                .unwrap_or("breeze-dark")
+                .to_string();
             let (tx, rx) = std::sync::mpsc::channel();
             self.loading = true;
             self.receiver = Some(rx);
 
-            std::thread::spawn(move || {
-                match Command::new(&kpath).arg("--version").output() {
+            std::thread::spawn(
+                move || match Command::new(&kpath).arg("--version").output() {
                     Ok(_) => {
                         let windows = get_open_windows(&kpath, &theme);
-                        let _ = tx.send(LoadResult::Success(windows));
+                        let apps = get_installed_apps(&theme);
+                        let _ = tx.send(LoadResult::Content { windows, apps });
                     }
                     Err(_) => {
                         let _ = tx.send(LoadResult::Error(format!(
                             "kdotool utility not found.\n\nPlease install it using cargo:\n\ncargo install kdotool"
                         )));
                     }
-                }
-            });
+                },
+            );
         }
     }
 
     fn refresh_apps(&mut self) {
-        let theme = self.force_theme.as_deref().unwrap_or("breeze-dark").to_string();
+        let theme = self
+            .force_theme
+            .as_deref()
+            .unwrap_or("breeze-dark")
+            .to_string();
         let (tx, rx) = std::sync::mpsc::channel();
         self.loading = true;
         self.receiver = Some(rx);
@@ -1021,9 +1700,91 @@ impl App {
         });
     }
 
-    fn launch_app_and_exit(&self, exec: String, ctx: &egui::Context) {
-        launch_app(&exec);
+    fn launch_app_and_exit(&self, app: &AppInfo, ctx: &egui::Context) {
+        if !launch_desktop_entry(&app.desktop_file_path) {
+            launch_app(&app.exec);
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    fn find_app_for_window<'a>(&'a self, win: &WindowInfo) -> Option<&'a AppInfo> {
+        let mut window_keys = Vec::new();
+
+        let class = win.class.trim();
+        if !class.is_empty() {
+            window_keys.push(normalize_app_match_key(class));
+            if let Some(last_segment) = class.rsplit('.').next() {
+                window_keys.push(normalize_app_match_key(last_segment));
+            }
+        }
+
+        if let Some(path) = &win.exe_path {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                window_keys.push(normalize_app_match_key(name));
+            }
+        }
+
+        if let Some(proc_name) = &win.active_process {
+            window_keys.push(normalize_app_match_key(proc_name));
+        }
+
+        window_keys.retain(|key| !key.is_empty());
+        if window_keys.is_empty() {
+            return None;
+        }
+
+        self.apps.iter().find(|app| {
+            let mut app_keys = Vec::new();
+            app_keys.push(normalize_app_match_key(&app.name));
+
+            if let Some(stem) = app
+                .desktop_file_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+            {
+                app_keys.push(normalize_app_match_key(stem));
+            }
+
+            if let Some(exec_name) = command_basename(&app.exec) {
+                app_keys.push(normalize_app_match_key(&exec_name));
+            }
+
+            app_keys.retain(|key| !key.is_empty());
+
+            window_keys.iter().any(|window_key| {
+                app_keys.iter().any(|app_key| {
+                    window_key == app_key
+                        || window_key.contains(app_key)
+                        || app_key.contains(window_key)
+                })
+            })
+        })
+    }
+
+    fn launch_window_app_and_exit(&self, win: &WindowInfo, ctx: &egui::Context) {
+        if let Some(app) = self.find_app_for_window(win) {
+            self.launch_app_and_exit(app, ctx);
+            return;
+        }
+
+        if let Some(exe_path) = &win.exe_path {
+            let exe = exe_path.clone();
+            std::thread::spawn(move || {
+                let mut cmd = Command::new(exe);
+                cmd.env_remove("PYTHONPATH");
+                cmd.env_remove("PYTHONHOME");
+                cmd.env_remove("VIRTUAL_ENV");
+                cmd.env_remove("UV_ACTIVE");
+                let _ = cmd.spawn();
+            });
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        if let Some(proc_name) = &win.active_process {
+            launch_app(proc_name);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 
     fn activate_and_exit(&self, id: String, ctx: &egui::Context) {
@@ -1033,12 +1794,12 @@ impl App {
             std::thread::spawn(move || {
                 // Query geometry first
                 let geom = get_window_geometry(&kpath, &id_clone);
-                
+
                 // Activate the window and raise it to make sure it comes to the top
                 let _ = Command::new(&kpath)
                     .args(["windowactivate", &id_clone, "windowraise", &id_clone])
                     .status();
-                    
+
                 // If we got geometry, spawn the border overlay process
                 if let Some((x, y, w, h)) = geom {
                     if let Ok(current_exe) = std::env::current_exe() {
@@ -1054,6 +1815,16 @@ impl App {
                             .spawn();
                     }
                 }
+            });
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    fn close_window_and_exit(&self, id: String, ctx: &egui::Context) {
+        if let Some(ref kpath) = self.kdotool_path {
+            let kpath = kpath.clone();
+            std::thread::spawn(move || {
+                let _ = Command::new(&kpath).args(["windowclose", &id]).status();
             });
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1076,11 +1847,12 @@ impl eframe::App for App {
                 if let Ok(result) = rx.try_recv() {
                     self.loading = false;
                     match result {
-                        LoadResult::Success(windows) => {
-                            self.windows = windows;
+                        LoadResult::AppsSuccess(apps) => {
+                            self.apps = apps;
                             self.selected_index = 0;
                         }
-                        LoadResult::AppsSuccess(apps) => {
+                        LoadResult::Content { windows, apps } => {
+                            self.windows = windows;
                             self.apps = apps;
                             self.selected_index = 0;
                         }
@@ -1097,6 +1869,7 @@ impl eframe::App for App {
         if self.close_on_blur
             && self.start_time.elapsed().as_millis() > 500
             && !ctx.input(|i| i.focused)
+            && !self.show_settings_menu
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
@@ -1169,13 +1942,28 @@ impl eframe::App for App {
                                 LauncherMode::Apps => "Search applications...",
                                 LauncherMode::Windows => "Search open windows...",
                             };
+                            let search_width = (ui.available_width() - 42.0).max(120.0);
                             let text_edit = egui::TextEdit::singleline(&mut self.search_query)
                                 .hint_text(hint_text)
-                                .desired_width(ui.available_width())
+                                .desired_width(search_width)
                                 .frame(false)
                                 .font(egui::FontId::proportional(16.0));
-                            
+
                             text_edit_response = Some(ui.add(text_edit));
+                            ui.add_space(8.0);
+                            if ui
+                                .button(
+                                    egui::RichText::new("⚙")
+                                        .size(16.0)
+                                        .color(egui::Color32::from_rgba_unmultiplied(
+                                            255, 255, 255, 190,
+                                        )),
+                                )
+                                .on_hover_text("Settings")
+                                .clicked()
+                            {
+                                self.show_settings_menu = !self.show_settings_menu;
+                            }
                         });
                     });
 
@@ -1192,7 +1980,7 @@ impl eframe::App for App {
                     let mut filtered_apps: Vec<(AppInfo, i64, bool)> = Vec::new();
                     let mut filtered_windows: Vec<(WindowInfo, i64)> = Vec::new();
 
-                    match self.mode {
+	                    match self.mode {
                         LauncherMode::Apps => {
                             filtered_apps = self.apps
                                 .iter()
@@ -1202,52 +1990,48 @@ impl eframe::App for App {
                                     if self.search_query.is_empty() {
                                         Some((app.clone(), 0, is_pinned))
                                     } else {
-                                        let name_score = match_app(&self.search_query, &app.name);
-                                        let comment_score = app.comment.as_ref()
-                                            .and_then(|c| match_app(&self.search_query, c))
-                                            .map(|s| s - 300);
-                                        
-                                        let score = match (name_score, comment_score) {
-                                            (Some(ns), Some(cs)) => Some(std::cmp::max(ns, cs)),
-                                            (Some(ns), None) => Some(ns),
-                                            (None, Some(cs)) => Some(cs),
-                                            (None, None) => None,
-                                        };
-
-                                        if let Some(score) = score {
-                                            Some((app.clone(), score, is_pinned))
-                                        } else {
-                                            None
-                                        }
+                                        app_search_rank(&self.search_query, app)
+                                            .map(|(distance, _)| (app.clone(), distance as i64, is_pinned))
                                     }
                                 })
                                 .collect();
 
-                            // Sort: pinned first. Within groups: alphabetical if search query is empty, else score descending.
-                            // If both are pinned, preserve their custom order from self.pinned_apps.
-                            filtered_apps.sort_by(|a, b| {
-                                // Sort by match score first (descending)
-                                match b.1.cmp(&a.1) {
-                                    std::cmp::Ordering::Equal => {
-                                        // If scores are equal, sort by pinned status (pinned first)
-                                        match (a.2, b.2) {
+                            if self.search_query.is_empty() {
+                                filtered_apps.sort_by(|a, b| {
+                                    a.0.is_settings_module
+                                        .cmp(&b.0.is_settings_module)
+                                        .then_with(|| match (a.2, b.2) {
                                             (true, false) => std::cmp::Ordering::Less,
                                             (false, true) => std::cmp::Ordering::Greater,
                                             (true, true) => {
-                                                // If both are pinned, sort by custom pinned order
-                                                let pos_a = self.pinned_apps.iter().position(|x| x == &a.0.desktop_file_path).unwrap_or(usize::MAX);
-                                                let pos_b = self.pinned_apps.iter().position(|x| x == &b.0.desktop_file_path).unwrap_or(usize::MAX);
-                                                pos_a.cmp(&pos_b)
+                                                pinned_app_position(&self.pinned_apps, &a.0)
+                                                    .cmp(&pinned_app_position(&self.pinned_apps, &b.0))
                                             }
-                                            (false, false) => {
-                                                // If both are unpinned, sort alphabetically
-                                                a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase())
+                                            (false, false) => a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()),
+                                        })
+                                });
+                            } else {
+                                filtered_apps.sort_by(|a, b| {
+                                    let a_rank = app_search_rank(&self.search_query, &a.0).unwrap_or((usize::MAX, false));
+                                    let b_rank = app_search_rank(&self.search_query, &b.0).unwrap_or((usize::MAX, false));
+
+                                    a_rank
+                                        .0
+                                        .cmp(&b_rank.0)
+                                        .then_with(|| b_rank.1.cmp(&a_rank.1))
+                                        .then_with(|| match (a.2, b.2) {
+                                            (true, false) => std::cmp::Ordering::Less,
+                                            (false, true) => std::cmp::Ordering::Greater,
+                                            (true, true) => {
+                                                pinned_app_position(&self.pinned_apps, &a.0)
+                                                    .cmp(&pinned_app_position(&self.pinned_apps, &b.0))
                                             }
-                                        }
-                                    }
-                                    other => other,
-                                }
-                            });
+                                            (false, false) => std::cmp::Ordering::Equal,
+                                        })
+                                        .then_with(|| a.0.is_settings_module.cmp(&b.0.is_settings_module))
+                                        .then_with(|| a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()))
+                                });
+                            }
                         }
                         LauncherMode::Windows => {
                             filtered_windows = self.windows
@@ -1259,7 +2043,7 @@ impl eframe::App for App {
                                         let title_score = match_app(&self.search_query, &w.title);
                                         let class_score = match_app(&self.search_query, &w.class)
                                             .map(|s| s - 100);
-                                        
+
                                         let score = match (title_score, class_score) {
                                             (Some(ts), Some(cs)) => Some(std::cmp::max(ts, cs)),
                                             (Some(ts), None) => Some(ts),
@@ -1275,13 +2059,81 @@ impl eframe::App for App {
                                     }
                                 })
                                 .collect();
-                            if !self.search_query.is_empty() {
-                                filtered_windows.sort_by(|a, b| b.1.cmp(&a.1));
+                            if self.search_query.is_empty() {
+                                filtered_windows.sort_by(|a, b| {
+                                    window_application_key(&a.0)
+                                        .cmp(&window_application_key(&b.0))
+                                        .then_with(|| a.0.title.to_lowercase().cmp(&b.0.title.to_lowercase()))
+                                });
+                            } else {
+                                filtered_windows.sort_by(|a, b| {
+                                    b.1.cmp(&a.1)
+                                        .then_with(|| {
+                                            window_application_key(&a.0)
+                                                .cmp(&window_application_key(&b.0))
+                                        })
+                                        .then_with(|| {
+                                            a.0.title.to_lowercase().cmp(&b.0.title.to_lowercase())
+                                        })
+                                });
                             }
+	                        }
+	                    }
+
+                    if self.mode == LauncherMode::Windows {
+                        filtered_apps = self.apps
+                            .iter()
+                            .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
+                            .filter_map(|app| {
+                                let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
+                                if self.search_query.is_empty() {
+                                    Some((app.clone(), 0, is_pinned))
+                                } else {
+                                    app_search_rank(&self.search_query, app)
+                                        .map(|(distance, _)| (app.clone(), distance as i64, is_pinned))
+                                }
+                            })
+                            .collect();
+
+                        if self.search_query.is_empty() {
+                            filtered_apps.sort_by(|a, b| {
+                                a.0.is_settings_module
+                                    .cmp(&b.0.is_settings_module)
+                                    .then_with(|| match (a.2, b.2) {
+                                        (true, false) => std::cmp::Ordering::Less,
+                                        (false, true) => std::cmp::Ordering::Greater,
+                                        (true, true) => {
+                                            pinned_app_position(&self.pinned_apps, &a.0)
+                                                .cmp(&pinned_app_position(&self.pinned_apps, &b.0))
+                                        }
+                                        (false, false) => a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()),
+                                    })
+                            });
+                        } else {
+                            filtered_apps.sort_by(|a, b| {
+                                let a_rank = app_search_rank(&self.search_query, &a.0).unwrap_or((usize::MAX, false));
+                                let b_rank = app_search_rank(&self.search_query, &b.0).unwrap_or((usize::MAX, false));
+
+                                a_rank
+                                    .0
+                                    .cmp(&b_rank.0)
+                                    .then_with(|| b_rank.1.cmp(&a_rank.1))
+                                    .then_with(|| match (a.2, b.2) {
+                                        (true, false) => std::cmp::Ordering::Less,
+                                        (false, true) => std::cmp::Ordering::Greater,
+                                        (true, true) => {
+                                            pinned_app_position(&self.pinned_apps, &a.0)
+                                                .cmp(&pinned_app_position(&self.pinned_apps, &b.0))
+                                        }
+                                        (false, false) => std::cmp::Ordering::Equal,
+                                    })
+                                    .then_with(|| a.0.is_settings_module.cmp(&b.0.is_settings_module))
+                                    .then_with(|| a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()))
+                            });
                         }
                     }
 
-                    let total_items = match self.mode {
+	                    let total_items = match self.mode {
                         LauncherMode::Apps => filtered_apps.len(),
                         LauncherMode::Windows => filtered_windows.len(),
                     };
@@ -1356,7 +2208,7 @@ impl eframe::App for App {
                             match self.mode {
                                 LauncherMode::Apps => {
                                     let app = &filtered_apps[self.selected_index].0;
-                                    self.launch_app_and_exit(app.exec.clone(), ctx);
+                                    self.launch_app_and_exit(app, ctx);
                                 }
                                 LauncherMode::Windows => {
                                     let win = &filtered_windows[self.selected_index].0;
@@ -1457,9 +2309,18 @@ impl eframe::App for App {
 
                     // 3. Render Items ScrollArea
                     let list_height = (ui.available_height() - 32.0).max(100.0);
-                    let row_height = 52.0;
+                    let row_height = self.win_row_height;
+                    let window_icon_size = egui::vec2(self.win_icon_size, self.win_icon_size);
+                    let app_icon_size = egui::vec2(self.app_icon_size, self.app_icon_size);
+                    let render_side_panel = self.mode == LauncherMode::Windows;
 
-                    if total_items == 0 {
+                    if render_side_panel {
+                        let previous_spacing = ui.spacing().item_spacing;
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.columns(2, |panes| {
+                            let ui = &mut panes[0];
+
+	                    if total_items == 0 {
                         ui.allocate_ui(egui::vec2(ui.available_width(), list_height), |ui| {
                             ui.vertical_centered(|ui| {
                                 ui.add_space(80.0);
@@ -1487,22 +2348,19 @@ impl eframe::App for App {
                             });
                         });
                     } else if self.icon_only && self.mode == LauncherMode::Apps {
-                        let scroll_delta = ctx.input(|i| i.smooth_scroll_delta);
                         egui::ScrollArea::vertical()
+                            .id_salt("apps_main_icon_grid_scroll")
                             .max_height(list_height)
                             .show(ui, |ui| {
-                                if scroll_delta.y != 0.0 {
-                                    ui.scroll_with_delta(egui::vec2(0.0, scroll_delta.y * 6.0));
-                                }
-                                
                                 ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
                                 ui.horizontal_wrapped(|ui| {
                                     for index in 0..total_items {
                                         let is_selected = index == self.selected_index;
                                         let app = &filtered_apps[index].0;
+                                        let tile_size = self.app_icon_tile_size;
 
                                         let (rect, response) = ui.allocate_exact_size(
-                                            egui::vec2(72.0, 72.0),
+                                            egui::vec2(tile_size, tile_size),
                                             egui::Sense::click(),
                                         );
 
@@ -1567,7 +2425,7 @@ impl eframe::App for App {
                                         }
 
                                         if response.clicked() {
-                                            self.launch_app_and_exit(app.exec.clone(), ctx);
+                                            self.launch_app_and_exit(app, ctx);
                                         }
 
                                         let bg_color = if is_selected {
@@ -1598,8 +2456,22 @@ impl eframe::App for App {
                                             );
                                         }
 
-                                        let icon_size = egui::vec2(48.0, 48.0);
-                                        let icon_rect = egui::Rect::from_center_size(rect.center(), icon_size);
+                                        let inner_rect = rect.shrink2(egui::vec2(6.0, 6.0));
+                                        let label_height = if self.app_icon_show_name {
+                                            (self.app_icon_name_size + 10.0).max(16.0)
+                                        } else {
+                                            0.0
+                                        };
+                                        let icon_center_y = inner_rect.min.y
+                                            + (inner_rect.height() - label_height) / 2.0;
+                                        let icon_rect = egui::Rect::from_center_size(
+                                            egui::pos2(rect.center().x, icon_center_y),
+                                            app_icon_size,
+                                        );
+                                        let label_rect = egui::Rect::from_min_max(
+                                            egui::pos2(inner_rect.min.x, inner_rect.max.y - label_height),
+                                            inner_rect.max,
+                                        );
 
                                         if let Some(ref path) = app.icon_path {
                                             let uri = format!("file://{}", path.to_string_lossy());
@@ -1609,7 +2481,7 @@ impl eframe::App for App {
                                                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
                                             );
                                             child_ui.add(
-                                                egui::Image::new(uri).max_size(icon_size),
+                                                egui::Image::new(uri).max_size(app_icon_size),
                                             );
                                         } else {
                                             ui.painter().rect_filled(
@@ -1637,17 +2509,28 @@ impl eframe::App for App {
                                                 egui::Color32::WHITE,
                                             );
                                         }
+
+                                        if self.app_icon_show_name {
+                                            let label = truncate_tile_label(&app.name, tile_size);
+                                            ui.painter().text(
+                                                label_rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                label,
+                                                egui::FontId::proportional(self.app_icon_name_size),
+                                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 210),
+                                            );
+                                        }
                                     }
                                 });
                             });
                     } else {
-                        let scroll_delta = ctx.input(|i| i.smooth_scroll_delta);
                         egui::ScrollArea::vertical()
+                            .id_salt(match self.mode {
+                                LauncherMode::Apps => "apps_main_list_scroll",
+                                LauncherMode::Windows => "windows_main_list_scroll",
+                            })
                             .max_height(list_height)
                             .show(ui, |ui| {
-                                if scroll_delta.y != 0.0 {
-                                    ui.scroll_with_delta(egui::vec2(0.0, scroll_delta.y * 6.0));
-                                }
                                 for index in 0..total_items {
                                     let is_selected = index == self.selected_index;
 
@@ -1657,39 +2540,48 @@ impl eframe::App for App {
                                     );
 
                                     response.clone().context_menu(|ui| {
-                                        if let LauncherMode::Apps = self.mode {
-                                            let app = &filtered_apps[index].0;
-                                            let path = app.desktop_file_path.clone();
-                                            let is_pinned = self.pinned_apps.contains(&path);
-                                            let label = if is_pinned { "📌 Unpin application" } else { "📌 Pin application" };
-                                            if ui.button(label).clicked() {
+                                        match self.mode {
+                                            LauncherMode::Apps => {
+                                                let app = &filtered_apps[index].0;
+                                                let path = app.desktop_file_path.clone();
+                                                let is_pinned = self.pinned_apps.contains(&path);
+                                                let label = if is_pinned { "📌 Unpin application" } else { "📌 Pin application" };
+                                                if ui.button(label).clicked() {
+                                                    if is_pinned {
+                                                        if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
+                                                            self.pinned_apps.remove(pos);
+                                                        }
+                                                    } else {
+                                                        self.pinned_apps.push(path.clone());
+                                                    }
+                                                    self.save_pinned_apps();
+                                                    ui.close();
+                                                }
+
                                                 if is_pinned {
                                                     if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
-                                                        self.pinned_apps.remove(pos);
+                                                        if pos > 0 {
+                                                            if ui.button("⬆ Move up").clicked() {
+                                                                self.pinned_apps.swap(pos, pos - 1);
+                                                                self.save_pinned_apps();
+                                                                ui.close();
+                                                            }
+                                                        }
+                                                        if pos + 1 < self.pinned_apps.len() {
+                                                            if ui.button("⬇ Move down").clicked() {
+                                                                self.pinned_apps.swap(pos, pos + 1);
+                                                                self.save_pinned_apps();
+                                                                ui.close();
+                                                            }
+                                                        }
                                                     }
-                                                } else {
-                                                    self.pinned_apps.push(path.clone());
                                                 }
-                                                self.save_pinned_apps();
-                                                ui.close();
                                             }
-
-                                            if is_pinned {
-                                                if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
-                                                    if pos > 0 {
-                                                        if ui.button("⬆ Move up").clicked() {
-                                                            self.pinned_apps.swap(pos, pos - 1);
-                                                            self.save_pinned_apps();
-                                                            ui.close();
-                                                        }
-                                                    }
-                                                    if pos + 1 < self.pinned_apps.len() {
-                                                        if ui.button("⬇ Move down").clicked() {
-                                                            self.pinned_apps.swap(pos, pos + 1);
-                                                            self.save_pinned_apps();
-                                                            ui.close();
-                                                        }
-                                                    }
+                                            LauncherMode::Windows => {
+                                                let win = &filtered_windows[index].0;
+                                                if ui.button("Close application").clicked() {
+                                                    self.close_window_and_exit(win.id.clone(), ctx);
+                                                    ui.close();
                                                 }
                                             }
                                         }
@@ -1708,12 +2600,19 @@ impl eframe::App for App {
                                         match self.mode {
                                             LauncherMode::Apps => {
                                                 let app = &filtered_apps[index].0;
-                                                self.launch_app_and_exit(app.exec.clone(), ctx);
+                                                self.launch_app_and_exit(app, ctx);
                                             }
                                             LauncherMode::Windows => {
                                                 let win = &filtered_windows[index].0;
                                                 self.activate_and_exit(win.id.clone(), ctx);
                                             }
+                                        }
+                                    }
+
+                                    if response.middle_clicked() {
+                                        if let LauncherMode::Windows = self.mode {
+                                            let win = &filtered_windows[index].0;
+                                            self.launch_window_app_and_exit(win, ctx);
                                         }
                                     }
 
@@ -1743,7 +2642,8 @@ impl eframe::App for App {
                                     }
 
                                     // Content placement
-                                    let content_rect = rect.shrink2(egui::vec2(12.0, 6.0));
+                                    let content_rect =
+                                        rect.shrink2(egui::vec2(12.0, self.win_padding));
                                     let mut child_ui = ui.new_child(
                                         egui::UiBuilder::new()
                                             .max_rect(content_rect)
@@ -1758,11 +2658,11 @@ impl eframe::App for App {
                                             if let Some(ref path) = app.icon_path {
                                                 let uri = format!("file://{}", path.to_string_lossy());
                                                 child_ui.add(
-                                                    egui::Image::new(uri).max_size(egui::vec2(32.0, 32.0)),
+                                                    egui::Image::new(uri).max_size(app_icon_size),
                                                 );
                                             } else {
                                                 let (icon_rect, _) = child_ui.allocate_exact_size(
-                                                    egui::vec2(32.0, 32.0),
+                                                    app_icon_size,
                                                     egui::Sense::hover(),
                                                 );
                                                 child_ui.painter().rect_filled(
@@ -1782,41 +2682,124 @@ impl eframe::App for App {
 
                                             child_ui.add_space(10.0);
 
-                                            child_ui.vertical(|ui| {
-                                                ui.horizontal(|ui| {
-                                                    ui.add(egui::Label::new(
+                                            let mut label_clicked = false;
+                                            if self.win_show_path {
+                                                let text_min_x = content_rect.min.x
+                                                    + app_icon_size.x
+                                                    + 10.0;
+                                                let text_rect = egui::Rect::from_min_max(
+                                                    egui::pos2(text_min_x, content_rect.min.y),
+                                                    content_rect.max,
+                                                );
+                                                let mut text_ui = ui.new_child(
+                                                    egui::UiBuilder::new()
+                                                        .max_rect(text_rect)
+                                                        .layout(egui::Layout::top_down(
+                                                            egui::Align::Min,
+                                                        )),
+                                                );
+                                                text_ui.spacing_mut().item_spacing.y = 0.0;
+                                                text_ui.add_space(
+                                                    ((self.win_row_height
+                                                        - (self.win_line_height
+                                                            + self.win_line_height * 0.8
+                                                            + self.win_text_spacing))
+                                                        / 2.0)
+                                                        .max(0.0),
+                                                );
+
+                                                let title_response = text_ui.add(
+                                                    egui::Label::new(
                                                         egui::RichText::new(&app.name)
                                                             .color(egui::Color32::WHITE)
                                                             .strong()
-                                                            .size(13.0),
-                                                    ));
-                                                    if self.pinned_apps.contains(&app.desktop_file_path) {
-                                                        ui.add_space(4.0);
-                                                        ui.label(
-                                                            egui::RichText::new("📌")
-                                                                .size(11.0)
-                                                                .color(egui::Color32::from_rgb(61, 174, 233)),
-                                                        );
-                                                    }
-                                                });
-                                                let is_link = std::fs::symlink_metadata(&app.desktop_file_path)
-                                                    .map(|m| m.file_type().is_symlink())
-                                                    .unwrap_or(false);
-                                                let mut subtext = app.desktop_file_path.to_string_lossy().to_string();
+                                                            .size(self.win_title_size)
+                                                            .line_height(Some(
+                                                                self.win_line_height,
+                                                            )),
+                                                    )
+                                                    .sense(egui::Sense::click())
+                                                    .truncate(),
+                                                );
+                                                if title_response.clicked() {
+                                                    label_clicked = true;
+                                                }
+                                                if self.disable_ibeam && title_response.hovered() {
+                                                    text_ui
+                                                        .ctx()
+                                                        .set_cursor_icon(egui::CursorIcon::Default);
+                                                }
+
+                                                text_ui.add_space(self.win_text_spacing);
+
+                                                let is_link =
+                                                    std::fs::symlink_metadata(&app.desktop_file_path)
+                                                        .map(|m| m.file_type().is_symlink())
+                                                        .unwrap_or(false);
+                                                let mut subtext =
+                                                    app.desktop_file_path.to_string_lossy().to_string();
                                                 if is_link {
                                                     subtext.push('@');
                                                 }
-                                                let display_subtext = if subtext.len() > 80 {
-                                                    format!("{}...", &subtext[..77])
-                                                } else {
-                                                    subtext
-                                                };
-                                                ui.add(egui::Label::new(
-                                                    egui::RichText::new(display_subtext)
-                                                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 130))
-                                                        .size(10.5),
-                                                ));
-                                            });
+                                                let path_response = text_ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(subtext)
+                                                            .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 130))
+                                                            .size(self.win_path_size)
+                                                            .line_height(Some(self.win_line_height * 0.8)),
+                                                    )
+                                                    .sense(egui::Sense::click())
+                                                    .truncate(),
+                                                );
+                                                if path_response.clicked() {
+                                                    label_clicked = true;
+                                                }
+                                                if self.disable_ibeam && path_response.hovered() {
+                                                    text_ui
+                                                        .ctx()
+                                                        .set_cursor_icon(egui::CursorIcon::Default);
+                                                }
+                                                if self.pinned_apps.contains(&app.desktop_file_path) {
+                                                    text_ui.add_space(4.0);
+                                                    text_ui.label(
+                                                        egui::RichText::new("📌")
+                                                            .size(11.0)
+                                                            .color(egui::Color32::from_rgb(61, 174, 233)),
+                                                    );
+                                                }
+                                            } else {
+                                                let title_response = child_ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(&app.name)
+                                                            .color(egui::Color32::WHITE)
+                                                            .strong()
+                                                            .size(self.win_title_size)
+                                                            .line_height(Some(self.win_line_height)),
+                                                    )
+                                                    .sense(egui::Sense::click())
+                                                    .truncate(),
+                                                );
+                                                if title_response.clicked() {
+                                                    label_clicked = true;
+                                                }
+                                                if self.disable_ibeam && title_response.hovered() {
+                                                    child_ui
+                                                        .ctx()
+                                                        .set_cursor_icon(egui::CursorIcon::Default);
+                                                }
+                                                if self.pinned_apps.contains(&app.desktop_file_path) {
+                                                    child_ui.add_space(4.0);
+                                                    child_ui.label(
+                                                        egui::RichText::new("📌")
+                                                            .size(11.0)
+                                                            .color(egui::Color32::from_rgb(61, 174, 233)),
+                                                    );
+                                                }
+                                            }
+
+                                            if label_clicked {
+                                                self.launch_app_and_exit(app, ctx);
+                                            }
                                         }
                                         LauncherMode::Windows => {
                                             let win = &filtered_windows[index].0;
@@ -1825,11 +2808,11 @@ impl eframe::App for App {
                                             if let Some(ref path) = win.icon_path {
                                                 let uri = format!("file://{}", path.to_string_lossy());
                                                 child_ui.add(
-                                                    egui::Image::new(uri).max_size(egui::vec2(32.0, 32.0)),
+                                                    egui::Image::new(uri).max_size(window_icon_size),
                                                 );
                                             } else {
                                                 let (icon_rect, _) = child_ui.allocate_exact_size(
-                                                    egui::vec2(32.0, 32.0),
+                                                    window_icon_size,
                                                     egui::Sense::hover(),
                                                 );
                                                 child_ui.painter().rect_filled(
@@ -1856,52 +2839,454 @@ impl eframe::App for App {
 
                                             child_ui.add_space(10.0);
 
-                                            child_ui.vertical(|ui| {
-                                                let display_title = if win.title.len() > 65 {
-                                                    format!("{}...", &win.title[..62])
-                                                } else {
-                                                    win.title.clone()
-                                                };
+                                            let mut label_clicked = false;
+                                            let display_title = if win.title.len() > 65 {
+                                                format!("{}...", &win.title[..62])
+                                            } else {
+                                                win.title.clone()
+                                            };
 
-                                                ui.add(egui::Label::new(
-                                                    egui::RichText::new(display_title)
-                                                        .color(egui::Color32::WHITE)
-                                                        .strong()
-                                                        .size(13.0),
-                                                ));
+                                            if self.win_show_path {
+                                                child_ui.vertical(|ui| {
+                                                    ui.spacing_mut().item_spacing.y = 0.0;
 
-                                                let subtext = if let Some(ref path) = win.exe_path {
-                                                    let is_link = std::fs::symlink_metadata(path)
-                                                        .map(|m| m.file_type().is_symlink())
-                                                        .unwrap_or(false);
-                                                    let mut path_str = path.to_string_lossy().to_string();
-                                                    if is_link {
-                                                        path_str.push('@');
+                                                    let title_response = ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(display_title)
+                                                                .color(egui::Color32::WHITE)
+                                                                .strong()
+                                                                .size(self.win_title_size)
+                                                                .line_height(Some(
+                                                                    self.win_line_height,
+                                                                )),
+                                                        )
+                                                        .sense(egui::Sense::click())
+                                                        .truncate(),
+                                                    );
+                                                    if title_response.clicked() {
+                                                        label_clicked = true;
                                                     }
-                                                    path_str
-                                                } else if let Some(ref proc_name) = win.active_process {
-                                                    format!("{} (running: {})", win.class, proc_name)
-                                                } else {
-                                                    win.class.clone()
-                                                };
-                                                ui.add(egui::Label::new(
-                                                    egui::RichText::new(subtext)
-                                                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 130))
-                                                        .size(10.5),
-                                                ));
-                                            });
+                                                    if self.disable_ibeam
+                                                        && title_response.hovered()
+                                                    {
+                                                        ui.ctx().set_cursor_icon(
+                                                            egui::CursorIcon::Default,
+                                                        );
+                                                    }
+
+                                                    ui.add_space(self.win_text_spacing);
+
+                                                    let subtext = if let Some(ref path) = win.exe_path
+                                                    {
+                                                        let is_link = std::fs::symlink_metadata(path)
+                                                            .map(|m| m.file_type().is_symlink())
+                                                            .unwrap_or(false);
+                                                        let mut path_str =
+                                                            path.to_string_lossy().to_string();
+                                                        if is_link {
+                                                            path_str.push('@');
+                                                        }
+                                                        path_str
+                                                    } else if let Some(ref proc_name) =
+                                                        win.active_process
+                                                    {
+                                                        format!(
+                                                            "{} (running: {})",
+                                                            win.class, proc_name
+                                                        )
+                                                    } else {
+                                                        win.class.clone()
+                                                    };
+                                                    let path_response = ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(subtext)
+                                                                .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 130))
+                                                                .size(self.win_path_size)
+                                                                .line_height(Some(self.win_line_height * 0.8)),
+                                                        )
+                                                        .sense(egui::Sense::click())
+                                                        .truncate(),
+                                                    );
+                                                    if path_response.clicked() {
+                                                        label_clicked = true;
+                                                    }
+                                                    if self.disable_ibeam && path_response.hovered()
+                                                    {
+                                                        ui.ctx().set_cursor_icon(
+                                                            egui::CursorIcon::Default,
+                                                        );
+                                                    }
+                                                });
+                                            } else {
+                                                let title_response = child_ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(display_title)
+                                                            .color(egui::Color32::WHITE)
+                                                            .strong()
+                                                            .size(self.win_title_size)
+                                                            .line_height(Some(self.win_line_height)),
+                                                    )
+                                                    .sense(egui::Sense::click())
+                                                    .truncate(),
+                                                );
+                                                if title_response.clicked() {
+                                                    label_clicked = true;
+                                                }
+                                                if self.disable_ibeam && title_response.hovered() {
+                                                    child_ui
+                                                        .ctx()
+                                                        .set_cursor_icon(egui::CursorIcon::Default);
+                                                }
+                                            }
+
+                                            if label_clicked {
+                                                self.activate_and_exit(win.id.clone(), ctx);
+                                            }
                                         }
                                     }
                                 }
                             });
-                    }
+	                    }
 
-                    ui.add_space(8.0);
+	                            let ui = &mut panes[1];
+	                            let edge_x = ui.min_rect().min.x;
+	                            let edge_y = ui.min_rect().min.y;
+	                            ui.painter().line_segment(
+	                                [
+	                                    egui::pos2(edge_x, edge_y),
+	                                    egui::pos2(edge_x, edge_y + list_height),
+	                                ],
+	                                egui::Stroke::new(
+	                                    1.0,
+	                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18),
+	                                ),
+	                            );
+                                    ui.add_space(10.0);
+                                    ui.vertical(|ui| {
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("apps_side_panel_scroll")
+                                            .max_height(list_height)
+                                            .show(ui, |ui| {
+	                                        if filtered_apps.is_empty() {
+	                                            ui.add_space(20.0);
+	                                            ui.label(
+	                                                egui::RichText::new(if self.loading {
+	                                                    "Loading applications..."
+	                                                } else {
+	                                                    "No matching applications found"
+	                                                })
+	                                                .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 120))
+	                                                .size(13.0),
+	                                            );
+                                                } else if self.icon_only {
+                                                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        for (index, item) in filtered_apps.iter().enumerate() {
+                                                            let app = &item.0;
+                                                            let tile_size = self.app_icon_tile_size;
+                                                            let (rect, response) = ui.allocate_exact_size(
+                                                                egui::vec2(tile_size, tile_size),
+                                                                egui::Sense::click(),
+                                                            );
+                                                            let response = response.on_hover_text(&app.name);
+	                                                    response.clone().context_menu(|ui| {
+	                                                        let path = app.desktop_file_path.clone();
+	                                                        let is_pinned = self.pinned_apps.contains(&path);
+	                                                        let label = if is_pinned { "📌 Unpin application" } else { "📌 Pin application" };
+	                                                        if ui.button(label).clicked() {
+	                                                            if is_pinned {
+	                                                                if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
+	                                                                    self.pinned_apps.remove(pos);
+	                                                                }
+	                                                            } else {
+	                                                                self.pinned_apps.push(path);
+	                                                            }
+	                                                            self.save_pinned_apps();
+	                                                            ui.close();
+	                                                        }
+	                                                    });
+	                                                    if response.clicked() {
+	                                                        self.launch_app_and_exit(app, ctx);
+	                                                    }
+	                                                    ui.painter().rect_filled(
+	                                                        rect,
+	                                                        egui::CornerRadius::same(10),
+	                                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 5),
+	                                                    );
+                                                            let inner_rect = rect.shrink2(egui::vec2(6.0, 6.0));
+                                                            let label_height = if self.app_icon_show_name {
+                                                                (self.app_icon_name_size + 10.0).max(16.0)
+                                                            } else {
+                                                                0.0
+                                                            };
+                                                            let icon_center_y = inner_rect.min.y
+                                                                + (inner_rect.height() - label_height)
+                                                                    / 2.0;
+                                                            let icon_rect = egui::Rect::from_center_size(
+                                                                egui::pos2(rect.center().x, icon_center_y),
+                                                                app_icon_size,
+                                                            );
+                                                            let label_rect = egui::Rect::from_min_max(
+                                                                egui::pos2(
+                                                                    inner_rect.min.x,
+                                                                    inner_rect.max.y - label_height,
+                                                                ),
+                                                                inner_rect.max,
+                                                            );
+                                                            if let Some(ref path) = app.icon_path {
+                                                                let uri = format!("file://{}", path.to_string_lossy());
+	                                                        let mut child_ui = ui.new_child(
+                                                                    egui::UiBuilder::new()
+                                                                        .max_rect(icon_rect)
+                                                                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                                                                );
+                                                                child_ui.add(
+                                                                    egui::Image::new(uri)
+                                                                        .max_size(app_icon_size),
+                                                                );
+                                                            } else {
+                                                                ui.painter().text(
+                                                                    icon_rect.center(),
+	                                                            egui::Align2::CENTER_CENTER,
+	                                                            app.name.chars().next().unwrap_or('?').to_uppercase().to_string(),
+	                                                            egui::FontId::proportional(18.0),
+	                                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180),
+                                                                );
+                                                            }
+                                                            if self.pinned_apps.contains(&app.desktop_file_path) {
+		                                                        ui.painter().text(
+		                                                            egui::pos2(rect.max.x - 10.0, rect.min.y + 10.0),
+	                                                            egui::Align2::CENTER_CENTER,
+	                                                            "📌",
+	                                                            egui::FontId::proportional(10.0),
+		                                                            egui::Color32::WHITE,
+		                                                        );
+		                                                    }
+
+                                                            if self.app_icon_show_name {
+                                                                let label =
+                                                                    truncate_tile_label(&app.name, tile_size);
+                                                                ui.painter().text(
+                                                                    label_rect.center(),
+                                                                    egui::Align2::CENTER_CENTER,
+                                                                    label,
+                                                                    egui::FontId::proportional(
+                                                                        self.app_icon_name_size,
+                                                                    ),
+                                                                    egui::Color32::from_rgba_unmultiplied(
+                                                                        255, 255, 255, 210,
+                                                                    ),
+                                                                );
+                                                            }
+		                                                    let _ = index;
+	                                                        }
+	                                                    });
+                                                } else {
+                                                    for item in &filtered_apps {
+                                                        let app = &item.0;
+                                                        let (rect, response) = ui.allocate_exact_size(
+                                                            egui::vec2(ui.available_width(), row_height),
+                                                            egui::Sense::click(),
+                                                        );
+	                                                response.clone().context_menu(|ui| {
+	                                                    let path = app.desktop_file_path.clone();
+	                                                    let is_pinned = self.pinned_apps.contains(&path);
+	                                                    let label = if is_pinned { "📌 Unpin application" } else { "📌 Pin application" };
+	                                                    if ui.button(label).clicked() {
+	                                                        if is_pinned {
+	                                                            if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
+	                                                                self.pinned_apps.remove(pos);
+	                                                            }
+	                                                        } else {
+	                                                            self.pinned_apps.push(path);
+	                                                        }
+	                                                        self.save_pinned_apps();
+	                                                        ui.close();
+	                                                    }
+	                                                });
+	                                                if response.clicked() {
+	                                                    self.launch_app_and_exit(app, ctx);
+	                                                }
+                                                        if response.hovered() {
+                                                            ui.painter().rect_filled(
+                                                                rect,
+	                                                        egui::CornerRadius::same(8),
+                                                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+                                                            );
+                                                        }
+                                                        let content_rect =
+                                                            rect.shrink2(egui::vec2(12.0, self.win_padding));
+                                                        let mut child_ui = ui.new_child(
+                                                            egui::UiBuilder::new()
+                                                                .max_rect(content_rect)
+                                                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                                                        );
+                                                        if let Some(ref path) = app.icon_path {
+                                                            let uri = format!("file://{}", path.to_string_lossy());
+                                                            child_ui.add(
+                                                                egui::Image::new(uri)
+                                                                    .max_size(app_icon_size),
+                                                            );
+                                                        } else {
+                                                            let (icon_rect, _) = child_ui.allocate_exact_size(
+                                                                app_icon_size,
+                                                                egui::Sense::hover(),
+                                                            );
+                                                            child_ui.painter().rect_filled(
+                                                                icon_rect,
+                                                                egui::CornerRadius::same(6),
+                                                                egui::Color32::from_rgba_unmultiplied(
+                                                                    255, 255, 255, 12,
+                                                                ),
+                                                            );
+                                                            child_ui.painter().text(
+                                                                icon_rect.center(),
+                                                                egui::Align2::CENTER_CENTER,
+                                                                app.name
+                                                                    .chars()
+                                                                    .next()
+                                                                    .unwrap_or('?')
+                                                                    .to_uppercase()
+                                                                    .to_string(),
+                                                                egui::FontId::proportional(15.0),
+                                                                egui::Color32::from_rgba_unmultiplied(
+                                                                    255, 255, 255, 160,
+                                                                ),
+                                                            );
+                                                        }
+                                                        child_ui.add_space(10.0);
+
+                                                        let mut label_clicked = false;
+                                                        if self.win_show_path {
+                                                            let text_min_x =
+                                                                content_rect.min.x + app_icon_size.x + 10.0;
+                                                            let text_rect = egui::Rect::from_min_max(
+                                                                egui::pos2(text_min_x, content_rect.min.y),
+                                                                content_rect.max,
+                                                            );
+                                                            let mut text_ui = ui.new_child(
+                                                                egui::UiBuilder::new()
+                                                                    .max_rect(text_rect)
+                                                                    .layout(egui::Layout::top_down(
+                                                                        egui::Align::Min,
+                                                                    )),
+                                                            );
+                                                            text_ui.spacing_mut().item_spacing.y = 0.0;
+                                                            text_ui.add_space(
+                                                                ((self.win_row_height
+                                                                    - (self.win_line_height
+                                                                        + self.win_line_height * 0.8
+                                                                        + self.win_text_spacing))
+                                                                    / 2.0)
+                                                                    .max(0.0),
+                                                            );
+
+                                                            let title_response = text_ui.add(
+                                                                egui::Label::new(
+                                                                    egui::RichText::new(&app.name)
+                                                                        .color(egui::Color32::WHITE)
+                                                                        .strong()
+                                                                        .size(self.win_title_size)
+                                                                        .line_height(Some(self.win_line_height)),
+                                                                )
+                                                                .sense(egui::Sense::click())
+                                                                .truncate(),
+                                                            );
+                                                            if title_response.clicked() {
+                                                                label_clicked = true;
+                                                            }
+                                                            if self.disable_ibeam && title_response.hovered() {
+                                                                text_ui
+                                                                    .ctx()
+                                                                    .set_cursor_icon(egui::CursorIcon::Default);
+                                                            }
+
+                                                            text_ui.add_space(self.win_text_spacing);
+
+                                                            let is_link = std::fs::symlink_metadata(
+                                                                &app.desktop_file_path,
+                                                            )
+                                                            .map(|m| m.file_type().is_symlink())
+                                                            .unwrap_or(false);
+                                                            let mut subtext = app
+                                                                .desktop_file_path
+                                                                .to_string_lossy()
+                                                                .to_string();
+                                                            if is_link {
+                                                                subtext.push('@');
+                                                            }
+                                                            let path_response = text_ui.add(
+                                                                egui::Label::new(
+                                                                    egui::RichText::new(subtext)
+                                                                        .color(egui::Color32::from_rgba_unmultiplied(
+                                                                            255, 255, 255, 130,
+                                                                        ))
+                                                                        .size(self.win_path_size)
+                                                                        .line_height(Some(
+                                                                            self.win_line_height * 0.8,
+                                                                        )),
+                                                                )
+                                                                .sense(egui::Sense::click())
+                                                                .truncate(),
+                                                            );
+                                                            if path_response.clicked() {
+                                                                label_clicked = true;
+                                                            }
+                                                            if self.disable_ibeam && path_response.hovered() {
+                                                                text_ui
+                                                                    .ctx()
+                                                                    .set_cursor_icon(egui::CursorIcon::Default);
+                                                            }
+                                                        } else {
+                                                            let title_response = child_ui.add(
+                                                                egui::Label::new(
+                                                                    egui::RichText::new(&app.name)
+                                                                        .color(egui::Color32::WHITE)
+                                                                        .strong()
+                                                                        .size(self.win_title_size)
+                                                                        .line_height(Some(self.win_line_height)),
+                                                                )
+                                                                .sense(egui::Sense::click())
+                                                                .truncate(),
+                                                            );
+                                                            if title_response.clicked() {
+                                                                label_clicked = true;
+                                                            }
+                                                            if self.disable_ibeam && title_response.hovered() {
+                                                                child_ui
+                                                                    .ctx()
+                                                                    .set_cursor_icon(egui::CursorIcon::Default);
+                                                            }
+                                                        }
+                                                        if label_clicked {
+                                                            self.launch_app_and_exit(app, ctx);
+                                                        }
+                                                    }
+                                                }
+                                            });
+	                            });
+	                        });
+	                        ui.spacing_mut().item_spacing = previous_spacing;
+	                    }
+
+	                    ui.add_space(8.0);
 
                     // 4. Subtle shortcut menu footer
                     ui.separator();
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
+                        if ui
+                            .button(
+                                egui::RichText::new("Settings")
+                                    .color(egui::Color32::from_rgba_unmultiplied(
+                                        255, 255, 255, 190,
+                                    ))
+                                    .size(10.5),
+                            )
+                            .clicked()
+                        {
+                            self.show_settings_menu = !self.show_settings_menu;
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let label_text = match self.mode {
                                 LauncherMode::Apps => format!("{} apps", total_items),
@@ -1921,9 +3306,9 @@ impl eframe::App for App {
                         ui.max_rect().max - resize_handle_size,
                         resize_handle_size,
                     );
-                    
+
                     let resize_response = ui.allocate_rect(resize_rect, egui::Sense::drag());
-                    
+
                     // Draw visual resize handle (diagonal grip lines)
                     let color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100);
                     let br = resize_rect.max - egui::vec2(2.0, 2.0);
@@ -1949,63 +3334,7 @@ impl eframe::App for App {
                     }
 
                     if self.show_settings_menu {
-                        let area = egui::Area::new(egui::Id::new("settings_overlay"))
-                            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                            .order(egui::Order::Foreground);
-                        
-                        area.show(ctx, |ui| {
-                            let frame = egui::Frame::window(&ui.style())
-                                .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 240))
-                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)))
-                                .corner_radius(egui::CornerRadius::same(12));
-                            
-                            frame.show(ui, |ui| {
-                                ui.set_width(320.0);
-                                ui.vertical(|ui| {
-                                    ui.add_space(8.0);
-                                    ui.vertical_centered(|ui| {
-                                        ui.heading(
-                                            egui::RichText::new("Launcher Settings")
-                                                .color(egui::Color32::WHITE)
-                                                .strong(),
-                                        );
-                                    });
-                                    ui.add_space(8.0);
-                                    
-                                    ui.add(egui::Separator::default());
-                                    ui.add_space(12.0);
-
-                                    ui.horizontal(|ui| {
-                                        let mut show_val = self.show_system_settings_modules;
-                                        let checkbox_response = ui.checkbox(
-                                            &mut show_val,
-                                            egui::RichText::new("Show system settings modules (KCM)")
-                                                .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220))
-                                                .size(13.0),
-                                        );
-                                        if checkbox_response.changed() {
-                                            self.show_system_settings_modules = show_val;
-                                            save_show_system_settings_modules(show_val);
-                                        }
-                                    });
-                                    
-                                    ui.add_space(16.0);
-                                    ui.vertical_centered(|ui| {
-                                        if ui.add(
-                                            egui::Button::new(
-                                                egui::RichText::new("Close Settings (F10)")
-                                                    .color(egui::Color32::WHITE)
-                                                    .size(13.0)
-                                            )
-                                            .fill(egui::Color32::from_rgba_unmultiplied(61, 174, 233, 200))
-                                        ).clicked() {
-                                            self.show_settings_menu = false;
-                                        }
-                                    });
-                                    ui.add_space(8.0);
-                                });
-                            });
-                        });
+                        self.show_settings_popup(ctx);
                     }
                 });
             });
@@ -2059,12 +3388,12 @@ impl eframe::App for BorderOverlay {
             return;
         }
         ctx.request_repaint();
-        
+
         let panel_frame = egui::Frame {
             fill: egui::Color32::TRANSPARENT,
             ..Default::default()
         };
-        
+
         egui::CentralPanel::default()
             .frame(panel_frame)
             .show(ctx, |ui| {
@@ -2072,16 +3401,19 @@ impl eframe::App for BorderOverlay {
                 let total_secs = self.duration.as_secs_f32();
                 let progress = (elapsed / total_secs).clamp(0.0, 1.0);
                 let alpha = ((1.0 - progress) * 255.0) as u8;
-                
+
                 let rect = egui::Rect::from_min_size(
                     egui::pos2(self.local_x, self.local_y),
                     egui::vec2(self.tw, self.th),
                 );
-                
+
                 ui.painter().rect_stroke(
                     rect,
                     egui::CornerRadius::same(6),
-                    egui::Stroke::new(3.0, egui::Color32::from_rgba_unmultiplied(235, 40, 40, alpha)),
+                    egui::Stroke::new(
+                        3.0,
+                        egui::Color32::from_rgba_unmultiplied(235, 40, 40, alpha),
+                    ),
                     egui::StrokeKind::Inside,
                 );
             });
@@ -2103,19 +3435,19 @@ fn get_monitors() -> Vec<MonitorInfo> {
         Err(_) => return monitors,
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
-    
+
     let blocks: Vec<&str> = stdout.split("\"name\":").collect();
     if blocks.len() <= 1 {
         return monitors;
     }
-    
+
     for block in &blocks[1..] {
         let mut x = None;
         let mut y = None;
         let mut width = None;
         let mut height = None;
         let mut scale = Some(1.0);
-        
+
         if let Some(pos_idx) = block.find("\"pos\":") {
             let pos_str = &block[pos_idx..];
             if let Some(brace_open) = pos_str.find('{') {
@@ -2124,11 +3456,13 @@ fn get_monitors() -> Vec<MonitorInfo> {
                     for line in pos_content.lines() {
                         let line = line.trim();
                         if line.starts_with("\"x\":") {
-                            x = line.strip_prefix("\"x\":")
+                            x = line
+                                .strip_prefix("\"x\":")
                                 .map(|s| s.trim_matches(|c| c == ',' || c == ' ' || c == '\n'))
                                 .and_then(|s| s.parse::<f32>().ok());
                         } else if line.starts_with("\"y\":") {
-                            y = line.strip_prefix("\"y\":")
+                            y = line
+                                .strip_prefix("\"y\":")
                                 .map(|s| s.trim_matches(|c| c == ',' || c == ' ' || c == '\n'))
                                 .and_then(|s| s.parse::<f32>().ok());
                         }
@@ -2136,7 +3470,7 @@ fn get_monitors() -> Vec<MonitorInfo> {
                 }
             }
         }
-        
+
         if let Some(size_idx) = block.find("\"size\":") {
             let size_str = &block[size_idx..];
             if let Some(brace_open) = size_str.find('{') {
@@ -2145,11 +3479,13 @@ fn get_monitors() -> Vec<MonitorInfo> {
                     for line in size_content.lines() {
                         let line = line.trim();
                         if line.starts_with("\"width\":") {
-                            width = line.strip_prefix("\"width\":")
+                            width = line
+                                .strip_prefix("\"width\":")
                                 .map(|s| s.trim_matches(|c| c == ',' || c == ' ' || c == '\n'))
                                 .and_then(|s| s.parse::<f32>().ok());
                         } else if line.starts_with("\"height\":") {
-                            height = line.strip_prefix("\"height\":")
+                            height = line
+                                .strip_prefix("\"height\":")
                                 .map(|s| s.trim_matches(|c| c == ',' || c == ' ' || c == '\n'))
                                 .and_then(|s| s.parse::<f32>().ok());
                         }
@@ -2157,20 +3493,30 @@ fn get_monitors() -> Vec<MonitorInfo> {
                 }
             }
         }
-        
+
         for line in block.lines() {
             let line = line.trim();
             if line.starts_with("\"scale\":") {
-                if let Some(s_val) = line.strip_prefix("\"scale\":")
+                if let Some(s_val) = line
+                    .strip_prefix("\"scale\":")
                     .map(|s| s.trim_matches(|c| c == ',' || c == ' ' || c == '\n'))
-                    .and_then(|s| s.parse::<f32>().ok()) {
+                    .and_then(|s| s.parse::<f32>().ok())
+                {
                     scale = Some(s_val);
                 }
             }
         }
-        
-        if let (Some(x), Some(y), Some(width), Some(height), Some(scale)) = (x, y, width, height, scale) {
-            monitors.push(MonitorInfo { x, y, width, height, scale });
+
+        if let (Some(x), Some(y), Some(width), Some(height), Some(scale)) =
+            (x, y, width, height, scale)
+        {
+            monitors.push(MonitorInfo {
+                x,
+                y,
+                width,
+                height,
+                scale,
+            });
         }
     }
     monitors
@@ -2178,34 +3524,37 @@ fn get_monitors() -> Vec<MonitorInfo> {
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
-    
+
     if args.len() >= 7 && args[1] == "--draw-border" {
         let tx: f32 = args[2].parse().unwrap_or(0.0);
         let ty: f32 = args[3].parse().unwrap_or(0.0);
         let tw: f32 = args[4].parse().unwrap_or(100.0);
         let th: f32 = args[5].parse().unwrap_or(100.0);
-        
+
         // Find which monitor contains the target window center
         let target_center_x = tx + tw / 2.0;
         let target_center_y = ty + th / 2.0;
-        
+
         let mut mx = 0.0;
         let mut my = 0.0;
-        
+
         for monitor in get_monitors() {
             let logical_w = monitor.width / monitor.scale;
             let logical_h = monitor.height / monitor.scale;
-            if target_center_x >= monitor.x && target_center_x <= monitor.x + logical_w
-               && target_center_y >= monitor.y && target_center_y <= monitor.y + logical_h {
+            if target_center_x >= monitor.x
+                && target_center_x <= monitor.x + logical_w
+                && target_center_y >= monitor.y
+                && target_center_y <= monitor.y + logical_h
+            {
                 mx = monitor.x;
                 my = monitor.y;
                 break;
             }
         }
-        
+
         let local_x = tx - mx;
         let local_y = ty - my;
-        
+
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title("Border Overlay")
@@ -2216,7 +3565,7 @@ fn main() -> eframe::Result {
                 .with_mouse_passthrough(true),
             ..Default::default()
         };
-        
+
         let _ = eframe::run_native(
             "Border Overlay",
             options,
@@ -2233,17 +3582,10 @@ fn main() -> eframe::Result {
         );
         return Ok(());
     }
-    
-    // Pre-parse mode to determine which socket path to use
-    let mut mode = LauncherMode::Windows;
-    for arg in &args {
-        if arg == "-a" || arg == "--apps" {
-            mode = LauncherMode::Apps;
-            break;
-        }
-    }
 
-    // Single instance check using Unix domain socket (mode-specific)
+    let mode = LauncherMode::Windows;
+
+    // Single instance check using Unix domain socket
     let socket_path = get_socket_path(mode);
     if socket_path.exists() {
         if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
@@ -2265,7 +3607,7 @@ fn main() -> eframe::Result {
 
     let mut close_on_blur = false;
     let mut force_theme = None;
-    let mut icon_only = false;
+    let icon_only = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -2273,14 +3615,6 @@ fn main() -> eframe::Result {
             "-h" | "--help" => {
                 print_help();
                 return Ok(());
-            }
-            "-a" | "--apps" => {
-                // Already processed in pre-parse step
-                i += 1;
-            }
-            "-i" | "--icon-only" => {
-                icon_only = true;
-                i += 1;
             }
             "--close-on-blur" => {
                 close_on_blur = true;
@@ -2305,10 +3639,7 @@ fn main() -> eframe::Result {
 
     let (width, height) = load_window_size();
 
-    let title = match mode {
-        LauncherMode::Apps => "Search Applications",
-        LauncherMode::Windows => "Open Application Windows",
-    };
+    let title = "Open Application Windows";
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -2325,7 +3656,13 @@ fn main() -> eframe::Result {
         title,
         options,
         Box::new(move |cc| {
-            Ok(Box::new(App::new(cc, close_on_blur, force_theme, mode, icon_only)))
+            Ok(Box::new(App::new(
+                cc,
+                close_on_blur,
+                force_theme,
+                mode,
+                icon_only,
+            )))
         }),
     )
 }

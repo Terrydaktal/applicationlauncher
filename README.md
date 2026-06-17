@@ -21,15 +21,15 @@ A fast, visually stunning GUI application launcher built in Rust using `egui` an
   - **Icon Resolution & Caching**: Implements XDG Freedesktop Icon Theme specifications via the `freedesktop-icons` crate, traversing custom theme (`breeze`, `breeze-dark`) and `hicolor` inheritances. Additionally, it parses application `.desktop` files (both system-wide and user-local) to extract hardcoded absolute icon paths (common in custom or user-compiled applications like CopyQ) and specific icon overrides. It caches lookup results to eliminate redundant filesystem traversals.
   - **Fuzzy Matcher**: Uses `fuzzy-matcher`'s `SkimMatcherV2` to perform real-time, fuzzy filtering on window titles and class names.
   - **Asynchronous Startup & Threaded Loading**: Offloads all process execution and filesystem queries to background threads. This opens the main GUI window instantly (0ms perceived latency), allowing the user to focus and type into the search box immediately while the window list loading spinner completes in the background.
-  - **GUI Rendering**: Employs `egui` (version `0.33`) to draw a frameless, borderless, semi-transparent acrylic window with rounded corners and a premium vertical accent highlight bar.
-  - **Icon Only Grid Mode**: Supports an icon-only grid display mode (`-i` / `--icon-only`) for the application launcher, displaying applications in a visual grid that adjusts dynamically to window resizing.
-  - **Temporary Window Border Overlay**: Spawns a borderless fullscreen overlay (`--draw-border`) that draws a temporary fading red outline around the target window for 250ms with KWin background dimming to highlight its location on the screen.
+  - **GUI Rendering**: Employs `egui` (version `0.33`) to draw a frameless, borderless, semi-transparent acrylic window with rounded corners, a main open-window list, and an application side panel.
+  - **Application Panel Icon Grid**: Supports a settings-controlled icon grid display for the application side panel.
+  - **Temporary Window Border Overlay**: Spawns a borderless fullscreen overlay (`--draw-border`) that draws a temporary fading red outline around the target window for 250ms.
   - **Keyboard Navigation**: Captures system-wide keystrokes within the viewport:
-    - `Up/Down Arrows` (and Left/Right in grid mode): Navigate through filtered results.
+    - `Up/Down Arrows`: Navigate through filtered window results.
     - `Enter`: Activate and raise the selected window.
     - `Escape`: Close the launcher.
     - `F5`: Force-refresh the open window list.
-    - `Ctrl+P`: Toggle pin/unpin status for applications.
+    - `F10`: Open launcher settings.
   - **Focus Loss Behavior**: Auto-closes the launcher immediately when the window loses focus (can be disabled via `--no-close-on-blur`).
 
 ## Requirements
@@ -68,20 +68,13 @@ SYNOPSIS
 DESCRIPTION
     applicationlauncher is a fast, visually stunning GUI application launcher
     designed for KDE Plasma Wayland. It queries the list of all open window
-    objects using kdotool, allows searching them via a fuzzy-matching interface,
-    and switches focus to the selected window.
+    objects using kdotool, shows installed applications in a side panel, allows
+    searching both via a fuzzy-matching interface, and switches focus to the
+    selected window or launches the selected application.
 
 OPTIONS
     -h, --help
         Print this help information and exit.
-
-    -a, --apps
-        Open the launcher in application mode to show and launch installed
-        desktop applications rather than active window objects.
-
-    -i, --icon-only
-        Show only application icons in a grid format without names (only
-        applicable in application launcher mode).
 
     --close-on-blur
         Close the launcher window automatically when it loses focus.
@@ -95,15 +88,16 @@ OPTIONS
 
 OPERATION
     When launched, the application retrieves a list of all open windows using
-    kdotool. It renders a frameless GUI window containing a search input.
-    As you type, the list is filtered using a fuzzy matcher.
+    kdotool and scans installed desktop applications. It renders a frameless GUI
+    window containing a search input, a main window list, and an application side
+    panel. As you type, both lists are filtered using a fuzzy matcher.
     
     Keyboard Navigation:
-        - Up/Down Arrows: Move selection.
-        - Enter: Activate selected window (or launch selected application).
+        - Up/Down Arrows: Move selected window.
+        - Enter: Activate selected window.
         - Escape: Close launcher.
         - F5: Refresh list.
-        - Ctrl+P: Toggle pin/unpin status for the selected application.
+        - F10: Open launcher settings.
 
 EXAMPLES
     applicationlauncher
