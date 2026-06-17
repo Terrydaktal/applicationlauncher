@@ -5,6 +5,13 @@ use std::process::Command;
 use std::time::Instant;
 
 #[derive(Clone, Debug)]
+struct ProcessChainEntry {
+    pid: i32,
+    name: String,
+    exe_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
 struct WindowInfo {
     id: String,
     title: String,
@@ -12,6 +19,7 @@ struct WindowInfo {
     icon_path: Option<PathBuf>,
     active_process: Option<String>,
     exe_path: Option<PathBuf>,
+    process_chain: Vec<ProcessChainEntry>,
 }
 
 #[derive(Clone, Debug)]
@@ -39,6 +47,16 @@ enum LoadResult {
     Error(String),
 }
 
+enum UiEvent {
+    FocusLauncher,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivePane {
+    Windows,
+    Apps,
+}
+
 struct App {
     mode: LauncherMode,
     windows: Vec<WindowInfo>,
@@ -46,6 +64,12 @@ struct App {
     pinned_apps: Vec<PathBuf>,
     search_query: String,
     selected_index: usize,
+    side_panel_selected_index: usize,
+    active_pane: ActivePane,
+    rendered_app_grid_columns: usize,
+    rendered_side_panel_grid_columns: usize,
+    rendered_window_row_centers: Vec<f32>,
+    rendered_side_panel_item_centers: Vec<f32>,
     kdotool_path: Option<PathBuf>,
     error_message: Option<String>,
     start_time: Instant,
@@ -53,6 +77,7 @@ struct App {
     force_theme: Option<String>,
     loading: bool,
     receiver: Option<std::sync::mpsc::Receiver<LoadResult>>,
+    ui_event_rx: std::sync::mpsc::Receiver<UiEvent>,
     width: f32,
     height: f32,
     icon_only: bool,
@@ -71,6 +96,7 @@ struct App {
     app_icon_show_name: bool,
     app_icon_name_size: f32,
     disable_ibeam: bool,
+    process_chain_popup: Option<WindowInfo>,
 }
 
 #[derive(Clone, Copy)]
@@ -678,6 +704,61 @@ fn command_basename(exec: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+
+    let keep = max_chars.saturating_sub(3);
+    let mut truncated: String = text.chars().take(keep).collect();
+    truncated.push_str("...");
+    truncated
+}
+
+fn best_app_match_score(window_keys: &[String], app: &AppInfo) -> Option<(usize, usize, usize)> {
+    let mut best_score: Option<(usize, usize, usize)> = None;
+
+    let mut app_keys = Vec::new();
+    app_keys.push(normalize_app_match_key(&app.name));
+
+    if let Some(stem) = app
+        .desktop_file_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+    {
+        app_keys.push(normalize_app_match_key(stem));
+    }
+
+    if let Some(exec_name) = command_basename(&app.exec) {
+        app_keys.push(normalize_app_match_key(&exec_name));
+    }
+
+    app_keys.retain(|key| !key.is_empty());
+
+    for window_key in window_keys {
+        for app_key in &app_keys {
+            let score = if window_key == app_key {
+                Some((0, app_key.len().abs_diff(window_key.len()), app.name.len()))
+            } else if app_key.starts_with(window_key) || window_key.starts_with(app_key) {
+                Some((1, app_key.len().abs_diff(window_key.len()), app.name.len()))
+            } else if app_key.contains(window_key) || window_key.contains(app_key) {
+                Some((2, app_key.len().abs_diff(window_key.len()), app.name.len()))
+            } else {
+                None
+            };
+
+            if let Some(score) = score {
+                if best_score.is_none_or(|current| score < current) {
+                    best_score = Some(score);
+                }
+            }
+        }
+    }
+
+    best_score
+}
+
 fn truncate_tile_label(text: &str, tile_size: f32) -> String {
     let max_chars = ((tile_size / 7.0).floor() as usize).clamp(6, 22);
     let char_count = text.chars().count();
@@ -689,6 +770,63 @@ fn truncate_tile_label(text: &str, tile_size: f32) -> String {
     let mut truncated: String = text.chars().take(keep).collect();
     truncated.push_str("...");
     truncated
+}
+
+fn grid_move_down(index: usize, len: usize, columns: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+
+    let columns = columns.max(1);
+    let next = index.saturating_add(columns);
+    if next < len { next } else { index % columns }
+}
+
+fn grid_move_up(index: usize, len: usize, columns: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+
+    let columns = columns.max(1);
+    if index >= columns {
+        return index - columns;
+    }
+
+    let column = index % columns;
+    let mut last_in_column = column.min(len - 1);
+    while last_in_column + columns < len {
+        last_in_column += columns;
+    }
+    last_in_column
+}
+
+fn nearest_center_index(centers: &[f32], target_y: f32) -> Option<usize> {
+    centers
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            let da = (*a - target_y).abs();
+            let db = (*b - target_y).abs();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(index, _)| index)
+}
+
+fn show_immediate_icon_tooltip(response: &egui::Response, text: &str) {
+    if !response.hovered() {
+        return;
+    }
+
+    let _ = egui::Tooltip::always_open(
+        response.ctx.clone(),
+        response.layer_id,
+        response.id.with("icon_tooltip"),
+        response.rect,
+    )
+    .gap(8.0)
+    .show(|ui| {
+        ui.label(text);
+    });
 }
 
 fn parse_desktop_file(path: &Path, theme: &str) -> Option<AppInfo> {
@@ -885,9 +1023,14 @@ fn parse_proc_stat(stat_content: &str) -> Option<(i32, String, i32)> {
     Some((pid, name, ppid))
 }
 
-fn get_process_tree() -> (HashMap<i32, Vec<i32>>, HashMap<i32, String>) {
+fn get_process_tree() -> (
+    HashMap<i32, Vec<i32>>,
+    HashMap<i32, String>,
+    HashMap<i32, i32>,
+) {
     let mut ppid_to_children = HashMap::new();
     let mut pid_to_name = HashMap::new();
+    let mut pid_to_ppid = HashMap::new();
 
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for entry in entries {
@@ -900,6 +1043,7 @@ fn get_process_tree() -> (HashMap<i32, Vec<i32>>, HashMap<i32, String>) {
                             if let Ok(content) = std::fs::read_to_string(stat_path) {
                                 if let Some((pid, proc_name, ppid)) = parse_proc_stat(&content) {
                                     pid_to_name.insert(pid, proc_name);
+                                    pid_to_ppid.insert(pid, ppid);
                                     ppid_to_children
                                         .entry(ppid)
                                         .or_insert_with(Vec::new)
@@ -913,7 +1057,7 @@ fn get_process_tree() -> (HashMap<i32, Vec<i32>>, HashMap<i32, String>) {
         }
     }
 
-    (ppid_to_children, pid_to_name)
+    (ppid_to_children, pid_to_name, pid_to_ppid)
 }
 
 fn is_shell(name: &str) -> bool {
@@ -975,6 +1119,35 @@ fn find_terminal_leaf(
     }
 }
 
+fn build_process_chain(
+    start_pid: i32,
+    pid_to_name: &HashMap<i32, String>,
+    pid_to_ppid: &HashMap<i32, i32>,
+) -> Vec<ProcessChainEntry> {
+    let mut chain = Vec::new();
+    let mut current_pid = Some(start_pid);
+
+    while let Some(pid) = current_pid {
+        let name = pid_to_name
+            .get(&pid)
+            .cloned()
+            .unwrap_or_else(|| pid.to_string());
+        let exe_path = std::fs::read_link(format!("/proc/{}/exe", pid)).ok();
+        chain.push(ProcessChainEntry {
+            pid,
+            name,
+            exe_path,
+        });
+
+        current_pid = pid_to_ppid
+            .get(&pid)
+            .copied()
+            .filter(|ppid| *ppid > 0 && *ppid != pid);
+    }
+
+    chain
+}
+
 fn get_open_windows(kdotool_path: &Path, theme: &str) -> Vec<WindowInfo> {
     // 1. Fetch all window IDs using kdotool search
     let output = match Command::new(kdotool_path)
@@ -1032,7 +1205,7 @@ fn get_open_windows(kdotool_path: &Path, theme: &str) -> Vec<WindowInfo> {
     let lines: Vec<&str> = meta_stdout.lines().collect();
 
     // 3. Scan /proc once to build process tree before querying PIDs
-    let (ppid_to_children, pid_to_name) = get_process_tree();
+    let (ppid_to_children, pid_to_name, pid_to_ppid) = get_process_tree();
 
     let mut windows = Vec::new();
     let theme_str = theme.to_string();
@@ -1086,6 +1259,7 @@ fn get_open_windows(kdotool_path: &Path, theme: &str) -> Vec<WindowInfo> {
             // Detect active process running in terminal and resolve binary exe path
             let mut active_process = None;
             let mut exe_path = None;
+            let mut process_chain = Vec::new();
             if let Some(pid) = pid {
                 let is_terminal = class_lower.contains("terminal")
                     || class_lower == "konsole"
@@ -1104,9 +1278,11 @@ fn get_open_windows(kdotool_path: &Path, theme: &str) -> Vec<WindowInfo> {
                     }
                 }
 
-                if let Ok(path) = std::fs::read_link(format!("/proc/{}/exe", target_pid)) {
+                if let Ok(path) = std::fs::read_link(format!("/proc/{}/exe", pid)) {
                     exe_path = Some(path);
                 }
+
+                process_chain = build_process_chain(target_pid, &pid_to_name, &pid_to_ppid);
             }
 
             // Insert active process name between terminal name and working directory in the title
@@ -1158,6 +1334,7 @@ fn get_open_windows(kdotool_path: &Path, theme: &str) -> Vec<WindowInfo> {
                 icon_path,
                 active_process,
                 exe_path,
+                process_chain,
             });
         } else {
             idx += 1;
@@ -1232,6 +1409,7 @@ impl App {
         force_theme: Option<String>,
         mode: LauncherMode,
         icon_only: bool,
+        ui_event_rx: std::sync::mpsc::Receiver<UiEvent>,
     ) -> Self {
         // Install loaders to enable SVG and PNG image support
         egui_extras::install_image_loaders(&cc.egui_ctx);
@@ -1264,6 +1442,12 @@ impl App {
             pinned_apps,
             search_query: String::new(),
             selected_index: 0,
+            side_panel_selected_index: 0,
+            active_pane: ActivePane::Windows,
+            rendered_app_grid_columns: 1,
+            rendered_side_panel_grid_columns: 1,
+            rendered_window_row_centers: Vec::new(),
+            rendered_side_panel_item_centers: Vec::new(),
             kdotool_path: Some(kdotool_path),
             error_message: None,
             start_time: Instant::now(),
@@ -1271,6 +1455,7 @@ impl App {
             force_theme,
             loading: false,
             receiver: None,
+            ui_event_rx,
             width,
             height,
             icon_only: icon_only || settings.app_icon_mode,
@@ -1289,6 +1474,7 @@ impl App {
             app_icon_show_name: settings.app_icon_show_name,
             app_icon_name_size: settings.app_icon_name_size,
             disable_ibeam: settings.disable_ibeam,
+            process_chain_popup: None,
         };
 
         match app.mode {
@@ -1655,6 +1841,85 @@ impl App {
         }
     }
 
+    fn show_process_chain_popup(&mut self, ctx: &egui::Context) {
+        let Some(window_info) = self.process_chain_popup.clone() else {
+            return;
+        };
+
+        let viewport_id = egui::ViewportId::from_hash_of("launcher_process_chain_popup");
+        let builder = egui::ViewportBuilder::default()
+            .with_title(format!("Execution Chain: {}", window_info.title))
+            .with_inner_size([620.0, 420.0])
+            .with_min_inner_size([420.0, 260.0])
+            .with_resizable(true);
+
+        let mut should_close = false;
+        ctx.show_viewport_immediate(viewport_id, builder, |ctx, _class| {
+            if ctx.input(|i| i.viewport().close_requested()) {
+                should_close = true;
+                return;
+            }
+
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                should_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::window(&ctx.style())
+                        .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 240))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+                        ))
+                        .corner_radius(egui::CornerRadius::same(12)),
+                )
+                .show(ctx, |ui| {
+                    ui.heading(
+                        egui::RichText::new(&window_info.title)
+                            .color(egui::Color32::WHITE)
+                            .strong(),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("Leaf process to parent process chain")
+                            .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170)),
+                    );
+                    ui.add_space(10.0);
+
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for entry in &window_info.process_chain {
+                            ui.group(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} (pid {})",
+                                        entry.name, entry.pid
+                                    ))
+                                    .color(egui::Color32::WHITE)
+                                    .strong(),
+                                );
+                                let path_text = entry
+                                    .exe_path
+                                    .as_ref()
+                                    .map(|path| path.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "Executable path unavailable".to_string());
+                                ui.label(egui::RichText::new(path_text).color(
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160),
+                                ));
+                            });
+                            ui.add_space(6.0);
+                        }
+                    });
+                });
+        });
+
+        if should_close {
+            self.process_chain_popup = None;
+        }
+    }
+
     fn refresh_windows(&mut self) {
         if let Some(ref kpath) = self.kdotool_path {
             let kpath = kpath.clone();
@@ -1704,7 +1969,7 @@ impl App {
         if !launch_desktop_entry(&app.desktop_file_path) {
             launch_app(&app.exec);
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        ctx.request_repaint();
     }
 
     fn find_app_for_window<'a>(&'a self, win: &WindowInfo) -> Option<&'a AppInfo> {
@@ -1733,40 +1998,14 @@ impl App {
             return None;
         }
 
-        self.apps.iter().find(|app| {
-            let mut app_keys = Vec::new();
-            app_keys.push(normalize_app_match_key(&app.name));
-
-            if let Some(stem) = app
-                .desktop_file_path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-            {
-                app_keys.push(normalize_app_match_key(stem));
-            }
-
-            if let Some(exec_name) = command_basename(&app.exec) {
-                app_keys.push(normalize_app_match_key(&exec_name));
-            }
-
-            app_keys.retain(|key| !key.is_empty());
-
-            window_keys.iter().any(|window_key| {
-                app_keys.iter().any(|app_key| {
-                    window_key == app_key
-                        || window_key.contains(app_key)
-                        || app_key.contains(window_key)
-                })
-            })
-        })
+        self.apps
+            .iter()
+            .filter_map(|app| best_app_match_score(&window_keys, app).map(|score| (app, score)))
+            .min_by_key(|(app, score)| (*score, app.is_settings_module))
+            .map(|(app, _)| app)
     }
 
     fn launch_window_app_and_exit(&self, win: &WindowInfo, ctx: &egui::Context) {
-        if let Some(app) = self.find_app_for_window(win) {
-            self.launch_app_and_exit(app, ctx);
-            return;
-        }
-
         if let Some(exe_path) = &win.exe_path {
             let exe = exe_path.clone();
             std::thread::spawn(move || {
@@ -1777,13 +2016,18 @@ impl App {
                 cmd.env_remove("UV_ACTIVE");
                 let _ = cmd.spawn();
             });
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            ctx.request_repaint();
             return;
         }
 
         if let Some(proc_name) = &win.active_process {
             launch_app(proc_name);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            ctx.request_repaint();
+            return;
+        }
+
+        if let Some(app) = self.find_app_for_window(win) {
+            self.launch_app_and_exit(app, ctx);
         }
     }
 
@@ -1817,7 +2061,7 @@ impl App {
                 }
             });
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        ctx.request_repaint();
     }
 
     fn close_window_and_exit(&self, id: String, ctx: &egui::Context) {
@@ -1827,7 +2071,7 @@ impl App {
                 let _ = Command::new(&kpath).args(["windowclose", &id]).status();
             });
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        ctx.request_repaint();
     }
 }
 
@@ -1850,11 +2094,15 @@ impl eframe::App for App {
                         LoadResult::AppsSuccess(apps) => {
                             self.apps = apps;
                             self.selected_index = 0;
+                            self.side_panel_selected_index = 0;
+                            self.active_pane = ActivePane::Windows;
                         }
                         LoadResult::Content { windows, apps } => {
                             self.windows = windows;
                             self.apps = apps;
                             self.selected_index = 0;
+                            self.side_panel_selected_index = 0;
+                            self.active_pane = ActivePane::Windows;
                         }
                         LoadResult::Error(err) => {
                             self.error_message = Some(err);
@@ -1865,11 +2113,25 @@ impl eframe::App for App {
             }
         }
 
+        while let Ok(event) = self.ui_event_rx.try_recv() {
+            match event {
+                UiEvent::FocusLauncher => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                        egui::UserAttentionType::Informational,
+                    ));
+                }
+            }
+        }
+
         // Focus loss auto-close
         if self.close_on_blur
             && self.start_time.elapsed().as_millis() > 500
             && !ctx.input(|i| i.focused)
             && !self.show_settings_menu
+            && self.process_chain_popup.is_none()
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
@@ -2142,10 +2404,20 @@ impl eframe::App for App {
                     if self.selected_index >= total_items {
                         self.selected_index = 0;
                     }
+                    if self.side_panel_selected_index >= filtered_apps.len() {
+                        self.side_panel_selected_index = 0;
+                    }
 
+                    let render_side_panel = self.mode == LauncherMode::Windows;
                     let mut scroll_to_selected = false;
+                    let mut scroll_to_side_selected = false;
                     let columns = if self.icon_only && self.mode == LauncherMode::Apps {
-                        (((ui.available_width() + 12.0) / 84.0).floor() as usize).max(1)
+                        self.rendered_app_grid_columns.max(1)
+                    } else {
+                        1
+                    };
+                    let side_panel_columns = if render_side_panel && self.icon_only {
+                        self.rendered_side_panel_grid_columns.max(1)
                     } else {
                         1
                     };
@@ -2164,7 +2436,89 @@ impl eframe::App for App {
 
                     if !self.show_settings_menu {
                         // Keyboard navigation inputs
-                        if self.icon_only && self.mode == LauncherMode::Apps {
+                        if render_side_panel && self.icon_only {
+	                            if self.active_pane == ActivePane::Windows {
+	                                if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight))
+	                                    && !filtered_apps.is_empty()
+		                                {
+		                                    let target_y = self
+		                                        .rendered_window_row_centers
+		                                        .get(self.selected_index)
+		                                        .copied()
+		                                        .unwrap_or(self.selected_index as f32 * self.win_row_height);
+		                                    self.side_panel_selected_index = nearest_center_index(
+		                                        &self.rendered_side_panel_item_centers,
+		                                        target_y,
+		                                    )
+		                                    .unwrap_or(0)
+		                                    .min(filtered_apps.len() - 1);
+		                                    self.active_pane = ActivePane::Apps;
+		                                    scroll_to_side_selected = true;
+		                                }
+                                if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown))
+                                    && total_items > 0
+                                {
+                                    self.selected_index = (self.selected_index + 1) % total_items;
+                                    scroll_to_selected = true;
+                                }
+                                if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp))
+                                    && total_items > 0
+                                {
+                                    self.selected_index = if self.selected_index == 0 {
+                                        total_items - 1
+                                    } else {
+                                        self.selected_index - 1
+                                    };
+                                    scroll_to_selected = true;
+                                }
+		                            } else if !filtered_apps.is_empty() {
+		                                if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+		                                    if self.side_panel_selected_index % side_panel_columns == 0 {
+		                                        let target_y = self
+		                                            .rendered_side_panel_item_centers
+		                                            .get(self.side_panel_selected_index)
+		                                            .copied()
+		                                            .unwrap_or(self.side_panel_selected_index as f32);
+		                                        if total_items > 0 {
+		                                            self.selected_index = nearest_center_index(
+		                                                &self.rendered_window_row_centers,
+		                                                target_y,
+		                                            )
+		                                            .unwrap_or(0)
+		                                            .min(total_items - 1);
+		                                        }
+		                                        self.active_pane = ActivePane::Windows;
+		                                        scroll_to_selected = true;
+		                                    } else {
+	                                        self.side_panel_selected_index -= 1;
+	                                        scroll_to_side_selected = true;
+	                                    }
+	                                }
+                                if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                                    self.side_panel_selected_index =
+                                        (self.side_panel_selected_index + 1) % filtered_apps.len();
+                                    scroll_to_side_selected = true;
+                                }
+	                                if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+	                                    self.side_panel_selected_index =
+	                                        grid_move_down(
+	                                            self.side_panel_selected_index,
+	                                            filtered_apps.len(),
+	                                            side_panel_columns,
+	                                        );
+	                                    scroll_to_side_selected = true;
+	                                }
+	                                if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+	                                    self.side_panel_selected_index =
+	                                        grid_move_up(
+	                                            self.side_panel_selected_index,
+	                                            filtered_apps.len(),
+	                                            side_panel_columns,
+	                                        );
+	                                    scroll_to_side_selected = true;
+	                                }
+                            }
+                        } else if self.icon_only && self.mode == LauncherMode::Apps {
                             if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) && total_items > 0 {
                                 self.selected_index = (self.selected_index + 1) % total_items;
                                 scroll_to_selected = true;
@@ -2177,18 +2531,16 @@ impl eframe::App for App {
                                 };
                                 scroll_to_selected = true;
                             }
-                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) && total_items > 0 {
-                                self.selected_index = (self.selected_index + columns) % total_items;
-                                scroll_to_selected = true;
-                            }
-                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) && total_items > 0 {
-                                self.selected_index = if self.selected_index < columns {
-                                    total_items - 1
-                                } else {
-                                    self.selected_index - columns
-                                };
-                                scroll_to_selected = true;
-                            }
+	                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) && total_items > 0 {
+	                                self.selected_index =
+	                                    grid_move_down(self.selected_index, total_items, columns);
+	                                scroll_to_selected = true;
+	                            }
+	                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) && total_items > 0 {
+	                                self.selected_index =
+	                                    grid_move_up(self.selected_index, total_items, columns);
+	                                scroll_to_selected = true;
+	                            }
                         } else {
                             if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) && total_items > 0 {
                                 self.selected_index = (self.selected_index + 1) % total_items;
@@ -2211,8 +2563,16 @@ impl eframe::App for App {
                                     self.launch_app_and_exit(app, ctx);
                                 }
                                 LauncherMode::Windows => {
-                                    let win = &filtered_windows[self.selected_index].0;
-                                    self.activate_and_exit(win.id.clone(), ctx);
+                                    if render_side_panel && self.icon_only && self.active_pane == ActivePane::Apps {
+                                        if let Some(app) =
+                                            filtered_apps.get(self.side_panel_selected_index).map(|item| &item.0)
+                                        {
+                                            self.launch_app_and_exit(app, ctx);
+                                        }
+                                    } else {
+                                        let win = &filtered_windows[self.selected_index].0;
+                                        self.activate_and_exit(win.id.clone(), ctx);
+                                    }
                                 }
                             }
                         }
@@ -2312,7 +2672,6 @@ impl eframe::App for App {
                     let row_height = self.win_row_height;
                     let window_icon_size = egui::vec2(self.win_icon_size, self.win_icon_size);
                     let app_icon_size = egui::vec2(self.app_icon_size, self.app_icon_size);
-                    let render_side_panel = self.mode == LauncherMode::Windows;
 
                     if render_side_panel {
                         let previous_spacing = ui.spacing().item_spacing;
@@ -2321,7 +2680,10 @@ impl eframe::App for App {
                             let ui = &mut panes[0];
 
 	                    if total_items == 0 {
-                        ui.allocate_ui(egui::vec2(ui.available_width(), list_height), |ui| {
+	                        if self.mode == LauncherMode::Windows {
+	                            self.rendered_window_row_centers.clear();
+	                        }
+	                        ui.allocate_ui(egui::vec2(ui.available_width(), list_height), |ui| {
                             ui.vertical_centered(|ui| {
                                 ui.add_space(80.0);
                                 if self.loading {
@@ -2350,25 +2712,35 @@ impl eframe::App for App {
                     } else if self.icon_only && self.mode == LauncherMode::Apps {
                         egui::ScrollArea::vertical()
                             .id_salt("apps_main_icon_grid_scroll")
-                            .max_height(list_height)
-                            .show(ui, |ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    for index in 0..total_items {
-                                        let is_selected = index == self.selected_index;
-                                        let app = &filtered_apps[index].0;
-                                        let tile_size = self.app_icon_tile_size;
+	                            .max_height(list_height)
+	                            .show(ui, |ui| {
+	                                ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+	                                let mut rendered_columns = 0usize;
+	                                let mut first_row_y = None;
+	                                ui.horizontal_wrapped(|ui| {
+		                                    for index in 0..total_items {
+		                                        let is_selected = index == self.selected_index;
+		                                        let app = &filtered_apps[index].0;
+		                                        let tile_size = self.app_icon_tile_size;
 
                                         let (rect, response) = ui.allocate_exact_size(
                                             egui::vec2(tile_size, tile_size),
-                                            egui::Sense::click(),
-                                        );
+	                                            egui::Sense::click(),
+	                                        );
 
-                                        if response.hovered() {
-                                            self.selected_index = index;
-                                        }
+	                                        let center_y = rect.center().y;
+	                                        match first_row_y {
+	                                            None => {
+	                                                first_row_y = Some(center_y);
+	                                                rendered_columns = 1;
+	                                            }
+	                                            Some(row_y) if (center_y - row_y).abs() < 1.0 => {
+	                                                rendered_columns += 1;
+	                                            }
+	                                            Some(_) => {}
+	                                        }
 
-                                        let response = response.on_hover_text(&app.name);
+		                                        show_immediate_icon_tooltip(&response, &app.name);
 
                                         response.clone().context_menu(|ui| {
                                             let path = app.desktop_file_path.clone();
@@ -2428,11 +2800,13 @@ impl eframe::App for App {
                                             self.launch_app_and_exit(app, ctx);
                                         }
 
-                                        let bg_color = if is_selected {
-                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18)
-                                        } else {
-                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 4)
-                                        };
+	                                        let bg_color = if is_selected {
+	                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18)
+	                                        } else if response.hovered() {
+	                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10)
+	                                        } else {
+	                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 4)
+	                                        };
 
                                         ui.painter().rect_filled(
                                             rect,
@@ -2520,10 +2894,12 @@ impl eframe::App for App {
                                                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 210),
                                             );
                                         }
-                                    }
-                                });
-                            });
+	                                    }
+	                                });
+	                                self.rendered_app_grid_columns = rendered_columns.max(1);
+	                            });
                     } else {
+                        let mut rendered_window_row_centers = Vec::new();
                         egui::ScrollArea::vertical()
                             .id_salt(match self.mode {
                                 LauncherMode::Apps => "apps_main_list_scroll",
@@ -2531,96 +2907,30 @@ impl eframe::App for App {
                             })
                             .max_height(list_height)
                             .show(ui, |ui| {
-                                for index in 0..total_items {
-                                    let is_selected = index == self.selected_index;
+		                                for index in 0..total_items {
+		                                    let is_selected = index == self.selected_index
+		                                        && (self.mode == LauncherMode::Apps
+		                                            || self.active_pane == ActivePane::Windows);
 
-                                    let (rect, response) = ui.allocate_exact_size(
-                                        egui::vec2(ui.available_width(), row_height),
-                                        egui::Sense::click(),
-                                    );
-
-                                    response.clone().context_menu(|ui| {
-                                        match self.mode {
-                                            LauncherMode::Apps => {
-                                                let app = &filtered_apps[index].0;
-                                                let path = app.desktop_file_path.clone();
-                                                let is_pinned = self.pinned_apps.contains(&path);
-                                                let label = if is_pinned { "📌 Unpin application" } else { "📌 Pin application" };
-                                                if ui.button(label).clicked() {
-                                                    if is_pinned {
-                                                        if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
-                                                            self.pinned_apps.remove(pos);
-                                                        }
-                                                    } else {
-                                                        self.pinned_apps.push(path.clone());
-                                                    }
-                                                    self.save_pinned_apps();
-                                                    ui.close();
-                                                }
-
-                                                if is_pinned {
-                                                    if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
-                                                        if pos > 0 {
-                                                            if ui.button("⬆ Move up").clicked() {
-                                                                self.pinned_apps.swap(pos, pos - 1);
-                                                                self.save_pinned_apps();
-                                                                ui.close();
-                                                            }
-                                                        }
-                                                        if pos + 1 < self.pinned_apps.len() {
-                                                            if ui.button("⬇ Move down").clicked() {
-                                                                self.pinned_apps.swap(pos, pos + 1);
-                                                                self.save_pinned_apps();
-                                                                ui.close();
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            LauncherMode::Windows => {
-                                                let win = &filtered_windows[index].0;
-                                                if ui.button("Close application").clicked() {
-                                                    self.close_window_and_exit(win.id.clone(), ctx);
-                                                    ui.close();
-                                                }
-                                            }
-                                        }
-                                    });
+	                                    let (rect, response) = ui.allocate_exact_size(
+	                                        egui::vec2(ui.available_width(), row_height),
+	                                        egui::Sense::click(),
+	                                    );
+	                                    if self.mode == LauncherMode::Windows {
+	                                        rendered_window_row_centers.push(rect.center().y);
+	                                    }
 
                                      if is_selected && scroll_to_selected {
                                          response.scroll_to_me(None);
                                      }
 
-                                    // Selection highlights
-                                    if response.hovered() {
-                                        self.selected_index = index;
-                                    }
-
-                                    if response.clicked() {
-                                        match self.mode {
-                                            LauncherMode::Apps => {
-                                                let app = &filtered_apps[index].0;
-                                                self.launch_app_and_exit(app, ctx);
-                                            }
-                                            LauncherMode::Windows => {
-                                                let win = &filtered_windows[index].0;
-                                                self.activate_and_exit(win.id.clone(), ctx);
-                                            }
-                                        }
-                                    }
-
-                                    if response.middle_clicked() {
-                                        if let LauncherMode::Windows = self.mode {
-                                            let win = &filtered_windows[index].0;
-                                            self.launch_window_app_and_exit(win, ctx);
-                                        }
-                                    }
-
-                                    let bg_color = if is_selected {
-                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18)
-                                    } else {
-                                        egui::Color32::TRANSPARENT
-                                    };
+	                                    let bg_color = if is_selected {
+	                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18)
+	                                    } else if response.hovered() {
+	                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 9)
+	                                    } else {
+	                                        egui::Color32::TRANSPARENT
+	                                    };
 
                                     ui.painter().rect_filled(
                                         rect,
@@ -2839,12 +3149,7 @@ impl eframe::App for App {
 
                                             child_ui.add_space(10.0);
 
-                                            let mut label_clicked = false;
-                                            let display_title = if win.title.len() > 65 {
-                                                format!("{}...", &win.title[..62])
-                                            } else {
-                                                win.title.clone()
-                                            };
+                                            let display_title = truncate_chars(&win.title, 65);
 
                                             if self.win_show_path {
                                                 child_ui.vertical(|ui| {
@@ -2860,12 +3165,9 @@ impl eframe::App for App {
                                                                     self.win_line_height,
                                                                 )),
                                                         )
-                                                        .sense(egui::Sense::click())
+                                                        .sense(egui::Sense::hover())
                                                         .truncate(),
                                                     );
-                                                    if title_response.clicked() {
-                                                        label_clicked = true;
-                                                    }
                                                     if self.disable_ibeam
                                                         && title_response.hovered()
                                                     {
@@ -2904,12 +3206,9 @@ impl eframe::App for App {
                                                                 .size(self.win_path_size)
                                                                 .line_height(Some(self.win_line_height * 0.8)),
                                                         )
-                                                        .sense(egui::Sense::click())
+                                                        .sense(egui::Sense::hover())
                                                         .truncate(),
                                                     );
-                                                    if path_response.clicked() {
-                                                        label_clicked = true;
-                                                    }
                                                     if self.disable_ibeam && path_response.hovered()
                                                     {
                                                         ui.ctx().set_cursor_icon(
@@ -2926,26 +3225,111 @@ impl eframe::App for App {
                                                             .size(self.win_title_size)
                                                             .line_height(Some(self.win_line_height)),
                                                     )
-                                                    .sense(egui::Sense::click())
+                                                    .sense(egui::Sense::hover())
                                                     .truncate(),
                                                 );
-                                                if title_response.clicked() {
-                                                    label_clicked = true;
-                                                }
                                                 if self.disable_ibeam && title_response.hovered() {
                                                     child_ui
                                                         .ctx()
                                                         .set_cursor_icon(egui::CursorIcon::Default);
                                                 }
                                             }
-
-                                            if label_clicked {
-                                                self.activate_and_exit(win.id.clone(), ctx);
-                                            }
                                         }
                                     }
-                                }
-                            });
+
+                                    let overlay_response = ui.interact(
+                                        rect,
+                                        ui.id().with(("main_row_overlay", index)),
+                                        egui::Sense::click(),
+                                    );
+
+                                    overlay_response.clone().context_menu(|ui| {
+                                        match self.mode {
+                                            LauncherMode::Apps => {
+                                                let app = &filtered_apps[index].0;
+                                                let path = app.desktop_file_path.clone();
+                                                let is_pinned = self.pinned_apps.contains(&path);
+                                                let label = if is_pinned { "📌 Unpin application" } else { "📌 Pin application" };
+                                                if ui.button(label).clicked() {
+                                                    if is_pinned {
+                                                        if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
+                                                            self.pinned_apps.remove(pos);
+                                                        }
+                                                    } else {
+                                                        self.pinned_apps.push(path.clone());
+                                                    }
+                                                    self.save_pinned_apps();
+                                                    ui.close();
+                                                }
+
+                                                if is_pinned {
+                                                    if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
+                                                        if pos > 0 {
+                                                            if ui.button("⬆ Move up").clicked() {
+                                                                self.pinned_apps.swap(pos, pos - 1);
+                                                                self.save_pinned_apps();
+                                                                ui.close();
+                                                            }
+                                                        }
+                                                        if pos + 1 < self.pinned_apps.len() {
+                                                            if ui.button("⬇ Move down").clicked() {
+                                                                self.pinned_apps.swap(pos, pos + 1);
+                                                                self.save_pinned_apps();
+                                                                ui.close();
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            LauncherMode::Windows => {
+                                                let win = &filtered_windows[index].0;
+                                                if ui.button("Show execution chain").clicked() {
+                                                    self.process_chain_popup = Some(win.clone());
+                                                    ui.close();
+                                                }
+                                                if ui.button("Close application").clicked() {
+                                                    self.close_window_and_exit(win.id.clone(), ctx);
+                                                    ui.close();
+                                                }
+                                            }
+                                        }
+                                    });
+
+	                                    if overlay_response.hovered() {
+	                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+	                                    }
+
+	                                    if overlay_response.clicked() {
+	                                        match self.mode {
+	                                            LauncherMode::Apps => {
+	                                                self.selected_index = index;
+	                                                let app = &filtered_apps[index].0;
+	                                                self.launch_app_and_exit(app, ctx);
+	                                            }
+	                                            LauncherMode::Windows => {
+	                                                self.active_pane = ActivePane::Windows;
+	                                                self.selected_index = index;
+	                                                let win = &filtered_windows[index].0;
+	                                                self.activate_and_exit(win.id.clone(), ctx);
+	                                            }
+                                        }
+                                    }
+
+	                                    if overlay_response.middle_clicked() {
+	                                        if let LauncherMode::Windows = self.mode {
+	                                            self.active_pane = ActivePane::Windows;
+	                                            self.selected_index = index;
+	                                            let win = &filtered_windows[index].0;
+	                                            self.launch_window_app_and_exit(win, ctx);
+	                                        }
+	                                    }
+	                                }
+		                            });
+                        if self.mode == LauncherMode::Windows {
+                            self.rendered_window_row_centers = rendered_window_row_centers;
+                        } else {
+                            self.rendered_window_row_centers.clear();
+                        }
 	                    }
 
 	                            let ui = &mut panes[1];
@@ -2961,14 +3345,15 @@ impl eframe::App for App {
 	                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18),
 	                                ),
 	                            );
-                                    ui.add_space(10.0);
                                     ui.vertical(|ui| {
                                         egui::ScrollArea::vertical()
                                             .id_salt("apps_side_panel_scroll")
                                             .max_height(list_height)
                                             .show(ui, |ui| {
-	                                        if filtered_apps.is_empty() {
-	                                            ui.add_space(20.0);
+		                                        if filtered_apps.is_empty() {
+		                                            self.rendered_side_panel_item_centers.clear();
+		                                            self.rendered_side_panel_grid_columns = 1;
+		                                            ui.add_space(20.0);
 	                                            ui.label(
 	                                                egui::RichText::new(if self.loading {
 	                                                    "Loading applications..."
@@ -2978,20 +3363,42 @@ impl eframe::App for App {
 	                                                .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 120))
 	                                                .size(13.0),
 	                                            );
-                                                } else if self.icon_only {
-                                                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
-                                                    ui.horizontal_wrapped(|ui| {
-                                                        for (index, item) in filtered_apps.iter().enumerate() {
-                                                            let app = &item.0;
-                                                            let tile_size = self.app_icon_tile_size;
+		                                                } else if self.icon_only {
+		                                                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
+		                                                    let mut rendered_columns = 0usize;
+		                                                    let mut first_row_y = None;
+		                                                    let mut rendered_item_centers = Vec::new();
+		                                                    ui.horizontal_wrapped(|ui| {
+			                                                        for (index, item) in filtered_apps.iter().enumerate() {
+		                                                            let app = &item.0;
+		                                                            let tile_size = self.app_icon_tile_size;
+		                                                            let is_selected = self.active_pane == ActivePane::Apps
+	                                                                && index == self.side_panel_selected_index;
                                                             let (rect, response) = ui.allocate_exact_size(
                                                                 egui::vec2(tile_size, tile_size),
-                                                                egui::Sense::click(),
-                                                            );
-                                                            let response = response.on_hover_text(&app.name);
-	                                                    response.clone().context_menu(|ui| {
-	                                                        let path = app.desktop_file_path.clone();
-	                                                        let is_pinned = self.pinned_apps.contains(&path);
+	                                                                egui::Sense::click(),
+	                                                            );
+		                                                            let center_y = rect.center().y;
+		                                                            rendered_item_centers.push(center_y);
+		                                                            match first_row_y {
+	                                                                None => {
+	                                                                    first_row_y = Some(center_y);
+	                                                                    rendered_columns = 1;
+	                                                                }
+	                                                                Some(row_y)
+	                                                                    if (center_y - row_y).abs() < 1.0 =>
+	                                                                {
+	                                                                    rendered_columns += 1;
+	                                                                }
+	                                                                Some(_) => {}
+	                                                            }
+	                                                            show_immediate_icon_tooltip(&response, &app.name);
+                                                            if is_selected && scroll_to_side_selected {
+                                                                response.scroll_to_me(None);
+                                                            }
+		                                                    response.clone().context_menu(|ui| {
+		                                                        let path = app.desktop_file_path.clone();
+		                                                        let is_pinned = self.pinned_apps.contains(&path);
 	                                                        let label = if is_pinned { "📌 Unpin application" } else { "📌 Pin application" };
 	                                                        if ui.button(label).clicked() {
 	                                                            if is_pinned {
@@ -3002,17 +3409,36 @@ impl eframe::App for App {
 	                                                                self.pinned_apps.push(path);
 	                                                            }
 	                                                            self.save_pinned_apps();
-	                                                            ui.close();
-	                                                        }
-	                                                    });
-	                                                    if response.clicked() {
-	                                                        self.launch_app_and_exit(app, ctx);
-	                                                    }
-	                                                    ui.painter().rect_filled(
-	                                                        rect,
-	                                                        egui::CornerRadius::same(10),
-	                                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 5),
-	                                                    );
+		                                                            ui.close();
+		                                                        }
+		                                                    });
+		                                                    if response.clicked() {
+	                                                                self.active_pane = ActivePane::Apps;
+	                                                                self.side_panel_selected_index = index;
+		                                                        self.launch_app_and_exit(app, ctx);
+		                                                    }
+		                                                    ui.painter().rect_filled(
+		                                                        rect,
+		                                                        egui::CornerRadius::same(10),
+			                                                        if is_selected {
+			                                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18)
+			                                                        } else if response.hovered() {
+			                                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10)
+			                                                        } else {
+			                                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 5)
+			                                                        },
+		                                                    );
+                                                            if is_selected {
+                                                                ui.painter().rect_stroke(
+                                                                    rect,
+                                                                    egui::CornerRadius::same(10),
+                                                                    egui::Stroke::new(
+                                                                        1.5,
+                                                                        egui::Color32::from_rgb(61, 174, 233),
+                                                                    ),
+                                                                    egui::StrokeKind::Inside,
+                                                                );
+                                                            }
                                                             let inner_rect = rect.shrink2(egui::vec2(6.0, 6.0));
                                                             let label_height = if self.app_icon_show_name {
                                                                 (self.app_icon_name_size + 10.0).max(16.0)
@@ -3079,10 +3505,16 @@ impl eframe::App for App {
                                                                 );
                                                             }
 		                                                    let _ = index;
-	                                                        }
+		                                                        }
 	                                                    });
-                                                } else {
-                                                    for item in &filtered_apps {
+		                                                    self.rendered_side_panel_grid_columns =
+		                                                        rendered_columns.max(1);
+			                                                    self.rendered_side_panel_item_centers =
+			                                                        rendered_item_centers;
+	                                                } else {
+	                                                    self.rendered_side_panel_item_centers.clear();
+	                                                    self.rendered_side_panel_grid_columns = 1;
+	                                                    for item in &filtered_apps {
                                                         let app = &item.0;
                                                         let (rect, response) = ui.allocate_exact_size(
                                                             egui::vec2(ui.available_width(), row_height),
@@ -3269,37 +3701,6 @@ impl eframe::App for App {
 	                        ui.spacing_mut().item_spacing = previous_spacing;
 	                    }
 
-	                    ui.add_space(8.0);
-
-                    // 4. Subtle shortcut menu footer
-                    ui.separator();
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button(
-                                egui::RichText::new("Settings")
-                                    .color(egui::Color32::from_rgba_unmultiplied(
-                                        255, 255, 255, 190,
-                                    ))
-                                    .size(10.5),
-                            )
-                            .clicked()
-                        {
-                            self.show_settings_menu = !self.show_settings_menu;
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let label_text = match self.mode {
-                                LauncherMode::Apps => format!("{} apps", total_items),
-                                LauncherMode::Windows => format!("{} windows", total_items),
-                            };
-                            ui.label(
-                                egui::RichText::new(label_text)
-                                    .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100))
-                                    .size(9.5),
-                            );
-                        });
-                    });
-
                     // Custom drag-resize handle at the bottom-right corner
                     let resize_handle_size = egui::vec2(16.0, 16.0);
                     let resize_rect = egui::Rect::from_min_size(
@@ -3336,6 +3737,9 @@ impl eframe::App for App {
                     if self.show_settings_menu {
                         self.show_settings_popup(ctx);
                     }
+                    if self.process_chain_popup.is_some() {
+                        self.show_process_chain_popup(ctx);
+                    }
                 });
             });
     }
@@ -3346,7 +3750,6 @@ impl eframe::App for App {
 }
 
 struct SingleInstanceLock {
-    _listener: std::os::unix::net::UnixListener,
     path: PathBuf,
 }
 
@@ -3366,6 +3769,25 @@ fn get_socket_path(mode: LauncherMode) -> PathBuf {
     } else {
         std::env::temp_dir().join(filename)
     }
+}
+
+fn focus_existing_launcher_window() {
+    let kpath = get_kdotool_path();
+    let _ = Command::new(kpath)
+        .args([
+            "search",
+            "--title",
+            "Open Application Windows",
+            "windowstate",
+            "--remove",
+            "MINIMIZED",
+            "%@",
+            "windowactivate",
+            "%@",
+            "windowraise",
+            "%@",
+        ])
+        .status();
 }
 
 struct BorderOverlay {
@@ -3589,7 +4011,7 @@ fn main() -> eframe::Result {
     let socket_path = get_socket_path(mode);
     if socket_path.exists() {
         if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
-            // Another instance in the same mode is already running
+            focus_existing_launcher_window();
             return Ok(());
         }
         let _ = std::fs::remove_file(&socket_path);
@@ -3600,10 +4022,9 @@ fn main() -> eframe::Result {
         Err(_) => return Ok(()),
     };
 
-    let _lock = SingleInstanceLock {
-        _listener: listener,
-        path: socket_path,
-    };
+    let (ui_event_tx, ui_event_rx) = std::sync::mpsc::channel();
+
+    let _lock = SingleInstanceLock { path: socket_path };
 
     let mut close_on_blur = false;
     let mut force_theme = None;
@@ -3656,12 +4077,26 @@ fn main() -> eframe::Result {
         title,
         options,
         Box::new(move |cc| {
+            let repaint_ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    match stream {
+                        Ok(_) => {
+                            let _ = ui_event_tx.send(UiEvent::FocusLauncher);
+                            repaint_ctx.request_repaint();
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
             Ok(Box::new(App::new(
                 cc,
                 close_on_blur,
                 force_theme,
                 mode,
                 icon_only,
+                ui_event_rx,
             )))
         }),
     )

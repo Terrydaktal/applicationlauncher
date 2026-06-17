@@ -1,64 +1,133 @@
-# Application Launcher (Wayland / KDE Plasma)
+# applicationlauncher
 
-A fast, visually stunning GUI application launcher built in Rust using `egui` and `eframe`. It queries open window objects using `kdotool`, allows searching them via a fuzzy-matching interface, and activates/raises the selected window.
+`applicationlauncher` is a Rust GUI launcher for KDE Plasma on Wayland. It combines two workflows in one frameless window: a searchable list of open windows on the left and a searchable application panel on the right. It uses `kdotool` for KWin window control, scans installed desktop entries, keeps launcher settings on disk, and supports keyboard-first navigation across both panels.
 
 ## Project Structure
 
-```
+```text
 .
-├── src
-│   └── main.rs         # Core application logic, GUI layout, icon lookup, and window management
-├── Cargo.lock          # Dependency lock file
-├── Cargo.toml          # Cargo package configuration and dependencies
-└── README.md           # Project documentation (this file)
+├── src/
+│   └── main.rs
+├── Cargo.toml
+├── Cargo.lock
+└── README.md
 ```
 
-### Components
+- `src/main.rs`: Entire application implementation. This includes window discovery, desktop entry parsing, fuzzy search, icon lookup, process chain inspection, popup windows, single-instance handling, CLI parsing, and all `egui` rendering.
+- `Cargo.toml`: Package metadata and Rust dependencies.
+- `Cargo.lock`: Locked dependency graph for reproducible builds.
+- `README.md`: Project documentation for the current GUI application.
 
-- **[src/main.rs](file:///home/lewis/Dev/applicationlauncher/src/main.rs)**:
-  - **D-Bus Querying**: Queries all window metadata (ID, title, class, PID) in a single, chained `kdotool` process execution. This reduces the number of process spawns from $N \times 3$ (where $N$ is the number of open windows) down to exactly 1, reducing launcher startup lag by 20x.
-  - **Terminal Active Process Discovery**: Traverses the `/proc` filesystem tree on Linux to identify child process trees of terminal emulators (like `xfce4-terminal`, `kitty`, `konsole`, `alacritty`), automatically finding the leaf active program (e.g., `nvim`, `fish`, `lsyncd`, `python`). It displays this running application name in the subtitle (e.g., `xfce4-terminal (running: lsyncd)`) and uses it to resolve custom application icons (e.g., showing a Neovim icon instead of a generic terminal icon).
-  - **Icon Resolution & Caching**: Implements XDG Freedesktop Icon Theme specifications via the `freedesktop-icons` crate, traversing custom theme (`breeze`, `breeze-dark`) and `hicolor` inheritances. Additionally, it parses application `.desktop` files (both system-wide and user-local) to extract hardcoded absolute icon paths (common in custom or user-compiled applications like CopyQ) and specific icon overrides. It caches lookup results to eliminate redundant filesystem traversals.
-  - **Fuzzy Matcher**: Uses `fuzzy-matcher`'s `SkimMatcherV2` to perform real-time, fuzzy filtering on window titles and class names.
-  - **Asynchronous Startup & Threaded Loading**: Offloads all process execution and filesystem queries to background threads. This opens the main GUI window instantly (0ms perceived latency), allowing the user to focus and type into the search box immediately while the window list loading spinner completes in the background.
-  - **GUI Rendering**: Employs `egui` (version `0.33`) to draw a frameless, borderless, semi-transparent acrylic window with rounded corners, a main open-window list, and an application side panel.
-  - **Application Panel Icon Grid**: Supports a settings-controlled icon grid display for the application side panel.
-  - **Temporary Window Border Overlay**: Spawns a borderless fullscreen overlay (`--draw-border`) that draws a temporary fading red outline around the target window for 250ms.
-  - **Keyboard Navigation**: Captures system-wide keystrokes within the viewport:
-    - `Up/Down Arrows`: Navigate through filtered window results.
-    - `Enter`: Activate and raise the selected window.
-    - `Escape`: Close the launcher.
-    - `F5`: Force-refresh the open window list.
-    - `F10`: Open launcher settings.
-  - **Focus Loss Behavior**: Auto-closes the launcher immediately when the window loses focus (can be disabled via `--no-close-on-blur`).
+## What It Does
+
+- Shows open windows in the main panel and installed applications in a conjoined side panel.
+- Filters windows and applications from the same search field.
+- Activates existing windows or launches new applications without closing the launcher.
+- Supports icon-grid mode for the application panel, including configurable icon size, tile size, label visibility, and label font size.
+- Keeps normal applications ahead of system settings modules on the default page when system modules are shown.
+- Provides context actions on windows, including closing the window and showing the execution chain popup.
+- Re-focuses the existing launcher instance instead of opening a second one.
+- Persists window size, pinned applications, and launcher settings under `$HOME/.config/applicationlauncher/`.
+
+## Runtime Architecture
+
+The application is implemented as a single native `eframe` / `egui` binary.
+
+- Window loading:
+  Uses `kdotool` to query KWin-managed windows, then resolves metadata such as title, class, PID, icon, executable path, and terminal child processes.
+- Application loading:
+  Scans desktop files, parses launcher metadata, resolves icon names and icon files, and classifies likely settings modules separately from normal applications.
+- Search and sorting:
+  Applies fuzzy matching and custom ordering rules for windows and applications.
+- UI:
+  Draws a frameless launcher window, a separate settings popup window, and a separate execution-chain popup window.
+- Single-instance behavior:
+  Uses a Unix socket lock so a second launch request focuses the already-running instance.
+
+## Features
+
+- Dual-panel layout with open windows and an application panel shown together.
+- Keyboard navigation across both panels, including cross-panel selection that follows physical row alignment.
+- Independent scrolling behavior for the two panels.
+- Immediate icon tooltips in application icon mode.
+- Pinning and reordering of applications.
+- Middle-click on a window entry to launch another instance of the underlying application.
+- Right-click on a window entry to close the application or inspect its execution chain.
+- Optional close-on-blur behavior.
+- Temporary border overlay support for highlighting a target window.
 
 ## Requirements
 
-- **Linux** (Tested on KDE Plasma 6 Wayland / CachyOS)
-- **kdotool**: A window control utility for KDE Plasma Wayland.
-  - Install it via cargo if it is not already installed:
-    ```bash
-    cargo install kdotool
-    ```
+- Linux
+- KDE Plasma on Wayland
+- `kdotool` available in `PATH`
 
-## Build and Execution
+Install Rust dependencies and build with Cargo. `kdotool` is the main external runtime dependency used for window activation, raising, and closing.
 
-To compile and execute the application:
+## Build
 
-1. **Build the binary**:
-   ```bash
-   cargo build --release
-   ```
-2. **Run the launcher**:
-   ```bash
-   cargo run --release
-   ```
-
-## Command Line Interface (CLI) Manual
-
-Refer to the help manual page below (also available by running with `-h` or `--help`):
-
+```bash
+cargo build --release
 ```
+
+## Run
+
+```bash
+cargo run --release
+```
+
+Or run the compiled binary directly:
+
+```bash
+./target/release/applicationlauncher
+```
+
+## Settings and Data Files
+
+The launcher writes its runtime data to:
+
+- `$HOME/.config/applicationlauncher/settings.txt`
+  Stores launcher settings such as icon mode, system module visibility, icon sizes, tile size, text sizes, row sizing, and cursor behavior.
+- `$HOME/.config/applicationlauncher/window_size.txt`
+  Stores the current launcher window width and height.
+- `$HOME/.config/applicationlauncher/pinned_apps.txt`
+  Stores pinned application desktop file paths in display order.
+
+## Settings Window
+
+The settings UI is shown in a separate popup window rather than embedded inside the launcher.
+
+Current settings cover:
+
+- Application panel:
+  `Show System Modules`, `Icon Grid Mode`, `Icon Size`, `Tile Size`, `Show Names`, `Name Size`
+- Open window view:
+  Row height, icon size, padding, text spacing, line height, title size, path size, and whether the subtitle path is shown
+- General:
+  `Disable text select cursor (I-beam)`
+
+## Keyboard and Mouse Behavior
+
+- `Up` / `Down`
+  Move through the active panel. In app icon mode, movement follows the rendered grid layout.
+- `Left` / `Right`
+  Move within the app icon grid or switch between the windows and application panels when crossing the first or last column edge.
+- `Enter`
+  Activates the selected window or launches the selected application.
+- `Escape`
+  Closes the launcher, or closes popup windows when they are focused.
+- `F5`
+  Refreshes the open windows or application data, depending on context.
+- `F10`
+  Opens the settings popup window.
+- Mouse:
+  Hover highlighting is separate from keyboard selection. Window entries and app tiles support click and context actions across the full entry area.
+
+## Command Line Interface
+
+The binary currently exposes this CLI surface:
+
+```text
 NAME
     applicationlauncher - A sleek application launcher for KDE Wayland in Rust
 
@@ -68,9 +137,8 @@ SYNOPSIS
 DESCRIPTION
     applicationlauncher is a fast, visually stunning GUI application launcher
     designed for KDE Plasma Wayland. It queries the list of all open window
-    objects using kdotool, shows installed applications in a side panel, allows
-    searching both via a fuzzy-matching interface, and switches focus to the
-    selected window or launches the selected application.
+    objects using kdotool, allows searching them via a fuzzy-matching interface,
+    and switches focus to the selected window.
 
 OPTIONS
     -h, --help
@@ -82,16 +150,13 @@ OPTIONS
     --theme <THEME>
         Force a specific icon theme (default: automatically detected).
 
-    --draw-border <x> <y> <w> <h> <id>
-        Internal command used to spawn a temporary fading border overlay
-        around a window to highlight its location on the screen.
-
 OPERATION
     When launched, the application retrieves a list of all open windows using
-    kdotool and scans installed desktop applications. It renders a frameless GUI
-    window containing a search input, a main window list, and an application side
-    panel. As you type, both lists are filtered using a fuzzy matcher.
-    
+    kdotool and installed desktop applications from the local system. It renders
+    a frameless GUI window containing a search input, a main window list, and an
+    application side panel. As you type, both lists are filtered using a fuzzy
+    matcher.
+
     Keyboard Navigation:
         - Up/Down Arrows: Move selected window.
         - Enter: Activate selected window.
@@ -103,18 +168,15 @@ EXAMPLES
     applicationlauncher
         Launch the application launcher.
 
-    applicationlauncher --close-on-blur
-        Launch the application launcher with auto-close on focus loss enabled.
-
 FILES
-    $HOME/.config/applicationlauncher/config.toml
-        Optional configuration file (reserved for future use).
-
     $HOME/.config/applicationlauncher/window_size.txt
         Stores the persisted width and height of the launcher window.
 
     $HOME/.config/applicationlauncher/pinned_apps.txt
         Stores absolute paths of pinned desktop applications.
+
+    $HOME/.config/applicationlauncher/settings.txt
+        Stores persisted launcher settings.
 
 PATHS
     /usr/share/icons
@@ -134,3 +196,9 @@ EXIT STATUS
 AUTHORS
     Terrydaktal <9lewis9@gmail.com>
 ```
+
+## Development Notes
+
+- The repo currently keeps all application logic in one file: [src/main.rs](/home/lewis/Dev/applicationlauncher/src/main.rs).
+- `target/` is ignored through `.gitignore`.
+- The launcher is stateful across runs because it persists both UI settings and pinned application ordering.
