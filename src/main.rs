@@ -15,12 +15,33 @@ const KWIN_WINDOW_FEED_METADATA: &str =
     include_str!("../kwin/applicationlauncher-window-feed/metadata.json");
 const KWIN_WINDOW_FEED_MAIN_JS: &str =
     include_str!("../kwin/applicationlauncher-window-feed/contents/code/main.js");
+const AUDIO_SINK_POLL_MS: u128 = 200;
+const AUDIO_IDLE_REPAINT_MS: u64 = 200;
+const AUDIO_ACTIVE_REPAINT_MS: u64 = 80;
 
 #[derive(Clone, Debug)]
 struct ProcessChainEntry {
     pid: i32,
     name: String,
     exe_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PactlVolumeChannel {
+    value_percent: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PactlSinkInput {
+    index: u32,
+    #[serde(default)]
+    corked: bool,
+    #[serde(default)]
+    mute: bool,
+    #[serde(default)]
+    volume: HashMap<String, PactlVolumeChannel>,
+    #[serde(default)]
+    properties: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -31,7 +52,9 @@ struct WindowInfo {
     icon_path: Option<PathBuf>,
     active_process: Option<String>,
     exe_path: Option<PathBuf>,
+    cwd_path: Option<PathBuf>,
     process_chain: Vec<ProcessChainEntry>,
+    pid: Option<i32>,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +145,7 @@ struct App {
     rendered_side_panel_grid_columns: usize,
     rendered_window_row_centers: Vec<f32>,
     rendered_side_panel_item_centers: Vec<f32>,
+    scroll_to_first_window_on_focus: bool,
     kdotool_path: Option<PathBuf>,
     error_message: Option<String>,
     start_time: Instant,
@@ -155,6 +179,11 @@ struct App {
     last_selected_window_id: Option<String>,
     missing_window_counts: HashMap<String, usize>,
     use_kwin_window_feed: bool,
+    cached_sink_inputs: Vec<PactlSinkInput>,
+    last_volume_fetch: Option<Instant>,
+    app_scroll_sensitivity: f32,
+    win_scroll_sensitivity: f32,
+    last_stale_prune: Option<Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -174,6 +203,8 @@ struct LauncherSettings {
     app_icon_show_name: bool,
     app_icon_name_size: f32,
     disable_ibeam: bool,
+    app_scroll_sensitivity: f32,
+    win_scroll_sensitivity: f32,
 }
 
 impl Default for LauncherSettings {
@@ -194,6 +225,8 @@ impl Default for LauncherSettings {
             app_icon_show_name: true,
             app_icon_name_size: 10.5,
             disable_ibeam: false,
+            app_scroll_sensitivity: 1.0,
+            win_scroll_sensitivity: 1.0,
         }
     }
 }
@@ -403,6 +436,18 @@ fn load_launcher_settings() -> LauncherSettings {
                             settings.disable_ibeam =
                                 value.parse::<bool>().unwrap_or(settings.disable_ibeam);
                         }
+                        "app_scroll_sensitivity" => {
+                            settings.app_scroll_sensitivity = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(0.1, 10.0))
+                                .unwrap_or(settings.app_scroll_sensitivity);
+                        }
+                        "win_scroll_sensitivity" => {
+                            settings.win_scroll_sensitivity = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(0.1, 10.0))
+                                .unwrap_or(settings.win_scroll_sensitivity);
+                        }
                         _ => {}
                     }
                 }
@@ -419,7 +464,7 @@ fn save_launcher_settings(settings: LauncherSettings) {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("settings.txt");
         let content = format!(
-            "show_system_settings_modules={}\napp_icon_mode={}\nwin_icon_size={:.1}\nwin_padding={:.1}\nwin_row_height={:.1}\nwin_text_spacing={:.1}\nwin_line_height={:.1}\nwin_show_path={}\nwin_title_size={:.1}\nwin_path_size={:.1}\napp_icon_size={:.1}\napp_icon_tile_size={:.1}\napp_icon_show_name={}\napp_icon_name_size={:.1}\ndisable_ibeam={}\n",
+            "show_system_settings_modules={}\napp_icon_mode={}\nwin_icon_size={:.1}\nwin_padding={:.1}\nwin_row_height={:.1}\nwin_text_spacing={:.1}\nwin_line_height={:.1}\nwin_show_path={}\nwin_title_size={:.1}\nwin_path_size={:.1}\napp_icon_size={:.1}\napp_icon_tile_size={:.1}\napp_icon_show_name={}\napp_icon_name_size={:.1}\ndisable_ibeam={}\napp_scroll_sensitivity={:.2}\nwin_scroll_sensitivity={:.2}\n",
             settings.show_system_settings_modules,
             settings.app_icon_mode,
             settings.win_icon_size,
@@ -434,7 +479,9 @@ fn save_launcher_settings(settings: LauncherSettings) {
             settings.app_icon_tile_size,
             settings.app_icon_show_name,
             settings.app_icon_name_size,
-            settings.disable_ibeam
+            settings.disable_ibeam,
+            settings.app_scroll_sensitivity,
+            settings.win_scroll_sensitivity
         );
         let _ = std::fs::write(path, content);
     }
@@ -450,6 +497,29 @@ fn parse_icon_from_desktop(path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+fn lookup_theme_icon_exact(theme: &str, name: &str) -> Option<PathBuf> {
+    let themes_to_check = if theme == "breeze-dark" {
+        vec!["breeze-dark", "breeze", "hicolor"]
+    } else if theme == "breeze" {
+        vec!["breeze", "breeze-dark", "hicolor"]
+    } else {
+        vec![theme, "breeze-dark", "breeze", "hicolor"]
+    };
+
+    for t in themes_to_check {
+        if let Some(path) = freedesktop_icons::lookup(name)
+            .with_theme(t)
+            .with_size(48)
+            .find()
+        {
+            return Some(path);
+        }
+    }
+
+    let pixmap = PathBuf::from(format!("/usr/share/pixmaps/{}.png", name));
+    pixmap.exists().then_some(pixmap)
 }
 
 fn find_icon(theme: &str, class: &str) -> Option<PathBuf> {
@@ -762,6 +832,23 @@ fn command_basename(exec: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+fn is_terminal_app_name(value: &str) -> bool {
+    let lower = value.to_lowercase();
+    lower.contains("terminal")
+        || lower.contains("konsole")
+        || lower.contains("kitty")
+        || lower.contains("alacritty")
+        || lower.contains("wezterm")
+}
+
+fn is_terminal_icon_name(value: &str) -> bool {
+    let lower = value.to_lowercase();
+    lower == "terminal"
+        || lower == "utilities-terminal"
+        || lower.ends_with("-terminal")
+        || lower.contains("terminal-symbolic")
+}
+
 fn truncate_chars(text: &str, max_chars: usize) -> String {
     let char_count = text.chars().count();
     if char_count <= max_chars {
@@ -772,6 +859,232 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     let mut truncated: String = text.chars().take(keep).collect();
     truncated.push_str("...");
     truncated
+}
+
+fn effective_list_row_height(
+    configured_height: f32,
+    icon_height: f32,
+    vertical_padding: f32,
+    line_height: f32,
+    text_spacing: f32,
+    show_path: bool,
+) -> f32 {
+    let text_height = if show_path {
+        line_height + text_spacing + line_height * 0.8
+    } else {
+        line_height
+    };
+
+    configured_height
+        .max(icon_height + vertical_padding * 2.0)
+        .max(text_height + vertical_padding * 2.0)
+}
+
+fn display_path(path: &Path) -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        let home_path = Path::new(&home);
+        if let Ok(stripped) = path.strip_prefix(home_path) {
+            if stripped.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", stripped.to_string_lossy());
+        }
+    }
+    path.to_string_lossy().to_string()
+}
+
+fn paint_wayland_fallback_icon(painter: &egui::Painter, rect: egui::Rect) {
+    let radius = (rect.width().min(rect.height()) * 0.18).clamp(4.0, 9.0);
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(radius as u8),
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+    );
+    painter.rect_stroke(
+        rect.shrink(0.5),
+        egui::CornerRadius::same(radius as u8),
+        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28)),
+        egui::StrokeKind::Inside,
+    );
+
+    let c = rect.center();
+    let scale = rect.width().min(rect.height()) / 48.0;
+    let stroke = egui::Stroke::new(
+        (3.0 * scale).max(1.5),
+        egui::Color32::from_rgba_unmultiplied(230, 245, 255, 210),
+    );
+    let accent = egui::Color32::from_rgb(61, 174, 233);
+
+    let points = [
+        egui::pos2(c.x - 14.0 * scale, c.y - 9.0 * scale),
+        egui::pos2(c.x - 7.0 * scale, c.y + 12.0 * scale),
+        egui::pos2(c.x, c.y - 2.0 * scale),
+        egui::pos2(c.x + 7.0 * scale, c.y + 12.0 * scale),
+        egui::pos2(c.x + 14.0 * scale, c.y - 9.0 * scale),
+    ];
+    painter.line(points.to_vec(), stroke);
+    painter.circle_filled(points[0], 3.2 * scale, accent);
+    painter.circle_filled(points[2], 3.2 * scale, accent);
+    painter.circle_filled(points[4], 3.2 * scale, accent);
+}
+
+fn paint_icon_in_rect(
+    ui: &mut egui::Ui,
+    icon_path: Option<&PathBuf>,
+    rect: egui::Rect,
+    icon_size: egui::Vec2,
+) {
+    if let Some(path) = icon_path {
+        let uri = format!("file://{}", path.to_string_lossy());
+        let mut child_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        child_ui.add(egui::Image::new(uri).max_size(icon_size));
+    } else {
+        paint_wayland_fallback_icon(ui.painter(), rect);
+    }
+}
+
+fn sink_input_level(sink: &PactlSinkInput) -> f32 {
+    if sink.mute || sink.corked {
+        return 0.0;
+    }
+
+    if sink
+        .properties
+        .get("media.category")
+        .is_some_and(|category| !category.eq_ignore_ascii_case("Playback"))
+    {
+        return 0.0;
+    }
+
+    if sink.properties.get("media.class").is_some_and(|class| {
+        let class = class.to_ascii_lowercase();
+        !class.contains("output") && !class.contains("playback")
+    }) {
+        return 0.0;
+    }
+
+    let mut total = 0.0;
+    let mut count = 0.0;
+    for channel in sink.volume.values() {
+        if let Ok(percent) = channel.value_percent.trim_end_matches('%').parse::<f32>() {
+            total += percent;
+            count += 1.0;
+        }
+    }
+
+    if count == 0.0 {
+        return 0.0;
+    }
+
+    let level = total / count / 100.0;
+    if level < 0.01 {
+        0.0
+    } else {
+        level.clamp(0.0, 1.5)
+    }
+}
+
+fn active_audio_level_for_sinks(sinks: &[PactlSinkInput]) -> Option<f32> {
+    let mut max_level = 0.0f32;
+    for sink in sinks {
+        max_level = max_level.max(sink_input_level(sink));
+    }
+    (max_level > 0.0).then_some(max_level)
+}
+
+fn app_audio_level(app: &AppInfo, sink_inputs: &[PactlSinkInput]) -> Option<f32> {
+    let stem = app
+        .desktop_file_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(normalize_app_match_key);
+    let exec_name = command_basename(&app.exec).map(|name| normalize_app_match_key(&name));
+    let app_name = normalize_app_match_key(&app.name);
+
+    let mut matches = Vec::new();
+    for sink in sink_inputs {
+        if sink_input_level(sink) <= 0.0 {
+            continue;
+        }
+
+        let candidates = [
+            sink.properties.get("application.id"),
+            sink.properties.get("application.name"),
+            sink.properties.get("application.icon_name"),
+            sink.properties.get("application.process.binary"),
+        ];
+
+        let matched = candidates.iter().flatten().any(|value| {
+            let normalized = normalize_app_match_key(value);
+            !normalized.is_empty()
+                && (normalized == app_name
+                    || stem.as_ref().is_some_and(|stem| normalized == *stem)
+                    || exec_name
+                        .as_ref()
+                        .is_some_and(|exec_name| normalized == *exec_name))
+        });
+
+        if matched {
+            matches.push(sink.clone());
+        }
+    }
+
+    active_audio_level_for_sinks(&matches)
+}
+
+fn paint_audio_activity_ring(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    level: f32,
+    time_seconds: f32,
+) {
+    let strength = level.clamp(0.12, 1.2);
+    let center = rect.center();
+    let base_radius = rect.width().max(rect.height()) * 0.57;
+    let max_bar = (rect.width().max(rect.height()) * 0.18).clamp(4.0, 14.0);
+    let bars = 24;
+
+    for i in 0..bars {
+        let t = i as f32 / bars as f32;
+        let angle = t * std::f32::consts::TAU;
+        let wave_a = ((time_seconds * 7.5 + t * 13.0).sin() * 0.5 + 0.5).powf(1.4);
+        let wave_b = ((time_seconds * 11.0 - t * 19.0).sin() * 0.5 + 0.5) * 0.45;
+        let bar_level = (0.25 + wave_a * 0.75 + wave_b).clamp(0.0, 1.0) * strength;
+        let inner = base_radius + 1.0;
+        let outer = inner + max_bar * bar_level;
+        let dir = egui::vec2(angle.cos(), angle.sin());
+        let alpha = (70.0 + 135.0 * bar_level).clamp(45.0, 210.0) as u8;
+        let color = if i % 3 == 0 {
+            egui::Color32::from_rgba_unmultiplied(126, 226, 255, alpha)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(61, 174, 233, alpha)
+        };
+
+        painter.line_segment(
+            [center + dir * inner, center + dir * outer],
+            egui::Stroke::new((1.2 + 1.7 * bar_level).clamp(1.2, 3.0), color),
+        );
+    }
+}
+
+fn process_exists(pid: i32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+fn replace_terminal_suffix_path(original_suffix: &str, cwd: &str) -> String {
+    let trimmed = original_suffix.trim();
+    if trimmed.is_empty() {
+        return cwd.to_string();
+    }
+
+    match trimmed.rfind(char::is_whitespace) {
+        Some(split_at) => format!("{} {}", trimmed[..split_at].trim_end(), cwd),
+        None => cwd.to_string(),
+    }
 }
 
 fn best_app_match_score(window_keys: &[String], app: &AppInfo) -> Option<(usize, usize, usize)> {
@@ -995,12 +1308,21 @@ fn parse_desktop_file(path: &Path, theme: &str) -> Option<AppInfo> {
     let name = name?;
     let exec = exec?;
 
+    let is_terminal_app = is_terminal_app_name(&name)
+        || is_terminal_app_name(&exec)
+        || command_basename(&exec)
+            .as_deref()
+            .is_some_and(is_terminal_app_name);
+
     let icon_path = icon.and_then(|i| {
         let p = PathBuf::from(&i);
         if p.is_absolute() && p.exists() {
             return Some(p);
         }
-        find_icon(theme, &i)
+        if !is_terminal_app && is_terminal_icon_name(&i) {
+            return None;
+        }
+        lookup_theme_icon_exact(theme, &i)
     });
 
     Some(AppInfo {
@@ -1135,6 +1457,21 @@ fn find_terminal_leaf(
     pid_to_name: &HashMap<i32, String>,
 ) -> Option<(i32, String)> {
     let mut current_pid = terminal_pid;
+
+    // First, try to locate a shell among the direct children of the terminal emulator.
+    // If one is found, we start our search for commands run inside the shell from there,
+    // which prevents being distracted by background helper processes spawned directly by the terminal.
+    if let Some(children) = ppid_to_children.get(&terminal_pid) {
+        for &child in children {
+            if let Some(name) = pid_to_name.get(&child) {
+                if is_shell(name) {
+                    current_pid = child;
+                    break;
+                }
+            }
+        }
+    }
+
     loop {
         if let Some(children) = ppid_to_children.get(&current_pid) {
             let mut valid_children = Vec::new();
@@ -1239,6 +1576,12 @@ fn build_window_info(
         return None;
     }
 
+    if let Some(pid) = pid {
+        if !process_exists(pid) {
+            return None;
+        }
+    }
+
     let display_title = if title.is_empty() {
         class.clone()
     } else {
@@ -1247,6 +1590,7 @@ fn build_window_info(
 
     let mut active_process = None;
     let mut exe_path = None;
+    let mut cwd_path = None;
     let mut process_chain = Vec::new();
     if let Some(pid) = pid {
         let mut target_pid = pid;
@@ -1263,17 +1607,31 @@ fn build_window_info(
             exe_path = Some(path);
         }
 
+        if let Ok(path) = std::fs::read_link(format!("/proc/{}/cwd", target_pid)) {
+            cwd_path = Some(path);
+        }
+
         process_chain = build_process_chain(target_pid, pid_to_name, pid_to_ppid);
     }
 
     let mut final_title = display_title;
     if let Some(ref proc_name) = active_process {
+        let terminal_suffix = if is_terminal_class(&class_lower) {
+            cwd_path.as_ref().map(|path| display_path(path))
+        } else {
+            None
+        };
         let separators = [" - ", " — ", " – ", " : ", " | "];
         let mut split_found = false;
         for sep in separators {
             if let Some(pos) = final_title.find(sep) {
                 let (left, right) = final_title.split_at(pos);
-                let right_clean = &right[sep.len()..];
+                let original_suffix = &right[sep.len()..];
+                let right_clean = if let Some(cwd) = terminal_suffix.as_deref() {
+                    replace_terminal_suffix_path(original_suffix, cwd)
+                } else {
+                    original_suffix.trim().to_string()
+                };
                 final_title = format!(
                     "{}{}{}{}{}",
                     left.trim(),
@@ -1313,7 +1671,9 @@ fn build_window_info(
         icon_path,
         active_process,
         exe_path,
+        cwd_path,
         process_chain,
+        pid,
     })
 }
 
@@ -1654,6 +2014,8 @@ impl App {
         // Install loaders to enable SVG and PNG image support
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
+        setup_system_fonts(&cc.egui_ctx);
+
         // Styling the theme for custom dark acrylic style
         let mut visuals = egui::Visuals::dark();
         visuals.window_corner_radius = egui::CornerRadius::same(12);
@@ -1691,11 +2053,16 @@ impl App {
             search_query: String::new(),
             selected_index: 0,
             side_panel_selected_index: 0,
-            active_pane: ActivePane::Windows,
+            active_pane: if mode == LauncherMode::Windows {
+                ActivePane::Windows
+            } else {
+                ActivePane::Apps
+            },
             rendered_app_grid_columns: 1,
             rendered_side_panel_grid_columns: 1,
             rendered_window_row_centers: Vec::new(),
             rendered_side_panel_item_centers: Vec::new(),
+            scroll_to_first_window_on_focus: false,
             kdotool_path: Some(kdotool_path),
             error_message: None,
             start_time: Instant::now(),
@@ -1729,6 +2096,11 @@ impl App {
             last_selected_window_id: None,
             missing_window_counts: HashMap::new(),
             use_kwin_window_feed,
+            cached_sink_inputs: Vec::new(),
+            last_volume_fetch: None,
+            app_scroll_sensitivity: settings.app_scroll_sensitivity,
+            win_scroll_sensitivity: settings.win_scroll_sensitivity,
+            last_stale_prune: None,
         };
 
         if !app.use_kwin_window_feed {
@@ -1764,10 +2136,10 @@ impl App {
                             } else {
                                 break; // channel disconnected
                             }
-                        }
-                    }
-                }
-            });
+		                                        }
+		                                    }
+		                                }
+			                            });
         }
 
         if let Some(err) = kwin_window_feed_error {
@@ -1809,6 +2181,8 @@ impl App {
             app_icon_show_name: self.app_icon_show_name,
             app_icon_name_size: self.app_icon_name_size,
             disable_ibeam: self.disable_ibeam,
+            app_scroll_sensitivity: self.app_scroll_sensitivity,
+            win_scroll_sensitivity: self.win_scroll_sensitivity,
         });
     }
 
@@ -1946,6 +2320,20 @@ impl App {
                     self.save_settings();
                 }
                 ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Scroll Sensitivity:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut app_scroll_sens = self.app_scroll_sensitivity;
+                if ui
+                    .add(egui::Slider::new(&mut app_scroll_sens, 0.1..=5.0).show_value(true))
+                    .changed()
+                {
+                    self.app_scroll_sensitivity = app_scroll_sens;
+                    self.save_settings();
+                }
+                ui.end_row();
             });
 
         ui.add_space(14.0);
@@ -2069,6 +2457,20 @@ impl App {
                     .changed()
                 {
                     self.win_path_size = path_size;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Scroll Sensitivity:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut win_scroll_sens = self.win_scroll_sensitivity;
+                if ui
+                    .add(egui::Slider::new(&mut win_scroll_sens, 0.1..=5.0).show_value(true))
+                    .changed()
+                {
+                    self.win_scroll_sensitivity = win_scroll_sens;
                     self.save_settings();
                 }
                 ui.end_row();
@@ -2307,6 +2709,65 @@ impl App {
         }
     }
 
+    fn prune_stale_windows(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_stale_prune
+            .is_some_and(|last| now.duration_since(last) < std::time::Duration::from_secs(1))
+        {
+            return;
+        }
+        self.last_stale_prune = Some(now);
+
+        let stale_ids: HashSet<String> = self
+            .windows
+            .iter()
+            .filter(|window| window.pid.is_some_and(|pid| !process_exists(pid)))
+            .map(|window| window.id.clone())
+            .collect();
+
+        if stale_ids.is_empty() {
+            return;
+        }
+
+        self.windows.retain(|window| !stale_ids.contains(&window.id));
+        self.missing_window_counts
+            .retain(|window_id, _| !stale_ids.contains(window_id));
+
+        if self
+            .last_selected_window_id
+            .as_ref()
+            .is_some_and(|window_id| stale_ids.contains(window_id))
+        {
+            self.last_selected_window_id = None;
+        }
+    }
+
+    fn update_sink_inputs_cache(&mut self) {
+        let now = Instant::now();
+        let needs_update = self.last_volume_fetch.map_or(true, |last| {
+            now.duration_since(last).as_millis() > AUDIO_SINK_POLL_MS
+        });
+        if needs_update {
+            self.last_volume_fetch = Some(now);
+            let output = Command::new("pactl")
+                .args(&["--format=json", "list", "sink-inputs"])
+                .output();
+            if let Ok(out) = output {
+                if out.status.success() {
+                    match serde_json::from_slice::<Vec<PactlSinkInput>>(&out.stdout) {
+                        Ok(sink_inputs) => {
+                            self.cached_sink_inputs = sink_inputs;
+                        }
+                        Err(_) => {
+                            self.cached_sink_inputs.clear();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn refresh_windows(&mut self) {
         if let Some(ref kpath) = self.kdotool_path {
             let kpath = kpath.clone();
@@ -2503,7 +2964,7 @@ impl eframe::App for App {
                             self.apps = apps;
                             self.selected_index = 0;
                             self.side_panel_selected_index = 0;
-                            self.active_pane = ActivePane::Windows;
+                            self.active_pane = ActivePane::Apps;
                         }
                         LoadResult::Content { windows, apps } => {
                             self.windows = windows;
@@ -2527,13 +2988,41 @@ impl eframe::App for App {
                 UiEvent::FocusLauncher => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                        egui::WindowLevel::AlwaysOnTop,
+                    ));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                         egui::UserAttentionType::Informational,
                     ));
+                    request_launcher_foreground();
+                    self.search_query.clear();
+                    self.selected_index = 0;
+                    self.side_panel_selected_index = 0;
+                    self.last_selected_window_id = None;
+                    self.scroll_to_first_window_on_focus = self.mode == LauncherMode::Windows;
+                    self.active_pane = if self.mode == LauncherMode::Windows {
+                        ActivePane::Windows
+                    } else {
+                        ActivePane::Apps
+                    };
                 }
             }
         }
+
+        self.update_sink_inputs_cache();
+        let has_active_audio = self
+            .cached_sink_inputs
+            .iter()
+            .any(|sink| sink_input_level(sink) > 0.0);
+        let audio_repaint_ms = if has_active_audio {
+            AUDIO_ACTIVE_REPAINT_MS
+        } else {
+            AUDIO_IDLE_REPAINT_MS
+        };
+        ctx.request_repaint_after(std::time::Duration::from_millis(audio_repaint_ms));
+
+        self.prune_stale_windows();
 
         // Focus loss auto-close
         if self.close_on_blur
@@ -2828,6 +3317,12 @@ impl eframe::App for App {
                     let render_side_panel = self.mode == LauncherMode::Windows;
                     let mut scroll_to_selected = false;
                     let mut scroll_to_side_selected = false;
+                    if self.scroll_to_first_window_on_focus {
+                        self.selected_index = 0;
+                        self.active_pane = ActivePane::Windows;
+                        scroll_to_selected = true;
+                        self.scroll_to_first_window_on_focus = false;
+                    }
                     let columns = if self.icon_only && self.mode == LauncherMode::Apps {
                         self.rendered_app_grid_columns.max(1)
                     } else {
@@ -2858,11 +3353,21 @@ impl eframe::App for App {
 	                                if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight))
 	                                    && !filtered_apps.is_empty()
 		                                {
-		                                    let target_y = self
-		                                        .rendered_window_row_centers
-		                                        .get(self.selected_index)
-		                                        .copied()
-		                                        .unwrap_or(self.selected_index as f32 * self.win_row_height);
+			                                    let target_y = self
+			                                        .rendered_window_row_centers
+			                                        .get(self.selected_index)
+			                                        .copied()
+			                                        .unwrap_or_else(|| {
+                                                    let row_height = effective_list_row_height(
+                                                        self.win_row_height,
+                                                        self.win_icon_size,
+                                                        self.win_padding,
+                                                        self.win_line_height,
+                                                        self.win_text_spacing,
+                                                        self.win_show_path,
+                                                    );
+                                                    self.selected_index as f32 * row_height
+                                                });
 		                                    self.side_panel_selected_index = nearest_center_index(
 		                                        &self.rendered_side_panel_item_centers,
 		                                        target_y,
@@ -3084,11 +3589,30 @@ impl eframe::App for App {
                         }
                     }
 
-                    // 3. Render Items ScrollArea
-                    let list_height = (ui.available_height() - 32.0).max(100.0);
-                    let row_height = self.win_row_height;
-                    let window_icon_size = egui::vec2(self.win_icon_size, self.win_icon_size);
-                    let app_icon_size = egui::vec2(self.app_icon_size, self.app_icon_size);
+	                    // 3. Render Items ScrollArea
+	                    let list_height = (ui.available_height() - 32.0).max(100.0);
+	                    let window_icon_size = egui::vec2(self.win_icon_size, self.win_icon_size);
+	                    let app_icon_size = egui::vec2(self.app_icon_size, self.app_icon_size);
+                        let window_row_height = effective_list_row_height(
+                            self.win_row_height,
+                            window_icon_size.y,
+                            self.win_padding,
+                            self.win_line_height,
+                            self.win_text_spacing,
+                            self.win_show_path,
+                        );
+                        let app_row_height = effective_list_row_height(
+                            self.win_row_height,
+                            app_icon_size.y,
+                            self.win_padding,
+                            self.win_line_height,
+                            self.win_text_spacing,
+                            self.win_show_path,
+                        );
+	                    let row_height = match self.mode {
+                            LauncherMode::Apps => app_row_height,
+                            LauncherMode::Windows => window_row_height,
+                        };
 
                     if render_side_panel {
                         let previous_spacing = ui.spacing().item_spacing;
@@ -3127,18 +3651,22 @@ impl eframe::App for App {
                             });
                         });
                     } else if self.icon_only && self.mode == LauncherMode::Apps {
+                        let sensitivity = self.app_scroll_sensitivity;
                         egui::ScrollArea::vertical()
+                            .wheel_scroll_multiplier(egui::vec2(1.0, sensitivity))
                             .id_salt("apps_main_icon_grid_scroll")
-	                            .max_height(list_height)
-	                            .show(ui, |ui| {
+                            .max_height(list_height)
+                            .show(ui, |ui| {
 	                                ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
 	                                let mut rendered_columns = 0usize;
 	                                let mut first_row_y = None;
 	                                ui.horizontal_wrapped(|ui| {
 		                                    for index in 0..total_items {
 		                                        let is_selected = index == self.selected_index;
-		                                        let app = &filtered_apps[index].0;
-		                                        let tile_size = self.app_icon_tile_size;
+			                                        let app = &filtered_apps[index].0;
+			                                        let tile_size = self.app_icon_tile_size;
+                                                let audio_level =
+                                                    app_audio_level(app, &self.cached_sink_inputs);
 
                                         let (rect, response) = ui.allocate_exact_size(
                                             egui::vec2(tile_size, tile_size),
@@ -3255,40 +3783,29 @@ impl eframe::App for App {
                                         };
                                         let icon_center_y = inner_rect.min.y
                                             + (inner_rect.height() - label_height) / 2.0;
-                                        let icon_rect = egui::Rect::from_center_size(
-                                            egui::pos2(rect.center().x, icon_center_y),
-                                            app_icon_size,
-                                        );
-                                        let label_rect = egui::Rect::from_min_max(
+	                                        let icon_rect = egui::Rect::from_center_size(
+	                                            egui::pos2(rect.center().x, icon_center_y),
+	                                            app_icon_size,
+	                                        );
+                                                if let Some(level) = audio_level {
+                                                    paint_audio_activity_ring(
+                                                        ui.painter(),
+                                                        icon_rect,
+                                                        level,
+                                                        ctx.input(|i| i.time) as f32,
+                                                    );
+                                                }
+	                                        let label_rect = egui::Rect::from_min_max(
                                             egui::pos2(inner_rect.min.x, inner_rect.max.y - label_height),
                                             inner_rect.max,
                                         );
 
-                                        if let Some(ref path) = app.icon_path {
-                                            let uri = format!("file://{}", path.to_string_lossy());
-                                            let mut child_ui = ui.new_child(
-                                                egui::UiBuilder::new()
-                                                    .max_rect(icon_rect)
-                                                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                                            );
-                                            child_ui.add(
-                                                egui::Image::new(uri).max_size(app_icon_size),
-                                            );
-                                        } else {
-                                            ui.painter().rect_filled(
-                                                icon_rect,
-                                                egui::CornerRadius::same(8),
-                                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12),
-                                            );
-                                            let first_char = app.name.chars().next().unwrap_or('?').to_uppercase().to_string();
-                                            ui.painter().text(
-                                                icon_rect.center(),
-                                                egui::Align2::CENTER_CENTER,
-                                                first_char,
-                                                egui::FontId::proportional(20.0),
-                                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180),
-                                            );
-                                        }
+                                        paint_icon_in_rect(
+                                            ui,
+                                            app.icon_path.as_ref(),
+                                            icon_rect,
+                                            app_icon_size,
+                                        );
 
                                         if self.pinned_apps.contains(&app.desktop_file_path) {
                                             let badge_pos = egui::pos2(rect.max.x - 12.0, rect.min.y + 12.0);
@@ -3317,14 +3834,21 @@ impl eframe::App for App {
 	                            });
                     } else {
                         let mut rendered_window_row_centers = Vec::new();
+                        let sensitivity = match self.mode {
+                            LauncherMode::Apps => self.app_scroll_sensitivity,
+                            LauncherMode::Windows => self.win_scroll_sensitivity,
+                        };
                         egui::ScrollArea::vertical()
+                            .wheel_scroll_multiplier(egui::vec2(1.0, sensitivity))
                             .id_salt(match self.mode {
                                 LauncherMode::Apps => "apps_main_list_scroll",
                                 LauncherMode::Windows => "windows_main_list_scroll",
-                            })
-                            .max_height(list_height)
-                            .show(ui, |ui| {
-		                                for index in 0..total_items {
+	                            })
+	                            .max_height(list_height)
+	                            .show(ui, |ui| {
+                                    let previous_item_spacing = ui.spacing().item_spacing;
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+			                                for index in 0..total_items {
 		                                    let is_selected = index == self.selected_index
 		                                        && (self.mode == LauncherMode::Apps
 		                                            || self.active_pane == ActivePane::Windows);
@@ -3333,6 +3857,7 @@ impl eframe::App for App {
 	                                        egui::vec2(ui.available_width(), row_height),
 	                                        egui::Sense::click(),
 	                                    );
+	                                    let row_visual_rect = rect.intersect(ui.clip_rect());
 	                                    if self.mode == LauncherMode::Windows {
 	                                        rendered_window_row_centers.push(rect.center().y);
 	                                    }
@@ -3350,16 +3875,33 @@ impl eframe::App for App {
 	                                    };
 
                                     ui.painter().rect_filled(
-                                        rect,
+                                        row_visual_rect,
                                         egui::CornerRadius::same(8),
                                         bg_color,
                                     );
+                                    if is_selected {
+                                        ui.painter().rect_stroke(
+                                            row_visual_rect.shrink(0.5),
+                                            egui::CornerRadius::same(8),
+                                            egui::Stroke::new(
+                                                1.0,
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    61, 174, 233, 140,
+                                                ),
+                                            ),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                    }
 
                                     // Premium left accent highlight bar
                                     if is_selected {
                                         let accent_rect = egui::Rect::from_min_size(
-                                            egui::pos2(rect.min.x + 2.0, rect.min.y + (rect.height() - 24.0) / 2.0),
-                                            egui::vec2(3.0, 24.0),
+                                            egui::pos2(
+                                                row_visual_rect.min.x + 2.0,
+                                                row_visual_rect.min.y
+                                                    + (row_visual_rect.height() - 28.0) / 2.0,
+                                            ),
+                                            egui::vec2(3.0, 28.0),
                                         );
                                         ui.painter().rect_filled(
                                             accent_rect,
@@ -3378,34 +3920,30 @@ impl eframe::App for App {
                                     );
 
                                     match self.mode {
-                                        LauncherMode::Apps => {
-                                            let app = &filtered_apps[index].0;
+	                                        LauncherMode::Apps => {
+	                                            let app = &filtered_apps[index].0;
+                                                let audio_level =
+                                                    app_audio_level(app, &self.cached_sink_inputs);
 
-                                            // Icon render
-                                            if let Some(ref path) = app.icon_path {
-                                                let uri = format!("file://{}", path.to_string_lossy());
-                                                child_ui.add(
-                                                    egui::Image::new(uri).max_size(app_icon_size),
-                                                );
-                                            } else {
+		                                            // Icon render
                                                 let (icon_rect, _) = child_ui.allocate_exact_size(
                                                     app_icon_size,
                                                     egui::Sense::hover(),
                                                 );
-                                                child_ui.painter().rect_filled(
+                                                if let Some(level) = audio_level {
+                                                    paint_audio_activity_ring(
+                                                        child_ui.painter(),
+                                                        icon_rect,
+                                                        level,
+                                                        ctx.input(|i| i.time) as f32,
+                                                    );
+                                                }
+                                                paint_icon_in_rect(
+                                                    &mut child_ui,
+                                                    app.icon_path.as_ref(),
                                                     icon_rect,
-                                                    egui::CornerRadius::same(6),
-                                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+                                                    app_icon_size,
                                                 );
-                                                let first_char = app.name.chars().next().unwrap_or('?').to_uppercase().to_string();
-                                                child_ui.painter().text(
-                                                    icon_rect.center(),
-                                                    egui::Align2::CENTER_CENTER,
-                                                    first_char,
-                                                    egui::FontId::proportional(15.0),
-                                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160),
-                                                );
-                                            }
 
                                             child_ui.add_space(10.0);
 
@@ -3425,12 +3963,12 @@ impl eframe::App for App {
                                                             egui::Align::Min,
                                                         )),
                                                 );
-                                                text_ui.spacing_mut().item_spacing.y = 0.0;
-                                                text_ui.add_space(
-                                                    ((self.win_row_height
-                                                        - (self.win_line_height
-                                                            + self.win_line_height * 0.8
-                                                            + self.win_text_spacing))
+	                                                text_ui.spacing_mut().item_spacing.y = 0.0;
+	                                                text_ui.add_space(
+	                                                    ((content_rect.height()
+	                                                        - (self.win_line_height
+	                                                            + self.win_line_height * 0.8
+	                                                            + self.win_text_spacing))
                                                         / 2.0)
                                                         .max(0.0),
                                                 );
@@ -3528,41 +4066,35 @@ impl eframe::App for App {
                                                 self.launch_app_and_exit(app, ctx);
                                             }
                                         }
-                                        LauncherMode::Windows => {
-                                            let win = &filtered_windows[index].0;
+	                                        LauncherMode::Windows => {
+	                                            let win = &filtered_windows[index].0;
+                                                let audio_level =
+                                                    active_audio_level_for_sinks(
+                                                        &find_sink_inputs_for_window(
+                                                            win,
+                                                            &self.cached_sink_inputs,
+                                                        ),
+                                                    );
 
-                                            // Icon render
-                                            if let Some(ref path) = win.icon_path {
-                                                let uri = format!("file://{}", path.to_string_lossy());
-                                                child_ui.add(
-                                                    egui::Image::new(uri).max_size(window_icon_size),
-                                                );
-                                            } else {
+		                                            // Icon render
                                                 let (icon_rect, _) = child_ui.allocate_exact_size(
                                                     window_icon_size,
                                                     egui::Sense::hover(),
                                                 );
-                                                child_ui.painter().rect_filled(
+                                                if let Some(level) = audio_level {
+                                                    paint_audio_activity_ring(
+                                                        child_ui.painter(),
+                                                        icon_rect,
+                                                        level,
+                                                        ctx.input(|i| i.time) as f32,
+                                                    );
+                                                }
+                                                paint_icon_in_rect(
+                                                    &mut child_ui,
+                                                    win.icon_path.as_ref(),
                                                     icon_rect,
-                                                    egui::CornerRadius::same(6),
-                                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+                                                    window_icon_size,
                                                 );
-
-                                                let first_char = win.class
-                                                    .chars()
-                                                    .next()
-                                                    .unwrap_or('?')
-                                                    .to_uppercase()
-                                                    .to_string();
-
-                                                child_ui.painter().text(
-                                                    icon_rect.center(),
-                                                    egui::Align2::CENTER_CENTER,
-                                                    first_char,
-                                                    egui::FontId::proportional(15.0),
-                                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160),
-                                                );
-                                            }
 
                                             child_ui.add_space(10.0);
 
@@ -3595,13 +4127,14 @@ impl eframe::App for App {
 
                                                     ui.add_space(self.win_text_spacing);
 
-                                                    let subtext = if let Some(ref path) = win.exe_path
+                                                    let subtext = if let Some(ref path) = win.cwd_path
                                                     {
+                                                        display_path(path)
+                                                    } else if let Some(ref path) = win.exe_path {
                                                         let is_link = std::fs::symlink_metadata(path)
                                                             .map(|m| m.file_type().is_symlink())
                                                             .unwrap_or(false);
-                                                        let mut path_str =
-                                                            path.to_string_lossy().to_string();
+                                                        let mut path_str = display_path(path);
                                                         if is_link {
                                                             path_str.push('@');
                                                         }
@@ -3708,6 +4241,46 @@ impl eframe::App for App {
                                                     self.close_window_and_exit(win.id.clone(), ctx);
                                                     ui.close();
                                                 }
+
+                                                // Volume Control
+                                                self.update_sink_inputs_cache();
+                                                let matching_sinks = find_sink_inputs_for_window(win, &self.cached_sink_inputs);
+                                                if !matching_sinks.is_empty() {
+                                                    ui.separator();
+                                                    ui.label("🔊 Volume Control");
+                                                    for sink in &matching_sinks {
+                                                        let sink_index = sink.index;
+                                                        let current_vol = if let Some(chan) = sink.volume.values().next() {
+                                                            chan.value_percent.trim_end_matches('%').parse::<f32>().unwrap_or(100.0)
+                                                        } else {
+                                                            100.0
+                                                        };
+                                                        let mut current_mute = sink.mute;
+
+                                                        ui.horizontal(|ui| {
+                                                            // Mute button
+                                                            let mute_label = if current_mute { "🔇" } else { "🔊" };
+                                                            if ui.button(mute_label).clicked() {
+                                                                current_mute = !current_mute;
+                                                                set_sink_input_mute(sink_index, current_mute);
+                                                                if let Some(s) = self.cached_sink_inputs.iter_mut().find(|s| s.index == sink_index) {
+                                                                    s.mute = current_mute;
+                                                                }
+                                                            }
+
+                                                            // Volume slider
+                                                            let mut vol_val = current_vol as u32;
+                                                            if ui.add(egui::Slider::new(&mut vol_val, 0..=100).show_value(true)).changed() {
+                                                                set_sink_input_volume(sink_index, vol_val);
+                                                                if let Some(s) = self.cached_sink_inputs.iter_mut().find(|s| s.index == sink_index) {
+                                                                    if let Some(chan) = s.volume.values_mut().next() {
+                                                                        chan.value_percent = format!("{}%", vol_val);
+                                                                    }
+                                                                }
+                                                            }
+                                                        });
+                                                    }
+                                                }
                                             }
                                         }
                                     });
@@ -3732,16 +4305,17 @@ impl eframe::App for App {
                                         }
                                     }
 
-	                                    if overlay_response.middle_clicked() {
-	                                        if let LauncherMode::Windows = self.mode {
-	                                            self.active_pane = ActivePane::Windows;
-	                                            self.selected_index = index;
-	                                            let win = &filtered_windows[index].0;
-	                                            self.launch_window_app_and_exit(win, ctx);
-	                                        }
-	                                    }
-	                                }
-		                            });
+		                                    if overlay_response.middle_clicked() {
+		                                        if let LauncherMode::Windows = self.mode {
+		                                            self.active_pane = ActivePane::Windows;
+		                                            self.selected_index = index;
+		                                            let win = &filtered_windows[index].0;
+		                                            self.launch_window_app_and_exit(win, ctx);
+		                                        }
+		                                    }
+		                                }
+                                    ui.spacing_mut().item_spacing = previous_item_spacing;
+			                            });
                         if self.mode == LauncherMode::Windows {
                             self.rendered_window_row_centers = rendered_window_row_centers;
                         } else {
@@ -3763,7 +4337,9 @@ impl eframe::App for App {
 	                                ),
 	                            );
                                     ui.vertical(|ui| {
+                                        let sensitivity = self.app_scroll_sensitivity;
                                         egui::ScrollArea::vertical()
+                                            .wheel_scroll_multiplier(egui::vec2(1.0, sensitivity))
                                             .id_salt("apps_side_panel_scroll")
                                             .max_height(list_height)
                                             .show(ui, |ui| {
@@ -3786,9 +4362,14 @@ impl eframe::App for App {
 		                                                    let mut first_row_y = None;
 		                                                    let mut rendered_item_centers = Vec::new();
 		                                                    ui.horizontal_wrapped(|ui| {
-			                                                        for (index, item) in filtered_apps.iter().enumerate() {
-		                                                            let app = &item.0;
-		                                                            let tile_size = self.app_icon_tile_size;
+				                                                        for (index, item) in filtered_apps.iter().enumerate() {
+			                                                            let app = &item.0;
+			                                                            let tile_size = self.app_icon_tile_size;
+                                                                    let audio_level =
+                                                                        app_audio_level(
+                                                                            app,
+                                                                            &self.cached_sink_inputs,
+                                                                        );
 		                                                            let is_selected = self.active_pane == ActivePane::Apps
 	                                                                && index == self.side_panel_selected_index;
                                                             let (rect, response) = ui.allocate_exact_size(
@@ -3823,11 +4404,29 @@ impl eframe::App for App {
 	                                                                    self.pinned_apps.remove(pos);
 	                                                                }
 	                                                            } else {
-	                                                                self.pinned_apps.push(path);
+	                                                                self.pinned_apps.push(path.clone());
 	                                                            }
 	                                                            self.save_pinned_apps();
 		                                                            ui.close();
 		                                                        }
+                                                                if is_pinned {
+                                                                    if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
+                                                                        if pos > 0 {
+                                                                            if ui.button("⬆ Move up").clicked() {
+                                                                                self.pinned_apps.swap(pos, pos - 1);
+                                                                                self.save_pinned_apps();
+                                                                                ui.close();
+                                                                            }
+                                                                        }
+                                                                        if pos + 1 < self.pinned_apps.len() {
+                                                                            if ui.button("⬇ Move down").clicked() {
+                                                                                self.pinned_apps.swap(pos, pos + 1);
+                                                                                self.save_pinned_apps();
+                                                                                ui.close();
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
 		                                                    });
 		                                                    if response.clicked() {
 	                                                                self.active_pane = ActivePane::Apps;
@@ -3865,37 +4464,32 @@ impl eframe::App for App {
                                                             let icon_center_y = inner_rect.min.y
                                                                 + (inner_rect.height() - label_height)
                                                                     / 2.0;
-                                                            let icon_rect = egui::Rect::from_center_size(
-                                                                egui::pos2(rect.center().x, icon_center_y),
-                                                                app_icon_size,
-                                                            );
-                                                            let label_rect = egui::Rect::from_min_max(
+	                                                            let icon_rect = egui::Rect::from_center_size(
+	                                                                egui::pos2(rect.center().x, icon_center_y),
+	                                                                app_icon_size,
+	                                                            );
+                                                                    if let Some(level) = audio_level {
+                                                                        paint_audio_activity_ring(
+                                                                            ui.painter(),
+                                                                            icon_rect,
+                                                                            level,
+                                                                            ctx.input(|i| i.time)
+                                                                                as f32,
+                                                                        );
+                                                                    }
+	                                                            let label_rect = egui::Rect::from_min_max(
                                                                 egui::pos2(
                                                                     inner_rect.min.x,
                                                                     inner_rect.max.y - label_height,
                                                                 ),
                                                                 inner_rect.max,
                                                             );
-                                                            if let Some(ref path) = app.icon_path {
-                                                                let uri = format!("file://{}", path.to_string_lossy());
-	                                                        let mut child_ui = ui.new_child(
-                                                                    egui::UiBuilder::new()
-                                                                        .max_rect(icon_rect)
-                                                                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                                                                );
-                                                                child_ui.add(
-                                                                    egui::Image::new(uri)
-                                                                        .max_size(app_icon_size),
-                                                                );
-                                                            } else {
-                                                                ui.painter().text(
-                                                                    icon_rect.center(),
-	                                                            egui::Align2::CENTER_CENTER,
-	                                                            app.name.chars().next().unwrap_or('?').to_uppercase().to_string(),
-	                                                            egui::FontId::proportional(18.0),
-	                                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180),
-                                                                );
-                                                            }
+                                                            paint_icon_in_rect(
+                                                                ui,
+                                                                app.icon_path.as_ref(),
+                                                                icon_rect,
+                                                                app_icon_size,
+                                                            );
                                                             if self.pinned_apps.contains(&app.desktop_file_path) {
 		                                                        ui.painter().text(
 		                                                            egui::pos2(rect.max.x - 10.0, rect.min.y + 10.0),
@@ -3931,10 +4525,15 @@ impl eframe::App for App {
 	                                                } else {
 	                                                    self.rendered_side_panel_item_centers.clear();
 	                                                    self.rendered_side_panel_grid_columns = 1;
-	                                                    for item in &filtered_apps {
-                                                        let app = &item.0;
-                                                        let (rect, response) = ui.allocate_exact_size(
-                                                            egui::vec2(ui.available_width(), row_height),
+		                                                    for item in &filtered_apps {
+	                                                        let app = &item.0;
+                                                            let audio_level =
+                                                                app_audio_level(
+                                                                    app,
+                                                                    &self.cached_sink_inputs,
+                                                                );
+	                                                        let (rect, response) = ui.allocate_exact_size(
+                                                            egui::vec2(ui.available_width(), app_row_height),
                                                             egui::Sense::click(),
                                                         );
 	                                                response.clone().context_menu(|ui| {
@@ -3947,11 +4546,29 @@ impl eframe::App for App {
 	                                                                self.pinned_apps.remove(pos);
 	                                                            }
 	                                                        } else {
-	                                                            self.pinned_apps.push(path);
+	                                                            self.pinned_apps.push(path.clone());
 	                                                        }
 	                                                        self.save_pinned_apps();
 	                                                        ui.close();
 	                                                    }
+                                                        if is_pinned {
+                                                            if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
+                                                                if pos > 0 {
+                                                                    if ui.button("⬆ Move up").clicked() {
+                                                                        self.pinned_apps.swap(pos, pos - 1);
+                                                                        self.save_pinned_apps();
+                                                                        ui.close();
+                                                                    }
+                                                                }
+                                                                if pos + 1 < self.pinned_apps.len() {
+                                                                    if ui.button("⬇ Move down").clicked() {
+                                                                        self.pinned_apps.swap(pos, pos + 1);
+                                                                        self.save_pinned_apps();
+                                                                        ui.close();
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
 	                                                });
 	                                                if response.clicked() {
 	                                                    self.launch_app_and_exit(app, ctx);
@@ -3970,39 +4587,24 @@ impl eframe::App for App {
                                                                 .max_rect(content_rect)
                                                                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
                                                         );
-                                                        if let Some(ref path) = app.icon_path {
-                                                            let uri = format!("file://{}", path.to_string_lossy());
-                                                            child_ui.add(
-                                                                egui::Image::new(uri)
-                                                                    .max_size(app_icon_size),
-                                                            );
-                                                        } else {
                                                             let (icon_rect, _) = child_ui.allocate_exact_size(
                                                                 app_icon_size,
                                                                 egui::Sense::hover(),
                                                             );
-                                                            child_ui.painter().rect_filled(
+                                                            if let Some(level) = audio_level {
+                                                                paint_audio_activity_ring(
+                                                                    child_ui.painter(),
+                                                                    icon_rect,
+                                                                    level,
+                                                                    ctx.input(|i| i.time) as f32,
+                                                                );
+                                                            }
+                                                            paint_icon_in_rect(
+                                                                &mut child_ui,
+                                                                app.icon_path.as_ref(),
                                                                 icon_rect,
-                                                                egui::CornerRadius::same(6),
-                                                                egui::Color32::from_rgba_unmultiplied(
-                                                                    255, 255, 255, 12,
-                                                                ),
+                                                                app_icon_size,
                                                             );
-                                                            child_ui.painter().text(
-                                                                icon_rect.center(),
-                                                                egui::Align2::CENTER_CENTER,
-                                                                app.name
-                                                                    .chars()
-                                                                    .next()
-                                                                    .unwrap_or('?')
-                                                                    .to_uppercase()
-                                                                    .to_string(),
-                                                                egui::FontId::proportional(15.0),
-                                                                egui::Color32::from_rgba_unmultiplied(
-                                                                    255, 255, 255, 160,
-                                                                ),
-                                                            );
-                                                        }
                                                         child_ui.add_space(10.0);
 
                                                         let mut label_clicked = false;
@@ -4022,7 +4624,7 @@ impl eframe::App for App {
                                                             );
                                                             text_ui.spacing_mut().item_spacing.y = 0.0;
                                                             text_ui.add_space(
-                                                                ((self.win_row_height
+                                                                ((content_rect.height()
                                                                     - (self.win_line_height
                                                                         + self.win_line_height * 0.8
                                                                         + self.win_text_spacing))
@@ -4196,21 +4798,36 @@ fn get_socket_path(mode: LauncherMode) -> PathBuf {
 
 fn focus_existing_launcher_window() {
     let kpath = get_kdotool_path();
-    let _ = Command::new(kpath)
-        .args([
-            "search",
-            "--title",
-            "Open Application Windows",
-            "windowstate",
-            "--remove",
-            "MINIMIZED",
-            "%@",
-            "windowactivate",
-            "%@",
-            "windowraise",
-            "%@",
-        ])
-        .status();
+    let mut ids = Vec::new();
+
+    for args in [
+        ["search", "--class", "applicationlauncher"].as_slice(),
+        ["search", "--title", "Open Application Windows"].as_slice(),
+    ] {
+        if let Ok(output) = Command::new(&kpath).args(args).output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for id in stdout.lines().map(str::trim).filter(|id| !id.is_empty()) {
+                    if !ids.iter().any(|existing: &String| existing == id) {
+                        ids.push(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    for id in ids {
+        let _ = Command::new(&kpath)
+            .args(["windowstate", "--remove", "MINIMIZED", &id])
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let _ = Command::new(&kpath).args(["windowactivate", &id]).status();
+        let _ = Command::new(&kpath).args(["windowraise", &id]).status();
+    }
+}
+
+fn request_launcher_foreground() {
+    std::thread::spawn(focus_existing_launcher_window);
 }
 
 struct BorderOverlay {
@@ -4523,4 +5140,105 @@ fn main() -> eframe::Result {
             )))
         }),
     )
+}
+
+fn set_sink_input_volume(index: u32, volume_percent: u32) {
+    let _ = Command::new("pactl")
+        .args(&["set-sink-input-volume", &index.to_string(), &format!("{}%", volume_percent)])
+        .status();
+}
+
+fn set_sink_input_mute(index: u32, mute: bool) {
+    let _ = Command::new("pactl")
+        .args(&["set-sink-input-mute", &index.to_string(), if mute { "1" } else { "0" }])
+        .status();
+}
+
+fn find_sink_inputs_for_window(window: &WindowInfo, sink_inputs: &[PactlSinkInput]) -> Vec<PactlSinkInput> {
+    let mut matches = Vec::new();
+    
+    // 1. Try to match by PID
+    if let Some(wpid) = window.pid {
+        let wpid_str = wpid.to_string();
+        for sink in sink_inputs {
+            if let Some(pid_val) = sink.properties.get("application.process.id") {
+                if pid_val == &wpid_str {
+                    matches.push(sink.clone());
+                }
+            }
+        }
+    }
+    
+    // 2. Try to match by process chain PIDs
+    if matches.is_empty() {
+        for entry in &window.process_chain {
+            let pid_str = entry.pid.to_string();
+            for sink in sink_inputs {
+                if let Some(pid_val) = sink.properties.get("application.process.id") {
+                    if pid_val == &pid_str {
+                        matches.push(sink.clone());
+                    }
+                }
+            }
+        }
+    }
+    
+    // 3. Try to match by class or active process name
+    if matches.is_empty() {
+        let class_lower = window.class.to_lowercase();
+        let active_lower = window.active_process.as_ref().map(|s| s.to_lowercase());
+        for sink in sink_inputs {
+            let app_name = sink.properties.get("application.name").map(|s| s.to_lowercase());
+            let app_binary = sink.properties.get("application.process.binary").map(|s| s.to_lowercase());
+            
+            let name_match = app_name.as_ref().map_or(false, |n| {
+                n.contains(&class_lower) || class_lower.contains(n) ||
+                active_lower.as_ref().map_or(false, |act| n.contains(act) || act.contains(n))
+            });
+            let binary_match = app_binary.as_ref().map_or(false, |b| {
+                b.contains(&class_lower) || class_lower.contains(b) ||
+                active_lower.as_ref().map_or(false, |act| b.contains(act) || act.contains(b))
+            });
+            
+            if name_match || binary_match {
+                matches.push(sink.clone());
+            }
+        }
+    }
+    
+    matches
+}
+
+fn setup_system_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    
+    // Fallback paths for symbol fonts supporting Braille
+    let paths = [
+        "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    ];
+    
+    let mut loaded_any = false;
+    for (i, path) in paths.iter().enumerate() {
+        if let Ok(data) = std::fs::read(path) {
+            let key = format!("sys_symbol_{}", i);
+            fonts.font_data.insert(
+                key.clone(),
+                std::sync::Arc::new(egui::FontData::from_owned(data)),
+            );
+            if let Some(vec) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                vec.push(key.clone());
+            }
+            if let Some(vec) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                vec.push(key);
+            }
+            loaded_any = true;
+        }
+    }
+    
+    if loaded_any {
+        ctx.set_fonts(fonts);
+    }
 }

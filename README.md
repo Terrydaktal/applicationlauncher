@@ -39,6 +39,30 @@ The application is implemented as a single native `eframe` / `egui` binary.
   Scans desktop files, parses launcher metadata, resolves icon names and icon files, and classifies likely settings modules separately from normal applications.
 - Search and sorting:
   Applies fuzzy matching and custom ordering rules for windows and applications.
+
+  ### Sorting Precedence Rules
+
+  #### 1. Applications Panel
+  * **When the search box is empty:**
+    1. **Type**: Regular apps come first (settings modules are pushed to the end).
+    2. **Pin Status**: Pinned applications come before unpinned applications.
+    3. **Sub-ordering**: Pinned apps are sorted by their user-defined pin order. Unpinned apps are sorted alphabetically (case-insensitive) by name.
+  * **When a search query is typed:**
+    1. **Fuzzy Match Score**: Best/closest match score (lowest edit distance) comes first.
+    2. **Exact Prefix Match Boost**: Exact prefix matches are boosted to the top of the matching subset.
+    3. **Pin Status**: Pinned apps come before unpinned apps.
+    4. **Sub-ordering**: Pinned apps are sorted by their pinned order.
+    5. **Type**: Regular apps come before settings modules.
+    6. **Name**: Alphabetically (case-insensitive) by name.
+
+  #### 2. Open Windows Panel
+  * **When the search box is empty:**
+    1. **Application Key**: Grouped alphabetically (case-insensitive) by the window's application class/key.
+    2. **Window Title**: Alphabetically (case-insensitive) by window title.
+  * **When a search query is typed:**
+    1. **Fuzzy Match Score**: Highest fuzzy score (matching title or class name) comes first.
+    2. **Application Key**: Alphabetically (case-insensitive) by application class/key.
+    3. **Window Title**: Alphabetically (case-insensitive) by window title.
 - UI:
   Draws a frameless launcher window, a separate settings popup window, and a separate execution-chain popup window.
 - Single-instance behavior:
