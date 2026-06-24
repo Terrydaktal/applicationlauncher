@@ -1,10 +1,15 @@
 use eframe::egui;
 use serde::Deserialize;
+use std::backtrace::Backtrace;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
+use fuzzy_rank::metadata::{
+    MetadataCandidate, MetadataQuery, SearchField, dedup_push_search_field, sort_matches,
+};
+use fuzzy_rank::ranking::SearchRank;
 use zbus::interface;
 
 const WINDOW_REMOVAL_CONFIRMATION_POLLS: usize = 2;
@@ -16,6 +21,9 @@ const KWIN_WINDOW_FEED_METADATA: &str =
 const KWIN_WINDOW_FEED_MAIN_JS: &str =
     include_str!("../kwin/applicationlauncher-window-feed/contents/code/main.js");
 const AUDIO_SINK_POLL_MS: u128 = 200;
+const AUDIO_ACTIVITY_GRACE_MS: u128 = 350;
+const PIPEWIRE_ACTIVE_US_THRESHOLD: f32 = 10.0;
+const PIPEWIRE_ACTIVE_TOTAL_US_THRESHOLD: f32 = 20.0;
 const AUDIO_IDLE_REPAINT_MS: u64 = 200;
 const AUDIO_ACTIVE_REPAINT_MS: u64 = 80;
 
@@ -67,6 +75,23 @@ struct AppInfo {
     is_settings_module: bool,
 }
 
+#[derive(Clone, Debug)]
+struct RankedAppMatch {
+    app: AppInfo,
+    rank: SearchRank,
+    is_pinned: bool,
+    candidate_key: String,
+    candidate_score: f64,
+}
+
+#[derive(Clone, Debug)]
+struct RankedWindowMatch {
+    window: WindowInfo,
+    rank: SearchRank,
+    candidate_key: String,
+    candidate_score: f64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LauncherMode {
     Windows,
@@ -102,6 +127,15 @@ struct KWinWindowPayload {
 enum WindowFeedEvent {
     Upsert(KWinWindowPayload),
     Remove(String),
+}
+
+#[derive(Clone, Debug)]
+struct AudioCacheUpdate {
+    sink_inputs: Vec<PactlSinkInput>,
+    active_media_app_keys: HashSet<String>,
+    observed_pipewire_node_ids: HashSet<u32>,
+    active_pipewire_node_ids: HashSet<u32>,
+    pipewire_activity_cache_valid: bool,
 }
 
 struct KWinWindowFeed {
@@ -175,12 +209,16 @@ struct App {
     process_chain_popup: Option<WindowInfo>,
     window_receiver: Receiver<Vec<WindowInfo>>,
     window_feed_receiver: Receiver<WindowFeedEvent>,
+    audio_cache_receiver: Receiver<AudioCacheUpdate>,
     rapid_polling: std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_selected_window_id: Option<String>,
     missing_window_counts: HashMap<String, usize>,
     use_kwin_window_feed: bool,
     cached_sink_inputs: Vec<PactlSinkInput>,
-    last_volume_fetch: Option<Instant>,
+    active_media_app_keys: HashSet<String>,
+    observed_pipewire_node_ids: HashSet<u32>,
+    active_pipewire_node_ids: HashSet<u32>,
+    pipewire_activity_cache_valid: bool,
     app_scroll_sensitivity: f32,
     win_scroll_sensitivity: f32,
     last_stale_prune: Option<Instant>,
@@ -622,113 +660,108 @@ fn find_icon(theme: &str, class: &str) -> Option<PathBuf> {
     None
 }
 
-fn fuzzy_match_details(query: &str, target: &str) -> Option<(usize, usize)> {
-    let query_lower = query.to_lowercase();
-    let target_lower = target.to_lowercase();
+fn app_search_rank(query: &MetadataQuery, app: &AppInfo) -> Option<SearchRank> {
+    let cleaned_exec = clean_exec_cmd(&app.exec);
+    let exec_basename = command_basename(&app.exec);
+    let desktop_stem = app
+        .desktop_file_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.to_string());
 
-    let q_len = query_lower.chars().count();
-    if q_len == 0 {
-        return Some((0, 0));
+    let mut owned_values = Vec::new();
+    owned_values.push((0, normalize_metadata_search_value(&app.name)));
+    if let Some(value) = exec_basename {
+        owned_values.push((1, normalize_metadata_search_value(&value)));
+    }
+    if let Some(value) = desktop_stem {
+        owned_values.push((2, normalize_metadata_search_value(&value)));
+    }
+    if let Some(value) = app.comment.clone() {
+        owned_values.push((3, normalize_metadata_search_value(&value)));
+    }
+    owned_values.push((4, normalize_metadata_search_value(&cleaned_exec)));
+
+    let mut fields = Vec::new();
+    for (priority, value) in &owned_values {
+        dedup_push_search_field(&mut fields, *priority, Some(value.as_str()));
     }
 
-    let t_len = target_lower.chars().count();
-    let limit = q_len / 2;
-
-    if t_len < q_len.saturating_sub(limit) {
-        return None;
-    }
-
-    let inf = limit + 1;
-    let query_chars: Vec<char> = query_lower.chars().collect();
-    let target_chars: Vec<char> = target_lower.chars().collect();
-
-    let mut prev_prev = vec![inf; t_len + 1];
-    let mut prev = vec![0; t_len + 1]; // Substring search start cost is 0
-    let mut curr = vec![inf; t_len + 1];
-
-    for i in 1..=q_len {
-        curr.fill(inf);
-        curr[0] = i;
-
-        let mut row_min = inf;
-        for j in 1..=t_len {
-            let cost = usize::from(query_chars[i - 1] != target_chars[j - 1]);
-            let deletion = prev[j] + 1;
-            let insertion = curr[j - 1] + 1;
-            let substitution = prev[j - 1] + cost;
-            let mut cell = deletion.min(insertion).min(substitution);
-
-            if i > 1
-                && j > 1
-                && query_chars[i - 1] == target_chars[j - 2]
-                && query_chars[i - 2] == target_chars[j - 1]
-            {
-                cell = cell.min(prev_prev[j - 2] + 1);
-            }
-
-            curr[j] = cell;
-            row_min = row_min.min(cell);
-        }
-
-        if row_min > limit {
-            return None;
-        }
-
-        std::mem::swap(&mut prev_prev, &mut prev);
-        std::mem::swap(&mut prev, &mut curr);
-    }
-
-    let mut min_distance = inf;
-    let mut best_end_idx = 0;
-
-    let search_start = q_len.saturating_sub(limit).max(1);
-    let search_end = t_len;
-
-    for j in search_start..=search_end {
-        if prev[j] < min_distance {
-            min_distance = prev[j];
-            best_end_idx = j;
-        }
-    }
-
-    if min_distance <= limit {
-        let start_idx = best_end_idx.saturating_sub(q_len);
-
-        Some((min_distance, start_idx))
-    } else {
-        None
-    }
+    query.search_rank(MetadataCandidate {
+        key: "",
+        fields: &fields,
+        score: 0.0,
+    })
 }
 
-fn match_app(query: &str, target: &str) -> Option<i64> {
-    let (min_distance, start_idx) = fuzzy_match_details(query, target)?;
-    let target_lower = target.to_lowercase();
-    let target_chars: Vec<char> = target_lower.chars().collect();
-    let t_len = target_chars.len();
+fn window_search_rank(query: &MetadataQuery, win: &WindowInfo) -> Option<SearchRank> {
+    let app_key = window_application_key(win);
+    let exe_basename = win
+        .exe_path
+        .as_ref()
+        .and_then(|path| path.file_name().and_then(|name| name.to_str()))
+        .map(|name| name.to_string());
+    let cwd_display = win.cwd_path.as_ref().map(|path| display_path(path));
 
-    let is_word_boundary = start_idx == 0 || {
-        let prev_char = target_chars.get(start_idx.saturating_sub(1));
-        prev_char.map_or(true, |c| {
-            c.is_whitespace() || *c == '-' || *c == '_' || *c == '/' || *c == '.'
+    let mut owned_values = Vec::new();
+    owned_values.push((0, normalize_metadata_search_value(&win.title)));
+    owned_values.push((1, normalize_metadata_search_value(&app_key)));
+    if !win.class.eq_ignore_ascii_case(&app_key) {
+        owned_values.push((2, normalize_metadata_search_value(&win.class)));
+    }
+    if let Some(value) = win.active_process.clone() {
+        owned_values.push((3, normalize_metadata_search_value(&value)));
+    }
+    if let Some(value) = exe_basename {
+        owned_values.push((4, normalize_metadata_search_value(&value)));
+    }
+    if let Some(value) = cwd_display {
+        owned_values.push((5, normalize_metadata_search_value(&value)));
+    }
+
+    let mut fields = Vec::new();
+    for (priority, value) in &owned_values {
+        dedup_push_search_field(&mut fields, *priority, Some(value.as_str()));
+    }
+
+    query.search_rank(MetadataCandidate {
+        key: "",
+        fields: &fields,
+        score: 0.0,
+    })
+}
+
+fn sort_ranked_matches<T, FKey, FScore, FRank>(
+    items: &mut [T],
+    key_fn: FKey,
+    score_fn: FScore,
+    rank_fn: FRank,
+) where
+    FKey: Fn(&T) -> &str,
+    FScore: Fn(&T) -> f64,
+    FRank: Fn(&T) -> &SearchRank,
+{
+    let empty_fields: [SearchField<'_>; 0] = [];
+    let mut matches: Vec<(MetadataCandidate<'_>, SearchRank)> = items
+        .iter()
+        .map(|item| {
+            (
+                MetadataCandidate {
+                    key: key_fn(item),
+                    fields: &empty_fields,
+                    score: score_fn(item),
+                },
+                rank_fn(item).clone(),
+            )
         })
-    };
-
-    let mut score = 1000 - (min_distance as i64 * 300) - (start_idx as i64 * 20) - (t_len as i64);
-    if !is_word_boundary {
-        score -= 150;
-    }
-    Some(score)
-}
-
-fn app_search_rank(query: &str, app: &AppInfo) -> Option<(usize, bool)> {
-    if let Some((distance, start_idx)) = fuzzy_match_details(query, &app.name) {
-        return Some((distance, start_idx == 0));
-    }
-
-    app.comment
-        .as_deref()
-        .and_then(|comment| fuzzy_match_details(query, comment))
-        .map(|(distance, _)| (distance.saturating_add(1000), false))
+        .collect();
+    sort_matches(&mut matches);
+    let order: HashMap<String, usize> = matches
+        .into_iter()
+        .enumerate()
+        .map(|(index, (candidate, _))| (candidate.key.to_string(), index))
+        .collect();
+    items.sort_by_key(|item| order.get(key_fn(item)).copied().unwrap_or(usize::MAX));
 }
 
 fn pinned_app_position(pinned_apps: &[PathBuf], app: &AppInfo) -> usize {
@@ -799,6 +832,21 @@ fn normalize_app_match_key(value: &str) -> String {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect()
+}
+
+fn push_normalized_key_variants(keys: &mut HashSet<String>, value: &str) {
+    let normalized = normalize_app_match_key(value);
+    if !normalized.is_empty() {
+        keys.insert(normalized);
+    }
+
+    for token in value
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .map(normalize_app_match_key)
+        .filter(|token| !token.is_empty())
+    {
+        keys.insert(token);
+    }
 }
 
 fn window_application_key(win: &WindowInfo) -> String {
@@ -893,6 +941,66 @@ fn display_path(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
+fn normalize_metadata_search_value(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    for ch in value.chars() {
+        let mapped = match ch {
+            '—' | '–' | '−' => '-',
+            '•' | '·' | '●' | '▪' | '◦' | '‣' => ' ',
+            c if c.is_ascii() => c,
+            _ => ' ',
+        };
+        normalized.push(mapped);
+    }
+
+    normalized
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn launcher_state_dir() -> PathBuf {
+    if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
+        return PathBuf::from(state_home).join("applicationlauncher");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".local/state/applicationlauncher");
+    }
+    std::env::temp_dir().join("applicationlauncher")
+}
+
+fn install_panic_hook() {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let mut message = String::new();
+        message.push_str(&format!("panic: {panic_info}\n"));
+        if let Some(location) = panic_info.location() {
+            message.push_str(&format!(
+                "location: {}:{}:{}\n",
+                location.file(),
+                location.line(),
+                location.column()
+            ));
+        }
+        message.push_str(&format!("backtrace:\n{}\n", Backtrace::force_capture()));
+
+        let state_dir = launcher_state_dir();
+        if std::fs::create_dir_all(&state_dir).is_ok() {
+            let panic_log = state_dir.join("panic.log");
+            let mut panic_entry = String::new();
+            panic_entry.push_str("\n==== applicationlauncher panic ====\n");
+            panic_entry.push_str(&format!("{:?}\n", std::time::SystemTime::now()));
+            panic_entry.push_str(&message);
+            let _ = std::fs::write(&panic_log, panic_entry.as_bytes());
+            let latest_log = state_dir.join("panic-latest.log");
+            let _ = std::fs::write(latest_log, message.as_bytes());
+        }
+
+        eprintln!("{message}");
+        previous_hook(panic_info);
+    }));
+}
+
 fn paint_wayland_fallback_icon(painter: &egui::Painter, rect: egui::Rect) {
     let radius = (rect.width().min(rect.height()) * 0.18).clamp(4.0, 9.0);
     painter.rect_filled(
@@ -947,7 +1055,47 @@ fn paint_icon_in_rect(
     }
 }
 
-fn sink_input_level(sink: &PactlSinkInput) -> f32 {
+fn sink_input_is_actively_rendering(
+    sink: &PactlSinkInput,
+    active_media_app_keys: &HashSet<String>,
+    observed_pipewire_node_ids: &HashSet<u32>,
+    active_pipewire_node_ids: &HashSet<u32>,
+    pipewire_activity_cache_valid: bool,
+) -> bool {
+    if sink_input_is_browser_like(sink) {
+        return sink_input_media_keys(sink)
+            .iter()
+            .any(|key| active_media_app_keys.contains(key));
+    }
+
+    // `pw-top` snapshots can miss short-lived activity, so only treat PipeWire
+    // as authoritative when this node actually appeared in the sampled output.
+    if !pipewire_activity_cache_valid {
+        return true;
+    }
+
+    let Some(id) = sink
+        .properties
+        .get("object.id")
+        .and_then(|id| id.parse::<u32>().ok())
+    else {
+        return true;
+    };
+
+    if !observed_pipewire_node_ids.contains(&id) {
+        return true;
+    }
+
+    active_pipewire_node_ids.contains(&id)
+}
+
+fn sink_input_level(
+    sink: &PactlSinkInput,
+    active_media_app_keys: &HashSet<String>,
+    observed_pipewire_node_ids: &HashSet<u32>,
+    active_pipewire_node_ids: &HashSet<u32>,
+    pipewire_activity_cache_valid: bool,
+) -> f32 {
     if sink.mute || sink.corked {
         return 0.0;
     }
@@ -964,6 +1112,16 @@ fn sink_input_level(sink: &PactlSinkInput) -> f32 {
         let class = class.to_ascii_lowercase();
         !class.contains("output") && !class.contains("playback")
     }) {
+        return 0.0;
+    }
+
+    if !sink_input_is_actively_rendering(
+        sink,
+        active_media_app_keys,
+        observed_pipewire_node_ids,
+        active_pipewire_node_ids,
+        pipewire_activity_cache_valid,
+    ) {
         return 0.0;
     }
 
@@ -988,15 +1146,34 @@ fn sink_input_level(sink: &PactlSinkInput) -> f32 {
     }
 }
 
-fn active_audio_level_for_sinks(sinks: &[PactlSinkInput]) -> Option<f32> {
+fn active_audio_level_for_sinks(
+    sinks: &[PactlSinkInput],
+    active_media_app_keys: &HashSet<String>,
+    observed_pipewire_node_ids: &HashSet<u32>,
+    active_pipewire_node_ids: &HashSet<u32>,
+    pipewire_activity_cache_valid: bool,
+) -> Option<f32> {
     let mut max_level = 0.0f32;
     for sink in sinks {
-        max_level = max_level.max(sink_input_level(sink));
+        max_level = max_level.max(sink_input_level(
+            sink,
+            active_media_app_keys,
+            observed_pipewire_node_ids,
+            active_pipewire_node_ids,
+            pipewire_activity_cache_valid,
+        ));
     }
     (max_level > 0.0).then_some(max_level)
 }
 
-fn app_audio_level(app: &AppInfo, sink_inputs: &[PactlSinkInput]) -> Option<f32> {
+fn app_audio_level(
+    app: &AppInfo,
+    sink_inputs: &[PactlSinkInput],
+    active_media_app_keys: &HashSet<String>,
+    observed_pipewire_node_ids: &HashSet<u32>,
+    active_pipewire_node_ids: &HashSet<u32>,
+    pipewire_activity_cache_valid: bool,
+) -> Option<f32> {
     let stem = app
         .desktop_file_path
         .file_stem()
@@ -1007,7 +1184,14 @@ fn app_audio_level(app: &AppInfo, sink_inputs: &[PactlSinkInput]) -> Option<f32>
 
     let mut matches = Vec::new();
     for sink in sink_inputs {
-        if sink_input_level(sink) <= 0.0 {
+        if sink_input_level(
+            sink,
+            active_media_app_keys,
+            observed_pipewire_node_ids,
+            active_pipewire_node_ids,
+            pipewire_activity_cache_valid,
+        ) <= 0.0
+        {
             continue;
         }
 
@@ -1033,7 +1217,187 @@ fn app_audio_level(app: &AppInfo, sink_inputs: &[PactlSinkInput]) -> Option<f32>
         }
     }
 
-    active_audio_level_for_sinks(&matches)
+    active_audio_level_for_sinks(
+        &matches,
+        active_media_app_keys,
+        observed_pipewire_node_ids,
+        active_pipewire_node_ids,
+        pipewire_activity_cache_valid,
+    )
+}
+
+fn fetch_sink_inputs() -> Vec<PactlSinkInput> {
+    let output = Command::new("pactl")
+        .args(["--format=json", "list", "sink-inputs"])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            serde_json::from_slice::<Vec<PactlSinkInput>>(&out.stdout).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn sink_input_media_keys(sink: &PactlSinkInput) -> HashSet<String> {
+    [
+        "application.id",
+        "application.name",
+        "application.icon_name",
+        "application.process.binary",
+        "node.name",
+    ]
+    .iter()
+    .filter_map(|key| sink.properties.get(*key))
+    .map(|value| normalize_app_match_key(value))
+    .filter(|value| !value.is_empty())
+    .collect()
+}
+
+fn sink_input_is_browser_like(sink: &PactlSinkInput) -> bool {
+    sink_input_media_keys(sink).iter().any(|key| {
+        matches!(
+            key.as_str(),
+            "firefox"
+                | "librewolf"
+                | "floorp"
+                | "zen"
+                | "googlechrome"
+                | "chrome"
+                | "chromium"
+                | "brave"
+                | "bravebrowser"
+                | "microsoftedge"
+                | "edge"
+                | "vivaldi"
+        )
+    })
+}
+
+fn mpris_service_names() -> Vec<String> {
+    let output = Command::new("busctl")
+        .args(["--user", "list", "--no-legend"])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .filter(|name| name.starts_with("org.mpris.MediaPlayer2."))
+            .map(ToOwned::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn busctl_string_property(service: &str, interface: &str, property: &str) -> Option<String> {
+    let output = Command::new("busctl")
+        .args([
+            "--user",
+            "get-property",
+            service,
+            "/org/mpris/MediaPlayer2",
+            interface,
+            property,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first_quote = stdout.find('"')?;
+    let rest = &stdout[first_quote + 1..];
+    let second_quote = rest.find('"')?;
+    Some(rest[..second_quote].to_owned())
+}
+
+fn fetch_active_media_app_keys() -> HashSet<String> {
+    let mut keys = HashSet::new();
+    for service in mpris_service_names() {
+        let is_playing = busctl_string_property(
+            &service,
+            "org.mpris.MediaPlayer2.Player",
+            "PlaybackStatus",
+        )
+        .is_some_and(|status| status.eq_ignore_ascii_case("Playing"));
+        if !is_playing {
+            continue;
+        }
+
+        if let Some(identity) =
+            busctl_string_property(&service, "org.mpris.MediaPlayer2", "Identity")
+        {
+            push_normalized_key_variants(&mut keys, &identity);
+        }
+
+        if let Some(service_suffix) = service.strip_prefix("org.mpris.MediaPlayer2.") {
+            push_normalized_key_variants(&mut keys, service_suffix);
+            if let Some(base_name) = service_suffix.split(".instance_").next() {
+                push_normalized_key_variants(&mut keys, base_name);
+            }
+        }
+    }
+    keys
+}
+
+fn fetch_pipewire_activity() -> (HashSet<u32>, HashSet<u32>, bool) {
+    let output = Command::new("pw-top").args(["-b", "-n", "1"]).output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let mut observed_ids = HashSet::new();
+            let mut active_ids = HashSet::new();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty()
+                    || trimmed.starts_with("PipeWire")
+                    || trimmed.starts_with("ID ")
+                {
+                    continue;
+                }
+
+                let cols: Vec<&str> = trimmed.split_whitespace().collect();
+                if cols.len() < 6 {
+                    continue;
+                }
+
+                let Some(state) = cols.first().and_then(|value| value.chars().next()) else {
+                    continue;
+                };
+                if !matches!(state, 'R' | 'S' | 'I' | 'C' | 'X') {
+                    continue;
+                }
+
+                let Some(id) = cols.get(1).and_then(|value| value.parse::<u32>().ok()) else {
+                    continue;
+                };
+                observed_ids.insert(id);
+
+                let wait_us = cols
+                    .get(4)
+                    .and_then(|value| value.strip_suffix("us"))
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .unwrap_or(0.0);
+                let busy_us = cols
+                    .get(5)
+                    .and_then(|value| value.strip_suffix("us"))
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .unwrap_or(0.0);
+                let wait_active = wait_us >= PIPEWIRE_ACTIVE_US_THRESHOLD;
+                let busy_active = busy_us >= PIPEWIRE_ACTIVE_US_THRESHOLD;
+                let total_active =
+                    (wait_us + busy_us) >= PIPEWIRE_ACTIVE_TOTAL_US_THRESHOLD;
+                let is_active = (wait_active || busy_active) && total_active;
+
+                if is_active {
+                    active_ids.insert(id);
+                }
+            }
+
+            (observed_ids, active_ids, true)
+        }
+        _ => (HashSet::new(), HashSet::new(), false),
+    }
 }
 
 fn paint_audio_activity_ring(
@@ -2040,10 +2404,12 @@ impl App {
 
         let (window_tx, window_rx) = std::sync::mpsc::channel();
         let (window_feed_tx, window_feed_rx) = std::sync::mpsc::channel();
+        let (audio_cache_tx, audio_cache_rx) = std::sync::mpsc::channel();
         let rapid_polling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let kwin_window_feed_error =
             setup_kwin_window_feed(window_feed_tx, cc.egui_ctx.clone()).err();
         let use_kwin_window_feed = kwin_window_feed_error.is_none();
+        let audio_repaint_ctx = cc.egui_ctx.clone();
 
         let mut app = Self {
             mode,
@@ -2092,16 +2458,64 @@ impl App {
             process_chain_popup: None,
             window_receiver: window_rx,
             window_feed_receiver: window_feed_rx,
+            audio_cache_receiver: audio_cache_rx,
             rapid_polling: std::sync::Arc::clone(&rapid_polling),
             last_selected_window_id: None,
             missing_window_counts: HashMap::new(),
             use_kwin_window_feed,
             cached_sink_inputs: Vec::new(),
-            last_volume_fetch: None,
+            active_media_app_keys: HashSet::new(),
+            observed_pipewire_node_ids: HashSet::new(),
+            active_pipewire_node_ids: HashSet::new(),
+            pipewire_activity_cache_valid: false,
             app_scroll_sensitivity: settings.app_scroll_sensitivity,
             win_scroll_sensitivity: settings.win_scroll_sensitivity,
             last_stale_prune: None,
         };
+
+        std::thread::spawn(move || {
+            let mut recent_active_pipewire_nodes: HashMap<u32, std::time::Instant> = HashMap::new();
+            loop {
+                let sink_inputs = fetch_sink_inputs();
+                let active_media_app_keys = fetch_active_media_app_keys();
+                let (
+                    observed_pipewire_node_ids,
+                    active_pipewire_node_ids,
+                    pipewire_activity_cache_valid,
+                ) =
+                    fetch_pipewire_activity();
+                let now = std::time::Instant::now();
+
+                if pipewire_activity_cache_valid {
+                    for id in active_pipewire_node_ids {
+                        recent_active_pipewire_nodes.insert(id, now);
+                    }
+                    recent_active_pipewire_nodes.retain(|_, last_seen| {
+                        now.duration_since(*last_seen).as_millis() <= AUDIO_ACTIVITY_GRACE_MS
+                    });
+                } else {
+                    recent_active_pipewire_nodes.clear();
+                }
+
+                let effective_active_pipewire_node_ids =
+                    recent_active_pipewire_nodes.keys().copied().collect::<HashSet<u32>>();
+
+                if audio_cache_tx
+                    .send(AudioCacheUpdate {
+                        sink_inputs,
+                        active_media_app_keys,
+                        observed_pipewire_node_ids,
+                        active_pipewire_node_ids: effective_active_pipewire_node_ids,
+                        pipewire_activity_cache_valid,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                audio_repaint_ctx.request_repaint();
+                std::thread::sleep(std::time::Duration::from_millis(AUDIO_SINK_POLL_MS as u64));
+            }
+        });
 
         if !app.use_kwin_window_feed {
             let kpath = app.kdotool_path.clone();
@@ -2743,31 +3157,6 @@ impl App {
         }
     }
 
-    fn update_sink_inputs_cache(&mut self) {
-        let now = Instant::now();
-        let needs_update = self.last_volume_fetch.map_or(true, |last| {
-            now.duration_since(last).as_millis() > AUDIO_SINK_POLL_MS
-        });
-        if needs_update {
-            self.last_volume_fetch = Some(now);
-            let output = Command::new("pactl")
-                .args(&["--format=json", "list", "sink-inputs"])
-                .output();
-            if let Ok(out) = output {
-                if out.status.success() {
-                    match serde_json::from_slice::<Vec<PactlSinkInput>>(&out.stdout) {
-                        Ok(sink_inputs) => {
-                            self.cached_sink_inputs = sink_inputs;
-                        }
-                        Err(_) => {
-                            self.cached_sink_inputs.clear();
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     fn refresh_windows(&mut self) {
         if let Some(ref kpath) = self.kdotool_path {
             let kpath = kpath.clone();
@@ -3010,11 +3399,30 @@ impl eframe::App for App {
             }
         }
 
-        self.update_sink_inputs_cache();
+        let mut latest_audio_update = None;
+        while let Ok(update) = self.audio_cache_receiver.try_recv() {
+            latest_audio_update = Some(update);
+        }
+        if let Some(update) = latest_audio_update {
+            self.cached_sink_inputs = update.sink_inputs;
+            self.active_media_app_keys = update.active_media_app_keys;
+            self.observed_pipewire_node_ids = update.observed_pipewire_node_ids;
+            self.active_pipewire_node_ids = update.active_pipewire_node_ids;
+            self.pipewire_activity_cache_valid = update.pipewire_activity_cache_valid;
+        }
+
         let has_active_audio = self
             .cached_sink_inputs
             .iter()
-            .any(|sink| sink_input_level(sink) > 0.0);
+            .any(|sink| {
+                sink_input_level(
+                    sink,
+                    &self.active_media_app_keys,
+                    &self.observed_pipewire_node_ids,
+                    &self.active_pipewire_node_ids,
+                    self.pipewire_activity_cache_valid,
+                ) > 0.0
+            });
         let audio_repaint_ms = if has_active_audio {
             AUDIO_ACTIVE_REPAINT_MS
         } else {
@@ -3136,31 +3544,27 @@ impl eframe::App for App {
 
                     ui.add_space(10.0);
 
-                    // 2. Filtering list
-                    let mut filtered_apps: Vec<(AppInfo, i64, bool)> = Vec::new();
-                    let mut filtered_windows: Vec<(WindowInfo, i64)> = Vec::new();
+	                    // 2. Filtering list
+	                    let mut filtered_apps: Vec<(AppInfo, bool)> = Vec::new();
+	                    let mut filtered_windows: Vec<WindowInfo> = Vec::new();
+                        let search_query = self.search_query.trim();
+                        let has_search_query = !search_query.is_empty();
 
 	                    match self.mode {
-                        LauncherMode::Apps => {
-                            filtered_apps = self.apps
-                                .iter()
-                                .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
-                                .filter_map(|app| {
-                                    let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
-                                    if self.search_query.is_empty() {
-                                        Some((app.clone(), 0, is_pinned))
-                                    } else {
-                                        app_search_rank(&self.search_query, app)
-                                            .map(|(distance, _)| (app.clone(), distance as i64, is_pinned))
-                                    }
-                                })
-                                .collect();
-
-                            if self.search_query.is_empty() {
-                                filtered_apps.sort_by(|a, b| {
+	                        LauncherMode::Apps => {
+	                            if !has_search_query {
+                                filtered_apps = self.apps
+                                    .iter()
+                                    .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
+                                    .map(|app| {
+                                        let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
+                                        (app.clone(), is_pinned)
+                                    })
+                                    .collect();
+	                                filtered_apps.sort_by(|a, b| {
                                     a.0.is_settings_module
                                         .cmp(&b.0.is_settings_module)
-                                        .then_with(|| match (a.2, b.2) {
+                                        .then_with(|| match (a.1, b.1) {
                                             (true, false) => std::cmp::Ordering::Less,
                                             (false, true) => std::cmp::Ordering::Greater,
                                             (true, true) => {
@@ -3169,136 +3573,247 @@ impl eframe::App for App {
                                             }
                                             (false, false) => a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()),
                                         })
-                                });
-                            } else {
-                                filtered_apps.sort_by(|a, b| {
-                                    let a_rank = app_search_rank(&self.search_query, &a.0).unwrap_or((usize::MAX, false));
-                                    let b_rank = app_search_rank(&self.search_query, &b.0).unwrap_or((usize::MAX, false));
-
-                                    a_rank
-                                        .0
-                                        .cmp(&b_rank.0)
-                                        .then_with(|| b_rank.1.cmp(&a_rank.1))
-                                        .then_with(|| match (a.2, b.2) {
-                                            (true, false) => std::cmp::Ordering::Less,
-                                            (false, true) => std::cmp::Ordering::Greater,
-                                            (true, true) => {
-                                                pinned_app_position(&self.pinned_apps, &a.0)
-                                                    .cmp(&pinned_app_position(&self.pinned_apps, &b.0))
-                                            }
-                                            (false, false) => std::cmp::Ordering::Equal,
-                                        })
-                                        .then_with(|| a.0.is_settings_module.cmp(&b.0.is_settings_module))
-                                        .then_with(|| a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()))
-                                });
-                            }
-                        }
-                        LauncherMode::Windows => {
-                            filtered_windows = self.windows
-                                .iter()
-                                .filter_map(|w| {
-                                    if self.search_query.is_empty() {
-                                        Some((w.clone(), 0))
-                                    } else {
-                                        let title_score = match_app(&self.search_query, &w.title);
-                                        let class_score = match_app(&self.search_query, &w.class)
-                                            .map(|s| s - 100);
-
-                                        let score = match (title_score, class_score) {
-                                            (Some(ts), Some(cs)) => Some(std::cmp::max(ts, cs)),
-                                            (Some(ts), None) => Some(ts),
-                                            (None, Some(cs)) => Some(cs),
-                                            (None, None) => None,
-                                        };
-
-                                        if let Some(score) = score {
-                                            Some((w.clone(), score))
+	                                });
+	                            } else if let (Some(base_query), Some(typo_query)) = (
+                                    MetadataQuery::new(search_query),
+                                    MetadataQuery::new(search_query).map(|q| q.with_typo_fallback(true)),
+                                ) {
+	                                let mut ranked_apps: Vec<RankedAppMatch> = self.apps
+	                                    .iter()
+                                    .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
+                                    .filter_map(|app| {
+                                        let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
+                                        let rank = app_search_rank(&base_query, app)?;
+                                        let pin_position = pinned_app_position(&self.pinned_apps, app);
+                                        let candidate_score = if is_pinned {
+                                            2_000_000.0 - pin_position as f64
+                                        } else if !app.is_settings_module {
+                                            1_000_000.0
                                         } else {
-                                            None
-                                        }
-                                    }
-                                })
-                                .collect();
-                            if self.search_query.is_empty() {
-                                filtered_windows.sort_by(|a, b| {
-                                    window_application_key(&a.0)
-                                        .cmp(&window_application_key(&b.0))
-                                        .then_with(|| a.0.title.to_lowercase().cmp(&b.0.title.to_lowercase()))
-                                });
-                            } else {
-                                filtered_windows.sort_by(|a, b| {
-                                    b.1.cmp(&a.1)
-                                        .then_with(|| {
-                                            window_application_key(&a.0)
-                                                .cmp(&window_application_key(&b.0))
+                                            0.0
+                                        };
+                                        Some(RankedAppMatch {
+                                            app: app.clone(),
+                                            rank,
+                                            is_pinned,
+                                            candidate_key: format!(
+                                                "{}\u{0}{}",
+                                                app.name.to_lowercase(),
+                                                app.desktop_file_path.to_string_lossy()
+                                            ),
+                                            candidate_score,
+	                                        })
+	                                    })
+	                                    .collect();
+	                                if ranked_apps.is_empty() {
+	                                    ranked_apps = self.apps
+                                        .iter()
+                                        .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
+                                        .filter_map(|app| {
+                                            let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
+	                                            let rank = app_search_rank(&typo_query, app)?;
+                                            let pin_position = pinned_app_position(&self.pinned_apps, app);
+                                            let candidate_score = if is_pinned {
+                                                2_000_000.0 - pin_position as f64
+                                            } else if !app.is_settings_module {
+                                                1_000_000.0
+                                            } else {
+                                                0.0
+                                            };
+                                            Some(RankedAppMatch {
+                                                app: app.clone(),
+                                                rank,
+                                                is_pinned,
+                                                candidate_key: format!(
+                                                    "{}\u{0}{}",
+                                                    app.name.to_lowercase(),
+                                                    app.desktop_file_path.to_string_lossy()
+                                                ),
+                                                candidate_score,
+                                            })
                                         })
-                                        .then_with(|| {
-                                            a.0.title.to_lowercase().cmp(&b.0.title.to_lowercase())
+                                        .collect();
+                                }
+                                sort_ranked_matches(
+                                    &mut ranked_apps,
+                                    |item| &item.candidate_key,
+                                    |item| item.candidate_score,
+                                    |item| &item.rank,
+                                );
+	                                filtered_apps = ranked_apps
+	                                    .into_iter()
+	                                    .map(|item| (item.app, item.is_pinned))
+	                                    .collect();
+	                            } else {
+                                    filtered_apps.clear();
+                                }
+	                        }
+	                        LauncherMode::Windows => {
+	                            if !has_search_query {
+                                filtered_windows = self.windows.clone();
+	                                filtered_windows.sort_by(|a, b| {
+                                    window_application_key(a)
+                                        .cmp(&window_application_key(b))
+                                        .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+	                                });
+	                            } else if let (Some(base_query), Some(typo_query)) = (
+                                    MetadataQuery::new(search_query),
+                                    MetadataQuery::new(search_query).map(|q| q.with_typo_fallback(true)),
+                                ) {
+	                                let mut ranked_windows: Vec<RankedWindowMatch> = self.windows
+                                    .iter()
+                                    .filter_map(|win| {
+                                        let rank = window_search_rank(&base_query, win)?;
+                                        Some(RankedWindowMatch {
+                                            window: win.clone(),
+                                            rank,
+                                            candidate_key: format!(
+                                                "{}\u{0}{}\u{0}{}",
+                                                window_application_key(win),
+                                                win.title.to_lowercase(),
+                                                win.id
+                                            ),
+                                            candidate_score: 0.0,
                                         })
-                                });
-                            }
+                                    })
+                                    .collect();
+	                                if ranked_windows.is_empty() {
+	                                    ranked_windows = self.windows
+                                        .iter()
+                                        .filter_map(|win| {
+	                                            let rank = window_search_rank(&typo_query, win)?;
+                                            Some(RankedWindowMatch {
+                                                window: win.clone(),
+                                                rank,
+                                                candidate_key: format!(
+                                                    "{}\u{0}{}\u{0}{}",
+                                                    window_application_key(win),
+                                                    win.title.to_lowercase(),
+                                                    win.id
+                                                ),
+                                                candidate_score: 0.0,
+                                            })
+                                        })
+                                        .collect();
+                                }
+                                sort_ranked_matches(
+                                    &mut ranked_windows,
+                                    |item| &item.candidate_key,
+                                    |item| item.candidate_score,
+                                    |item| &item.rank,
+                                );
+	                                filtered_windows =
+	                                    ranked_windows.into_iter().map(|item| item.window).collect();
+	                            } else {
+                                    filtered_windows.clear();
+                                }
 	                        }
 	                    }
 
-                    if self.mode == LauncherMode::Windows {
-                        filtered_apps = self.apps
-                            .iter()
-                            .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
-                            .filter_map(|app| {
-                                let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
-                                if self.search_query.is_empty() {
-                                    Some((app.clone(), 0, is_pinned))
-                                } else {
-                                    app_search_rank(&self.search_query, app)
-                                        .map(|(distance, _)| (app.clone(), distance as i64, is_pinned))
-                                }
-                            })
-                            .collect();
-
-                        if self.search_query.is_empty() {
-                            filtered_apps.sort_by(|a, b| {
-                                a.0.is_settings_module
-                                    .cmp(&b.0.is_settings_module)
-                                    .then_with(|| match (a.2, b.2) {
-                                        (true, false) => std::cmp::Ordering::Less,
-                                        (false, true) => std::cmp::Ordering::Greater,
-                                        (true, true) => {
+	                    if self.mode == LauncherMode::Windows {
+	                        if !has_search_query {
+	                            filtered_apps = self.apps
+	                                .iter()
+	                                .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
+	                                .map(|app| {
+	                                    let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
+	                                    (app.clone(), is_pinned)
+	                                })
+	                                .collect();
+	                            filtered_apps.sort_by(|a, b| {
+	                                a.0.is_settings_module
+	                                    .cmp(&b.0.is_settings_module)
+	                                    .then_with(|| match (a.1, b.1) {
+	                                        (true, false) => std::cmp::Ordering::Less,
+	                                        (false, true) => std::cmp::Ordering::Greater,
+	                                        (true, true) => {
                                             pinned_app_position(&self.pinned_apps, &a.0)
                                                 .cmp(&pinned_app_position(&self.pinned_apps, &b.0))
-                                        }
-                                        (false, false) => a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()),
-                                    })
-                            });
-                        } else {
-                            filtered_apps.sort_by(|a, b| {
-                                let a_rank = app_search_rank(&self.search_query, &a.0).unwrap_or((usize::MAX, false));
-                                let b_rank = app_search_rank(&self.search_query, &b.0).unwrap_or((usize::MAX, false));
-
-                                a_rank
-                                    .0
-                                    .cmp(&b_rank.0)
-                                    .then_with(|| b_rank.1.cmp(&a_rank.1))
-                                    .then_with(|| match (a.2, b.2) {
-                                        (true, false) => std::cmp::Ordering::Less,
-                                        (false, true) => std::cmp::Ordering::Greater,
-                                        (true, true) => {
-                                            pinned_app_position(&self.pinned_apps, &a.0)
-                                                .cmp(&pinned_app_position(&self.pinned_apps, &b.0))
-                                        }
-                                        (false, false) => std::cmp::Ordering::Equal,
-                                    })
-                                    .then_with(|| a.0.is_settings_module.cmp(&b.0.is_settings_module))
-                                    .then_with(|| a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()))
-                            });
-                        }
-                    }
-
-                    if self.mode == LauncherMode::Windows {
-                        if let Some(ref last_id) = self.last_selected_window_id {
-                            if let Some(pos) = filtered_windows.iter().position(|(w, _)| &w.id == last_id) {
-                                self.selected_index = pos;
+	                                        }
+	                                        (false, false) => a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()),
+	                                    })
+	                            });
+	                        } else if let (Some(base_query), Some(typo_query)) = (
+                                MetadataQuery::new(search_query),
+                                MetadataQuery::new(search_query).map(|q| q.with_typo_fallback(true)),
+                            ) {
+	                            let mut ranked_apps: Vec<RankedAppMatch> = self.apps
+	                                .iter()
+	                                .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
+	                                .filter_map(|app| {
+	                                    let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
+	                                    let rank = app_search_rank(&base_query, app)?;
+	                                    let pin_position = pinned_app_position(&self.pinned_apps, app);
+	                                    let candidate_score = if is_pinned {
+	                                        2_000_000.0 - pin_position as f64
+	                                    } else if !app.is_settings_module {
+	                                        1_000_000.0
+	                                    } else {
+	                                        0.0
+	                                    };
+	                                    Some(RankedAppMatch {
+	                                        app: app.clone(),
+	                                        rank,
+	                                        is_pinned,
+	                                        candidate_key: format!(
+	                                            "{}\u{0}{}",
+	                                            app.name.to_lowercase(),
+	                                            app.desktop_file_path.to_string_lossy()
+	                                        ),
+	                                        candidate_score,
+	                                    })
+	                                })
+	                                .collect();
+	                            if ranked_apps.is_empty() {
+	                                ranked_apps = self.apps
+	                                    .iter()
+	                                    .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
+	                                    .filter_map(|app| {
+	                                        let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
+	                                        let rank = app_search_rank(&typo_query, app)?;
+	                                        let pin_position = pinned_app_position(&self.pinned_apps, app);
+	                                        let candidate_score = if is_pinned {
+	                                            2_000_000.0 - pin_position as f64
+	                                        } else if !app.is_settings_module {
+	                                            1_000_000.0
+	                                        } else {
+	                                            0.0
+	                                        };
+	                                        Some(RankedAppMatch {
+	                                            app: app.clone(),
+	                                            rank,
+	                                            is_pinned,
+	                                            candidate_key: format!(
+	                                                "{}\u{0}{}",
+	                                                app.name.to_lowercase(),
+	                                                app.desktop_file_path.to_string_lossy()
+	                                            ),
+	                                            candidate_score,
+	                                        })
+	                                    })
+	                                    .collect();
+	                            }
+	                            sort_ranked_matches(
+	                                &mut ranked_apps,
+	                                |item| &item.candidate_key,
+	                                |item| item.candidate_score,
+	                                |item| &item.rank,
+	                            );
+	                            filtered_apps = ranked_apps
+	                                .into_iter()
+	                                .map(|item| (item.app, item.is_pinned))
+	                                .collect();
+	                        } else {
+                                filtered_apps.clear();
                             }
-                        }
+	                    }
+
+	                    if self.mode == LauncherMode::Windows {
+	                        if let Some(ref last_id) = self.last_selected_window_id {
+	                            if let Some(pos) = filtered_windows.iter().position(|w| &w.id == last_id) {
+	                                self.selected_index = pos;
+	                            }
+	                        }
                     }
 
                     let total_items = match self.mode {
@@ -3492,7 +4007,7 @@ impl eframe::App for App {
                                             self.launch_app_and_exit(app, ctx);
                                         }
                                     } else {
-                                        let win = &filtered_windows[self.selected_index].0;
+                                        let win = &filtered_windows[self.selected_index];
                                         self.activate_and_exit(win.id.clone(), ctx);
                                     }
                                 }
@@ -3590,7 +4105,7 @@ impl eframe::App for App {
                     }
 
 	                    // 3. Render Items ScrollArea
-	                    let list_height = (ui.available_height() - 32.0).max(100.0);
+		                    let list_height = ui.available_height().max(100.0);
 	                    let window_icon_size = egui::vec2(self.win_icon_size, self.win_icon_size);
 	                    let app_icon_size = egui::vec2(self.app_icon_size, self.app_icon_size);
                         let window_row_height = effective_list_row_height(
@@ -3666,7 +4181,14 @@ impl eframe::App for App {
 			                                        let app = &filtered_apps[index].0;
 			                                        let tile_size = self.app_icon_tile_size;
                                                 let audio_level =
-                                                    app_audio_level(app, &self.cached_sink_inputs);
+                                                    app_audio_level(
+                                                        app,
+                                                        &self.cached_sink_inputs,
+                                                        &self.active_media_app_keys,
+                                                        &self.observed_pipewire_node_ids,
+                                                        &self.active_pipewire_node_ids,
+                                                        self.pipewire_activity_cache_valid,
+                                                    );
 
                                         let (rect, response) = ui.allocate_exact_size(
                                             egui::vec2(tile_size, tile_size),
@@ -3923,7 +4445,14 @@ impl eframe::App for App {
 	                                        LauncherMode::Apps => {
 	                                            let app = &filtered_apps[index].0;
                                                 let audio_level =
-                                                    app_audio_level(app, &self.cached_sink_inputs);
+                                                    app_audio_level(
+                                                        app,
+                                                        &self.cached_sink_inputs,
+                                                        &self.active_media_app_keys,
+                                                        &self.observed_pipewire_node_ids,
+                                                        &self.active_pipewire_node_ids,
+                                                        self.pipewire_activity_cache_valid,
+                                                    );
 
 		                                            // Icon render
                                                 let (icon_rect, _) = child_ui.allocate_exact_size(
@@ -4067,13 +4596,17 @@ impl eframe::App for App {
                                             }
                                         }
 	                                        LauncherMode::Windows => {
-	                                            let win = &filtered_windows[index].0;
+	                                            let win = &filtered_windows[index];
                                                 let audio_level =
                                                     active_audio_level_for_sinks(
                                                         &find_sink_inputs_for_window(
                                                             win,
                                                             &self.cached_sink_inputs,
                                                         ),
+                                                        &self.active_media_app_keys,
+                                                        &self.observed_pipewire_node_ids,
+                                                        &self.active_pipewire_node_ids,
+                                                        self.pipewire_activity_cache_valid,
                                                     );
 
 		                                            // Icon render
@@ -4232,7 +4765,7 @@ impl eframe::App for App {
                                                 }
                                             }
                                             LauncherMode::Windows => {
-                                                let win = &filtered_windows[index].0;
+                                                let win = &filtered_windows[index];
                                                 if ui.button("Show execution chain").clicked() {
                                                     self.process_chain_popup = Some(win.clone());
                                                     ui.close();
@@ -4243,18 +4776,25 @@ impl eframe::App for App {
                                                 }
 
                                                 // Volume Control
-                                                self.update_sink_inputs_cache();
-                                                let matching_sinks = find_sink_inputs_for_window(win, &self.cached_sink_inputs);
+                                                let matching_sinks =
+                                                    dedup_sink_inputs_for_controls(
+                                                        &find_sink_inputs_for_window(
+                                                            win,
+                                                            &self.cached_sink_inputs,
+                                                        ),
+                                                    );
                                                 if !matching_sinks.is_empty() {
                                                     ui.separator();
                                                     ui.label("🔊 Volume Control");
                                                     for sink in &matching_sinks {
                                                         let sink_index = sink.index;
-                                                        let current_vol = if let Some(chan) = sink.volume.values().next() {
-                                                            chan.value_percent.trim_end_matches('%').parse::<f32>().unwrap_or(100.0)
-                                                        } else {
-                                                            100.0
-                                                        };
+                                                        let sink_process_id = sink
+                                                            .properties
+                                                            .get("application.process.id")
+                                                            .cloned();
+                                                        let current_vol =
+                                                            sink_display_volume_percent(sink)
+                                                                as f32;
                                                         let mut current_mute = sink.mute;
 
                                                         ui.horizontal(|ui| {
@@ -4262,19 +4802,57 @@ impl eframe::App for App {
                                                             let mute_label = if current_mute { "🔇" } else { "🔊" };
                                                             if ui.button(mute_label).clicked() {
                                                                 current_mute = !current_mute;
-                                                                set_sink_input_mute(sink_index, current_mute);
-                                                                if let Some(s) = self.cached_sink_inputs.iter_mut().find(|s| s.index == sink_index) {
-                                                                    s.mute = current_mute;
+                                                                for cached_sink in
+                                                                    self.cached_sink_inputs.iter_mut()
+                                                                {
+                                                                    let same_group = cached_sink.index == sink_index
+                                                                        || sink_process_id.as_ref().is_some_and(|pid| {
+                                                                            cached_sink
+                                                                                .properties
+                                                                                .get("application.process.id")
+                                                                                == Some(pid)
+                                                                        });
+                                                                    if same_group {
+                                                                        set_sink_input_mute(
+                                                                            cached_sink.index,
+                                                                            current_mute,
+                                                                        );
+                                                                        cached_sink.mute =
+                                                                            current_mute;
+                                                                    }
                                                                 }
                                                             }
 
                                                             // Volume slider
                                                             let mut vol_val = current_vol as u32;
                                                             if ui.add(egui::Slider::new(&mut vol_val, 0..=100).show_value(true)).changed() {
-                                                                set_sink_input_volume(sink_index, vol_val);
-                                                                if let Some(s) = self.cached_sink_inputs.iter_mut().find(|s| s.index == sink_index) {
-                                                                    if let Some(chan) = s.volume.values_mut().next() {
-                                                                        chan.value_percent = format!("{}%", vol_val);
+                                                                for cached_sink in
+                                                                    self.cached_sink_inputs.iter_mut()
+                                                                {
+                                                                    let same_group = cached_sink.index == sink_index
+                                                                        || sink_process_id.as_ref().is_some_and(|pid| {
+                                                                            cached_sink
+                                                                                .properties
+                                                                                .get("application.process.id")
+                                                                                == Some(pid)
+                                                                        });
+                                                                    if same_group {
+                                                                        set_sink_input_volume(
+                                                                            cached_sink.index,
+                                                                            vol_val,
+                                                                        );
+                                                                        if let Some(chan) =
+                                                                            cached_sink
+                                                                                .volume
+                                                                                .values_mut()
+                                                                                .next()
+                                                                        {
+                                                                            chan.value_percent =
+                                                                                format!(
+                                                                                    "{}%",
+                                                                                    vol_val
+                                                                                );
+                                                                        }
                                                                     }
                                                                 }
                                                             }
@@ -4299,7 +4877,7 @@ impl eframe::App for App {
 	                                            LauncherMode::Windows => {
 	                                                self.active_pane = ActivePane::Windows;
 	                                                self.selected_index = index;
-	                                                let win = &filtered_windows[index].0;
+	                                                let win = &filtered_windows[index];
 	                                                self.activate_and_exit(win.id.clone(), ctx);
 	                                            }
                                         }
@@ -4309,7 +4887,7 @@ impl eframe::App for App {
 		                                        if let LauncherMode::Windows = self.mode {
 		                                            self.active_pane = ActivePane::Windows;
 		                                            self.selected_index = index;
-		                                            let win = &filtered_windows[index].0;
+		                                            let win = &filtered_windows[index];
 		                                            self.launch_window_app_and_exit(win, ctx);
 		                                        }
 		                                    }
@@ -4369,6 +4947,10 @@ impl eframe::App for App {
                                                                         app_audio_level(
                                                                             app,
                                                                             &self.cached_sink_inputs,
+                                                                            &self.active_media_app_keys,
+                                                                            &self.observed_pipewire_node_ids,
+                                                                            &self.active_pipewire_node_ids,
+                                                                            self.pipewire_activity_cache_valid,
                                                                         );
 		                                                            let is_selected = self.active_pane == ActivePane::Apps
 	                                                                && index == self.side_panel_selected_index;
@@ -4531,6 +5113,10 @@ impl eframe::App for App {
                                                                 app_audio_level(
                                                                     app,
                                                                     &self.cached_sink_inputs,
+                                                                    &self.active_media_app_keys,
+                                                                    &self.observed_pipewire_node_ids,
+                                                                    &self.active_pipewire_node_ids,
+                                                                    self.pipewire_activity_cache_valid,
                                                                 );
 	                                                        let (rect, response) = ui.allocate_exact_size(
                                                             egui::vec2(ui.available_width(), app_row_height),
@@ -4761,7 +5347,7 @@ impl eframe::App for App {
                     }
 
                     if self.mode == LauncherMode::Windows && !filtered_windows.is_empty() {
-                        self.last_selected_window_id = filtered_windows.get(self.selected_index).map(|(w, _)| w.id.clone());
+                        self.last_selected_window_id = filtered_windows.get(self.selected_index).map(|w| w.id.clone());
                     } else {
                         self.last_selected_window_id = None;
                     }
@@ -4985,6 +5571,7 @@ fn get_monitors() -> Vec<MonitorInfo> {
 }
 
 fn main() -> eframe::Result {
+    install_panic_hook();
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() >= 7 && args[1] == "--draw-border" {
@@ -5152,6 +5739,31 @@ fn set_sink_input_mute(index: u32, mute: bool) {
     let _ = Command::new("pactl")
         .args(&["set-sink-input-mute", &index.to_string(), if mute { "1" } else { "0" }])
         .status();
+}
+
+fn sink_display_volume_percent(sink: &PactlSinkInput) -> u32 {
+    sink.volume
+        .values()
+        .next()
+        .and_then(|chan| chan.value_percent.trim_end_matches('%').parse::<u32>().ok())
+        .unwrap_or(100)
+}
+
+fn dedup_sink_inputs_for_controls(sink_inputs: &[PactlSinkInput]) -> Vec<PactlSinkInput> {
+    let mut deduped = Vec::new();
+    let mut seen_process_ids = HashSet::new();
+
+    for sink in sink_inputs {
+        if let Some(process_id) = sink.properties.get("application.process.id") {
+            if seen_process_ids.insert(process_id.clone()) {
+                deduped.push(sink.clone());
+            }
+            continue;
+        }
+        deduped.push(sink.clone());
+    }
+
+    deduped
 }
 
 fn find_sink_inputs_for_window(window: &WindowInfo, sink_inputs: &[PactlSinkInput]) -> Vec<PactlSinkInput> {
