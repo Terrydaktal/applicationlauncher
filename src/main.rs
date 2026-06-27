@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use fuzzy_rank::metadata::{
     MetadataCandidate, MetadataQuery, SearchField, dedup_push_search_field, sort_matches,
 };
@@ -183,6 +183,7 @@ struct App {
     kdotool_path: Option<PathBuf>,
     error_message: Option<String>,
     start_time: Instant,
+    search_focus_until: Option<Instant>,
     close_on_blur: bool,
     force_theme: Option<String>,
     loading: bool,
@@ -808,6 +809,28 @@ fn launch_app(exec: &str) {
     });
 }
 
+fn launch_terminal_cd(target: &str) {
+    let target = target.trim();
+    if target.is_empty() {
+        return;
+    }
+
+    let target = target.to_string();
+    std::thread::spawn(move || {
+        let mut cmd = Command::new("xfce4-terminal");
+        cmd.arg("--command")
+            .arg(r#"fish -ic 'cd "$APPLICATIONLAUNCHER_CD_TARGET"; exec fish'"#)
+            .env("APPLICATIONLAUNCHER_CD_TARGET", target);
+
+        cmd.env_remove("PYTHONPATH");
+        cmd.env_remove("PYTHONHOME");
+        cmd.env_remove("VIRTUAL_ENV");
+        cmd.env_remove("UV_ACTIVE");
+
+        let _ = cmd.spawn();
+    });
+}
+
 fn launch_desktop_entry(desktop_file_path: &Path) -> bool {
     let Some(desktop_id) = desktop_file_path.file_name().and_then(|n| n.to_str()) else {
         return false;
@@ -871,6 +894,38 @@ fn window_application_key(win: &WindowInfo) -> String {
     }
 
     String::new()
+}
+
+fn duplicate_window_title_key(win: &WindowInfo) -> Option<String> {
+    let mut title = win.title.trim();
+    if title.is_empty() {
+        return None;
+    }
+
+    for separator in [" — ", " – "] {
+        if let Some((left, right)) = title.rsplit_once(separator) {
+            let suffix_key = normalize_app_match_key(right);
+            let app_key = normalize_app_match_key(&window_application_key(win));
+            let class_key = normalize_app_match_key(&win.class);
+            if !suffix_key.is_empty()
+                && (suffix_key == app_key
+                    || suffix_key == class_key
+                    || class_key.ends_with(&suffix_key)
+                    || suffix_key.ends_with(&app_key))
+            {
+                title = left.trim();
+                break;
+            }
+        }
+    }
+
+    (!title.is_empty()).then(|| title.to_string())
+}
+
+fn window_sort_title_key(win: &WindowInfo) -> String {
+    duplicate_window_title_key(win)
+        .unwrap_or_else(|| win.title.trim().to_string())
+        .to_lowercase()
 }
 
 fn command_basename(exec: &str) -> Option<String> {
@@ -2411,6 +2466,7 @@ impl App {
         let use_kwin_window_feed = kwin_window_feed_error.is_none();
         let audio_repaint_ctx = cc.egui_ctx.clone();
 
+        let now = Instant::now();
         let mut app = Self {
             mode,
             windows: Vec::new(),
@@ -2431,7 +2487,8 @@ impl App {
             scroll_to_first_window_on_focus: false,
             kdotool_path: Some(kdotool_path),
             error_message: None,
-            start_time: Instant::now(),
+            start_time: now,
+            search_focus_until: Some(now + Duration::from_millis(1200)),
             close_on_blur,
             force_theme,
             loading: false,
@@ -3385,6 +3442,7 @@ impl eframe::App for App {
                         egui::UserAttentionType::Informational,
                     ));
                     request_launcher_foreground();
+                    self.search_focus_until = Some(Instant::now() + Duration::from_millis(1200));
                     self.search_query.clear();
                     self.selected_index = 0;
                     self.side_panel_selected_index = 0;
@@ -3535,10 +3593,17 @@ impl eframe::App for App {
                         });
                     });
 
-                    // Force focus on text edit at launch
+                    // KWin may raise the window a few frames after we request it.
+                    // Keep retrying briefly so shortcut activation lands in search.
                     if let Some(ref resp) = text_edit_response {
-                        if self.start_time.elapsed().as_millis() < 400 && !self.show_settings_menu {
+                        if self
+                            .search_focus_until
+                            .is_some_and(|deadline| Instant::now() <= deadline)
+                            && !self.show_settings_menu
+                        {
                             resp.request_focus();
+                        } else {
+                            self.search_focus_until = None;
                         }
                     }
 
@@ -3547,7 +3612,7 @@ impl eframe::App for App {
 	                    // 2. Filtering list
 	                    let mut filtered_apps: Vec<(AppInfo, bool)> = Vec::new();
 	                    let mut filtered_windows: Vec<WindowInfo> = Vec::new();
-                        let search_query = self.search_query.trim();
+                        let search_query = self.search_query.trim().to_string();
                         let has_search_query = !search_query.is_empty();
 
 	                    match self.mode {
@@ -3575,8 +3640,8 @@ impl eframe::App for App {
                                         })
 	                                });
 	                            } else if let (Some(base_query), Some(typo_query)) = (
-                                    MetadataQuery::new(search_query),
-                                    MetadataQuery::new(search_query).map(|q| q.with_typo_fallback(true)),
+                                    MetadataQuery::new(&search_query),
+                                    MetadataQuery::new(&search_query).map(|q| q.with_typo_fallback(true)),
                                 ) {
 	                                let mut ranked_apps: Vec<RankedAppMatch> = self.apps
 	                                    .iter()
@@ -3654,11 +3719,14 @@ impl eframe::App for App {
 	                                filtered_windows.sort_by(|a, b| {
                                     window_application_key(a)
                                         .cmp(&window_application_key(b))
-                                        .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+                                        .then_with(|| {
+                                            window_sort_title_key(a).cmp(&window_sort_title_key(b))
+                                        })
+                                        .then_with(|| a.id.cmp(&b.id))
 	                                });
 	                            } else if let (Some(base_query), Some(typo_query)) = (
-                                    MetadataQuery::new(search_query),
-                                    MetadataQuery::new(search_query).map(|q| q.with_typo_fallback(true)),
+                                    MetadataQuery::new(&search_query),
+                                    MetadataQuery::new(&search_query).map(|q| q.with_typo_fallback(true)),
                                 ) {
 	                                let mut ranked_windows: Vec<RankedWindowMatch> = self.windows
                                     .iter()
@@ -3670,7 +3738,7 @@ impl eframe::App for App {
                                             candidate_key: format!(
                                                 "{}\u{0}{}\u{0}{}",
                                                 window_application_key(win),
-                                                win.title.to_lowercase(),
+                                                window_sort_title_key(win),
                                                 win.id
                                             ),
                                             candidate_score: 0.0,
@@ -3688,7 +3756,7 @@ impl eframe::App for App {
                                                 candidate_key: format!(
                                                     "{}\u{0}{}\u{0}{}",
                                                     window_application_key(win),
-                                                    win.title.to_lowercase(),
+                                                    window_sort_title_key(win),
                                                     win.id
                                                 ),
                                                 candidate_score: 0.0,
@@ -3734,8 +3802,8 @@ impl eframe::App for App {
 	                                    })
 	                            });
 	                        } else if let (Some(base_query), Some(typo_query)) = (
-                                MetadataQuery::new(search_query),
-                                MetadataQuery::new(search_query).map(|q| q.with_typo_fallback(true)),
+                                MetadataQuery::new(&search_query),
+                                MetadataQuery::new(&search_query).map(|q| q.with_typo_fallback(true)),
                             ) {
 	                            let mut ranked_apps: Vec<RankedAppMatch> = self.apps
 	                                .iter()
@@ -3816,9 +3884,15 @@ impl eframe::App for App {
 	                        }
                     }
 
+                    let show_terminal_cd_result =
+                        self.mode == LauncherMode::Windows && has_search_query;
+                    let terminal_cd_result_index = filtered_windows.len();
+
                     let total_items = match self.mode {
                         LauncherMode::Apps => filtered_apps.len(),
-                        LauncherMode::Windows => filtered_windows.len(),
+                        LauncherMode::Windows => {
+                            filtered_windows.len() + usize::from(show_terminal_cd_result)
+                        }
                     };
 
                     // Safety bounds check for list changes (run early to prevent index out of bounds)
@@ -3828,6 +3902,20 @@ impl eframe::App for App {
                     if self.side_panel_selected_index >= filtered_apps.len() {
                         self.side_panel_selected_index = 0;
                     }
+
+                    let duplicate_window_titles: HashMap<String, usize> = if self.mode
+                        == LauncherMode::Windows
+                    {
+                        let mut counts = HashMap::new();
+                        for window in &filtered_windows {
+                            if let Some(title) = duplicate_window_title_key(window) {
+                                *counts.entry(title).or_insert(0) += 1;
+                            }
+                        }
+                        counts
+                    } else {
+                        HashMap::new()
+                    };
 
                     let render_side_panel = self.mode == LauncherMode::Windows;
                     let mut scroll_to_selected = false;
@@ -4006,6 +4094,11 @@ impl eframe::App for App {
                                         {
                                             self.launch_app_and_exit(app, ctx);
                                         }
+                                    } else if show_terminal_cd_result
+                                        && self.selected_index == terminal_cd_result_index
+                                    {
+                                        launch_terminal_cd(&search_query);
+                                        ctx.request_repaint();
                                     } else {
                                         let win = &filtered_windows[self.selected_index];
                                         self.activate_and_exit(win.id.clone(), ctx);
@@ -4370,12 +4463,27 @@ impl eframe::App for App {
 	                            .show(ui, |ui| {
                                     let previous_item_spacing = ui.spacing().item_spacing;
                                     ui.spacing_mut().item_spacing.y = 0.0;
-			                                for index in 0..total_items {
-		                                    let is_selected = index == self.selected_index
-		                                        && (self.mode == LauncherMode::Apps
-		                                            || self.active_pane == ActivePane::Windows);
+				                                for index in 0..total_items {
+                                            let is_terminal_cd_row = self.mode
+                                                == LauncherMode::Windows
+                                                && show_terminal_cd_result
+                                                && index == terminal_cd_result_index;
+			                                    let is_selected = index == self.selected_index
+			                                        && (self.mode == LauncherMode::Apps
+			                                            || self.active_pane == ActivePane::Windows);
+                                            let has_duplicate_window_title = self.mode
+                                                == LauncherMode::Windows
+                                                && filtered_windows
+                                                    .get(index)
+                                                    .and_then(duplicate_window_title_key)
+                                                    .and_then(|title| {
+                                                        duplicate_window_titles
+                                                            .get(&title)
+                                                            .copied()
+                                                    })
+                                                    .is_some_and(|count| count > 1);
 
-	                                    let (rect, response) = ui.allocate_exact_size(
+		                                    let (rect, response) = ui.allocate_exact_size(
 	                                        egui::vec2(ui.available_width(), row_height),
 	                                        egui::Sense::click(),
 	                                    );
@@ -4388,13 +4496,19 @@ impl eframe::App for App {
                                          response.scroll_to_me(None);
                                      }
 
-	                                    let bg_color = if is_selected {
-	                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18)
-	                                    } else if response.hovered() {
-	                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 9)
-	                                    } else {
-	                                        egui::Color32::TRANSPARENT
-	                                    };
+		                                    let bg_color = if is_selected && has_duplicate_window_title {
+		                                        egui::Color32::from_rgba_unmultiplied(255, 214, 92, 48)
+		                                    } else if is_selected {
+		                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18)
+		                                    } else if has_duplicate_window_title && response.hovered() {
+		                                        egui::Color32::from_rgba_unmultiplied(255, 214, 92, 42)
+		                                    } else if has_duplicate_window_title {
+		                                        egui::Color32::from_rgba_unmultiplied(255, 214, 92, 30)
+		                                    } else if response.hovered() {
+		                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 9)
+		                                    } else {
+		                                        egui::Color32::TRANSPARENT
+		                                    };
 
                                     ui.painter().rect_filled(
                                         row_visual_rect,
@@ -4594,12 +4708,78 @@ impl eframe::App for App {
                                             if label_clicked {
                                                 self.launch_app_and_exit(app, ctx);
                                             }
-                                        }
-	                                        LauncherMode::Windows => {
-	                                            let win = &filtered_windows[index];
-                                                let audio_level =
-                                                    active_audio_level_for_sinks(
-                                                        &find_sink_inputs_for_window(
+	                                        }
+		                                        LauncherMode::Windows => {
+                                                if is_terminal_cd_row {
+                                                    let (icon_rect, _) = child_ui.allocate_exact_size(
+                                                        window_icon_size,
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    child_ui.painter().rect_filled(
+                                                        icon_rect.shrink(2.0),
+                                                        egui::CornerRadius::same(5),
+                                                        egui::Color32::from_rgba_unmultiplied(
+                                                            61, 174, 233, 45,
+                                                        ),
+                                                    );
+                                                    child_ui.painter().rect_stroke(
+                                                        icon_rect.shrink(2.0),
+                                                        egui::CornerRadius::same(5),
+                                                        egui::Stroke::new(
+                                                            1.0,
+                                                            egui::Color32::from_rgba_unmultiplied(
+                                                                61, 174, 233, 120,
+                                                            ),
+                                                        ),
+                                                        egui::StrokeKind::Inside,
+                                                    );
+                                                    child_ui.painter().text(
+                                                        icon_rect.center(),
+                                                        egui::Align2::CENTER_CENTER,
+                                                        ">_",
+                                                        egui::FontId::monospace(15.0),
+                                                        egui::Color32::from_rgba_unmultiplied(
+                                                            255, 255, 255, 220,
+                                                        ),
+                                                    );
+                                                    child_ui.add_space(10.0);
+
+                                                    if self.win_show_path {
+                                                        child_ui.vertical(|ui| {
+                                                            ui.spacing_mut().item_spacing.y = 0.0;
+                                                            ui.label(
+                                                                egui::RichText::new("cd in Terminal")
+                                                                    .color(egui::Color32::WHITE)
+                                                                    .strong()
+                                                                    .size(self.win_title_size)
+                                                                    .line_height(Some(self.win_line_height)),
+                                                            );
+                                                            ui.add_space(self.win_text_spacing);
+                                                            ui.label(
+                                                                egui::RichText::new(&search_query)
+                                                                    .color(egui::Color32::from_rgba_unmultiplied(
+                                                                        255, 255, 255, 130,
+                                                                    ))
+                                                                    .size(self.win_path_size)
+                                                                    .line_height(Some(
+                                                                        self.win_line_height * 0.8,
+                                                                    )),
+                                                            );
+                                                        });
+                                                    } else {
+                                                        child_ui.label(
+                                                            egui::RichText::new("cd in Terminal")
+                                                                .color(egui::Color32::WHITE)
+                                                                .strong()
+                                                                .size(self.win_title_size)
+                                                                .line_height(Some(self.win_line_height)),
+                                                        );
+                                                    }
+                                                } else {
+		                                            let win = &filtered_windows[index];
+	                                                let audio_level =
+	                                                    active_audio_level_for_sinks(
+	                                                        &find_sink_inputs_for_window(
                                                             win,
                                                             &self.cached_sink_inputs,
                                                         ),
@@ -4711,14 +4891,15 @@ impl eframe::App for App {
                                                     .sense(egui::Sense::hover())
                                                     .truncate(),
                                                 );
-                                                if self.disable_ibeam && title_response.hovered() {
-                                                    child_ui
-                                                        .ctx()
-                                                        .set_cursor_icon(egui::CursorIcon::Default);
+	                                                if self.disable_ibeam && title_response.hovered() {
+	                                                    child_ui
+	                                                        .ctx()
+	                                                        .set_cursor_icon(egui::CursorIcon::Default);
+	                                                }
+	                                            }
                                                 }
-                                            }
-                                        }
-                                    }
+	                                        }
+	                                    }
 
                                     let overlay_response = ui.interact(
                                         rect,
@@ -4726,168 +4907,178 @@ impl eframe::App for App {
                                         egui::Sense::click(),
                                     );
 
-                                    overlay_response.clone().context_menu(|ui| {
-                                        match self.mode {
-                                            LauncherMode::Apps => {
-                                                let app = &filtered_apps[index].0;
-                                                let path = app.desktop_file_path.clone();
-                                                let is_pinned = self.pinned_apps.contains(&path);
-                                                let label = if is_pinned { "📌 Unpin application" } else { "📌 Pin application" };
-                                                if ui.button(label).clicked() {
+                                    if !is_terminal_cd_row {
+                                        overlay_response.clone().context_menu(|ui| {
+                                            match self.mode {
+                                                LauncherMode::Apps => {
+                                                    let app = &filtered_apps[index].0;
+                                                    let path = app.desktop_file_path.clone();
+                                                    let is_pinned = self.pinned_apps.contains(&path);
+                                                    let label = if is_pinned { "📌 Unpin application" } else { "📌 Pin application" };
+                                                    if ui.button(label).clicked() {
+                                                        if is_pinned {
+                                                            if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
+                                                                self.pinned_apps.remove(pos);
+                                                            }
+                                                        } else {
+                                                            self.pinned_apps.push(path.clone());
+                                                        }
+                                                        self.save_pinned_apps();
+                                                        ui.close();
+                                                    }
+
                                                     if is_pinned {
                                                         if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
-                                                            self.pinned_apps.remove(pos);
-                                                        }
-                                                    } else {
-                                                        self.pinned_apps.push(path.clone());
-                                                    }
-                                                    self.save_pinned_apps();
-                                                    ui.close();
-                                                }
-
-                                                if is_pinned {
-                                                    if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
-                                                        if pos > 0 {
-                                                            if ui.button("⬆ Move up").clicked() {
-                                                                self.pinned_apps.swap(pos, pos - 1);
-                                                                self.save_pinned_apps();
-                                                                ui.close();
-                                                            }
-                                                        }
-                                                        if pos + 1 < self.pinned_apps.len() {
-                                                            if ui.button("⬇ Move down").clicked() {
-                                                                self.pinned_apps.swap(pos, pos + 1);
-                                                                self.save_pinned_apps();
-                                                                ui.close();
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            LauncherMode::Windows => {
-                                                let win = &filtered_windows[index];
-                                                if ui.button("Show execution chain").clicked() {
-                                                    self.process_chain_popup = Some(win.clone());
-                                                    ui.close();
-                                                }
-                                                if ui.button("Close application").clicked() {
-                                                    self.close_window_and_exit(win.id.clone(), ctx);
-                                                    ui.close();
-                                                }
-
-                                                // Volume Control
-                                                let matching_sinks =
-                                                    dedup_sink_inputs_for_controls(
-                                                        &find_sink_inputs_for_window(
-                                                            win,
-                                                            &self.cached_sink_inputs,
-                                                        ),
-                                                    );
-                                                if !matching_sinks.is_empty() {
-                                                    ui.separator();
-                                                    ui.label("🔊 Volume Control");
-                                                    for sink in &matching_sinks {
-                                                        let sink_index = sink.index;
-                                                        let sink_process_id = sink
-                                                            .properties
-                                                            .get("application.process.id")
-                                                            .cloned();
-                                                        let current_vol =
-                                                            sink_display_volume_percent(sink)
-                                                                as f32;
-                                                        let mut current_mute = sink.mute;
-
-                                                        ui.horizontal(|ui| {
-                                                            // Mute button
-                                                            let mute_label = if current_mute { "🔇" } else { "🔊" };
-                                                            if ui.button(mute_label).clicked() {
-                                                                current_mute = !current_mute;
-                                                                for cached_sink in
-                                                                    self.cached_sink_inputs.iter_mut()
-                                                                {
-                                                                    let same_group = cached_sink.index == sink_index
-                                                                        || sink_process_id.as_ref().is_some_and(|pid| {
-                                                                            cached_sink
-                                                                                .properties
-                                                                                .get("application.process.id")
-                                                                                == Some(pid)
-                                                                        });
-                                                                    if same_group {
-                                                                        set_sink_input_mute(
-                                                                            cached_sink.index,
-                                                                            current_mute,
-                                                                        );
-                                                                        cached_sink.mute =
-                                                                            current_mute;
-                                                                    }
+                                                            if pos > 0 {
+                                                                if ui.button("⬆ Move up").clicked() {
+                                                                    self.pinned_apps.swap(pos, pos - 1);
+                                                                    self.save_pinned_apps();
+                                                                    ui.close();
                                                                 }
                                                             }
+                                                            if pos + 1 < self.pinned_apps.len() {
+                                                                if ui.button("⬇ Move down").clicked() {
+                                                                    self.pinned_apps.swap(pos, pos + 1);
+                                                                    self.save_pinned_apps();
+                                                                    ui.close();
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                LauncherMode::Windows => {
+                                                    let win = &filtered_windows[index];
+                                                    if ui.button("Show execution chain").clicked() {
+                                                        self.process_chain_popup = Some(win.clone());
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Close application").clicked() {
+                                                        self.close_window_and_exit(win.id.clone(), ctx);
+                                                        ui.close();
+                                                    }
 
-                                                            // Volume slider
-                                                            let mut vol_val = current_vol as u32;
-                                                            if ui.add(egui::Slider::new(&mut vol_val, 0..=100).show_value(true)).changed() {
-                                                                for cached_sink in
-                                                                    self.cached_sink_inputs.iter_mut()
-                                                                {
-                                                                    let same_group = cached_sink.index == sink_index
-                                                                        || sink_process_id.as_ref().is_some_and(|pid| {
-                                                                            cached_sink
-                                                                                .properties
-                                                                                .get("application.process.id")
-                                                                                == Some(pid)
-                                                                        });
-                                                                    if same_group {
-                                                                        set_sink_input_volume(
-                                                                            cached_sink.index,
-                                                                            vol_val,
-                                                                        );
-                                                                        if let Some(chan) =
-                                                                            cached_sink
-                                                                                .volume
-                                                                                .values_mut()
-                                                                                .next()
-                                                                        {
-                                                                            chan.value_percent =
-                                                                                format!(
-                                                                                    "{}%",
-                                                                                    vol_val
-                                                                                );
+                                                    // Volume Control
+                                                    let matching_sinks =
+                                                        dedup_sink_inputs_for_controls(
+                                                            &find_sink_inputs_for_window(
+                                                                win,
+                                                                &self.cached_sink_inputs,
+                                                            ),
+                                                        );
+                                                    if !matching_sinks.is_empty() {
+                                                        ui.separator();
+                                                        ui.label("🔊 Volume Control");
+                                                        for sink in &matching_sinks {
+                                                            let sink_index = sink.index;
+                                                            let sink_process_id = sink
+                                                                .properties
+                                                                .get("application.process.id")
+                                                                .cloned();
+                                                            let current_vol =
+                                                                sink_display_volume_percent(sink)
+                                                                    as f32;
+                                                            let mut current_mute = sink.mute;
+
+                                                            ui.horizontal(|ui| {
+                                                                // Mute button
+                                                                let mute_label = if current_mute { "🔇" } else { "🔊" };
+                                                                if ui.button(mute_label).clicked() {
+                                                                    current_mute = !current_mute;
+                                                                    for cached_sink in
+                                                                        self.cached_sink_inputs.iter_mut()
+                                                                    {
+                                                                        let same_group = cached_sink.index == sink_index
+                                                                            || sink_process_id.as_ref().is_some_and(|pid| {
+                                                                                cached_sink
+                                                                                    .properties
+                                                                                    .get("application.process.id")
+                                                                                    == Some(pid)
+                                                                            });
+                                                                        if same_group {
+                                                                            set_sink_input_mute(
+                                                                                cached_sink.index,
+                                                                                current_mute,
+                                                                            );
+                                                                            cached_sink.mute =
+                                                                                current_mute;
                                                                         }
                                                                     }
                                                                 }
-                                                            }
-                                                        });
+
+                                                                // Volume slider
+                                                                let mut vol_val = current_vol as u32;
+                                                                if ui.add(egui::Slider::new(&mut vol_val, 0..=100).show_value(true)).changed() {
+                                                                    for cached_sink in
+                                                                        self.cached_sink_inputs.iter_mut()
+                                                                    {
+                                                                        let same_group = cached_sink.index == sink_index
+                                                                            || sink_process_id.as_ref().is_some_and(|pid| {
+                                                                                cached_sink
+                                                                                    .properties
+                                                                                    .get("application.process.id")
+                                                                                    == Some(pid)
+                                                                            });
+                                                                        if same_group {
+                                                                            set_sink_input_volume(
+                                                                                cached_sink.index,
+                                                                                vol_val,
+                                                                            );
+                                                                            if let Some(chan) =
+                                                                                cached_sink
+                                                                                    .volume
+                                                                                    .values_mut()
+                                                                                    .next()
+                                                                            {
+                                                                                chan.value_percent =
+                                                                                    format!(
+                                                                                        "{}%",
+                                                                                        vol_val
+                                                                                    );
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            });
+                                                        }
                                                     }
                                                 }
                                             }
-                                        }
-                                    });
+                                        });
+                                    }
 
 	                                    if overlay_response.hovered() {
 	                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
 	                                    }
 
-	                                    if overlay_response.clicked() {
-	                                        match self.mode {
-	                                            LauncherMode::Apps => {
-	                                                self.selected_index = index;
-	                                                let app = &filtered_apps[index].0;
-	                                                self.launch_app_and_exit(app, ctx);
-	                                            }
-	                                            LauncherMode::Windows => {
-	                                                self.active_pane = ActivePane::Windows;
-	                                                self.selected_index = index;
-	                                                let win = &filtered_windows[index];
-	                                                self.activate_and_exit(win.id.clone(), ctx);
-	                                            }
-                                        }
-                                    }
+		                                    if overlay_response.clicked() {
+		                                        match self.mode {
+		                                            LauncherMode::Apps => {
+		                                                self.selected_index = index;
+		                                                let app = &filtered_apps[index].0;
+		                                                self.launch_app_and_exit(app, ctx);
+		                                            }
+		                                            LauncherMode::Windows => {
+		                                                self.active_pane = ActivePane::Windows;
+		                                                self.selected_index = index;
+                                                    if is_terminal_cd_row {
+                                                        launch_terminal_cd(&search_query);
+                                                        ctx.request_repaint();
+                                                    } else {
+		                                                let win = &filtered_windows[index];
+		                                                self.activate_and_exit(win.id.clone(), ctx);
+                                                    }
+		                                            }
+	                                        }
+		                                    }
 
-		                                    if overlay_response.middle_clicked() {
-		                                        if let LauncherMode::Windows = self.mode {
-		                                            self.active_pane = ActivePane::Windows;
-		                                            self.selected_index = index;
-		                                            let win = &filtered_windows[index];
+			                                    if overlay_response.middle_clicked() {
+			                                        if let LauncherMode::Windows = self.mode {
+                                                if is_terminal_cd_row {
+                                                    continue;
+                                                }
+			                                            self.active_pane = ActivePane::Windows;
+			                                            self.selected_index = index;
+			                                            let win = &filtered_windows[index];
 		                                            self.launch_window_app_and_exit(win, ctx);
 		                                        }
 		                                    }
