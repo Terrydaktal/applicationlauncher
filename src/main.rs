@@ -20,12 +20,17 @@ const KWIN_WINDOW_FEED_METADATA: &str =
     include_str!("../kwin/applicationlauncher-window-feed/metadata.json");
 const KWIN_WINDOW_FEED_MAIN_JS: &str =
     include_str!("../kwin/applicationlauncher-window-feed/contents/code/main.js");
+const ATSPI_LOCATION_PROBE: &str = include_str!("atspi_location_probe.py");
 const AUDIO_SINK_POLL_MS: u128 = 200;
 const AUDIO_ACTIVITY_GRACE_MS: u128 = 350;
 const PIPEWIRE_ACTIVE_US_THRESHOLD: f32 = 10.0;
 const PIPEWIRE_ACTIVE_TOTAL_US_THRESHOLD: f32 = 20.0;
 const AUDIO_IDLE_REPAINT_MS: u64 = 200;
 const AUDIO_ACTIVE_REPAINT_MS: u64 = 80;
+const WINDOW_FEED_EVENTS_PER_FRAME: usize = 64;
+const WINDOW_SNAPSHOTS_PER_FRAME: usize = 4;
+const AUDIO_UPDATES_PER_FRAME: usize = 32;
+const UI_EVENTS_PER_FRAME: usize = 8;
 
 #[derive(Clone, Debug)]
 struct ProcessChainEntry {
@@ -815,12 +820,47 @@ fn launch_terminal_cd(target: &str) {
         return;
     }
 
-    let target = target.to_string();
+    launch_fish_terminal(Some(target.to_string()), None, None);
+}
+
+fn launch_fish_terminal(
+    cd_target: Option<String>,
+    command_after_cd: Option<&'static str>,
+    terminal_title: Option<String>,
+) {
     std::thread::spawn(move || {
+        let title_command = if terminal_title.is_some() {
+            r#"printf '\e]0;%s\a' "$APPLICATIONLAUNCHER_TERMINAL_TITLE"; "#
+        } else {
+            ""
+        };
+        let fish_command = match command_after_cd {
+            Some(command) => format!(
+                r#"{title_command}if test -n "$APPLICATIONLAUNCHER_CD_TARGET"; cd "$APPLICATIONLAUNCHER_CD_TARGET"; end; {command}; exec fish"#
+            ),
+            None => {
+                format!(
+                    r#"{title_command}if test -n "$APPLICATIONLAUNCHER_CD_TARGET"; cd "$APPLICATIONLAUNCHER_CD_TARGET"; end; exec fish"#
+                )
+            }
+        };
+
         let mut cmd = Command::new("xfce4-terminal");
+        if let Some(title) = terminal_title {
+            cmd.arg("--title")
+                .arg(&title)
+                .env("APPLICATIONLAUNCHER_TERMINAL_TITLE", title);
+        } else {
+            cmd.env("APPLICATIONLAUNCHER_TERMINAL_TITLE", "");
+        }
         cmd.arg("--command")
-            .arg(r#"fish -ic 'cd "$APPLICATIONLAUNCHER_CD_TARGET"; exec fish'"#)
-            .env("APPLICATIONLAUNCHER_CD_TARGET", target);
+            .arg(format!("fish -ic '{}'", fish_command));
+
+        if let Some(target) = cd_target {
+            cmd.env("APPLICATIONLAUNCHER_CD_TARGET", target);
+        } else {
+            cmd.env("APPLICATIONLAUNCHER_CD_TARGET", "");
+        }
 
         cmd.env_remove("PYTHONPATH");
         cmd.env_remove("PYTHONHOME");
@@ -829,6 +869,371 @@ fn launch_terminal_cd(target: &str) {
 
         let _ = cmd.spawn();
     });
+}
+
+fn launch_terminal_window() {
+    std::thread::spawn(move || {
+        let mut cmd = Command::new("xfce4-terminal");
+        cmd.env_remove("PYTHONPATH");
+        cmd.env_remove("PYTHONHOME");
+        cmd.env_remove("VIRTUAL_ENV");
+        cmd.env_remove("UV_ACTIVE");
+        let _ = cmd.spawn();
+    });
+}
+
+fn scrub_command_env(command: &mut Command) {
+    command.env_remove("PYTHONPATH");
+    command.env_remove("PYTHONHOME");
+    command.env_remove("VIRTUAL_ENV");
+    command.env_remove("UV_ACTIVE");
+}
+
+fn clone_terminal_command_for_window(win: &WindowInfo) -> Option<&'static str> {
+    let mut values = vec![win.title.as_str(), win.class.as_str()];
+    if let Some(process) = win.active_process.as_deref() {
+        values.push(process);
+    }
+    for entry in &win.process_chain {
+        values.push(&entry.name);
+    }
+
+    let matches = |needle: &str| {
+        values
+            .iter()
+            .any(|value| normalize_app_match_key(value).contains(needle))
+    };
+
+    if matches("codex") {
+        Some("codex resume --last")
+    } else if matches("agy") {
+        Some("agy -c")
+    } else if matches("htop") {
+        Some("htop")
+    } else {
+        None
+    }
+}
+
+fn source_terminal_title_for_clone(win: &WindowInfo) -> String {
+    let Some(proc_name) = win.active_process.as_deref() else {
+        return win.title.clone();
+    };
+    let proc_key = normalize_app_match_key(proc_name);
+    if proc_key.is_empty() {
+        return win.title.clone();
+    }
+
+    for sep in [" - ", " — ", " – ", " : ", " | "] {
+        let parts: Vec<&str> = win.title.split(sep).collect();
+        if parts.len() >= 3 && normalize_app_match_key(parts[1]) == proc_key {
+            let mut rebuilt = Vec::with_capacity(parts.len() - 1);
+            rebuilt.push(parts[0].trim());
+            rebuilt.extend(parts.iter().skip(2).map(|part| part.trim()));
+            return rebuilt.join(sep);
+        }
+    }
+
+    win.title.clone()
+}
+
+fn is_chrome_like_window(win: &WindowInfo) -> bool {
+    let mut values = vec![win.class.as_str()];
+    if let Some(process) = win.active_process.as_deref() {
+        values.push(process);
+    }
+    if let Some(path) = &win.exe_path {
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            values.push(name);
+        }
+    }
+
+    values.iter().any(|value| {
+        matches!(
+            normalize_app_match_key(value).as_str(),
+            "googlechrome" | "chrome" | "chromium" | "chromiumbrowser"
+        )
+    })
+}
+
+fn is_pcmanfm_window(win: &WindowInfo) -> bool {
+    let mut values = vec![win.class.as_str(), win.title.as_str()];
+    if let Some(process) = win.active_process.as_deref() {
+        values.push(process);
+    }
+    if let Some(path) = &win.exe_path {
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            values.push(name);
+        }
+    }
+
+    values
+        .iter()
+        .any(|value| normalize_app_match_key(value).contains("pcmanfm"))
+}
+
+fn is_pcmanfm_class(class_lower: &str) -> bool {
+    normalize_app_match_key(class_lower).contains("pcmanfm")
+}
+
+fn is_dolphin_window(win: &WindowInfo) -> bool {
+    let mut values = vec![win.class.as_str(), win.title.as_str()];
+    if let Some(process) = win.active_process.as_deref() {
+        values.push(process);
+    }
+    if let Some(path) = &win.exe_path {
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            values.push(name);
+        }
+    }
+
+    values
+        .iter()
+        .any(|value| normalize_app_match_key(value).contains("dolphin"))
+}
+
+fn extract_url_from_text(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .find(|token| token.starts_with("http://") || token.starts_with("https://"))
+        .map(|token| token.trim_matches(|c: char| matches!(c, '"' | '\'' | ')' | ']' | '}' | ',' | ';')).to_string())
+        .filter(|url| !url.is_empty())
+}
+
+fn clone_chrome_window(win: &WindowInfo) -> bool {
+    let Some(url) = extract_url_from_text(&win.title) else {
+        return false;
+    };
+
+    let mut command = if let Some(exe) = &win.exe_path {
+        Command::new(exe)
+    } else {
+        Command::new("google-chrome")
+    };
+    command.arg("--new-window").arg(url);
+    command.env_remove("PYTHONPATH");
+    command.env_remove("PYTHONHOME");
+    command.env_remove("VIRTUAL_ENV");
+    command.env_remove("UV_ACTIVE");
+    command.spawn().is_ok()
+}
+
+fn expand_display_path_candidate(value: &str) -> Option<PathBuf> {
+    let trimmed = value
+        .trim()
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | ')' | ']' | '}' | ',' | ';'));
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        let home = std::env::var("HOME").ok()?;
+        return Some(PathBuf::from(home).join(rest));
+    }
+
+    if trimmed == "~" {
+        return std::env::var("HOME").ok().map(PathBuf::from);
+    }
+
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() {
+        return Some(path);
+    }
+
+    if trimmed.contains('/') {
+        let home = std::env::var("HOME").ok()?;
+        return Some(PathBuf::from(home).join(trimmed));
+    }
+
+    None
+}
+
+fn normalize_file_manager_target(value: &str) -> Option<String> {
+    let trimmed = value
+        .trim()
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | ')' | ']' | '}' | ',' | ';'));
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains(['\n', '\r', '\t']) || trimmed.contains("No such file or directory") {
+        return None;
+    }
+    if trimmed.contains("://") {
+        return Some(trimmed.to_string());
+    }
+    let path = expand_display_path_candidate(trimmed)?;
+    if path.is_dir() {
+        Some(path.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+fn accessible_location_for_window(win: &WindowInfo) -> Option<String> {
+    let mut command = Command::new("python3");
+    command.arg("-c").arg(ATSPI_LOCATION_PROBE);
+    if let Some(pid) = win.pid {
+        command.arg("--pid").arg(pid.to_string());
+    }
+    command.arg("--title").arg(&win.title);
+    command.arg("--class").arg(&win.class);
+    scrub_command_env(&mut command);
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout);
+    let line = value.lines().map(str::trim).find(|line| !line.is_empty())?;
+    normalize_file_manager_target(line)
+}
+
+fn pcmanfm_path_from_title(title: &str) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    candidates.push(title.trim());
+
+    for separator in [" — ", " – ", " - ", " : ", " | "] {
+        candidates.extend(title.split(separator).map(str::trim));
+    }
+
+    candidates
+        .into_iter()
+        .find_map(expand_display_path_candidate)
+        .filter(|path| path.is_dir())
+}
+
+fn pcmanfm_location_hint_from_title(title: &str) -> Option<String> {
+    for part in title
+        .split(['—', '–'])
+        .flat_map(|part| part.split(" - "))
+        .map(str::trim)
+    {
+        if part.is_empty()
+            || part.contains(['\n', '\r', '\t'])
+            || part.contains("No such file or directory")
+            || normalize_app_match_key(part).contains("pcmanfm")
+        {
+            continue;
+        }
+        if expand_display_path_candidate(part).is_some() {
+            continue;
+        }
+        if part.contains('/')
+            || part.starts_with('.')
+            || part.starts_with('(')
+            || part.contains("://")
+        {
+            continue;
+        }
+        return Some(part.to_string());
+    }
+
+    None
+}
+
+fn clone_pcmanfm_with_fish_cd(target_hint: String) {
+    std::thread::spawn(move || {
+        let fallback_target = if normalize_app_match_key(&target_hint) == "trash" {
+            "trash:///".to_string()
+        } else {
+            target_hint.clone()
+        };
+        let mut cmd = Command::new("fish");
+        cmd.arg("-ic")
+            .arg(
+                r#"if cd "$APPLICATIONLAUNCHER_PCMANFM_TARGET"; pcmanfm --new-win "$PWD"; else; pcmanfm --new-win "$APPLICATIONLAUNCHER_PCMANFM_FALLBACK"; end"#,
+            )
+            .env("APPLICATIONLAUNCHER_PCMANFM_TARGET", target_hint)
+            .env("APPLICATIONLAUNCHER_PCMANFM_FALLBACK", fallback_target);
+        scrub_command_env(&mut cmd);
+        let _ = cmd.spawn();
+    });
+}
+
+fn launch_pcmanfm_target(exe_path: Option<PathBuf>, target: &str) -> bool {
+    let mut command = if let Some(exe) = exe_path {
+        Command::new(exe)
+    } else {
+        Command::new("pcmanfm")
+    };
+    command.arg("--new-win").arg(target);
+    scrub_command_env(&mut command);
+    command.spawn().is_ok()
+}
+
+fn clone_pcmanfm_window(win: &WindowInfo) -> bool {
+    let win = win.clone();
+    std::thread::spawn(move || {
+        if let Some(target) = accessible_location_for_window(&win) {
+            let _ = launch_pcmanfm_target(win.exe_path.clone(), &target);
+            return;
+        }
+
+        if let Some(target) = pcmanfm_path_from_title(&win.title) {
+            let _ = launch_pcmanfm_target(
+                win.exe_path.clone(),
+                &target.to_string_lossy(),
+            );
+            return;
+        }
+
+        if let Some(target_hint) = pcmanfm_location_hint_from_title(&win.title) {
+            clone_pcmanfm_with_fish_cd(target_hint);
+            return;
+        }
+
+        let fallback = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        let _ = launch_pcmanfm_target(win.exe_path.clone(), &fallback);
+    });
+    true
+}
+
+fn launch_dolphin_target(exe_path: Option<PathBuf>, target: Option<&str>) -> bool {
+    let mut command = if let Some(exe) = exe_path {
+        Command::new(exe)
+    } else {
+        Command::new("dolphin")
+    };
+    command.arg("--new-window");
+    if let Some(target) = target {
+        command.arg(target);
+    }
+    scrub_command_env(&mut command);
+    command.spawn().is_ok()
+}
+
+fn is_dolphin_app(app: &AppInfo) -> bool {
+    let mut values = vec![app.name.as_str(), app.exec.as_str()];
+    if let Some(stem) = app.desktop_file_path.file_stem().and_then(|stem| stem.to_str()) {
+        values.push(stem);
+    }
+
+    values
+        .iter()
+        .any(|value| normalize_app_match_key(value).contains("dolphin"))
+}
+
+fn launch_dolphin_app() -> bool {
+    let target = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    launch_dolphin_target(None, Some(&target))
+}
+
+fn clone_dolphin_window(win: &WindowInfo) -> bool {
+    let win = win.clone();
+    std::thread::spawn(move || {
+        if let Some(target) = accessible_location_for_window(&win) {
+            let _ = launch_dolphin_target(win.exe_path.clone(), Some(&target));
+            return;
+        }
+
+        if let Some(target) = pcmanfm_path_from_title(&win.title) {
+            let target = target.to_string_lossy().to_string();
+            let _ = launch_dolphin_target(win.exe_path.clone(), Some(&target));
+            return;
+        }
+
+        let fallback = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        let _ = launch_dolphin_target(win.exe_path.clone(), Some(&fallback));
+    });
+    true
 }
 
 fn launch_desktop_entry(desktop_file_path: &Path) -> bool {
@@ -910,8 +1315,7 @@ fn duplicate_window_title_key(win: &WindowInfo) -> Option<String> {
             if !suffix_key.is_empty()
                 && (suffix_key == app_key
                     || suffix_key == class_key
-                    || class_key.ends_with(&suffix_key)
-                    || suffix_key.ends_with(&app_key))
+                    || class_key.ends_with(&suffix_key))
             {
                 title = left.trim();
                 break;
@@ -922,10 +1326,43 @@ fn duplicate_window_title_key(win: &WindowInfo) -> Option<String> {
     (!title.is_empty()).then(|| title.to_string())
 }
 
-fn window_sort_title_key(win: &WindowInfo) -> String {
-    duplicate_window_title_key(win)
-        .unwrap_or_else(|| win.title.trim().to_string())
+fn duplicate_window_group_key(win: &WindowInfo) -> Option<(String, String)> {
+    let title = duplicate_window_title_key(win)?;
+    let app_key = normalize_app_match_key(&window_application_key(win));
+    (!app_key.is_empty()).then_some((app_key, title))
+}
+
+fn is_braille_spinner_char(ch: char) -> bool {
+    ('\u{2800}'..='\u{28ff}').contains(&ch)
+}
+
+fn normalize_window_sort_title(title: &str) -> String {
+    let without_spinners: String = title
+        .chars()
+        .filter(|ch| !is_braille_spinner_char(*ch))
+        .collect();
+
+    if without_spinners.contains(" - ") {
+        return without_spinners
+            .split(" - ")
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" - ")
+            .to_lowercase();
+    }
+
+    without_spinners
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
         .to_lowercase()
+}
+
+fn window_sort_title_key(win: &WindowInfo) -> String {
+    normalize_window_sort_title(
+        &duplicate_window_title_key(win).unwrap_or_else(|| win.title.trim().to_string()),
+    )
 }
 
 fn command_basename(exec: &str) -> Option<String> {
@@ -2065,6 +2502,12 @@ fn build_window_info(
         }
         if !split_found {
             final_title = format!("{} - {}", final_title, proc_name);
+        }
+    }
+    if is_pcmanfm_class(&class_lower) {
+        let title_key = normalize_app_match_key(&final_title);
+        if !title_key.ends_with("pcmanfm") {
+            final_title = format!("{} — PCManFM", final_title.trim());
         }
     }
 
@@ -3262,7 +3705,9 @@ impl App {
     fn launch_app_and_exit(&self, app: &AppInfo, ctx: &egui::Context) {
         self.rapid_polling
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        if !launch_desktop_entry(&app.desktop_file_path) {
+        if is_dolphin_app(app) {
+            launch_dolphin_app();
+        } else if !launch_desktop_entry(&app.desktop_file_path) {
             launch_app(&app.exec);
         }
         ctx.request_repaint();
@@ -3304,6 +3749,12 @@ impl App {
     fn launch_window_app_and_exit(&self, win: &WindowInfo, ctx: &egui::Context) {
         self.rapid_polling
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        if is_terminal_class(&win.class.to_lowercase()) {
+            launch_terminal_window();
+            ctx.request_repaint();
+            return;
+        }
+
         if let Some(exe_path) = &win.exe_path {
             let exe = exe_path.clone();
             std::thread::spawn(move || {
@@ -3327,6 +3778,42 @@ impl App {
         if let Some(app) = self.find_app_for_window(win) {
             self.launch_app_and_exit(app, ctx);
         }
+    }
+
+    fn clone_window_and_exit(&self, win: &WindowInfo, ctx: &egui::Context) {
+        self.rapid_polling
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        if is_terminal_class(&win.class.to_lowercase()) {
+            let cwd = win
+                .cwd_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string());
+            launch_fish_terminal(
+                cwd,
+                clone_terminal_command_for_window(win),
+                Some(source_terminal_title_for_clone(win)),
+            );
+            ctx.request_repaint();
+            return;
+        }
+
+        if is_pcmanfm_window(win) && clone_pcmanfm_window(win) {
+            ctx.request_repaint();
+            return;
+        }
+
+        if is_dolphin_window(win) && clone_dolphin_window(win) {
+            ctx.request_repaint();
+            return;
+        }
+
+        if is_chrome_like_window(win) && clone_chrome_window(win) {
+            ctx.request_repaint();
+            return;
+        }
+
+        self.launch_window_app_and_exit(win, ctx);
     }
 
     fn activate_and_exit(&self, id: String, ctx: &egui::Context) {
@@ -3385,17 +3872,38 @@ impl eframe::App for App {
         }
 
         if !self.loading && self.use_kwin_window_feed {
-            let mut pending_events = Vec::new();
-            while let Ok(event) = self.window_feed_receiver.try_recv() {
-                pending_events.push(event);
+            let mut pending_events = Vec::with_capacity(WINDOW_FEED_EVENTS_PER_FRAME);
+            for _ in 0..WINDOW_FEED_EVENTS_PER_FRAME {
+                match self.window_feed_receiver.try_recv() {
+                    Ok(event) => pending_events.push(event),
+                    Err(_) => break,
+                }
+            }
+            let hit_window_feed_budget = pending_events.len() == WINDOW_FEED_EVENTS_PER_FRAME;
+            if hit_window_feed_budget {
+                ctx.request_repaint();
             }
             self.apply_window_feed_events(pending_events);
         } else if !self.use_kwin_window_feed {
             // Check background receiver for periodic window updates
-            while let Ok(new_windows) = self.window_receiver.try_recv() {
+            let mut latest_windows = None;
+            let mut window_snapshot_count = 0;
+            for _ in 0..WINDOW_SNAPSHOTS_PER_FRAME {
+                match self.window_receiver.try_recv() {
+                    Ok(new_windows) => {
+                        latest_windows = Some(new_windows);
+                        window_snapshot_count += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if let Some(new_windows) = latest_windows {
                 if !self.loading {
                     self.apply_window_snapshot(new_windows);
                 }
+            }
+            if window_snapshot_count == WINDOW_SNAPSHOTS_PER_FRAME {
+                ctx.request_repaint();
             }
         }
 
@@ -3429,7 +3937,12 @@ impl eframe::App for App {
             }
         }
 
-        while let Ok(event) = self.ui_event_rx.try_recv() {
+        let mut ui_event_count = 0;
+        for _ in 0..UI_EVENTS_PER_FRAME {
+            let Ok(event) = self.ui_event_rx.try_recv() else {
+                break;
+            };
+            ui_event_count += 1;
             match event {
                 UiEvent::FocusLauncher => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -3456,10 +3969,20 @@ impl eframe::App for App {
                 }
             }
         }
+        if ui_event_count == UI_EVENTS_PER_FRAME {
+            ctx.request_repaint();
+        }
 
         let mut latest_audio_update = None;
-        while let Ok(update) = self.audio_cache_receiver.try_recv() {
-            latest_audio_update = Some(update);
+        let mut audio_update_count = 0;
+        for _ in 0..AUDIO_UPDATES_PER_FRAME {
+            match self.audio_cache_receiver.try_recv() {
+                Ok(update) => {
+                    latest_audio_update = Some(update);
+                    audio_update_count += 1;
+                }
+                Err(_) => break,
+            }
         }
         if let Some(update) = latest_audio_update {
             self.cached_sink_inputs = update.sink_inputs;
@@ -3467,6 +3990,9 @@ impl eframe::App for App {
             self.observed_pipewire_node_ids = update.observed_pipewire_node_ids;
             self.active_pipewire_node_ids = update.active_pipewire_node_ids;
             self.pipewire_activity_cache_valid = update.pipewire_activity_cache_valid;
+        }
+        if audio_update_count == AUDIO_UPDATES_PER_FRAME {
+            ctx.request_repaint();
         }
 
         let has_active_audio = self
@@ -3599,7 +4125,6 @@ impl eframe::App for App {
                         if self
                             .search_focus_until
                             .is_some_and(|deadline| Instant::now() <= deadline)
-                            && !self.show_settings_menu
                         {
                             resp.request_focus();
                         } else {
@@ -3903,13 +4428,13 @@ impl eframe::App for App {
                         self.side_panel_selected_index = 0;
                     }
 
-                    let duplicate_window_titles: HashMap<String, usize> = if self.mode
+                    let duplicate_window_titles: HashMap<(String, String), usize> = if self.mode
                         == LauncherMode::Windows
                     {
                         let mut counts = HashMap::new();
                         for window in &filtered_windows {
-                            if let Some(title) = duplicate_window_title_key(window) {
-                                *counts.entry(title).or_insert(0) += 1;
+                            if let Some(key) = duplicate_window_group_key(window) {
+                                *counts.entry(key).or_insert(0) += 1;
                             }
                         }
                         counts
@@ -4475,10 +5000,10 @@ impl eframe::App for App {
                                                 == LauncherMode::Windows
                                                 && filtered_windows
                                                     .get(index)
-                                                    .and_then(duplicate_window_title_key)
-                                                    .and_then(|title| {
+                                                    .and_then(duplicate_window_group_key)
+                                                    .and_then(|key| {
                                                         duplicate_window_titles
-                                                            .get(&title)
+                                                            .get(&key)
                                                             .copied()
                                                     })
                                                     .is_some_and(|count| count > 1);
@@ -4948,6 +5473,25 @@ impl eframe::App for App {
                                                 }
                                                 LauncherMode::Windows => {
                                                     let win = &filtered_windows[index];
+                                                    if ui.button("Clone window").clicked() {
+                                                        self.active_pane = ActivePane::Windows;
+                                                        self.selected_index = index;
+                                                        self.clone_window_and_exit(win, ctx);
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Open new window").clicked() {
+                                                        self.active_pane = ActivePane::Windows;
+                                                        self.selected_index = index;
+                                                        self.launch_window_app_and_exit(win, ctx);
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Open window").clicked() {
+                                                        self.active_pane = ActivePane::Windows;
+                                                        self.selected_index = index;
+                                                        self.activate_and_exit(win.id.clone(), ctx);
+                                                        ui.close();
+                                                    }
+                                                    ui.separator();
                                                     if ui.button("Show execution chain").clicked() {
                                                         self.process_chain_popup = Some(win.clone());
                                                         ui.close();
@@ -5535,6 +6079,12 @@ impl eframe::App for App {
                     }
                     if self.process_chain_popup.is_some() {
                         self.show_process_chain_popup(ctx);
+                    }
+
+                    if let Some(ref resp) = text_edit_response {
+                        if ctx.input(|i| i.focused) {
+                            resp.request_focus();
+                        }
                     }
 
                     if self.mode == LauncherMode::Windows && !filtered_windows.is_empty() {
