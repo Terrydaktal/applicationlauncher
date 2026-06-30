@@ -25,12 +25,19 @@ function serializeWindow(window) {
         return null;
     }
 
+    var geometry = window.frameGeometry;
+
     return {
         id: String(window.internalId),
         title: window.caption ? String(window.caption) : "",
         class: windowClass(window),
         desktopFileName: window.desktopFileName ? String(window.desktopFileName) : "",
-        pid: typeof window.pid === "number" ? window.pid : 0
+        pid: typeof window.pid === "number" ? window.pid : 0,
+        x: geometry ? Math.round(geometry.x) : 0,
+        y: geometry ? Math.round(geometry.y) : 0,
+        width: geometry ? Math.round(geometry.width) : 0,
+        height: geometry ? Math.round(geometry.height) : 0,
+        minimized: !!window.minimized
     };
 }
 

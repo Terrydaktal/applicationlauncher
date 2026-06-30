@@ -1,4 +1,8 @@
 use eframe::egui;
+use fuzzy_rank::metadata::{
+    MetadataCandidate, MetadataQuery, SearchField, dedup_push_search_field, sort_matches,
+};
+use fuzzy_rank::ranking::SearchRank;
 use serde::Deserialize;
 use std::backtrace::Backtrace;
 use std::collections::{HashMap, HashSet};
@@ -6,10 +10,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
-use fuzzy_rank::metadata::{
-    MetadataCandidate, MetadataQuery, SearchField, dedup_push_search_field, sort_matches,
-};
-use fuzzy_rank::ranking::SearchRank;
 use zbus::interface;
 
 const WINDOW_REMOVAL_CONFIRMATION_POLLS: usize = 2;
@@ -27,7 +27,7 @@ const PIPEWIRE_ACTIVE_US_THRESHOLD: f32 = 10.0;
 const PIPEWIRE_ACTIVE_TOTAL_US_THRESHOLD: f32 = 20.0;
 const AUDIO_IDLE_REPAINT_MS: u64 = 200;
 const AUDIO_ACTIVE_REPAINT_MS: u64 = 80;
-const WINDOW_FEED_EVENTS_PER_FRAME: usize = 64;
+const WINDOW_FEED_EVENTS_PER_FRAME: usize = 512;
 const WINDOW_SNAPSHOTS_PER_FRAME: usize = 4;
 const AUDIO_UPDATES_PER_FRAME: usize = 32;
 const UI_EVENTS_PER_FRAME: usize = 8;
@@ -62,10 +62,15 @@ struct WindowInfo {
     id: String,
     title: String,
     class: String,
+    desktop_file_name: Option<String>,
+    minimized: Option<bool>,
     icon_path: Option<PathBuf>,
     active_process: Option<String>,
     exe_path: Option<PathBuf>,
     cwd_path: Option<PathBuf>,
+    command_line: Option<String>,
+    command_summary: Option<String>,
+    geometry: Option<(i32, i32, i32, i32)>,
     process_chain: Vec<ProcessChainEntry>,
     pid: Option<i32>,
 }
@@ -84,6 +89,7 @@ struct AppInfo {
 struct RankedAppMatch {
     app: AppInfo,
     rank: SearchRank,
+    title_is_typo: bool,
     is_pinned: bool,
     candidate_key: String,
     candidate_score: f64,
@@ -93,6 +99,7 @@ struct RankedAppMatch {
 struct RankedWindowMatch {
     window: WindowInfo,
     rank: SearchRank,
+    title_is_typo: bool,
     candidate_key: String,
     candidate_score: f64,
 }
@@ -126,6 +133,16 @@ struct KWinWindowPayload {
     pid: i32,
     #[serde(default)]
     desktop_file_name: String,
+    #[serde(default)]
+    x: i32,
+    #[serde(default)]
+    y: i32,
+    #[serde(default)]
+    width: i32,
+    #[serde(default)]
+    height: i32,
+    #[serde(default)]
+    minimized: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +158,12 @@ struct AudioCacheUpdate {
     observed_pipewire_node_ids: HashSet<u32>,
     active_pipewire_node_ids: HashSet<u32>,
     pipewire_activity_cache_valid: bool,
+}
+
+struct SnapshotWindowDetails {
+    desktop_file_name: Option<String>,
+    geometry: Option<(i32, i32, i32, i32)>,
+    minimized: Option<bool>,
 }
 
 struct KWinWindowFeed {
@@ -630,6 +653,16 @@ fn find_icon(theme: &str, class: &str) -> Option<PathBuf> {
     if lower.contains("web") || lower.contains("browser") || lower.contains("firefox") {
         names.push("web-browser".to_string());
     }
+    if lower.contains("tor browser")
+        || lower.contains("tor-browser")
+        || lower.contains("torbrowser")
+    {
+        names.push("tor-browser".to_string());
+        names.push("tor-browser-alpha".to_string());
+        names.push("torbrowser".to_string());
+        names.push("firefox".to_string());
+        names.push("web-browser".to_string());
+    }
     if lower.contains("copyq") {
         names.push("copyq".to_string());
         names.push("edit-paste".to_string());
@@ -718,11 +751,17 @@ fn window_search_rank(query: &MetadataQuery, win: &WindowInfo) -> Option<SearchR
     if let Some(value) = win.active_process.clone() {
         owned_values.push((3, normalize_metadata_search_value(&value)));
     }
-    if let Some(value) = exe_basename {
+    if let Some(value) = win.command_summary.clone() {
         owned_values.push((4, normalize_metadata_search_value(&value)));
     }
-    if let Some(value) = cwd_display {
+    if let Some(value) = win.command_line.clone() {
         owned_values.push((5, normalize_metadata_search_value(&value)));
+    }
+    if let Some(value) = exe_basename {
+        owned_values.push((6, normalize_metadata_search_value(&value)));
+    }
+    if let Some(value) = cwd_display {
+        owned_values.push((7, normalize_metadata_search_value(&value)));
     }
 
     let mut fields = Vec::new();
@@ -821,6 +860,23 @@ fn launch_terminal_cd(target: &str) {
     }
 
     launch_fish_terminal(Some(target.to_string()), None, None);
+}
+
+fn launch_terminal_command(command: &str) {
+    let command = command.trim();
+    if command.is_empty() {
+        return;
+    }
+
+    let command = command.to_string();
+    std::thread::spawn(move || {
+        let mut cmd = Command::new("xfce4-terminal");
+        cmd.arg("--command")
+            .arg(r#"fish -ic 'eval "$APPLICATIONLAUNCHER_TERMINAL_COMMAND"; exec fish'"#)
+            .env("APPLICATIONLAUNCHER_TERMINAL_COMMAND", command);
+        scrub_command_env(&mut cmd);
+        let _ = cmd.spawn();
+    });
 }
 
 fn launch_fish_terminal(
@@ -995,7 +1051,11 @@ fn is_dolphin_window(win: &WindowInfo) -> bool {
 fn extract_url_from_text(text: &str) -> Option<String> {
     text.split_whitespace()
         .find(|token| token.starts_with("http://") || token.starts_with("https://"))
-        .map(|token| token.trim_matches(|c: char| matches!(c, '"' | '\'' | ')' | ']' | '}' | ',' | ';')).to_string())
+        .map(|token| {
+            token
+                .trim_matches(|c: char| matches!(c, '"' | '\'' | ')' | ']' | '}' | ',' | ';'))
+                .to_string()
+        })
         .filter(|url| !url.is_empty())
 }
 
@@ -1168,10 +1228,7 @@ fn clone_pcmanfm_window(win: &WindowInfo) -> bool {
         }
 
         if let Some(target) = pcmanfm_path_from_title(&win.title) {
-            let _ = launch_pcmanfm_target(
-                win.exe_path.clone(),
-                &target.to_string_lossy(),
-            );
+            let _ = launch_pcmanfm_target(win.exe_path.clone(), &target.to_string_lossy());
             return;
         }
 
@@ -1202,13 +1259,105 @@ fn launch_dolphin_target(exe_path: Option<PathBuf>, target: Option<&str>) -> boo
 
 fn is_dolphin_app(app: &AppInfo) -> bool {
     let mut values = vec![app.name.as_str(), app.exec.as_str()];
-    if let Some(stem) = app.desktop_file_path.file_stem().and_then(|stem| stem.to_str()) {
+    if let Some(stem) = app
+        .desktop_file_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+    {
         values.push(stem);
     }
 
     values
         .iter()
         .any(|value| normalize_app_match_key(value).contains("dolphin"))
+}
+
+fn push_unique_metadata_part(
+    parts: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    value: Option<String>,
+) {
+    let Some(value) = value.map(|value| value.trim().to_string()) else {
+        return;
+    };
+    if value.is_empty() {
+        return;
+    }
+    let key = normalize_metadata_search_value(&value);
+    if key.is_empty() || !seen.insert(key) {
+        return;
+    }
+    parts.push(value);
+}
+
+fn app_search_metadata_suffix(app: &AppInfo) -> String {
+    let cleaned_exec = clean_exec_cmd(&app.exec);
+    let exec_basename = command_basename(&app.exec);
+    let desktop_stem = app
+        .desktop_file_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.to_string());
+    let mut parts = Vec::new();
+    let mut seen = HashSet::new();
+    seen.insert(normalize_metadata_search_value(&app.name));
+    push_unique_metadata_part(&mut parts, &mut seen, exec_basename);
+    push_unique_metadata_part(&mut parts, &mut seen, desktop_stem);
+    push_unique_metadata_part(&mut parts, &mut seen, app.comment.clone());
+    push_unique_metadata_part(&mut parts, &mut seen, Some(cleaned_exec));
+    parts.join(" | ")
+}
+
+fn window_search_metadata_suffix(win: &WindowInfo) -> String {
+    let app_key = window_application_key(win);
+    let exe_basename = win
+        .exe_path
+        .as_ref()
+        .and_then(|path| path.file_name().and_then(|name| name.to_str()))
+        .map(|name| name.to_string());
+    let cwd_display = win.cwd_path.as_ref().map(|path| display_path(path));
+
+    let mut parts = Vec::new();
+    let mut seen = HashSet::new();
+    seen.insert(normalize_metadata_search_value(&win.title));
+    push_unique_metadata_part(&mut parts, &mut seen, Some(app_key.clone()));
+    if !win.class.eq_ignore_ascii_case(&app_key) {
+        push_unique_metadata_part(&mut parts, &mut seen, Some(win.class.clone()));
+    }
+    push_unique_metadata_part(&mut parts, &mut seen, win.active_process.clone());
+    push_unique_metadata_part(&mut parts, &mut seen, win.command_summary.clone());
+    push_unique_metadata_part(&mut parts, &mut seen, win.command_line.clone());
+    push_unique_metadata_part(&mut parts, &mut seen, exe_basename);
+    push_unique_metadata_part(&mut parts, &mut seen, cwd_display);
+    parts.join(" | ")
+}
+
+fn search_visible_app_title(app: &AppInfo, query: &str) -> String {
+    if query.trim().is_empty() {
+        return app.name.clone();
+    }
+    let suffix = app_search_metadata_suffix(app);
+    let full_text = if suffix.is_empty() {
+        app.name.clone()
+    } else {
+        format!("{} | {}", app.name, suffix)
+    };
+    let typo_match = visible_title_has_typo_match(&full_text, query);
+    focus_text_around_match(&full_text, query, typo_match, 110)
+}
+
+fn search_visible_window_title(win: &WindowInfo, query: &str) -> String {
+    if query.trim().is_empty() {
+        return win.title.clone();
+    }
+    let suffix = window_search_metadata_suffix(win);
+    let full_text = if suffix.is_empty() {
+        win.title.clone()
+    } else {
+        format!("{} | {}", win.title, suffix)
+    };
+    let typo_match = visible_title_has_typo_match(&full_text, query);
+    focus_text_around_match(&full_text, query, typo_match, 120)
 }
 
 fn launch_dolphin_app() -> bool {
@@ -1401,6 +1550,52 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     truncated
 }
 
+fn focus_text_around_match(text: &str, query: &str, typo_match: bool, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+
+    let ranges = if typo_match {
+        typo_title_match_ranges(text, query)
+    } else {
+        title_match_ranges(text, query)
+    };
+    let Some((match_start_byte, match_end_byte)) = ranges.first().copied() else {
+        return truncate_chars(text, max_chars);
+    };
+
+    let match_start_char = text[..match_start_byte].chars().count();
+    let match_end_char = text[..match_end_byte].chars().count();
+    let match_len = match_end_char.saturating_sub(match_start_char).max(1);
+    let available_context = max_chars.saturating_sub(match_len);
+    let left_context = available_context.min(24);
+
+    let mut start_char = match_start_char.saturating_sub(left_context);
+    let mut end_char = (start_char + max_chars).min(char_count);
+    if end_char.saturating_sub(start_char) < max_chars {
+        start_char = end_char.saturating_sub(max_chars);
+    }
+    if match_end_char > end_char {
+        end_char = match_end_char.min(char_count);
+        start_char = end_char.saturating_sub(max_chars);
+    }
+
+    let mut result = String::new();
+    if start_char > 0 {
+        result.push_str("...");
+    }
+    result.extend(
+        text.chars()
+            .skip(start_char)
+            .take(end_char.saturating_sub(start_char)),
+    );
+    if end_char < char_count {
+        result.push_str("...");
+    }
+    result
+}
+
 fn effective_list_row_height(
     configured_height: f32,
     icon_height: f32,
@@ -1445,10 +1640,61 @@ fn normalize_metadata_search_value(value: &str) -> String {
         normalized.push(mapped);
     }
 
-    normalized
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn read_proc_cmdline(pid: i32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{}/cmdline", pid)).ok()?;
+    let args = raw
+        .split(|byte| *byte == 0)
+        .filter_map(|part| {
+            if part.is_empty() {
+                return None;
+            }
+            std::str::from_utf8(part)
+                .ok()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string())
+        })
+        .collect::<Vec<_>>();
+    (!args.is_empty()).then_some(args)
+}
+
+fn compact_command_part(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let candidate = trimmed.trim_end_matches('/');
+    Path::new(candidate)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn summarize_command_line(args: &[String]) -> Option<String> {
+    let first = args.first()?;
+    let mut summary = vec![compact_command_part(first)];
+
+    for arg in args.iter().skip(1) {
+        if summary.len() >= 3 {
+            break;
+        }
+        if arg.trim().is_empty() || arg.starts_with('-') {
+            continue;
+        }
+        let compact = compact_command_part(arg);
+        if compact.is_empty() || summary.iter().any(|part| part == &compact) {
+            continue;
+        }
+        summary.push(compact);
+    }
+
+    (!summary.is_empty()).then_some(summary.join(" "))
 }
 
 fn launcher_state_dir() -> PathBuf {
@@ -1503,7 +1749,10 @@ fn paint_wayland_fallback_icon(painter: &egui::Painter, rect: egui::Rect) {
     painter.rect_stroke(
         rect.shrink(0.5),
         egui::CornerRadius::same(radius as u8),
-        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28)),
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
+        ),
         egui::StrokeKind::Inside,
     );
 
@@ -1806,12 +2055,9 @@ fn busctl_string_property(service: &str, interface: &str, property: &str) -> Opt
 fn fetch_active_media_app_keys() -> HashSet<String> {
     let mut keys = HashSet::new();
     for service in mpris_service_names() {
-        let is_playing = busctl_string_property(
-            &service,
-            "org.mpris.MediaPlayer2.Player",
-            "PlaybackStatus",
-        )
-        .is_some_and(|status| status.eq_ignore_ascii_case("Playing"));
+        let is_playing =
+            busctl_string_property(&service, "org.mpris.MediaPlayer2.Player", "PlaybackStatus")
+                .is_some_and(|status| status.eq_ignore_ascii_case("Playing"));
         if !is_playing {
             continue;
         }
@@ -1877,8 +2123,7 @@ fn fetch_pipewire_activity() -> (HashSet<u32>, HashSet<u32>, bool) {
                     .unwrap_or(0.0);
                 let wait_active = wait_us >= PIPEWIRE_ACTIVE_US_THRESHOLD;
                 let busy_active = busy_us >= PIPEWIRE_ACTIVE_US_THRESHOLD;
-                let total_active =
-                    (wait_us + busy_us) >= PIPEWIRE_ACTIVE_TOTAL_US_THRESHOLD;
+                let total_active = (wait_us + busy_us) >= PIPEWIRE_ACTIVE_TOTAL_US_THRESHOLD;
                 let is_active = (wait_active || busy_active) && total_active;
 
                 if is_active {
@@ -1943,6 +2188,116 @@ fn replace_terminal_suffix_path(original_suffix: &str, cwd: &str) -> String {
     }
 }
 
+fn is_terminal_title_marker(value: &str) -> bool {
+    let key = normalize_app_match_key(value);
+    key == "terminal"
+        || key == "xfce4terminal"
+        || key == "konsole"
+        || key == "kitty"
+        || key == "alacritty"
+        || key == "wezterm"
+        || key == "foot"
+        || key.ends_with("terminal")
+}
+
+fn terminal_title_segments(dynamic_title: &str, proc_name: &str, cwd: Option<&str>) -> Vec<String> {
+    let dynamic_title = dynamic_title.trim();
+    let mut segments = Vec::new();
+    let mut after_process = Vec::new();
+
+    match cwd {
+        Some(cwd) if !cwd.trim().is_empty() => {
+            let cwd = cwd.trim();
+            if dynamic_title.is_empty() {
+                after_process.push(cwd.to_string());
+            } else {
+                let cwd_context = replace_terminal_suffix_path(dynamic_title, cwd);
+                if dynamic_title == cwd || dynamic_title == cwd_context {
+                    segments.push(dynamic_title.to_string());
+                } else if dynamic_title.chars().any(char::is_whitespace) {
+                    segments.push(cwd_context);
+                } else {
+                    segments.push(dynamic_title.to_string());
+                    after_process.push(cwd_context);
+                }
+            }
+        }
+        _ if !dynamic_title.is_empty() => segments.push(dynamic_title.to_string()),
+        _ => {}
+    }
+
+    segments.push(proc_name.trim().to_string());
+    segments.extend(after_process);
+    segments.push("Terminal".to_string());
+    segments
+}
+
+fn terminal_display_title(raw_title: &str, proc_name: &str, cwd: Option<&str>) -> String {
+    let separators = [" - ", " — ", " – ", " : ", " | "];
+
+    for sep in separators {
+        let parts: Vec<&str> = raw_title.split(sep).map(str::trim).collect();
+        if parts.len() < 2 {
+            continue;
+        }
+
+        if parts
+            .first()
+            .is_some_and(|part| is_terminal_title_marker(part))
+        {
+            let suffix = parts[1..].join(sep);
+            return terminal_title_segments(&suffix, proc_name, cwd).join(sep);
+        }
+
+        if parts
+            .last()
+            .is_some_and(|part| is_terminal_title_marker(part))
+        {
+            let suffix = parts[..parts.len() - 1].join(sep);
+            return terminal_title_segments(&suffix, proc_name, cwd).join(sep);
+        }
+    }
+
+    terminal_title_segments(raw_title, proc_name, cwd).join(" - ")
+}
+
+fn normalize_terminal_title_marker_position(raw_title: &str) -> String {
+    let separators = [" - ", " — ", " – ", " : ", " | "];
+
+    for sep in separators {
+        let parts: Vec<&str> = raw_title.split(sep).map(str::trim).collect();
+        if parts.len() < 2 {
+            continue;
+        }
+
+        let first_is_marker = parts
+            .first()
+            .is_some_and(|part| is_terminal_title_marker(part));
+        let last_is_marker = parts
+            .last()
+            .is_some_and(|part| is_terminal_title_marker(part));
+
+        if first_is_marker && last_is_marker && parts.len() >= 3 {
+            return parts[1..].join(sep);
+        }
+
+        if first_is_marker {
+            let body = parts[1..]
+                .iter()
+                .copied()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>();
+            if !body.is_empty() {
+                let mut rebuilt = body;
+                rebuilt.push("Terminal");
+                return rebuilt.join(sep);
+            }
+        }
+    }
+
+    raw_title.trim().to_string()
+}
+
 fn best_app_match_score(window_keys: &[String], app: &AppInfo) -> Option<(usize, usize, usize)> {
     let mut best_score: Option<(usize, usize, usize)> = None;
 
@@ -1997,6 +2352,246 @@ fn truncate_tile_label(text: &str, tile_size: f32) -> String {
     let mut truncated: String = text.chars().take(keep).collect();
     truncated.push_str("...");
     truncated
+}
+
+fn title_match_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    let mut normalized = String::new();
+    let mut mapping = Vec::new();
+
+    for (start, ch) in text.char_indices() {
+        let end = start + ch.len_utf8();
+        let lower = ch.to_lowercase().collect::<String>();
+        let lower_start = normalized.len();
+        normalized.push_str(&lower);
+        let lower_end = normalized.len();
+        mapping.push((lower_start, lower_end, start, end));
+    }
+
+    let query_lower = query.to_lowercase();
+    let mut ranges = Vec::new();
+
+    for (match_start, _) in normalized.match_indices(&query_lower) {
+        let match_end = match_start + query_lower.len();
+        let mut original_start = None;
+        let mut original_end = None;
+
+        for (lower_start, lower_end, start, end) in &mapping {
+            if *lower_end <= match_start || *lower_start >= match_end {
+                continue;
+            }
+            original_start.get_or_insert(*start);
+            original_end = Some(*end);
+        }
+
+        if let (Some(start), Some(end)) = (original_start, original_end) {
+            if let Some((_, previous_end)) = ranges.last_mut() {
+                if start <= *previous_end {
+                    *previous_end = (*previous_end).max(end);
+                    continue;
+                }
+            }
+            ranges.push((start, end));
+        }
+    }
+
+    ranges
+}
+
+fn typo_title_match_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    let typo_query = match MetadataQuery::new(query).map(|q| q.with_typo_fallback(true)) {
+        Some(query) => query,
+        None => return Vec::new(),
+    };
+
+    let mut best: Option<(SearchRank, usize, usize)> = None;
+    let mut token_start = None;
+
+    for (idx, ch) in text.char_indices() {
+        if ch.is_ascii_alphanumeric() {
+            token_start.get_or_insert(idx);
+            continue;
+        }
+        if let Some(start) = token_start.take() {
+            let end = idx;
+            let token = &text[start..end];
+            let normalized = normalize_metadata_search_value(token);
+            if normalized.is_empty() {
+                continue;
+            }
+            let fields = [SearchField {
+                priority: 0,
+                value: normalized.as_str(),
+            }];
+            let candidate = MetadataCandidate {
+                key: "",
+                fields: &fields,
+                score: 0.0,
+            };
+            let Some(rank) = typo_query.search_rank(candidate) else {
+                continue;
+            };
+            if !rank_matches_visible_title_via_typo(&rank) {
+                continue;
+            }
+            let replace = best.as_ref().is_none_or(|(current, _, _)| rank < *current);
+            if replace {
+                best = Some((rank, start, end));
+            }
+        }
+    }
+
+    if let Some(start) = token_start.take() {
+        let end = text.len();
+        let token = &text[start..end];
+        let normalized = normalize_metadata_search_value(token);
+        if !normalized.is_empty() {
+            let fields = [SearchField {
+                priority: 0,
+                value: normalized.as_str(),
+            }];
+            let candidate = MetadataCandidate {
+                key: "",
+                fields: &fields,
+                score: 0.0,
+            };
+            if let Some(rank) = typo_query.search_rank(candidate) {
+                if rank_matches_visible_title_via_typo(&rank)
+                    && best.as_ref().is_none_or(|(current, _, _)| rank < *current)
+                {
+                    best = Some((rank, start, end));
+                }
+            }
+        }
+    }
+
+    best.map(|(_, start, end)| vec![(start, end)])
+        .unwrap_or_default()
+}
+
+fn highlighted_title_job(
+    text: &str,
+    query: &str,
+    font_size: f32,
+    typo_match: bool,
+) -> egui::text::LayoutJob {
+    let default_format = egui::TextFormat {
+        font_id: egui::FontId::proportional(font_size),
+        color: egui::Color32::WHITE,
+        ..Default::default()
+    };
+    let highlight_format = egui::TextFormat {
+        font_id: egui::FontId::proportional(font_size),
+        color: egui::Color32::from_rgb(235, 90, 90),
+        ..Default::default()
+    };
+    let typo_highlight_format = egui::TextFormat {
+        font_id: egui::FontId::proportional(font_size),
+        color: egui::Color32::from_rgb(235, 196, 72),
+        ..Default::default()
+    };
+
+    let ranges = if typo_match {
+        typo_title_match_ranges(text, query)
+    } else {
+        title_match_ranges(text, query)
+    };
+    let mut job = egui::text::LayoutJob::default();
+
+    if ranges.is_empty() {
+        job.append(text, 0.0, default_format);
+        return job;
+    }
+
+    let mut cursor = 0usize;
+    for (start, end) in ranges {
+        if cursor < start {
+            job.append(&text[cursor..start], 0.0, default_format.clone());
+        }
+        job.append(
+            &text[start..end],
+            0.0,
+            if typo_match {
+                typo_highlight_format.clone()
+            } else {
+                highlight_format.clone()
+            },
+        );
+        cursor = end;
+    }
+    if cursor < text.len() {
+        job.append(&text[cursor..], 0.0, default_format);
+    }
+
+    job
+}
+
+fn rank_matches_visible_title_via_typo(rank: &SearchRank) -> bool {
+    match rank {
+        SearchRank::Fuzzy(distance_rank) | SearchRank::Typo(distance_rank) => {
+            distance_rank.field_priority == 0
+        }
+        _ => false,
+    }
+}
+
+fn pick_better_rank(left: SearchRank, right: SearchRank) -> SearchRank {
+    if left <= right { left } else { right }
+}
+
+fn visible_title_has_typo_match(title: &str, query: &str) -> bool {
+    if query.trim().is_empty() || !title_match_ranges(title, query).is_empty() {
+        return false;
+    }
+    let typo_query = match MetadataQuery::new(query).map(|q| q.with_typo_fallback(true)) {
+        Some(query) => query,
+        None => return false,
+    };
+    let normalized = normalize_metadata_search_value(title);
+    if normalized.is_empty() {
+        return false;
+    }
+    let fields = [SearchField {
+        priority: 0,
+        value: normalized.as_str(),
+    }];
+    let candidate = MetadataCandidate {
+        key: "",
+        fields: &fields,
+        score: 0.0,
+    };
+    typo_query
+        .search_rank(candidate)
+        .as_ref()
+        .is_some_and(rank_matches_visible_title_via_typo)
+}
+
+fn paint_centered_title_job(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    query: &str,
+    text: &str,
+    font_size: f32,
+    typo_match: bool,
+    fallback_color: egui::Color32,
+) {
+    let galley = ui.ctx().fonts_mut(|fonts| {
+        fonts.layout_job(highlighted_title_job(text, query, font_size, typo_match))
+    });
+    let position = egui::pos2(
+        rect.center().x - galley.size().x / 2.0,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    ui.painter().galley(position, galley, fallback_color);
 }
 
 fn grid_move_down(index: usize, len: usize, columns: usize) -> usize {
@@ -2240,6 +2835,52 @@ fn get_installed_apps(theme: &str) -> Vec<AppInfo> {
     apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     apps
 }
+
+fn desktop_entry_search_dirs() -> Vec<PathBuf> {
+    let mut app_dirs = vec![PathBuf::from("/usr/share/applications")];
+    if let Ok(home) = std::env::var("HOME") {
+        app_dirs.push(PathBuf::from(format!("{}/.local/share/applications", home)));
+        let user_flatpak_dir = PathBuf::from(format!(
+            "{}/.local/share/flatpak/exports/share/applications",
+            home
+        ));
+        if user_flatpak_dir.exists() {
+            app_dirs.push(user_flatpak_dir);
+        }
+    }
+    let flatpak_dir = PathBuf::from("/var/lib/flatpak/exports/share/applications");
+    if flatpak_dir.exists() {
+        app_dirs.push(flatpak_dir);
+    }
+    app_dirs
+}
+
+fn resolve_desktop_file_path(desktop_file_name: &str) -> Option<PathBuf> {
+    let trimmed = desktop_file_name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let candidate = PathBuf::from(trimmed);
+    if candidate.is_absolute() && candidate.exists() {
+        return Some(candidate);
+    }
+
+    let base_name = if trimmed.ends_with(".desktop") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.desktop")
+    };
+
+    for dir in desktop_entry_search_dirs() {
+        let path = dir.join(&base_name);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    None
+}
 fn parse_proc_stat(stat_content: &str) -> Option<(i32, String, i32)> {
     let last_paren = stat_content.rfind(')')?;
     let (left, right) = stat_content.split_at(last_paren);
@@ -2412,7 +3053,10 @@ fn build_window_info(
     id: String,
     title: String,
     class: String,
+    desktop_file_name: Option<String>,
     pid: Option<i32>,
+    geometry: Option<(i32, i32, i32, i32)>,
+    minimized: Option<bool>,
     theme: &str,
     icon_cache: &mut HashMap<String, Option<PathBuf>>,
     ppid_to_children: &HashMap<i32, Vec<i32>>,
@@ -2447,6 +3091,8 @@ fn build_window_info(
     let mut active_process = None;
     let mut exe_path = None;
     let mut cwd_path = None;
+    let mut command_line = None;
+    let mut command_summary = None;
     let mut process_chain = Vec::new();
     if let Some(pid) = pid {
         let mut target_pid = pid;
@@ -2467,42 +3113,45 @@ fn build_window_info(
             cwd_path = Some(path);
         }
 
+        if let Some(args) = read_proc_cmdline(target_pid) {
+            command_summary = summarize_command_line(&args);
+            command_line = Some(args.join(" "));
+        }
+
         process_chain = build_process_chain(target_pid, pid_to_name, pid_to_ppid);
     }
 
     let mut final_title = display_title;
     if let Some(ref proc_name) = active_process {
-        let terminal_suffix = if is_terminal_class(&class_lower) {
-            cwd_path.as_ref().map(|path| display_path(path))
+        if is_terminal_class(&class_lower) {
+            let terminal_suffix = cwd_path.as_ref().map(|path| display_path(path));
+            final_title =
+                terminal_display_title(&final_title, proc_name, terminal_suffix.as_deref());
         } else {
-            None
-        };
-        let separators = [" - ", " — ", " – ", " : ", " | "];
-        let mut split_found = false;
-        for sep in separators {
-            if let Some(pos) = final_title.find(sep) {
-                let (left, right) = final_title.split_at(pos);
-                let original_suffix = &right[sep.len()..];
-                let right_clean = if let Some(cwd) = terminal_suffix.as_deref() {
-                    replace_terminal_suffix_path(original_suffix, cwd)
-                } else {
-                    original_suffix.trim().to_string()
-                };
-                final_title = format!(
-                    "{}{}{}{}{}",
-                    left.trim(),
-                    sep,
-                    proc_name,
-                    sep,
-                    right_clean.trim()
-                );
-                split_found = true;
-                break;
+            let separators = [" - ", " — ", " – ", " : ", " | "];
+            let mut split_found = false;
+            for sep in separators {
+                if let Some(pos) = final_title.find(sep) {
+                    let (left, right) = final_title.split_at(pos);
+                    let original_suffix = &right[sep.len()..];
+                    final_title = format!(
+                        "{}{}{}{}{}",
+                        left.trim(),
+                        sep,
+                        proc_name,
+                        sep,
+                        original_suffix.trim()
+                    );
+                    split_found = true;
+                    break;
+                }
+            }
+            if !split_found {
+                final_title = format!("{} - {}", final_title, proc_name);
             }
         }
-        if !split_found {
-            final_title = format!("{} - {}", final_title, proc_name);
-        }
+    } else if is_terminal_class(&class_lower) {
+        final_title = normalize_terminal_title_marker_position(&final_title);
     }
     if is_pcmanfm_class(&class_lower) {
         let title_key = normalize_app_match_key(&final_title);
@@ -2522,6 +3171,15 @@ fn build_window_info(
             if path.is_none() {
                 path = find_icon(theme, &class);
             }
+            if path.is_none() {
+                if let Some(name) = exe_path
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .and_then(|name| name.to_str())
+                {
+                    path = find_icon(theme, name);
+                }
+            }
             path
         })
         .clone();
@@ -2530,10 +3188,15 @@ fn build_window_info(
         id,
         title: final_title,
         class,
+        desktop_file_name,
+        minimized,
         icon_path,
         active_process,
         exe_path,
         cwd_path,
+        command_line,
+        command_summary,
+        geometry,
         process_chain,
         pid,
     })
@@ -2652,23 +3315,57 @@ fn window_info_from_kwin_payload(
     pid_to_ppid: &HashMap<i32, i32>,
 ) -> Option<WindowInfo> {
     let mut icon_cache = HashMap::new();
+    let desktop_file_name_value = payload.desktop_file_name.trim().to_string();
     let class = if payload.class.trim().is_empty() {
-        payload.desktop_file_name
+        desktop_file_name_value.clone()
     } else {
         payload.class
     };
     let pid = (payload.pid > 0).then_some(payload.pid);
+    let desktop_file_name =
+        (!desktop_file_name_value.is_empty()).then_some(desktop_file_name_value);
+    let geometry = (payload.width > 0 && payload.height > 0).then_some((
+        payload.x,
+        payload.y,
+        payload.width,
+        payload.height,
+    ));
+    let minimized = Some(payload.minimized);
     build_window_info(
         payload.id,
         payload.title,
         class,
+        desktop_file_name,
         pid,
+        geometry,
+        minimized,
         theme,
         &mut icon_cache,
         ppid_to_children,
         pid_to_name,
         pid_to_ppid,
     )
+}
+
+fn coalesce_window_feed_events(events: Vec<WindowFeedEvent>) -> Vec<WindowFeedEvent> {
+    let mut latest_by_id: HashMap<String, WindowFeedEvent> = HashMap::new();
+    let mut order = Vec::new();
+
+    for event in events {
+        let id = match &event {
+            WindowFeedEvent::Upsert(payload) => payload.id.clone(),
+            WindowFeedEvent::Remove(id) => id.clone(),
+        };
+        if !latest_by_id.contains_key(&id) {
+            order.push(id.clone());
+        }
+        latest_by_id.insert(id, event);
+    }
+
+    order
+        .into_iter()
+        .filter_map(|id| latest_by_id.remove(&id))
+        .collect()
 }
 
 fn get_open_windows(kdotool_path: &Path, theme: &str) -> Option<Vec<WindowInfo>> {
@@ -2788,11 +3485,16 @@ fn get_open_windows(kdotool_path: &Path, theme: &str) -> Option<Vec<WindowInfo>>
             }
         }
 
+        let snapshot_details = get_snapshot_window_details(&id);
+
         if let Some(window) = build_window_info(
             id,
             title,
             class,
+            snapshot_details.desktop_file_name,
             pid,
+            snapshot_details.geometry,
+            snapshot_details.minimized,
             &theme_str,
             &mut icon_cache,
             &ppid_to_children,
@@ -2862,6 +3564,63 @@ fn get_window_geometry(kpath: &Path, id: &str) -> Option<(f32, f32, f32, f32)> {
     }
 
     Some((x?, y?, width?, height?))
+}
+
+fn get_snapshot_window_details(id: &str) -> SnapshotWindowDetails {
+    let output = Command::new("qdbus6")
+        .args(["org.kde.KWin", "/KWin", "org.kde.KWin.getWindowInfo", id])
+        .output();
+
+    let Ok(output) = output else {
+        return SnapshotWindowDetails {
+            desktop_file_name: None,
+            geometry: None,
+            minimized: None,
+        };
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut desktop_file_name = None;
+    let mut minimized = None;
+    let mut x = None;
+    let mut y = None;
+    let mut width = None;
+    let mut height = None;
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("desktopFile:") {
+            let value = value.trim();
+            if !value.is_empty() {
+                desktop_file_name = Some(value.to_string());
+            }
+        } else if let Some(value) = line.strip_prefix("minimized:") {
+            minimized = match value.trim() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            };
+        } else if let Some(value) = line.strip_prefix("x:") {
+            x = value.trim().parse::<f64>().ok().map(|v| v.round() as i32);
+        } else if let Some(value) = line.strip_prefix("y:") {
+            y = value.trim().parse::<f64>().ok().map(|v| v.round() as i32);
+        } else if let Some(value) = line.strip_prefix("width:") {
+            width = value.trim().parse::<f64>().ok().map(|v| v.round() as i32);
+        } else if let Some(value) = line.strip_prefix("height:") {
+            height = value.trim().parse::<f64>().ok().map(|v| v.round() as i32);
+        }
+    }
+
+    SnapshotWindowDetails {
+        desktop_file_name,
+        geometry: match (x, y, width, height) {
+            (Some(x), Some(y), Some(width), Some(height)) if width > 0 && height > 0 => {
+                Some((x, y, width, height))
+            }
+            _ => None,
+        },
+        minimized,
+    }
 }
 
 impl App {
@@ -2982,8 +3741,7 @@ impl App {
                     observed_pipewire_node_ids,
                     active_pipewire_node_ids,
                     pipewire_activity_cache_valid,
-                ) =
-                    fetch_pipewire_activity();
+                ) = fetch_pipewire_activity();
                 let now = std::time::Instant::now();
 
                 if pipewire_activity_cache_valid {
@@ -2997,8 +3755,10 @@ impl App {
                     recent_active_pipewire_nodes.clear();
                 }
 
-                let effective_active_pipewire_node_ids =
-                    recent_active_pipewire_nodes.keys().copied().collect::<HashSet<u32>>();
+                let effective_active_pipewire_node_ids = recent_active_pipewire_nodes
+                    .keys()
+                    .copied()
+                    .collect::<HashSet<u32>>();
 
                 if audio_cache_tx
                     .send(AudioCacheUpdate {
@@ -3050,10 +3810,10 @@ impl App {
                             } else {
                                 break; // channel disconnected
                             }
-		                                        }
-		                                    }
-		                                }
-			                            });
+                        }
+                    }
+                }
+            });
         }
 
         if let Some(err) = kwin_window_feed_error {
@@ -3454,16 +4214,16 @@ impl App {
         }
     }
 
-    fn show_process_chain_popup(&mut self, ctx: &egui::Context) {
+    fn show_window_info_popup(&mut self, ctx: &egui::Context) {
         let Some(window_info) = self.process_chain_popup.clone() else {
             return;
         };
 
         let viewport_id = egui::ViewportId::from_hash_of("launcher_process_chain_popup");
         let builder = egui::ViewportBuilder::default()
-            .with_title(format!("Execution Chain: {}", window_info.title))
-            .with_inner_size([620.0, 420.0])
-            .with_min_inner_size([420.0, 260.0])
+            .with_title(format!("Window Info: {}", window_info.title))
+            .with_inner_size([760.0, 680.0])
+            .with_min_inner_size([520.0, 360.0])
             .with_resizable(true);
 
         let mut should_close = false;
@@ -3490,6 +4250,46 @@ impl App {
                         .corner_radius(egui::CornerRadius::same(12)),
                 )
                 .show(ctx, |ui| {
+                    let searchable_label_color = egui::Color32::from_rgb(214, 184, 86);
+                    let searchable_value_color = egui::Color32::from_rgb(255, 236, 170);
+                    let neutral_label_color =
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170);
+                    let neutral_value_color = egui::Color32::WHITE;
+                    let app_key = window_application_key(&window_info);
+                    let exe_basename = window_info
+                        .exe_path
+                        .as_ref()
+                        .and_then(|path| path.file_name().and_then(|name| name.to_str()))
+                        .map(|name| name.to_string())
+                        .unwrap_or_else(|| "Unavailable".to_string());
+                    let desktop_file_path = self
+                        .desktop_file_path_for_window(&window_info)
+                        .map(|path| path.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Unavailable".to_string());
+                    let cwd_search_value = window_info
+                        .cwd_path
+                        .as_ref()
+                        .map(|path| display_path(path))
+                        .unwrap_or_else(|| "Unavailable".to_string());
+                    let class_is_searched = !window_info.class.eq_ignore_ascii_case(&app_key);
+
+                    let info_row =
+                        |ui: &mut egui::Ui, label: &str, value: String, searched: bool| {
+                            let label_color = if searched {
+                                searchable_label_color
+                            } else {
+                                neutral_label_color
+                            };
+                            let value_color = if searched {
+                                searchable_value_color
+                            } else {
+                                neutral_value_color
+                            };
+                            ui.label(egui::RichText::new(label).color(label_color).strong());
+                            ui.label(egui::RichText::new(value).color(value_color).monospace());
+                            ui.end_row();
+                        };
+
                     ui.heading(
                         egui::RichText::new(&window_info.title)
                             .color(egui::Color32::WHITE)
@@ -3497,11 +4297,105 @@ impl App {
                     );
                     ui.add_space(6.0);
                     ui.label(
-                        egui::RichText::new("Leaf process to parent process chain")
-                            .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170)),
+                        egui::RichText::new(
+                            "Window metadata, process details, and execution chain",
+                        )
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170)),
                     );
                     ui.add_space(10.0);
 
+                    egui::Grid::new("window_info_grid")
+                        .num_columns(2)
+                        .spacing([14.0, 8.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            info_row(ui, "Title", window_info.title.clone(), true);
+                            info_row(ui, "Application key", app_key.clone(), true);
+                            info_row(ui, "Window ID", window_info.id.clone(), false);
+                            info_row(ui, "Class", window_info.class.clone(), class_is_searched);
+                            info_row(ui, "Desktop file", desktop_file_path, false);
+                            info_row(
+                                ui,
+                                "PID",
+                                window_info
+                                    .pid
+                                    .map(|pid| pid.to_string())
+                                    .unwrap_or_else(|| "Unavailable".to_string()),
+                                false,
+                            );
+                            info_row(
+                                ui,
+                                "Active process",
+                                window_info
+                                    .active_process
+                                    .clone()
+                                    .unwrap_or_else(|| "Unavailable".to_string()),
+                                true,
+                            );
+                            info_row(ui, "Executable basename", exe_basename, true);
+                            info_row(
+                                ui,
+                                "Executable path",
+                                window_info
+                                    .exe_path
+                                    .as_ref()
+                                    .map(|path| path.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "Unavailable".to_string()),
+                                false,
+                            );
+                            info_row(ui, "Working directory", cwd_search_value, true);
+                            info_row(
+                                ui,
+                                "Command summary",
+                                window_info
+                                    .command_summary
+                                    .clone()
+                                    .unwrap_or_else(|| "Unavailable".to_string()),
+                                true,
+                            );
+                            info_row(
+                                ui,
+                                "Command line",
+                                window_info
+                                    .command_line
+                                    .clone()
+                                    .unwrap_or_else(|| "Unavailable".to_string()),
+                                true,
+                            );
+                            info_row(
+                                ui,
+                                "Geometry",
+                                window_info
+                                    .geometry
+                                    .map(|(x, y, width, height)| {
+                                        format!(
+                                            "x={}, y={}, width={}, height={}",
+                                            x, y, width, height
+                                        )
+                                    })
+                                    .unwrap_or_else(|| "Unavailable".to_string()),
+                                false,
+                            );
+                            info_row(
+                                ui,
+                                "Minimized",
+                                window_info
+                                    .minimized
+                                    .map(|value| value.to_string())
+                                    .unwrap_or_else(|| "Unavailable".to_string()),
+                                false,
+                            );
+                        });
+
+                    ui.add_space(14.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("Execution chain")
+                            .color(egui::Color32::WHITE)
+                            .strong(),
+                    );
+                    ui.add_space(6.0);
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for entry in &window_info.process_chain {
                             ui.group(|ui| {
@@ -3588,6 +4482,7 @@ impl App {
             return;
         }
 
+        let events = coalesce_window_feed_events(events);
         let theme = self
             .force_theme
             .as_deref()
@@ -3644,7 +4539,8 @@ impl App {
             return;
         }
 
-        self.windows.retain(|window| !stale_ids.contains(&window.id));
+        self.windows
+            .retain(|window| !stale_ids.contains(&window.id));
         self.missing_window_counts
             .retain(|window_id, _| !stale_ids.contains(window_id));
 
@@ -3744,6 +4640,19 @@ impl App {
             .filter_map(|app| best_app_match_score(&window_keys, app).map(|score| (app, score)))
             .min_by_key(|(app, score)| (*score, app.is_settings_module))
             .map(|(app, _)| app)
+    }
+
+    fn desktop_file_path_for_window(&self, win: &WindowInfo) -> Option<PathBuf> {
+        if let Some(path) = win
+            .desktop_file_name
+            .as_deref()
+            .and_then(resolve_desktop_file_path)
+        {
+            return Some(path);
+        }
+
+        self.find_app_for_window(win)
+            .map(|app| app.desktop_file_path.clone())
     }
 
     fn launch_window_app_and_exit(&self, win: &WindowInfo, ctx: &egui::Context) {
@@ -3871,7 +4780,45 @@ impl eframe::App for App {
             self.height = current_size.y;
         }
 
-        if !self.loading && self.use_kwin_window_feed {
+        let mut handled_focus_launcher = false;
+        let mut ui_event_count = 0;
+        for _ in 0..UI_EVENTS_PER_FRAME {
+            let Ok(event) = self.ui_event_rx.try_recv() else {
+                break;
+            };
+            ui_event_count += 1;
+            match event {
+                UiEvent::FocusLauncher => {
+                    handled_focus_launcher = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                        egui::WindowLevel::AlwaysOnTop,
+                    ));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                        egui::UserAttentionType::Informational,
+                    ));
+                    request_launcher_foreground();
+                    self.search_focus_until = Some(Instant::now() + Duration::from_millis(1200));
+                    self.search_query.clear();
+                    self.selected_index = 0;
+                    self.side_panel_selected_index = 0;
+                    self.last_selected_window_id = None;
+                    self.scroll_to_first_window_on_focus = self.mode == LauncherMode::Windows;
+                    self.active_pane = if self.mode == LauncherMode::Windows {
+                        ActivePane::Windows
+                    } else {
+                        ActivePane::Apps
+                    };
+                }
+            }
+        }
+        if ui_event_count == UI_EVENTS_PER_FRAME || handled_focus_launcher {
+            ctx.request_repaint();
+        }
+
+        if !handled_focus_launcher && !self.loading && self.use_kwin_window_feed {
             let mut pending_events = Vec::with_capacity(WINDOW_FEED_EVENTS_PER_FRAME);
             for _ in 0..WINDOW_FEED_EVENTS_PER_FRAME {
                 match self.window_feed_receiver.try_recv() {
@@ -3908,7 +4855,7 @@ impl eframe::App for App {
         }
 
         // Check background receiver for window query results
-        if self.loading {
+        if !handled_focus_launcher && self.loading {
             ctx.request_repaint(); // Keep repainting until loaded to check channel promptly
             if let Some(ref rx) = self.receiver {
                 if let Ok(result) = rx.try_recv() {
@@ -3937,76 +4884,39 @@ impl eframe::App for App {
             }
         }
 
-        let mut ui_event_count = 0;
-        for _ in 0..UI_EVENTS_PER_FRAME {
-            let Ok(event) = self.ui_event_rx.try_recv() else {
-                break;
-            };
-            ui_event_count += 1;
-            match event {
-                UiEvent::FocusLauncher => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                        egui::WindowLevel::AlwaysOnTop,
-                    ));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
-                        egui::UserAttentionType::Informational,
-                    ));
-                    request_launcher_foreground();
-                    self.search_focus_until = Some(Instant::now() + Duration::from_millis(1200));
-                    self.search_query.clear();
-                    self.selected_index = 0;
-                    self.side_panel_selected_index = 0;
-                    self.last_selected_window_id = None;
-                    self.scroll_to_first_window_on_focus = self.mode == LauncherMode::Windows;
-                    self.active_pane = if self.mode == LauncherMode::Windows {
-                        ActivePane::Windows
-                    } else {
-                        ActivePane::Apps
-                    };
+        if !handled_focus_launcher {
+            let mut latest_audio_update = None;
+            let mut audio_update_count = 0;
+            for _ in 0..AUDIO_UPDATES_PER_FRAME {
+                match self.audio_cache_receiver.try_recv() {
+                    Ok(update) => {
+                        latest_audio_update = Some(update);
+                        audio_update_count += 1;
+                    }
+                    Err(_) => break,
                 }
             }
-        }
-        if ui_event_count == UI_EVENTS_PER_FRAME {
-            ctx.request_repaint();
-        }
-
-        let mut latest_audio_update = None;
-        let mut audio_update_count = 0;
-        for _ in 0..AUDIO_UPDATES_PER_FRAME {
-            match self.audio_cache_receiver.try_recv() {
-                Ok(update) => {
-                    latest_audio_update = Some(update);
-                    audio_update_count += 1;
-                }
-                Err(_) => break,
+            if let Some(update) = latest_audio_update {
+                self.cached_sink_inputs = update.sink_inputs;
+                self.active_media_app_keys = update.active_media_app_keys;
+                self.observed_pipewire_node_ids = update.observed_pipewire_node_ids;
+                self.active_pipewire_node_ids = update.active_pipewire_node_ids;
+                self.pipewire_activity_cache_valid = update.pipewire_activity_cache_valid;
+            }
+            if audio_update_count == AUDIO_UPDATES_PER_FRAME {
+                ctx.request_repaint();
             }
         }
-        if let Some(update) = latest_audio_update {
-            self.cached_sink_inputs = update.sink_inputs;
-            self.active_media_app_keys = update.active_media_app_keys;
-            self.observed_pipewire_node_ids = update.observed_pipewire_node_ids;
-            self.active_pipewire_node_ids = update.active_pipewire_node_ids;
-            self.pipewire_activity_cache_valid = update.pipewire_activity_cache_valid;
-        }
-        if audio_update_count == AUDIO_UPDATES_PER_FRAME {
-            ctx.request_repaint();
-        }
 
-        let has_active_audio = self
-            .cached_sink_inputs
-            .iter()
-            .any(|sink| {
-                sink_input_level(
-                    sink,
-                    &self.active_media_app_keys,
-                    &self.observed_pipewire_node_ids,
-                    &self.active_pipewire_node_ids,
-                    self.pipewire_activity_cache_valid,
-                ) > 0.0
-            });
+        let has_active_audio = self.cached_sink_inputs.iter().any(|sink| {
+            sink_input_level(
+                sink,
+                &self.active_media_app_keys,
+                &self.observed_pipewire_node_ids,
+                &self.active_pipewire_node_ids,
+                self.pipewire_activity_cache_valid,
+            ) > 0.0
+        });
         let audio_repaint_ms = if has_active_audio {
             AUDIO_ACTIVE_REPAINT_MS
         } else {
@@ -4014,7 +4924,9 @@ impl eframe::App for App {
         };
         ctx.request_repaint_after(std::time::Duration::from_millis(audio_repaint_ms));
 
-        self.prune_stale_windows();
+        if !handled_focus_launcher {
+            self.prune_stale_windows();
+        }
 
         // Focus loss auto-close
         if self.close_on_blur
@@ -4081,6 +4993,7 @@ impl eframe::App for App {
                     };
 
                     let mut text_edit_response = None;
+                    let mut search_query_changed = false;
 
                     search_bar_frame.show(ui, |ui| {
                         ui.horizontal(|ui| {
@@ -4101,7 +5014,9 @@ impl eframe::App for App {
                                 .frame(false)
                                 .font(egui::FontId::proportional(16.0));
 
-                            text_edit_response = Some(ui.add(text_edit));
+                            let response = ui.add(text_edit);
+                            search_query_changed = response.changed();
+                            text_edit_response = Some(response);
                             ui.add_space(8.0);
                             if ui
                                 .button(
@@ -4139,11 +5054,13 @@ impl eframe::App for App {
 	                    let mut filtered_windows: Vec<WindowInfo> = Vec::new();
                         let search_query = self.search_query.trim().to_string();
                         let has_search_query = !search_query.is_empty();
+                        let mut filtered_app_title_is_typos: Vec<bool> = Vec::new();
+                        let mut filtered_window_title_is_typos: Vec<bool> = Vec::new();
 
 	                    match self.mode {
 	                        LauncherMode::Apps => {
-	                            if !has_search_query {
-                                filtered_apps = self.apps
+		                            if !has_search_query {
+	                                filtered_apps = self.apps
                                     .iter()
                                     .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
                                     .map(|app| {
@@ -4151,7 +5068,7 @@ impl eframe::App for App {
                                         (app.clone(), is_pinned)
                                     })
                                     .collect();
-	                                filtered_apps.sort_by(|a, b| {
+		                                filtered_apps.sort_by(|a, b| {
                                     a.0.is_settings_module
                                         .cmp(&b.0.is_settings_module)
                                         .then_with(|| match (a.1, b.1) {
@@ -4163,17 +5080,30 @@ impl eframe::App for App {
                                             }
                                             (false, false) => a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()),
                                         })
-	                                });
+		                                });
+                                        filtered_app_title_is_typos =
+                                            vec![false; filtered_apps.len()];
 	                            } else if let (Some(base_query), Some(typo_query)) = (
                                     MetadataQuery::new(&search_query),
                                     MetadataQuery::new(&search_query).map(|q| q.with_typo_fallback(true)),
                                 ) {
-	                                let mut ranked_apps: Vec<RankedAppMatch> = self.apps
-	                                    .iter()
+		                                let mut ranked_apps: Vec<RankedAppMatch> = self.apps
+		                                    .iter()
                                     .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
                                     .filter_map(|app| {
                                         let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
-                                        let rank = app_search_rank(&base_query, app)?;
+                                        let base_rank = app_search_rank(&base_query, app);
+                                        let typo_rank = app_search_rank(&typo_query, app);
+                                        let rank = match (base_rank, typo_rank) {
+                                            (Some(base_rank), Some(typo_rank)) => {
+                                                pick_better_rank(base_rank, typo_rank)
+                                            }
+                                            (Some(base_rank), None) => base_rank,
+                                            (None, Some(typo_rank)) => typo_rank,
+                                            (None, None) => return None,
+                                        };
+                                        let title_is_typo =
+                                            visible_title_has_typo_match(&app.name, &search_query);
                                         let pin_position = pinned_app_position(&self.pinned_apps, app);
                                         let candidate_score = if is_pinned {
                                             2_000_000.0 - pin_position as f64
@@ -4185,6 +5115,7 @@ impl eframe::App for App {
                                         Some(RankedAppMatch {
                                             app: app.clone(),
                                             rank,
+                                            title_is_typo,
                                             is_pinned,
                                             candidate_key: format!(
                                                 "{}\u{0}{}",
@@ -4193,73 +5124,62 @@ impl eframe::App for App {
                                             ),
                                             candidate_score,
 	                                        })
-	                                    })
-	                                    .collect();
-	                                if ranked_apps.is_empty() {
-	                                    ranked_apps = self.apps
-                                        .iter()
-                                        .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
-                                        .filter_map(|app| {
-                                            let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
-	                                            let rank = app_search_rank(&typo_query, app)?;
-                                            let pin_position = pinned_app_position(&self.pinned_apps, app);
-                                            let candidate_score = if is_pinned {
-                                                2_000_000.0 - pin_position as f64
-                                            } else if !app.is_settings_module {
-                                                1_000_000.0
-                                            } else {
-                                                0.0
-                                            };
-                                            Some(RankedAppMatch {
-                                                app: app.clone(),
-                                                rank,
-                                                is_pinned,
-                                                candidate_key: format!(
-                                                    "{}\u{0}{}",
-                                                    app.name.to_lowercase(),
-                                                    app.desktop_file_path.to_string_lossy()
-                                                ),
-                                                candidate_score,
-                                            })
-                                        })
-                                        .collect();
-                                }
-                                sort_ranked_matches(
-                                    &mut ranked_apps,
+		                                    })
+		                                    .collect();
+		                                sort_ranked_matches(
+		                                    &mut ranked_apps,
                                     |item| &item.candidate_key,
-                                    |item| item.candidate_score,
-                                    |item| &item.rank,
-                                );
-	                                filtered_apps = ranked_apps
-	                                    .into_iter()
-	                                    .map(|item| (item.app, item.is_pinned))
+	                                    |item| item.candidate_score,
+	                                    |item| &item.rank,
+	                                );
+                                        filtered_app_title_is_typos = ranked_apps
+                                            .iter()
+                                            .map(|item| item.title_is_typo)
+                                            .collect();
+		                                filtered_apps = ranked_apps
+		                                    .into_iter()
+		                                    .map(|item| (item.app, item.is_pinned))
 	                                    .collect();
 	                            } else {
                                     filtered_apps.clear();
                                 }
 	                        }
 	                        LauncherMode::Windows => {
-	                            if !has_search_query {
-                                filtered_windows = self.windows.clone();
-	                                filtered_windows.sort_by(|a, b| {
+		                            if !has_search_query {
+	                                filtered_windows = self.windows.clone();
+		                                filtered_windows.sort_by(|a, b| {
                                     window_application_key(a)
                                         .cmp(&window_application_key(b))
                                         .then_with(|| {
                                             window_sort_title_key(a).cmp(&window_sort_title_key(b))
                                         })
                                         .then_with(|| a.id.cmp(&b.id))
-	                                });
-	                            } else if let (Some(base_query), Some(typo_query)) = (
+		                                });
+                                        filtered_window_title_is_typos =
+                                            vec![false; filtered_windows.len()];
+			                            } else if let (Some(base_query), Some(typo_query)) = (
                                     MetadataQuery::new(&search_query),
                                     MetadataQuery::new(&search_query).map(|q| q.with_typo_fallback(true)),
                                 ) {
-	                                let mut ranked_windows: Vec<RankedWindowMatch> = self.windows
+		                                let mut ranked_windows: Vec<RankedWindowMatch> = self.windows
                                     .iter()
                                     .filter_map(|win| {
-                                        let rank = window_search_rank(&base_query, win)?;
+                                        let base_rank = window_search_rank(&base_query, win);
+                                        let typo_rank = window_search_rank(&typo_query, win);
+                                        let rank = match (base_rank, typo_rank) {
+                                            (Some(base_rank), Some(typo_rank)) => {
+                                                pick_better_rank(base_rank, typo_rank)
+                                            }
+                                            (Some(base_rank), None) => base_rank,
+                                            (None, Some(typo_rank)) => typo_rank,
+                                            (None, None) => return None,
+                                        };
+                                        let title_is_typo =
+                                            visible_title_has_typo_match(&win.title, &search_query);
                                         Some(RankedWindowMatch {
                                             window: win.clone(),
                                             rank,
+                                            title_is_typo,
                                             candidate_key: format!(
                                                 "{}\u{0}{}\u{0}{}",
                                                 window_application_key(win),
@@ -4270,33 +5190,18 @@ impl eframe::App for App {
                                         })
                                     })
                                     .collect();
-	                                if ranked_windows.is_empty() {
-	                                    ranked_windows = self.windows
-                                        .iter()
-                                        .filter_map(|win| {
-	                                            let rank = window_search_rank(&typo_query, win)?;
-                                            Some(RankedWindowMatch {
-                                                window: win.clone(),
-                                                rank,
-                                                candidate_key: format!(
-                                                    "{}\u{0}{}\u{0}{}",
-                                                    window_application_key(win),
-                                                    window_sort_title_key(win),
-                                                    win.id
-                                                ),
-                                                candidate_score: 0.0,
-                                            })
-                                        })
-                                        .collect();
-                                }
-                                sort_ranked_matches(
-                                    &mut ranked_windows,
+		                                sort_ranked_matches(
+		                                    &mut ranked_windows,
                                     |item| &item.candidate_key,
-                                    |item| item.candidate_score,
-                                    |item| &item.rank,
-                                );
-	                                filtered_windows =
-	                                    ranked_windows.into_iter().map(|item| item.window).collect();
+	                                    |item| item.candidate_score,
+	                                    |item| &item.rank,
+	                                );
+                                        filtered_window_title_is_typos = ranked_windows
+                                            .iter()
+                                            .map(|item| item.title_is_typo)
+                                            .collect();
+		                                filtered_windows =
+		                                    ranked_windows.into_iter().map(|item| item.window).collect();
 	                            } else {
                                     filtered_windows.clear();
                                 }
@@ -4304,8 +5209,8 @@ impl eframe::App for App {
 	                    }
 
 	                    if self.mode == LauncherMode::Windows {
-	                        if !has_search_query {
-	                            filtered_apps = self.apps
+		                        if !has_search_query {
+		                            filtered_apps = self.apps
 	                                .iter()
 	                                .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
 	                                .map(|app| {
@@ -4313,7 +5218,7 @@ impl eframe::App for App {
 	                                    (app.clone(), is_pinned)
 	                                })
 	                                .collect();
-	                            filtered_apps.sort_by(|a, b| {
+		                            filtered_apps.sort_by(|a, b| {
 	                                a.0.is_settings_module
 	                                    .cmp(&b.0.is_settings_module)
 	                                    .then_with(|| match (a.1, b.1) {
@@ -4325,76 +5230,65 @@ impl eframe::App for App {
 	                                        }
 	                                        (false, false) => a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()),
 	                                    })
-	                            });
-	                        } else if let (Some(base_query), Some(typo_query)) = (
+		                            });
+                                        filtered_app_title_is_typos =
+                                            vec![false; filtered_apps.len()];
+			                        } else if let (Some(base_query), Some(typo_query)) = (
                                 MetadataQuery::new(&search_query),
                                 MetadataQuery::new(&search_query).map(|q| q.with_typo_fallback(true)),
                             ) {
-	                            let mut ranked_apps: Vec<RankedAppMatch> = self.apps
-	                                .iter()
-	                                .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
-	                                .filter_map(|app| {
-	                                    let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
-	                                    let rank = app_search_rank(&base_query, app)?;
-	                                    let pin_position = pinned_app_position(&self.pinned_apps, app);
-	                                    let candidate_score = if is_pinned {
-	                                        2_000_000.0 - pin_position as f64
+		                            let mut ranked_apps: Vec<RankedAppMatch> = self.apps
+		                                .iter()
+		                                .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
+		                                .filter_map(|app| {
+		                                    let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
+		                                    let base_rank = app_search_rank(&base_query, app);
+		                                    let typo_rank = app_search_rank(&typo_query, app);
+		                                    let rank = match (base_rank, typo_rank) {
+		                                        (Some(base_rank), Some(typo_rank)) => {
+		                                            pick_better_rank(base_rank, typo_rank)
+		                                        }
+		                                        (Some(base_rank), None) => base_rank,
+		                                        (None, Some(typo_rank)) => typo_rank,
+		                                        (None, None) => return None,
+		                                    };
+		                                    let title_is_typo =
+		                                        visible_title_has_typo_match(&app.name, &search_query);
+		                                    let pin_position = pinned_app_position(&self.pinned_apps, app);
+		                                    let candidate_score = if is_pinned {
+		                                        2_000_000.0 - pin_position as f64
 	                                    } else if !app.is_settings_module {
 	                                        1_000_000.0
 	                                    } else {
 	                                        0.0
 	                                    };
-	                                    Some(RankedAppMatch {
-	                                        app: app.clone(),
-	                                        rank,
-	                                        is_pinned,
-	                                        candidate_key: format!(
-	                                            "{}\u{0}{}",
+		                                    Some(RankedAppMatch {
+		                                        app: app.clone(),
+		                                        rank,
+		                                        title_is_typo,
+		                                        is_pinned,
+		                                        candidate_key: format!(
+		                                            "{}\u{0}{}",
 	                                            app.name.to_lowercase(),
 	                                            app.desktop_file_path.to_string_lossy()
 	                                        ),
 	                                        candidate_score,
 	                                    })
-	                                })
-	                                .collect();
-	                            if ranked_apps.is_empty() {
-	                                ranked_apps = self.apps
-	                                    .iter()
-	                                    .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
-	                                    .filter_map(|app| {
-	                                        let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
-	                                        let rank = app_search_rank(&typo_query, app)?;
-	                                        let pin_position = pinned_app_position(&self.pinned_apps, app);
-	                                        let candidate_score = if is_pinned {
-	                                            2_000_000.0 - pin_position as f64
-	                                        } else if !app.is_settings_module {
-	                                            1_000_000.0
-	                                        } else {
-	                                            0.0
-	                                        };
-	                                        Some(RankedAppMatch {
-	                                            app: app.clone(),
-	                                            rank,
-	                                            is_pinned,
-	                                            candidate_key: format!(
-	                                                "{}\u{0}{}",
-	                                                app.name.to_lowercase(),
-	                                                app.desktop_file_path.to_string_lossy()
-	                                            ),
-	                                            candidate_score,
-	                                        })
-	                                    })
-	                                    .collect();
-	                            }
-	                            sort_ranked_matches(
-	                                &mut ranked_apps,
-	                                |item| &item.candidate_key,
-	                                |item| item.candidate_score,
-	                                |item| &item.rank,
-	                            );
-	                            filtered_apps = ranked_apps
-	                                .into_iter()
-	                                .map(|item| (item.app, item.is_pinned))
+		                                })
+		                                .collect();
+			                            sort_ranked_matches(
+			                                &mut ranked_apps,
+		                                |item| &item.candidate_key,
+		                                |item| item.candidate_score,
+		                                |item| &item.rank,
+		                            );
+	                                    filtered_app_title_is_typos = ranked_apps
+	                                        .iter()
+	                                        .map(|item| item.title_is_typo)
+	                                        .collect();
+		                            filtered_apps = ranked_apps
+		                                .into_iter()
+		                                .map(|item| (item.app, item.is_pinned))
 	                                .collect();
 	                        } else {
                                 filtered_apps.clear();
@@ -4402,21 +5296,26 @@ impl eframe::App for App {
 	                    }
 
 	                    if self.mode == LauncherMode::Windows {
-	                        if let Some(ref last_id) = self.last_selected_window_id {
+                            if search_query_changed {
+                                self.selected_index = 0;
+                                self.last_selected_window_id = None;
+                                self.active_pane = ActivePane::Windows;
+                            } else if let Some(ref last_id) = self.last_selected_window_id {
 	                            if let Some(pos) = filtered_windows.iter().position(|w| &w.id == last_id) {
 	                                self.selected_index = pos;
 	                            }
 	                        }
                     }
 
-                    let show_terminal_cd_result =
+                    let show_terminal_actions =
                         self.mode == LauncherMode::Windows && has_search_query;
-                    let terminal_cd_result_index = filtered_windows.len();
+                    let terminal_run_result_index = filtered_windows.len();
+                    let terminal_cd_result_index = filtered_windows.len() + 1;
 
                     let total_items = match self.mode {
                         LauncherMode::Apps => filtered_apps.len(),
                         LauncherMode::Windows => {
-                            filtered_windows.len() + usize::from(show_terminal_cd_result)
+                            filtered_windows.len() + if show_terminal_actions { 2 } else { 0 }
                         }
                     };
 
@@ -4619,7 +5518,12 @@ impl eframe::App for App {
                                         {
                                             self.launch_app_and_exit(app, ctx);
                                         }
-                                    } else if show_terminal_cd_result
+                                    } else if show_terminal_actions
+                                        && self.selected_index == terminal_run_result_index
+                                    {
+                                        launch_terminal_command(&search_query);
+                                        ctx.request_repaint();
+                                    } else if show_terminal_actions
                                         && self.selected_index == terminal_cd_result_index
                                     {
                                         launch_terminal_cd(&search_query);
@@ -4881,7 +5785,7 @@ impl eframe::App for App {
                                             response.scroll_to_me(None);
                                         }
 
-                                        if response.clicked() {
+                                        if response.clicked() || response.middle_clicked() {
                                             self.launch_app_and_exit(app, ctx);
                                         }
 
@@ -4960,12 +5864,23 @@ impl eframe::App for App {
 
                                         if self.app_icon_show_name {
                                             let label = truncate_tile_label(&app.name, tile_size);
-                                            ui.painter().text(
-                                                label_rect.center(),
-                                                egui::Align2::CENTER_CENTER,
-                                                label,
-                                                egui::FontId::proportional(self.app_icon_name_size),
-                                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 210),
+                                            let title_is_typo = filtered_app_title_is_typos
+                                                .get(index)
+                                                .copied()
+                                                .unwrap_or(false);
+                                            paint_centered_title_job(
+                                                ui,
+                                                label_rect,
+                                                &search_query,
+                                                &label,
+                                                self.app_icon_name_size,
+                                                title_is_typo,
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    255,
+                                                    255,
+                                                    255,
+                                                    210,
+                                                ),
                                             );
                                         }
 	                                    }
@@ -4989,10 +5904,20 @@ impl eframe::App for App {
                                     let previous_item_spacing = ui.spacing().item_spacing;
                                     ui.spacing_mut().item_spacing.y = 0.0;
 				                                for index in 0..total_items {
-                                            let is_terminal_cd_row = self.mode
-                                                == LauncherMode::Windows
-                                                && show_terminal_cd_result
-                                                && index == terminal_cd_result_index;
+                                            let terminal_action_label =
+                                                if self.mode == LauncherMode::Windows
+                                                    && show_terminal_actions
+                                                    && index == terminal_run_result_index
+                                                {
+                                                    Some("run in Terminal")
+                                                } else if self.mode == LauncherMode::Windows
+                                                    && show_terminal_actions
+                                                    && index == terminal_cd_result_index
+                                                {
+                                                    Some("cd in Terminal")
+                                                } else {
+                                                    None
+                                                };
 			                                    let is_selected = index == self.selected_index
 			                                        && (self.mode == LauncherMode::Apps
 			                                            || self.active_pane == ActivePane::Windows);
@@ -5115,8 +6040,16 @@ impl eframe::App for App {
 
                                             child_ui.add_space(10.0);
 
-                                            let mut label_clicked = false;
-                                            if self.win_show_path {
+			                                            let display_title =
+			                                                search_visible_app_title(app, &search_query);
+			                                            let show_search_metadata =
+			                                                !search_query.trim().is_empty();
+			                                            let mut label_clicked = false;
+                                                let title_is_typo = filtered_app_title_is_typos
+                                                    .get(index)
+                                                    .copied()
+                                                    .unwrap_or(false);
+	                                            if self.win_show_path {
                                                 let text_min_x = content_rect.min.x
                                                     + app_icon_size.x
                                                     + 10.0;
@@ -5131,26 +6064,26 @@ impl eframe::App for App {
                                                             egui::Align::Min,
                                                         )),
                                                 );
-	                                                text_ui.spacing_mut().item_spacing.y = 0.0;
-	                                                text_ui.add_space(
-	                                                    ((content_rect.height()
-	                                                        - (self.win_line_height
-	                                                            + self.win_line_height * 0.8
-	                                                            + self.win_text_spacing))
-                                                        / 2.0)
-                                                        .max(0.0),
-                                                );
+		                                                text_ui.spacing_mut().item_spacing.y = 0.0;
+		                                                let text_block_height = if show_search_metadata {
+		                                                    self.win_line_height
+		                                                } else {
+		                                                    self.win_line_height
+		                                                        + self.win_line_height * 0.8
+		                                                        + self.win_text_spacing
+		                                                };
+		                                                text_ui.add_space(
+		                                                    ((content_rect.height() - text_block_height) / 2.0)
+		                                                        .max(0.0),
+		                                                );
 
                                                 let title_response = text_ui.add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(&app.name)
-                                                            .color(egui::Color32::WHITE)
-                                                            .strong()
-                                                            .size(self.win_title_size)
-                                                            .line_height(Some(
-                                                                self.win_line_height,
-                                                            )),
-                                                    )
+	                                                    egui::Label::new(highlighted_title_job(
+	                                                        &display_title,
+	                                                        &search_query,
+	                                                        self.win_title_size,
+	                                                        title_is_typo,
+                                                    ))
                                                     .sense(egui::Sense::click())
                                                     .truncate(),
                                                 );
@@ -5163,35 +6096,37 @@ impl eframe::App for App {
                                                         .set_cursor_icon(egui::CursorIcon::Default);
                                                 }
 
-                                                text_ui.add_space(self.win_text_spacing);
+                                                    if !show_search_metadata {
+	                                                    text_ui.add_space(self.win_text_spacing);
 
-                                                let is_link =
-                                                    std::fs::symlink_metadata(&app.desktop_file_path)
-                                                        .map(|m| m.file_type().is_symlink())
-                                                        .unwrap_or(false);
-                                                let mut subtext =
-                                                    app.desktop_file_path.to_string_lossy().to_string();
-                                                if is_link {
-                                                    subtext.push('@');
-                                                }
-                                                let path_response = text_ui.add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(subtext)
-                                                            .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 130))
-                                                            .size(self.win_path_size)
-                                                            .line_height(Some(self.win_line_height * 0.8)),
-                                                    )
-                                                    .sense(egui::Sense::click())
-                                                    .truncate(),
-                                                );
-                                                if path_response.clicked() {
-                                                    label_clicked = true;
-                                                }
-                                                if self.disable_ibeam && path_response.hovered() {
-                                                    text_ui
-                                                        .ctx()
-                                                        .set_cursor_icon(egui::CursorIcon::Default);
-                                                }
+	                                                    let is_link =
+	                                                        std::fs::symlink_metadata(&app.desktop_file_path)
+	                                                            .map(|m| m.file_type().is_symlink())
+	                                                            .unwrap_or(false);
+	                                                    let mut subtext =
+	                                                        app.desktop_file_path.to_string_lossy().to_string();
+	                                                    if is_link {
+	                                                        subtext.push('@');
+	                                                    }
+	                                                    let path_response = text_ui.add(
+	                                                        egui::Label::new(
+	                                                            egui::RichText::new(subtext)
+	                                                                .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 130))
+	                                                                .size(self.win_path_size)
+	                                                                .line_height(Some(self.win_line_height * 0.8)),
+	                                                        )
+	                                                        .sense(egui::Sense::click())
+	                                                        .truncate(),
+	                                                    );
+	                                                    if path_response.clicked() {
+	                                                        label_clicked = true;
+	                                                    }
+	                                                    if self.disable_ibeam && path_response.hovered() {
+	                                                        text_ui
+	                                                            .ctx()
+	                                                            .set_cursor_icon(egui::CursorIcon::Default);
+	                                                    }
+                                                    }
                                                 if self.pinned_apps.contains(&app.desktop_file_path) {
                                                     text_ui.add_space(4.0);
                                                     text_ui.label(
@@ -5202,13 +6137,12 @@ impl eframe::App for App {
                                                 }
                                             } else {
                                                 let title_response = child_ui.add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(&app.name)
-                                                            .color(egui::Color32::WHITE)
-                                                            .strong()
-                                                            .size(self.win_title_size)
-                                                            .line_height(Some(self.win_line_height)),
-                                                    )
+	                                                    egui::Label::new(highlighted_title_job(
+	                                                        &display_title,
+	                                                        &search_query,
+	                                                        self.win_title_size,
+	                                                        title_is_typo,
+                                                    ))
                                                     .sense(egui::Sense::click())
                                                     .truncate(),
                                                 );
@@ -5235,7 +6169,7 @@ impl eframe::App for App {
                                             }
 	                                        }
 		                                        LauncherMode::Windows => {
-                                                if is_terminal_cd_row {
+                                                if let Some(terminal_action_label) = terminal_action_label {
                                                     let (icon_rect, _) = child_ui.allocate_exact_size(
                                                         window_icon_size,
                                                         egui::Sense::hover(),
@@ -5273,7 +6207,7 @@ impl eframe::App for App {
                                                         child_ui.vertical(|ui| {
                                                             ui.spacing_mut().item_spacing.y = 0.0;
                                                             ui.label(
-                                                                egui::RichText::new("cd in Terminal")
+                                                                egui::RichText::new(terminal_action_label)
                                                                     .color(egui::Color32::WHITE)
                                                                     .strong()
                                                                     .size(self.win_title_size)
@@ -5293,7 +6227,7 @@ impl eframe::App for App {
                                                         });
                                                     } else {
                                                         child_ui.label(
-                                                            egui::RichText::new("cd in Terminal")
+                                                            egui::RichText::new(terminal_action_label)
                                                                 .color(egui::Color32::WHITE)
                                                                 .strong()
                                                                 .size(self.win_title_size)
@@ -5336,22 +6270,29 @@ impl eframe::App for App {
 
                                             child_ui.add_space(10.0);
 
-                                            let display_title = truncate_chars(&win.title, 65);
+		                                            let display_title = if search_query.trim().is_empty() {
+		                                                truncate_chars(&win.title, 65)
+		                                            } else {
+		                                                search_visible_window_title(win, &search_query)
+		                                            };
+		                                            let show_search_metadata =
+		                                                !search_query.trim().is_empty();
+	                                                let title_is_typo = filtered_window_title_is_typos
+	                                                    .get(index)
+	                                                    .copied()
+                                                    .unwrap_or(false);
 
                                             if self.win_show_path {
                                                 child_ui.vertical(|ui| {
                                                     ui.spacing_mut().item_spacing.y = 0.0;
 
                                                     let title_response = ui.add(
-                                                        egui::Label::new(
-                                                            egui::RichText::new(display_title)
-                                                                .color(egui::Color32::WHITE)
-                                                                .strong()
-                                                                .size(self.win_title_size)
-                                                                .line_height(Some(
-                                                                    self.win_line_height,
-                                                                )),
-                                                        )
+                                                        egui::Label::new(highlighted_title_job(
+                                                            &display_title,
+                                                            &search_query,
+                                                            self.win_title_size,
+                                                            title_is_typo,
+                                                        ))
                                                         .sense(egui::Sense::hover())
                                                         .truncate(),
                                                     );
@@ -5363,56 +6304,77 @@ impl eframe::App for App {
                                                         );
                                                     }
 
-                                                    ui.add_space(self.win_text_spacing);
+                                                    if !show_search_metadata {
+	                                                        ui.add_space(self.win_text_spacing);
 
-                                                    let subtext = if let Some(ref path) = win.cwd_path
-                                                    {
-                                                        display_path(path)
-                                                    } else if let Some(ref path) = win.exe_path {
-                                                        let is_link = std::fs::symlink_metadata(path)
-                                                            .map(|m| m.file_type().is_symlink())
-                                                            .unwrap_or(false);
-                                                        let mut path_str = display_path(path);
-                                                        if is_link {
-                                                            path_str.push('@');
-                                                        }
-                                                        path_str
-                                                    } else if let Some(ref proc_name) =
-                                                        win.active_process
-                                                    {
-                                                        format!(
-                                                            "{} (running: {})",
-                                                            win.class, proc_name
-                                                        )
-                                                    } else {
-                                                        win.class.clone()
-                                                    };
-                                                    let path_response = ui.add(
-                                                        egui::Label::new(
-                                                            egui::RichText::new(subtext)
-                                                                .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 130))
-                                                                .size(self.win_path_size)
-                                                                .line_height(Some(self.win_line_height * 0.8)),
-                                                        )
-                                                        .sense(egui::Sense::hover())
-                                                        .truncate(),
-                                                    );
-                                                    if self.disable_ibeam && path_response.hovered()
-                                                    {
-                                                        ui.ctx().set_cursor_icon(
-                                                            egui::CursorIcon::Default,
-                                                        );
+	                                                        let subtext = if let Some(ref path) = win.cwd_path
+	                                                        {
+	                                                            let path_display = display_path(path);
+	                                                            if let Some(ref command_summary) =
+	                                                                win.command_summary
+	                                                            {
+	                                                                if !normalize_app_match_key(command_summary)
+	                                                                    .eq(&normalize_app_match_key(&path_display))
+	                                                                {
+	                                                                    format!(
+	                                                                        "{} | {}",
+	                                                                        path_display, command_summary
+	                                                                    )
+	                                                                } else {
+	                                                                    path_display
+	                                                                }
+	                                                            } else {
+	                                                                path_display
+	                                                            }
+	                                                        } else if let Some(ref command_summary) =
+	                                                            win.command_summary
+	                                                        {
+	                                                            command_summary.clone()
+	                                                        } else if let Some(ref path) = win.exe_path {
+	                                                            let is_link = std::fs::symlink_metadata(path)
+	                                                                .map(|m| m.file_type().is_symlink())
+	                                                                .unwrap_or(false);
+	                                                            let mut path_str = display_path(path);
+	                                                            if is_link {
+	                                                                path_str.push('@');
+	                                                            }
+	                                                            path_str
+	                                                        } else if let Some(ref proc_name) =
+	                                                            win.active_process
+	                                                        {
+	                                                            format!(
+	                                                                "{} (running: {})",
+	                                                                win.class, proc_name
+	                                                            )
+	                                                        } else {
+	                                                            win.class.clone()
+	                                                        };
+	                                                        let path_response = ui.add(
+	                                                            egui::Label::new(
+	                                                                egui::RichText::new(subtext)
+	                                                                    .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 130))
+	                                                                    .size(self.win_path_size)
+	                                                                    .line_height(Some(self.win_line_height * 0.8)),
+	                                                            )
+	                                                            .sense(egui::Sense::hover())
+	                                                            .truncate(),
+	                                                        );
+	                                                        if self.disable_ibeam && path_response.hovered()
+	                                                        {
+	                                                            ui.ctx().set_cursor_icon(
+	                                                                egui::CursorIcon::Default,
+	                                                            );
+	                                                        }
                                                     }
                                                 });
                                             } else {
                                                 let title_response = child_ui.add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(display_title)
-                                                            .color(egui::Color32::WHITE)
-                                                            .strong()
-                                                            .size(self.win_title_size)
-                                                            .line_height(Some(self.win_line_height)),
-                                                    )
+                                                    egui::Label::new(highlighted_title_job(
+                                                        &display_title,
+                                                        &search_query,
+                                                        self.win_title_size,
+                                                        title_is_typo,
+                                                    ))
                                                     .sense(egui::Sense::hover())
                                                     .truncate(),
                                                 );
@@ -5432,7 +6394,7 @@ impl eframe::App for App {
                                         egui::Sense::click(),
                                     );
 
-                                    if !is_terminal_cd_row {
+                                    if terminal_action_label.is_none() {
                                         overlay_response.clone().context_menu(|ui| {
                                             match self.mode {
                                                 LauncherMode::Apps => {
@@ -5491,11 +6453,11 @@ impl eframe::App for App {
                                                         self.activate_and_exit(win.id.clone(), ctx);
                                                         ui.close();
                                                     }
-                                                    ui.separator();
-                                                    if ui.button("Show execution chain").clicked() {
+                                                    if ui.button("Show info").clicked() {
                                                         self.process_chain_popup = Some(win.clone());
                                                         ui.close();
                                                     }
+                                                    ui.separator();
                                                     if ui.button("Close application").clicked() {
                                                         self.close_window_and_exit(win.id.clone(), ctx);
                                                         ui.close();
@@ -5601,10 +6563,17 @@ impl eframe::App for App {
 		                                                let app = &filtered_apps[index].0;
 		                                                self.launch_app_and_exit(app, ctx);
 		                                            }
-		                                            LauncherMode::Windows => {
+                                                    LauncherMode::Windows => {
 		                                                self.active_pane = ActivePane::Windows;
 		                                                self.selected_index = index;
-                                                    if is_terminal_cd_row {
+                                                    if show_terminal_actions
+                                                        && index == terminal_run_result_index
+                                                    {
+                                                        launch_terminal_command(&search_query);
+                                                        ctx.request_repaint();
+                                                    } else if show_terminal_actions
+                                                        && index == terminal_cd_result_index
+                                                    {
                                                         launch_terminal_cd(&search_query);
                                                         ctx.request_repaint();
                                                     } else {
@@ -5616,16 +6585,20 @@ impl eframe::App for App {
 		                                    }
 
 			                                    if overlay_response.middle_clicked() {
-			                                        if let LauncherMode::Windows = self.mode {
-                                                if is_terminal_cd_row {
-                                                    continue;
-                                                }
+			                                        if let LauncherMode::Apps = self.mode {
+                                                    self.selected_index = index;
+                                                    let app = &filtered_apps[index].0;
+                                                    self.launch_app_and_exit(app, ctx);
+                                                } else if let LauncherMode::Windows = self.mode {
+                                                    if terminal_action_label.is_some() {
+                                                        continue;
+                                                    }
 			                                            self.active_pane = ActivePane::Windows;
 			                                            self.selected_index = index;
 			                                            let win = &filtered_windows[index];
 		                                            self.launch_window_app_and_exit(win, ctx);
 		                                        }
-		                                    }
+			                                    }
 		                                }
                                     ui.spacing_mut().item_spacing = previous_item_spacing;
 			                            });
@@ -5745,11 +6718,11 @@ impl eframe::App for App {
                                                                     }
                                                                 }
 		                                                    });
-		                                                    if response.clicked() {
-	                                                                self.active_pane = ActivePane::Apps;
-	                                                                self.side_panel_selected_index = index;
-		                                                        self.launch_app_and_exit(app, ctx);
-		                                                    }
+			                                                    if response.clicked() || response.middle_clicked() {
+		                                                                self.active_pane = ActivePane::Apps;
+		                                                                self.side_panel_selected_index = index;
+			                                                        self.launch_app_and_exit(app, ctx);
+			                                                    }
 		                                                    ui.painter().rect_filled(
 		                                                        rect,
 		                                                        egui::CornerRadius::same(10),
@@ -5820,13 +6793,18 @@ impl eframe::App for App {
                                                             if self.app_icon_show_name {
                                                                 let label =
                                                                     truncate_tile_label(&app.name, tile_size);
-                                                                ui.painter().text(
-                                                                    label_rect.center(),
-                                                                    egui::Align2::CENTER_CENTER,
-                                                                    label,
-                                                                    egui::FontId::proportional(
-                                                                        self.app_icon_name_size,
-                                                                    ),
+                                                                let title_is_typo =
+                                                                    filtered_app_title_is_typos
+                                                                        .get(index)
+                                                                        .copied()
+                                                                        .unwrap_or(false);
+                                                                paint_centered_title_job(
+                                                                    ui,
+                                                                    label_rect,
+                                                                    &search_query,
+                                                                    &label,
+                                                                    self.app_icon_name_size,
+                                                                    title_is_typo,
                                                                     egui::Color32::from_rgba_unmultiplied(
                                                                         255, 255, 255, 210,
                                                                     ),
@@ -5842,7 +6820,7 @@ impl eframe::App for App {
 	                                                } else {
 	                                                    self.rendered_side_panel_item_centers.clear();
 	                                                    self.rendered_side_panel_grid_columns = 1;
-		                                                    for item in &filtered_apps {
+			                                                    for (index, item) in filtered_apps.iter().enumerate() {
 	                                                        let app = &item.0;
                                                             let audio_level =
                                                                 app_audio_level(
@@ -5891,9 +6869,9 @@ impl eframe::App for App {
                                                             }
                                                         }
 	                                                });
-	                                                if response.clicked() {
-	                                                    self.launch_app_and_exit(app, ctx);
-	                                                }
+		                                                if response.clicked() || response.middle_clicked() {
+		                                                    self.launch_app_and_exit(app, ctx);
+		                                                }
                                                         if response.hovered() {
                                                             ui.painter().rect_filled(
                                                                 rect,
@@ -5928,8 +6906,17 @@ impl eframe::App for App {
                                                             );
                                                         child_ui.add_space(10.0);
 
-                                                        let mut label_clicked = false;
-                                                        if self.win_show_path {
+		                                                        let display_title =
+		                                                            search_visible_app_title(app, &search_query);
+		                                                        let show_search_metadata =
+		                                                            !search_query.trim().is_empty();
+		                                                        let mut label_clicked = false;
+		                                                            let title_is_typo =
+                                                                filtered_app_title_is_typos
+                                                                    .get(index)
+                                                                    .copied()
+                                                                    .unwrap_or(false);
+	                                                        if self.win_show_path {
                                                             let text_min_x =
                                                                 content_rect.min.x + app_icon_size.x + 10.0;
                                                             let text_rect = egui::Rect::from_min_max(
@@ -5943,23 +6930,27 @@ impl eframe::App for App {
                                                                         egui::Align::Min,
                                                                     )),
                                                             );
-                                                            text_ui.spacing_mut().item_spacing.y = 0.0;
-                                                            text_ui.add_space(
-                                                                ((content_rect.height()
-                                                                    - (self.win_line_height
-                                                                        + self.win_line_height * 0.8
-                                                                        + self.win_text_spacing))
-                                                                    / 2.0)
-                                                                    .max(0.0),
-                                                            );
+	                                                            text_ui.spacing_mut().item_spacing.y = 0.0;
+	                                                            let text_block_height = if show_search_metadata {
+	                                                                self.win_line_height
+	                                                            } else {
+	                                                                self.win_line_height
+	                                                                    + self.win_line_height * 0.8
+	                                                                    + self.win_text_spacing
+	                                                            };
+	                                                            text_ui.add_space(
+	                                                                ((content_rect.height() - text_block_height) / 2.0)
+	                                                                    .max(0.0),
+	                                                            );
 
                                                             let title_response = text_ui.add(
                                                                 egui::Label::new(
-                                                                    egui::RichText::new(&app.name)
-                                                                        .color(egui::Color32::WHITE)
-                                                                        .strong()
-                                                                        .size(self.win_title_size)
-                                                                        .line_height(Some(self.win_line_height)),
+	                                                                    highlighted_title_job(
+	                                                                        &display_title,
+	                                                                        &search_query,
+	                                                                        self.win_title_size,
+	                                                                        title_is_typo,
+                                                                    ),
                                                                 )
                                                                 .sense(egui::Sense::click())
                                                                 .truncate(),
@@ -5973,50 +6964,53 @@ impl eframe::App for App {
                                                                     .set_cursor_icon(egui::CursorIcon::Default);
                                                             }
 
-                                                            text_ui.add_space(self.win_text_spacing);
+                                                            if !show_search_metadata {
+	                                                            text_ui.add_space(self.win_text_spacing);
 
-                                                            let is_link = std::fs::symlink_metadata(
-                                                                &app.desktop_file_path,
-                                                            )
-                                                            .map(|m| m.file_type().is_symlink())
-                                                            .unwrap_or(false);
-                                                            let mut subtext = app
-                                                                .desktop_file_path
-                                                                .to_string_lossy()
-                                                                .to_string();
-                                                            if is_link {
-                                                                subtext.push('@');
-                                                            }
-                                                            let path_response = text_ui.add(
-                                                                egui::Label::new(
-                                                                    egui::RichText::new(subtext)
-                                                                        .color(egui::Color32::from_rgba_unmultiplied(
-                                                                            255, 255, 255, 130,
-                                                                        ))
-                                                                        .size(self.win_path_size)
-                                                                        .line_height(Some(
-                                                                            self.win_line_height * 0.8,
-                                                                        )),
-                                                                )
-                                                                .sense(egui::Sense::click())
-                                                                .truncate(),
-                                                            );
-                                                            if path_response.clicked() {
-                                                                label_clicked = true;
-                                                            }
-                                                            if self.disable_ibeam && path_response.hovered() {
-                                                                text_ui
-                                                                    .ctx()
-                                                                    .set_cursor_icon(egui::CursorIcon::Default);
+	                                                            let is_link = std::fs::symlink_metadata(
+	                                                                &app.desktop_file_path,
+	                                                            )
+	                                                            .map(|m| m.file_type().is_symlink())
+	                                                            .unwrap_or(false);
+	                                                            let mut subtext = app
+	                                                                .desktop_file_path
+	                                                                .to_string_lossy()
+	                                                                .to_string();
+	                                                            if is_link {
+	                                                                subtext.push('@');
+	                                                            }
+	                                                            let path_response = text_ui.add(
+	                                                                egui::Label::new(
+	                                                                    egui::RichText::new(subtext)
+	                                                                        .color(egui::Color32::from_rgba_unmultiplied(
+	                                                                            255, 255, 255, 130,
+	                                                                        ))
+	                                                                        .size(self.win_path_size)
+	                                                                        .line_height(Some(
+	                                                                            self.win_line_height * 0.8,
+	                                                                        )),
+	                                                                )
+	                                                                .sense(egui::Sense::click())
+	                                                                .truncate(),
+	                                                            );
+	                                                            if path_response.clicked() {
+	                                                                label_clicked = true;
+	                                                            }
+	                                                            if self.disable_ibeam && path_response.hovered() {
+	                                                                text_ui
+	                                                                    .ctx()
+	                                                                    .set_cursor_icon(egui::CursorIcon::Default);
+	                                                            }
                                                             }
                                                         } else {
                                                             let title_response = child_ui.add(
                                                                 egui::Label::new(
-                                                                    egui::RichText::new(&app.name)
-                                                                        .color(egui::Color32::WHITE)
-                                                                        .strong()
-                                                                        .size(self.win_title_size)
-                                                                        .line_height(Some(self.win_line_height)),
+	                                                                    highlighted_title_job(
+	                                                                        &display_title,
+	                                                                        &search_query,
+	                                                                        self.win_title_size,
+	                                                                        title_is_typo,
+                                                                    ),
                                                                 )
                                                                 .sense(egui::Sense::click())
                                                                 .truncate(),
@@ -6078,7 +7072,7 @@ impl eframe::App for App {
                         self.show_settings_popup(ctx);
                     }
                     if self.process_chain_popup.is_some() {
-                        self.show_process_chain_popup(ctx);
+                        self.show_window_info_popup(ctx);
                     }
 
                     if let Some(ref resp) = text_edit_response {
@@ -6472,13 +7466,21 @@ fn main() -> eframe::Result {
 
 fn set_sink_input_volume(index: u32, volume_percent: u32) {
     let _ = Command::new("pactl")
-        .args(&["set-sink-input-volume", &index.to_string(), &format!("{}%", volume_percent)])
+        .args(&[
+            "set-sink-input-volume",
+            &index.to_string(),
+            &format!("{}%", volume_percent),
+        ])
         .status();
 }
 
 fn set_sink_input_mute(index: u32, mute: bool) {
     let _ = Command::new("pactl")
-        .args(&["set-sink-input-mute", &index.to_string(), if mute { "1" } else { "0" }])
+        .args(&[
+            "set-sink-input-mute",
+            &index.to_string(),
+            if mute { "1" } else { "0" },
+        ])
         .status();
 }
 
@@ -6507,9 +7509,12 @@ fn dedup_sink_inputs_for_controls(sink_inputs: &[PactlSinkInput]) -> Vec<PactlSi
     deduped
 }
 
-fn find_sink_inputs_for_window(window: &WindowInfo, sink_inputs: &[PactlSinkInput]) -> Vec<PactlSinkInput> {
+fn find_sink_inputs_for_window(
+    window: &WindowInfo,
+    sink_inputs: &[PactlSinkInput],
+) -> Vec<PactlSinkInput> {
     let mut matches = Vec::new();
-    
+
     // 1. Try to match by PID
     if let Some(wpid) = window.pid {
         let wpid_str = wpid.to_string();
@@ -6521,7 +7526,7 @@ fn find_sink_inputs_for_window(window: &WindowInfo, sink_inputs: &[PactlSinkInpu
             }
         }
     }
-    
+
     // 2. Try to match by process chain PIDs
     if matches.is_empty() {
         for entry in &window.process_chain {
@@ -6535,36 +7540,48 @@ fn find_sink_inputs_for_window(window: &WindowInfo, sink_inputs: &[PactlSinkInpu
             }
         }
     }
-    
+
     // 3. Try to match by class or active process name
     if matches.is_empty() {
         let class_lower = window.class.to_lowercase();
         let active_lower = window.active_process.as_ref().map(|s| s.to_lowercase());
         for sink in sink_inputs {
-            let app_name = sink.properties.get("application.name").map(|s| s.to_lowercase());
-            let app_binary = sink.properties.get("application.process.binary").map(|s| s.to_lowercase());
-            
+            let app_name = sink
+                .properties
+                .get("application.name")
+                .map(|s| s.to_lowercase());
+            let app_binary = sink
+                .properties
+                .get("application.process.binary")
+                .map(|s| s.to_lowercase());
+
             let name_match = app_name.as_ref().map_or(false, |n| {
-                n.contains(&class_lower) || class_lower.contains(n) ||
-                active_lower.as_ref().map_or(false, |act| n.contains(act) || act.contains(n))
+                n.contains(&class_lower)
+                    || class_lower.contains(n)
+                    || active_lower
+                        .as_ref()
+                        .map_or(false, |act| n.contains(act) || act.contains(n))
             });
             let binary_match = app_binary.as_ref().map_or(false, |b| {
-                b.contains(&class_lower) || class_lower.contains(b) ||
-                active_lower.as_ref().map_or(false, |act| b.contains(act) || act.contains(b))
+                b.contains(&class_lower)
+                    || class_lower.contains(b)
+                    || active_lower
+                        .as_ref()
+                        .map_or(false, |act| b.contains(act) || act.contains(b))
             });
-            
+
             if name_match || binary_match {
                 matches.push(sink.clone());
             }
         }
     }
-    
+
     matches
 }
 
 fn setup_system_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    
+
     // Fallback paths for symbol fonts supporting Braille
     let paths = [
         "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
@@ -6572,7 +7589,7 @@ fn setup_system_fonts(ctx: &egui::Context) {
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
     ];
-    
+
     let mut loaded_any = false;
     for (i, path) in paths.iter().enumerate() {
         if let Ok(data) = std::fs::read(path) {
@@ -6590,7 +7607,7 @@ fn setup_system_fonts(ctx: &egui::Context) {
             loaded_any = true;
         }
     }
-    
+
     if loaded_any {
         ctx.set_fonts(fonts);
     }
