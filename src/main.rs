@@ -1332,16 +1332,29 @@ fn window_search_metadata_suffix(win: &WindowInfo) -> String {
     parts.join(" | ")
 }
 
+fn full_search_visible_app_title(app: &AppInfo) -> String {
+    let suffix = app_search_metadata_suffix(app);
+    if suffix.is_empty() {
+        app.name.clone()
+    } else {
+        format!("{} | {}", app.name, suffix)
+    }
+}
+
+fn full_search_visible_window_title(win: &WindowInfo) -> String {
+    let suffix = window_search_metadata_suffix(win);
+    if suffix.is_empty() {
+        win.title.clone()
+    } else {
+        format!("{} | {}", win.title, suffix)
+    }
+}
+
 fn search_visible_app_title(app: &AppInfo, query: &str) -> String {
     if query.trim().is_empty() {
         return app.name.clone();
     }
-    let suffix = app_search_metadata_suffix(app);
-    let full_text = if suffix.is_empty() {
-        app.name.clone()
-    } else {
-        format!("{} | {}", app.name, suffix)
-    };
+    let full_text = full_search_visible_app_title(app);
     let typo_match = visible_title_has_typo_match(&full_text, query);
     focus_text_around_match(&full_text, query, typo_match, 110)
 }
@@ -1350,12 +1363,7 @@ fn search_visible_window_title(win: &WindowInfo, query: &str) -> String {
     if query.trim().is_empty() {
         return win.title.clone();
     }
-    let suffix = window_search_metadata_suffix(win);
-    let full_text = if suffix.is_empty() {
-        win.title.clone()
-    } else {
-        format!("{} | {}", win.title, suffix)
-    };
+    let full_text = full_search_visible_window_title(win);
     let typo_match = visible_title_has_typo_match(&full_text, query);
     focus_text_around_match(&full_text, query, typo_match, 120)
 }
@@ -2403,78 +2411,9 @@ fn title_match_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
 }
 
 fn typo_title_match_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
-    let query = query.trim();
-    if query.is_empty() {
-        return Vec::new();
-    }
-
-    let typo_query = match MetadataQuery::new(query).map(|q| q.with_typo_fallback(true)) {
-        Some(query) => query,
-        None => return Vec::new(),
-    };
-
-    let mut best: Option<(SearchRank, usize, usize)> = None;
-    let mut token_start = None;
-
-    for (idx, ch) in text.char_indices() {
-        if ch.is_ascii_alphanumeric() {
-            token_start.get_or_insert(idx);
-            continue;
-        }
-        if let Some(start) = token_start.take() {
-            let end = idx;
-            let token = &text[start..end];
-            let normalized = normalize_metadata_search_value(token);
-            if normalized.is_empty() {
-                continue;
-            }
-            let fields = [SearchField {
-                priority: 0,
-                value: normalized.as_str(),
-            }];
-            let candidate = MetadataCandidate {
-                key: "",
-                fields: &fields,
-                score: 0.0,
-            };
-            let Some(rank) = typo_query.search_rank(candidate) else {
-                continue;
-            };
-            if !rank_matches_visible_title_via_typo(&rank) {
-                continue;
-            }
-            let replace = best.as_ref().is_none_or(|(current, _, _)| rank < *current);
-            if replace {
-                best = Some((rank, start, end));
-            }
-        }
-    }
-
-    if let Some(start) = token_start.take() {
-        let end = text.len();
-        let token = &text[start..end];
-        let normalized = normalize_metadata_search_value(token);
-        if !normalized.is_empty() {
-            let fields = [SearchField {
-                priority: 0,
-                value: normalized.as_str(),
-            }];
-            let candidate = MetadataCandidate {
-                key: "",
-                fields: &fields,
-                score: 0.0,
-            };
-            if let Some(rank) = typo_query.search_rank(candidate) {
-                if rank_matches_visible_title_via_typo(&rank)
-                    && best.as_ref().is_none_or(|(current, _, _)| rank < *current)
-                {
-                    best = Some((rank, start, end));
-                }
-            }
-        }
-    }
-
-    best.map(|(_, start, end)| vec![(start, end)])
+    visible_title_match_provenance(text, query)
+        .and_then(|rank| alnum_token_range_by_index(text, rank.provenance().token_index))
+        .map(|range| vec![range])
         .unwrap_or_default()
 }
 
@@ -2536,12 +2475,7 @@ fn highlighted_title_job(
 }
 
 fn rank_matches_visible_title_via_typo(rank: &SearchRank) -> bool {
-    match rank {
-        SearchRank::Fuzzy(distance_rank) | SearchRank::Typo(distance_rank) => {
-            distance_rank.field_priority == 0
-        }
-        _ => false,
-    }
+    rank.provenance().field_priority == 0
 }
 
 fn pick_better_rank(left: SearchRank, right: SearchRank) -> SearchRank {
@@ -2552,13 +2486,14 @@ fn visible_title_has_typo_match(title: &str, query: &str) -> bool {
     if query.trim().is_empty() || !title_match_ranges(title, query).is_empty() {
         return false;
     }
-    let typo_query = match MetadataQuery::new(query).map(|q| q.with_typo_fallback(true)) {
-        Some(query) => query,
-        None => return false,
-    };
-    let normalized = normalize_metadata_search_value(title);
+    visible_title_match_provenance(title, query).is_some()
+}
+
+fn visible_title_match_provenance(text: &str, query: &str) -> Option<SearchRank> {
+    let typo_query = MetadataQuery::new(query)?.with_typo_fallback(true);
+    let normalized = normalize_metadata_search_value(text);
     if normalized.is_empty() {
-        return false;
+        return None;
     }
     let fields = [SearchField {
         priority: 0,
@@ -2569,10 +2504,34 @@ fn visible_title_has_typo_match(title: &str, query: &str) -> bool {
         fields: &fields,
         score: 0.0,
     };
-    typo_query
-        .search_rank(candidate)
-        .as_ref()
-        .is_some_and(rank_matches_visible_title_via_typo)
+    let rank = typo_query.search_rank(candidate)?;
+    rank_matches_visible_title_via_typo(&rank).then_some(rank)
+}
+
+fn alnum_token_range_by_index(text: &str, token_index: usize) -> Option<(usize, usize)> {
+    let mut current_index = 0usize;
+    let mut token_start = None;
+
+    for (idx, ch) in text.char_indices() {
+        if ch.is_ascii_alphanumeric() {
+            token_start.get_or_insert(idx);
+            continue;
+        }
+        if let Some(start) = token_start.take() {
+            if current_index == token_index {
+                return Some((start, idx));
+            }
+            current_index += 1;
+        }
+    }
+
+    token_start.and_then(|start| {
+        if current_index == token_index {
+            Some((start, text.len()))
+        } else {
+            None
+        }
+    })
 }
 
 fn paint_centered_title_job(
@@ -5102,8 +5061,10 @@ impl eframe::App for App {
                                             (None, Some(typo_rank)) => typo_rank,
                                             (None, None) => return None,
                                         };
-                                        let title_is_typo =
-                                            visible_title_has_typo_match(&app.name, &search_query);
+                                        let title_is_typo = visible_title_has_typo_match(
+                                            &full_search_visible_app_title(app),
+                                            &search_query,
+                                        );
                                         let pin_position = pinned_app_position(&self.pinned_apps, app);
                                         let candidate_score = if is_pinned {
                                             2_000_000.0 - pin_position as f64
@@ -5174,8 +5135,10 @@ impl eframe::App for App {
                                             (None, Some(typo_rank)) => typo_rank,
                                             (None, None) => return None,
                                         };
-                                        let title_is_typo =
-                                            visible_title_has_typo_match(&win.title, &search_query);
+                                        let title_is_typo = visible_title_has_typo_match(
+                                            &full_search_visible_window_title(win),
+                                            &search_query,
+                                        );
                                         Some(RankedWindowMatch {
                                             window: win.clone(),
                                             rank,
@@ -5252,8 +5215,10 @@ impl eframe::App for App {
 		                                        (None, Some(typo_rank)) => typo_rank,
 		                                        (None, None) => return None,
 		                                    };
-		                                    let title_is_typo =
-		                                        visible_title_has_typo_match(&app.name, &search_query);
+		                                    let title_is_typo = visible_title_has_typo_match(
+		                                        &full_search_visible_app_title(app),
+		                                        &search_query,
+		                                    );
 		                                    let pin_position = pinned_app_position(&self.pinned_apps, app);
 		                                    let candidate_score = if is_pinned {
 		                                        2_000_000.0 - pin_position as f64
