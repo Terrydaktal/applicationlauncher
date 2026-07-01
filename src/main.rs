@@ -1,8 +1,8 @@
 use eframe::egui;
 use fuzzy_rank::metadata::{
-    MetadataCandidate, MetadataQuery, SearchField, dedup_push_search_field, sort_matches,
+    MetadataCandidate, MetadataQuery, SearchField, dedup_push_search_field,
 };
-use fuzzy_rank::ranking::SearchRank;
+use fuzzy_rank::ranking::{SearchRank, compare_search_results};
 use serde::Deserialize;
 use std::backtrace::Backtrace;
 use std::collections::{HashMap, HashSet};
@@ -90,6 +90,7 @@ struct RankedAppMatch {
     app: AppInfo,
     rank: SearchRank,
     title_is_typo: bool,
+    visible_match_priority: u8,
     is_pinned: bool,
     candidate_key: String,
     candidate_score: f64,
@@ -100,6 +101,7 @@ struct RankedWindowMatch {
     window: WindowInfo,
     rank: SearchRank,
     title_is_typo: bool,
+    visible_match_priority: u8,
     candidate_key: String,
     candidate_score: f64,
 }
@@ -112,10 +114,7 @@ enum LauncherMode {
 
 enum LoadResult {
     AppsSuccess(Vec<AppInfo>),
-    Content {
-        windows: Vec<WindowInfo>,
-        apps: Vec<AppInfo>,
-    },
+    WindowsSuccess(Vec<WindowInfo>),
     Error(String),
 }
 
@@ -216,7 +215,10 @@ struct App {
     force_theme: Option<String>,
     loading: bool,
     receiver: Option<std::sync::mpsc::Receiver<LoadResult>>,
+    background_apps_receiver: Option<Receiver<Vec<AppInfo>>>,
+    background_window_enrichment_receiver: Option<Receiver<Vec<WindowInfo>>>,
     ui_event_rx: std::sync::mpsc::Receiver<UiEvent>,
+    kwin_window_feed_setup_rx: Option<Receiver<Result<(), String>>>,
     width: f32,
     height: f32,
     icon_only: bool,
@@ -236,6 +238,7 @@ struct App {
     app_icon_name_size: f32,
     disable_ibeam: bool,
     process_chain_popup: Option<WindowInfo>,
+    window_sender: Sender<Vec<WindowInfo>>,
     window_receiver: Receiver<Vec<WindowInfo>>,
     window_feed_receiver: Receiver<WindowFeedEvent>,
     audio_cache_receiver: Receiver<AudioCacheUpdate>,
@@ -243,6 +246,7 @@ struct App {
     last_selected_window_id: Option<String>,
     missing_window_counts: HashMap<String, usize>,
     use_kwin_window_feed: bool,
+    window_polling_started: bool,
     cached_sink_inputs: Vec<PactlSinkInput>,
     active_media_app_keys: HashSet<String>,
     observed_pipewire_node_ids: HashSet<u32>,
@@ -251,6 +255,38 @@ struct App {
     app_scroll_sensitivity: f32,
     win_scroll_sensitivity: f32,
     last_stale_prune: Option<Instant>,
+    filtered_search_cache: Option<FilteredSearchCache>,
+    apps_generation: u64,
+    windows_generation: u64,
+    pinned_apps_generation: u64,
+}
+
+#[derive(Clone, Debug)]
+struct FilteredSearchResults {
+    apps: Vec<(AppInfo, bool)>,
+    windows: Vec<WindowInfo>,
+    app_display_titles: Vec<String>,
+    window_display_titles: Vec<String>,
+    app_highlight_segments: Vec<Vec<(usize, usize, bool)>>,
+    window_highlight_segments: Vec<Vec<(usize, usize, bool)>>,
+    app_title_is_typos: Vec<bool>,
+    window_title_is_typos: Vec<bool>,
+}
+
+#[derive(Clone, Debug)]
+struct FilteredSearchCache {
+    key: FilteredSearchCacheKey,
+    results: FilteredSearchResults,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FilteredSearchCacheKey {
+    mode: LauncherMode,
+    query: String,
+    show_system_settings_modules: bool,
+    pinned_apps_generation: u64,
+    apps_generation: u64,
+    windows_generation: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -295,6 +331,24 @@ impl Default for LauncherSettings {
             app_scroll_sensitivity: 1.0,
             win_scroll_sensitivity: 1.0,
         }
+    }
+}
+
+fn filtered_search_cache_key(
+    mode: LauncherMode,
+    query: &str,
+    show_system_settings_modules: bool,
+    pinned_apps_generation: u64,
+    apps_generation: u64,
+    windows_generation: u64,
+) -> FilteredSearchCacheKey {
+    FilteredSearchCacheKey {
+        mode,
+        query: query.to_string(),
+        show_system_settings_modules,
+        pinned_apps_generation,
+        apps_generation,
+        windows_generation,
     }
 }
 
@@ -776,37 +830,32 @@ fn window_search_rank(query: &MetadataQuery, win: &WindowInfo) -> Option<SearchR
     })
 }
 
-fn sort_ranked_matches<T, FKey, FScore, FRank>(
+fn sort_ranked_matches_with_visible<T, FVisible, FKey, FScore, FRank>(
     items: &mut [T],
+    visible_priority_fn: FVisible,
     key_fn: FKey,
     score_fn: FScore,
     rank_fn: FRank,
 ) where
+    FVisible: Fn(&T) -> u8,
     FKey: Fn(&T) -> &str,
     FScore: Fn(&T) -> f64,
     FRank: Fn(&T) -> &SearchRank,
 {
-    let empty_fields: [SearchField<'_>; 0] = [];
-    let mut matches: Vec<(MetadataCandidate<'_>, SearchRank)> = items
-        .iter()
-        .map(|item| {
-            (
-                MetadataCandidate {
-                    key: key_fn(item),
-                    fields: &empty_fields,
-                    score: score_fn(item),
-                },
-                rank_fn(item).clone(),
-            )
-        })
-        .collect();
-    sort_matches(&mut matches);
-    let order: HashMap<String, usize> = matches
-        .into_iter()
-        .enumerate()
-        .map(|(index, (candidate, _))| (candidate.key.to_string(), index))
-        .collect();
-    items.sort_by_key(|item| order.get(key_fn(item)).copied().unwrap_or(usize::MAX));
+    items.sort_unstable_by(|left, right| {
+        visible_priority_fn(left)
+            .cmp(&visible_priority_fn(right))
+            .then_with(|| {
+                compare_search_results(
+                    rank_fn(left),
+                    score_fn(left),
+                    key_fn(left),
+                    rank_fn(right),
+                    score_fn(right),
+                    key_fn(right),
+                )
+            })
+    });
 }
 
 fn pinned_app_position(pinned_apps: &[PathBuf], app: &AppInfo) -> usize {
@@ -2380,48 +2429,170 @@ fn title_match_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
         mapping.push((lower_start, lower_end, start, end));
     }
 
-    let query_lower = query.to_lowercase();
+    let query_terms = normalize_metadata_search_value(query)
+        .to_lowercase()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if query_terms.is_empty() {
+        return Vec::new();
+    }
     let mut ranges = Vec::new();
 
-    for (match_start, _) in normalized.match_indices(&query_lower) {
-        let match_end = match_start + query_lower.len();
-        let mut original_start = None;
-        let mut original_end = None;
+    for query_term in query_terms {
+        for (match_start, _) in normalized.match_indices(&query_term) {
+            let match_end = match_start + query_term.len();
+            let mut original_start = None;
+            let mut original_end = None;
 
-        for (lower_start, lower_end, start, end) in &mapping {
-            if *lower_end <= match_start || *lower_start >= match_end {
-                continue;
-            }
-            original_start.get_or_insert(*start);
-            original_end = Some(*end);
-        }
-
-        if let (Some(start), Some(end)) = (original_start, original_end) {
-            if let Some((_, previous_end)) = ranges.last_mut() {
-                if start <= *previous_end {
-                    *previous_end = (*previous_end).max(end);
+            for (lower_start, lower_end, start, end) in &mapping {
+                if *lower_end <= match_start || *lower_start >= match_end {
                     continue;
                 }
+                original_start.get_or_insert(*start);
+                original_end = Some(*end);
             }
-            ranges.push((start, end));
+
+            if let (Some(start), Some(end)) = (original_start, original_end) {
+                ranges.push((start, end));
+            }
         }
     }
 
-    ranges
+    ranges.sort_by_key(|(start, end)| (*start, *end));
+    let mut merged = Vec::new();
+    for (start, end) in ranges {
+        if let Some((_, previous_end)) = merged.last_mut() {
+            if start <= *previous_end {
+                *previous_end = (*previous_end).max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+
+    merged
+}
+
+fn normalized_query_terms(query: &str) -> Vec<String> {
+    normalize_metadata_search_value(query)
+        .to_lowercase()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+fn alnum_tokens_with_ranges(text: &str) -> Vec<(usize, usize, String)> {
+    let mut tokens = Vec::new();
+    let mut token_start = None;
+
+    for (idx, ch) in text.char_indices() {
+        if ch.is_ascii_alphanumeric() {
+            token_start.get_or_insert(idx);
+            continue;
+        }
+        if let Some(start) = token_start.take() {
+            let end = idx;
+            let normalized = normalize_metadata_search_value(&text[start..end]).to_lowercase();
+            if !normalized.is_empty() {
+                tokens.push((start, end, normalized));
+            }
+        }
+    }
+
+    if let Some(start) = token_start {
+        let end = text.len();
+        let normalized = normalize_metadata_search_value(&text[start..end]).to_lowercase();
+        if !normalized.is_empty() {
+            tokens.push((start, end, normalized));
+        }
+    }
+
+    tokens
 }
 
 fn typo_title_match_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
-    visible_title_match_provenance(text, query)
-        .and_then(|rank| alnum_token_range_by_index(text, rank.provenance().token_index))
-        .map(|range| vec![range])
-        .unwrap_or_default()
+    let Some(rank) = visible_title_match_provenance(text, query) else {
+        return Vec::new();
+    };
+    let Some((_, _, winning_token)) = alnum_tokens_with_ranges(text)
+        .into_iter()
+        .nth(rank.provenance().token_index)
+    else {
+        return Vec::new();
+    };
+
+    alnum_tokens_with_ranges(text)
+        .into_iter()
+        .filter_map(|(start, end, token)| (token == winning_token).then_some((start, end)))
+        .collect()
 }
 
-fn highlighted_title_job(
+fn title_highlight_segments(text: &str, query: &str) -> Vec<(usize, usize, bool)> {
+    let query_terms = normalized_query_terms(query);
+    let mut red_ranges = Vec::new();
+    let mut matched_terms = HashSet::new();
+    for term in &query_terms {
+        let ranges = title_match_ranges(text, term);
+        if !ranges.is_empty() {
+            matched_terms.insert(term.clone());
+            red_ranges.extend(ranges);
+        }
+    }
+    red_ranges.sort_by_key(|(start, end)| (*start, *end));
+    let mut merged_red_ranges = Vec::new();
+    for (start, end) in red_ranges {
+        if let Some((_, previous_end)) = merged_red_ranges.last_mut() {
+            if start <= *previous_end {
+                *previous_end = (*previous_end).max(end);
+                continue;
+            }
+        }
+        merged_red_ranges.push((start, end));
+    }
+
+    let mut yellow_ranges = Vec::new();
+    for term in &query_terms {
+        if matched_terms.contains(term) {
+            continue;
+        }
+        if let Some((start, end)) = typo_title_match_ranges(text, term).into_iter().next() {
+            let overlaps_red = merged_red_ranges
+                .iter()
+                .any(|(red_start, red_end)| start < *red_end && end > *red_start);
+            if !overlaps_red {
+                yellow_ranges.push((start, end));
+            }
+        }
+    }
+    yellow_ranges.sort_by_key(|(start, end)| (*start, *end));
+    let mut merged_yellow_ranges = Vec::new();
+    for (start, end) in yellow_ranges {
+        if let Some((_, previous_end)) = merged_yellow_ranges.last_mut() {
+            if start <= *previous_end {
+                *previous_end = (*previous_end).max(end);
+                continue;
+            }
+        }
+        merged_yellow_ranges.push((start, end));
+    }
+
+    let mut segments = Vec::new();
+    for (start, end) in merged_red_ranges {
+        segments.push((start, end, true));
+    }
+    for (start, end) in merged_yellow_ranges {
+        segments.push((start, end, false));
+    }
+    segments.sort_by_key(|(start, end, is_red)| (*start, *end, !*is_red));
+
+    segments
+}
+
+fn highlighted_title_job_from_segments(
     text: &str,
-    query: &str,
     font_size: f32,
-    typo_match: bool,
+    segments: &[(usize, usize, bool)],
 ) -> egui::text::LayoutJob {
     let default_format = egui::TextFormat {
         font_id: egui::FontId::proportional(font_size),
@@ -2439,30 +2610,25 @@ fn highlighted_title_job(
         ..Default::default()
     };
 
-    let ranges = if typo_match {
-        typo_title_match_ranges(text, query)
-    } else {
-        title_match_ranges(text, query)
-    };
     let mut job = egui::text::LayoutJob::default();
 
-    if ranges.is_empty() {
+    if segments.is_empty() {
         job.append(text, 0.0, default_format);
         return job;
     }
 
     let mut cursor = 0usize;
-    for (start, end) in ranges {
+    for &(start, end, is_red) in segments {
         if cursor < start {
             job.append(&text[cursor..start], 0.0, default_format.clone());
         }
         job.append(
             &text[start..end],
             0.0,
-            if typo_match {
-                typo_highlight_format.clone()
-            } else {
+            if is_red {
                 highlight_format.clone()
+            } else {
+                typo_highlight_format.clone()
             },
         );
         cursor = end;
@@ -2472,6 +2638,16 @@ fn highlighted_title_job(
     }
 
     job
+}
+
+fn highlighted_title_job(
+    text: &str,
+    query: &str,
+    font_size: f32,
+    _typo_match: bool,
+) -> egui::text::LayoutJob {
+    let segments = title_highlight_segments(text, query);
+    highlighted_title_job_from_segments(text, font_size, &segments)
 }
 
 fn rank_matches_visible_title_via_typo(rank: &SearchRank) -> bool {
@@ -2487,6 +2663,18 @@ fn visible_title_has_typo_match(title: &str, query: &str) -> bool {
         return false;
     }
     visible_title_match_provenance(title, query).is_some()
+}
+
+fn visible_match_priority(title: &str, query: &str) -> u8 {
+    if query.trim().is_empty() {
+        0
+    } else if !title_match_ranges(title, query).is_empty()
+        || visible_title_has_typo_match(title, query)
+    {
+        0
+    } else {
+        1
+    }
 }
 
 fn visible_title_match_provenance(text: &str, query: &str) -> Option<SearchRank> {
@@ -2506,32 +2694,6 @@ fn visible_title_match_provenance(text: &str, query: &str) -> Option<SearchRank>
     };
     let rank = typo_query.search_rank(candidate)?;
     rank_matches_visible_title_via_typo(&rank).then_some(rank)
-}
-
-fn alnum_token_range_by_index(text: &str, token_index: usize) -> Option<(usize, usize)> {
-    let mut current_index = 0usize;
-    let mut token_start = None;
-
-    for (idx, ch) in text.char_indices() {
-        if ch.is_ascii_alphanumeric() {
-            token_start.get_or_insert(idx);
-            continue;
-        }
-        if let Some(start) = token_start.take() {
-            if current_index == token_index {
-                return Some((start, idx));
-            }
-            current_index += 1;
-        }
-    }
-
-    token_start.and_then(|start| {
-        if current_index == token_index {
-            Some((start, text.len()))
-        } else {
-            None
-        }
-    })
 }
 
 fn paint_centered_title_job(
@@ -3327,7 +3489,11 @@ fn coalesce_window_feed_events(events: Vec<WindowFeedEvent>) -> Vec<WindowFeedEv
         .collect()
 }
 
-fn get_open_windows(kdotool_path: &Path, theme: &str) -> Option<Vec<WindowInfo>> {
+fn get_open_windows_with_snapshot_mode(
+    kdotool_path: &Path,
+    theme: &str,
+    include_snapshot_details: bool,
+) -> Option<Vec<WindowInfo>> {
     // 1. Fetch all window IDs using kdotool search
     let output = match Command::new(kdotool_path)
         .arg("search")
@@ -3444,7 +3610,15 @@ fn get_open_windows(kdotool_path: &Path, theme: &str) -> Option<Vec<WindowInfo>>
             }
         }
 
-        let snapshot_details = get_snapshot_window_details(&id);
+        let snapshot_details = if include_snapshot_details {
+            get_snapshot_window_details(&id)
+        } else {
+            SnapshotWindowDetails {
+                desktop_file_name: None,
+                geometry: None,
+                minimized: None,
+            }
+        };
 
         if let Some(window) = build_window_info(
             id,
@@ -3465,6 +3639,14 @@ fn get_open_windows(kdotool_path: &Path, theme: &str) -> Option<Vec<WindowInfo>>
     }
 
     Some(windows)
+}
+
+fn get_open_windows(kdotool_path: &Path, theme: &str) -> Option<Vec<WindowInfo>> {
+    get_open_windows_with_snapshot_mode(kdotool_path, theme, true)
+}
+
+fn get_open_windows_fast(kdotool_path: &Path, theme: &str) -> Option<Vec<WindowInfo>> {
+    get_open_windows_with_snapshot_mode(kdotool_path, theme, false)
 }
 
 fn load_pinned_apps() -> Vec<PathBuf> {
@@ -3621,11 +3803,15 @@ impl App {
         let (window_tx, window_rx) = std::sync::mpsc::channel();
         let (window_feed_tx, window_feed_rx) = std::sync::mpsc::channel();
         let (audio_cache_tx, audio_cache_rx) = std::sync::mpsc::channel();
+        let (kwin_window_feed_setup_tx, kwin_window_feed_setup_rx) = std::sync::mpsc::channel();
         let rapid_polling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let kwin_window_feed_error =
-            setup_kwin_window_feed(window_feed_tx, cc.egui_ctx.clone()).err();
-        let use_kwin_window_feed = kwin_window_feed_error.is_none();
         let audio_repaint_ctx = cc.egui_ctx.clone();
+        let kwin_window_feed_repaint_ctx = cc.egui_ctx.clone();
+
+        std::thread::spawn(move || {
+            let result = setup_kwin_window_feed(window_feed_tx, kwin_window_feed_repaint_ctx);
+            let _ = kwin_window_feed_setup_tx.send(result);
+        });
 
         let now = Instant::now();
         let mut app = Self {
@@ -3654,7 +3840,10 @@ impl App {
             force_theme,
             loading: false,
             receiver: None,
+            background_apps_receiver: None,
+            background_window_enrichment_receiver: None,
             ui_event_rx,
+            kwin_window_feed_setup_rx: Some(kwin_window_feed_setup_rx),
             width,
             height,
             icon_only: icon_only || settings.app_icon_mode,
@@ -3674,13 +3863,15 @@ impl App {
             app_icon_name_size: settings.app_icon_name_size,
             disable_ibeam: settings.disable_ibeam,
             process_chain_popup: None,
+            window_sender: window_tx.clone(),
             window_receiver: window_rx,
             window_feed_receiver: window_feed_rx,
             audio_cache_receiver: audio_cache_rx,
             rapid_polling: std::sync::Arc::clone(&rapid_polling),
             last_selected_window_id: None,
             missing_window_counts: HashMap::new(),
-            use_kwin_window_feed,
+            use_kwin_window_feed: false,
+            window_polling_started: false,
             cached_sink_inputs: Vec::new(),
             active_media_app_keys: HashSet::new(),
             observed_pipewire_node_ids: HashSet::new(),
@@ -3689,6 +3880,10 @@ impl App {
             app_scroll_sensitivity: settings.app_scroll_sensitivity,
             win_scroll_sensitivity: settings.win_scroll_sensitivity,
             last_stale_prune: None,
+            filtered_search_cache: None,
+            apps_generation: 0,
+            windows_generation: 0,
+            pinned_apps_generation: 0,
         };
 
         std::thread::spawn(move || {
@@ -3736,52 +3931,13 @@ impl App {
             }
         });
 
-        if !app.use_kwin_window_feed {
-            let kpath = app.kdotool_path.clone();
-            let theme = app
-                .force_theme
-                .as_deref()
-                .unwrap_or("breeze-dark")
-                .to_string();
-            let rapid_polling_thread = std::sync::Arc::clone(&rapid_polling);
-            let ctx = cc.egui_ctx.clone();
-            std::thread::spawn(move || {
-                let mut rapid_poll_count = 0;
-                if let Some(kpath) = kpath {
-                    loop {
-                        if rapid_polling_thread.load(std::sync::atomic::Ordering::SeqCst) {
-                            rapid_polling_thread.store(false, std::sync::atomic::Ordering::SeqCst);
-                            rapid_poll_count = 15; // 15 * 300ms = 4.5 seconds of rapid polling
-                        }
-
-                        let sleep_dur = if rapid_poll_count > 0 {
-                            rapid_poll_count -= 1;
-                            std::time::Duration::from_millis(300)
-                        } else {
-                            std::time::Duration::from_millis(1000)
-                        };
-
-                        std::thread::sleep(sleep_dur);
-
-                        if let Some(windows) = get_open_windows(&kpath, &theme) {
-                            if window_tx.send(windows).is_ok() {
-                                ctx.request_repaint();
-                            } else {
-                                break; // channel disconnected
-                            }
-                        }
-                    }
-                }
-            });
-        }
-
-        if let Some(err) = kwin_window_feed_error {
-            eprintln!("Falling back to kdotool window polling: {err}");
-        }
-
         match app.mode {
             LauncherMode::Apps => app.refresh_apps(),
-            LauncherMode::Windows => app.refresh_windows(),
+            LauncherMode::Windows => {
+                app.refresh_windows();
+                app.start_background_app_load();
+                app.start_background_window_enrichment();
+            }
         }
 
         app
@@ -3819,7 +3975,7 @@ impl App {
         });
     }
 
-    fn save_pinned_apps(&self) {
+    fn save_pinned_apps(&mut self) {
         if let Ok(home) = std::env::var("HOME") {
             let dir = PathBuf::from(format!("{}/.config/applicationlauncher", home));
             let _ = std::fs::create_dir_all(&dir);
@@ -3831,6 +3987,7 @@ impl App {
             }
             let _ = std::fs::write(path, content);
         }
+        self.pinned_apps_generation = self.pinned_apps_generation.wrapping_add(1);
     }
 
     fn render_settings_panel(&mut self, ui: &mut egui::Ui) -> bool {
@@ -4390,6 +4547,7 @@ impl App {
         if self.windows.is_empty() {
             self.windows = new_windows;
             self.missing_window_counts.clear();
+            self.windows_generation = self.windows_generation.wrapping_add(1);
             return;
         }
 
@@ -4434,6 +4592,7 @@ impl App {
         self.missing_window_counts
             .retain(|window_id, _| retained_ids.contains(window_id));
         self.windows = merged;
+        self.windows_generation = self.windows_generation.wrapping_add(1);
     }
 
     fn apply_window_feed_events(&mut self, events: Vec<WindowFeedEvent>) {
@@ -4448,6 +4607,7 @@ impl App {
             .unwrap_or("breeze-dark")
             .to_string();
         let (ppid_to_children, pid_to_name, pid_to_ppid) = get_process_tree();
+        let mut changed = false;
 
         for event in events {
             match event {
@@ -4467,13 +4627,20 @@ impl App {
                         } else {
                             self.windows.push(window);
                         }
+                        changed = true;
                     }
                 }
                 WindowFeedEvent::Remove(id) => {
                     self.missing_window_counts.remove(&id);
+                    let previous_len = self.windows.len();
                     self.windows.retain(|window| window.id != id);
+                    changed |= self.windows.len() != previous_len;
                 }
             }
+        }
+
+        if changed {
+            self.windows_generation = self.windows_generation.wrapping_add(1);
         }
     }
 
@@ -4502,6 +4669,7 @@ impl App {
             .retain(|window| !stale_ids.contains(&window.id));
         self.missing_window_counts
             .retain(|window_id, _| !stale_ids.contains(window_id));
+        self.windows_generation = self.windows_generation.wrapping_add(1);
 
         if self
             .last_selected_window_id
@@ -4527,9 +4695,8 @@ impl App {
             std::thread::spawn(
                 move || match Command::new(&kpath).arg("--version").output() {
                     Ok(_) => {
-                        let windows = get_open_windows(&kpath, &theme).unwrap_or_default();
-                        let apps = get_installed_apps(&theme);
-                        let _ = tx.send(LoadResult::Content { windows, apps });
+                        let windows = get_open_windows_fast(&kpath, &theme).unwrap_or_default();
+                        let _ = tx.send(LoadResult::WindowsSuccess(windows));
                     }
                     Err(_) => {
                         let _ = tx.send(LoadResult::Error(format!(
@@ -4539,6 +4706,40 @@ impl App {
                 },
             );
         }
+    }
+
+    fn start_background_window_enrichment(&mut self) {
+        let Some(kpath) = self.kdotool_path.clone() else {
+            self.background_window_enrichment_receiver = None;
+            return;
+        };
+        let theme = self
+            .force_theme
+            .as_deref()
+            .unwrap_or("breeze-dark")
+            .to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.background_window_enrichment_receiver = Some(rx);
+
+        std::thread::spawn(move || {
+            let windows = get_open_windows(&kpath, &theme).unwrap_or_default();
+            let _ = tx.send(windows);
+        });
+    }
+
+    fn start_background_app_load(&mut self) {
+        let theme = self
+            .force_theme
+            .as_deref()
+            .unwrap_or("breeze-dark")
+            .to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.background_apps_receiver = Some(rx);
+
+        std::thread::spawn(move || {
+            let apps = get_installed_apps(&theme);
+            let _ = tx.send(apps);
+        });
     }
 
     fn refresh_apps(&mut self) {
@@ -4554,6 +4755,52 @@ impl App {
         std::thread::spawn(move || {
             let apps = get_installed_apps(&theme);
             let _ = tx.send(LoadResult::AppsSuccess(apps));
+        });
+    }
+
+    fn start_window_polling_thread(&mut self, ctx: &egui::Context) {
+        if self.window_polling_started {
+            return;
+        }
+        self.window_polling_started = true;
+
+        let Some(kpath) = self.kdotool_path.clone() else {
+            return;
+        };
+        let theme = self
+            .force_theme
+            .as_deref()
+            .unwrap_or("breeze-dark")
+            .to_string();
+        let rapid_polling_thread = std::sync::Arc::clone(&self.rapid_polling);
+        let window_tx = self.window_sender.clone();
+        let ctx = ctx.clone();
+
+        std::thread::spawn(move || {
+            let mut rapid_poll_count = 0;
+            loop {
+                if rapid_polling_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                    rapid_polling_thread.store(false, std::sync::atomic::Ordering::SeqCst);
+                    rapid_poll_count = 15; // 15 * 300ms = 4.5 seconds of rapid polling
+                }
+
+                let sleep_dur = if rapid_poll_count > 0 {
+                    rapid_poll_count -= 1;
+                    std::time::Duration::from_millis(300)
+                } else {
+                    std::time::Duration::from_millis(1000)
+                };
+
+                std::thread::sleep(sleep_dur);
+
+                if let Some(windows) = get_open_windows(&kpath, &theme) {
+                    if window_tx.send(windows).is_ok() {
+                        ctx.request_repaint();
+                    } else {
+                        break;
+                    }
+                }
+            }
         });
     }
 
@@ -4777,6 +5024,24 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
+        if let Some(result) = self
+            .kwin_window_feed_setup_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        {
+            self.kwin_window_feed_setup_rx = None;
+            match result {
+                Ok(()) => {
+                    self.use_kwin_window_feed = true;
+                    ctx.request_repaint();
+                }
+                Err(err) => {
+                    eprintln!("Falling back to kdotool window polling: {err}");
+                    self.start_window_polling_thread(ctx);
+                }
+            }
+        }
+
         if !handled_focus_launcher && !self.loading && self.use_kwin_window_feed {
             let mut pending_events = Vec::with_capacity(WINDOW_FEED_EVENTS_PER_FRAME);
             for _ in 0..WINDOW_FEED_EVENTS_PER_FRAME {
@@ -4813,6 +5078,43 @@ impl eframe::App for App {
             }
         }
 
+        if !handled_focus_launcher {
+            match self
+                .background_window_enrichment_receiver
+                .as_ref()
+                .map(|rx| rx.try_recv())
+            {
+                Some(Ok(windows)) => {
+                    self.apply_window_snapshot(windows);
+                    self.background_window_enrichment_receiver = None;
+                    ctx.request_repaint();
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                    self.background_window_enrichment_receiver = None;
+                }
+                _ => {}
+            }
+        }
+
+        if !handled_focus_launcher {
+            match self
+                .background_apps_receiver
+                .as_ref()
+                .map(|rx| rx.try_recv())
+            {
+                Some(Ok(apps)) => {
+                    self.apps = apps;
+                    self.apps_generation = self.apps_generation.wrapping_add(1);
+                    self.background_apps_receiver = None;
+                    ctx.request_repaint();
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                    self.background_apps_receiver = None;
+                }
+                _ => {}
+            }
+        }
+
         // Check background receiver for window query results
         if !handled_focus_launcher && self.loading {
             ctx.request_repaint(); // Keep repainting until loaded to check channel promptly
@@ -4822,14 +5124,15 @@ impl eframe::App for App {
                     match result {
                         LoadResult::AppsSuccess(apps) => {
                             self.apps = apps;
+                            self.apps_generation = self.apps_generation.wrapping_add(1);
                             self.selected_index = 0;
                             self.side_panel_selected_index = 0;
                             self.active_pane = ActivePane::Apps;
                         }
-                        LoadResult::Content { windows, apps } => {
+                        LoadResult::WindowsSuccess(windows) => {
                             self.windows = windows;
                             self.missing_window_counts.clear();
-                            self.apps = apps;
+                            self.windows_generation = self.windows_generation.wrapping_add(1);
                             self.selected_index = 0;
                             self.side_panel_selected_index = 0;
                             self.active_pane = ActivePane::Windows;
@@ -5011,12 +5314,46 @@ impl eframe::App for App {
 	                    // 2. Filtering list
 	                    let mut filtered_apps: Vec<(AppInfo, bool)> = Vec::new();
 	                    let mut filtered_windows: Vec<WindowInfo> = Vec::new();
+                        let mut filtered_app_display_titles: Vec<String> = Vec::new();
+                        let mut filtered_window_display_titles: Vec<String> = Vec::new();
+                        let mut filtered_app_highlight_segments: Vec<Vec<(usize, usize, bool)>> =
+                            Vec::new();
+                        let mut filtered_window_highlight_segments: Vec<Vec<(usize, usize, bool)>> =
+                            Vec::new();
                         let search_query = self.search_query.trim().to_string();
                         let has_search_query = !search_query.is_empty();
                         let mut filtered_app_title_is_typos: Vec<bool> = Vec::new();
                         let mut filtered_window_title_is_typos: Vec<bool> = Vec::new();
+                        let filter_cache_key = has_search_query.then(|| {
+                            filtered_search_cache_key(
+                                self.mode,
+                                &search_query,
+                                self.show_system_settings_modules,
+                                self.pinned_apps_generation,
+                                self.apps_generation,
+                                self.windows_generation,
+                            )
+                        });
 
-	                    match self.mode {
+                        if let Some(cache) = filter_cache_key.as_ref().and_then(|cache_key| {
+                            self.filtered_search_cache
+                                .as_ref()
+                                .filter(|cache| cache.key == *cache_key)
+                        }) {
+                            filtered_apps = cache.results.apps.clone();
+                            filtered_windows = cache.results.windows.clone();
+                            filtered_app_display_titles = cache.results.app_display_titles.clone();
+                            filtered_window_display_titles =
+                                cache.results.window_display_titles.clone();
+                            filtered_app_highlight_segments =
+                                cache.results.app_highlight_segments.clone();
+                            filtered_window_highlight_segments =
+                                cache.results.window_highlight_segments.clone();
+                            filtered_app_title_is_typos = cache.results.app_title_is_typos.clone();
+                            filtered_window_title_is_typos =
+                                cache.results.window_title_is_typos.clone();
+                        } else {
+		                    match self.mode {
 	                        LauncherMode::Apps => {
 		                            if !has_search_query {
 	                                filtered_apps = self.apps
@@ -5039,10 +5376,8 @@ impl eframe::App for App {
                                             }
                                             (false, false) => a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()),
                                         })
-		                                });
-                                        filtered_app_title_is_typos =
-                                            vec![false; filtered_apps.len()];
-	                            } else if let (Some(base_query), Some(typo_query)) = (
+				                                });
+			                            } else if let (Some(base_query), Some(typo_query)) = (
                                     MetadataQuery::new(&search_query),
                                     MetadataQuery::new(&search_query).map(|q| q.with_typo_fallback(true)),
                                 ) {
@@ -5065,6 +5400,10 @@ impl eframe::App for App {
                                             &full_search_visible_app_title(app),
                                             &search_query,
                                         );
+                                        let visible_match_priority = visible_match_priority(
+                                            &full_search_visible_app_title(app),
+                                            &search_query,
+                                        );
                                         let pin_position = pinned_app_position(&self.pinned_apps, app);
                                         let candidate_score = if is_pinned {
                                             2_000_000.0 - pin_position as f64
@@ -5077,6 +5416,7 @@ impl eframe::App for App {
                                             app: app.clone(),
                                             rank,
                                             title_is_typo,
+                                            visible_match_priority,
                                             is_pinned,
                                             candidate_key: format!(
                                                 "{}\u{0}{}",
@@ -5087,17 +5427,37 @@ impl eframe::App for App {
 	                                        })
 		                                    })
 		                                    .collect();
-		                                sort_ranked_matches(
+		                                sort_ranked_matches_with_visible(
 		                                    &mut ranked_apps,
-                                    |item| &item.candidate_key,
-	                                    |item| item.candidate_score,
-	                                    |item| &item.rank,
+                                            |item| item.visible_match_priority,
+	                                    |item| &item.candidate_key,
+		                                    |item| item.candidate_score,
+		                                    |item| &item.rank,
 	                                );
                                         filtered_app_title_is_typos = ranked_apps
                                             .iter()
                                             .map(|item| item.title_is_typo)
                                             .collect();
-		                                filtered_apps = ranked_apps
+                                        filtered_app_display_titles = ranked_apps
+                                            .iter()
+                                            .map(|item| {
+                                                search_visible_app_title(
+                                                    &item.app,
+                                                    &search_query,
+                                                )
+                                            })
+                                            .collect();
+                                        filtered_app_highlight_segments =
+                                            filtered_app_display_titles
+                                                .iter()
+                                                .map(|title| {
+                                                    title_highlight_segments(
+                                                        title,
+                                                        &search_query,
+                                                    )
+                                                })
+                                                .collect();
+			                                filtered_apps = ranked_apps
 		                                    .into_iter()
 		                                    .map(|item| (item.app, item.is_pinned))
 	                                    .collect();
@@ -5115,9 +5475,7 @@ impl eframe::App for App {
                                             window_sort_title_key(a).cmp(&window_sort_title_key(b))
                                         })
                                         .then_with(|| a.id.cmp(&b.id))
-		                                });
-                                        filtered_window_title_is_typos =
-                                            vec![false; filtered_windows.len()];
+				                                });
 			                            } else if let (Some(base_query), Some(typo_query)) = (
                                     MetadataQuery::new(&search_query),
                                     MetadataQuery::new(&search_query).map(|q| q.with_typo_fallback(true)),
@@ -5139,10 +5497,15 @@ impl eframe::App for App {
                                             &full_search_visible_window_title(win),
                                             &search_query,
                                         );
+                                        let visible_match_priority = visible_match_priority(
+                                            &full_search_visible_window_title(win),
+                                            &search_query,
+                                        );
                                         Some(RankedWindowMatch {
                                             window: win.clone(),
                                             rank,
                                             title_is_typo,
+                                            visible_match_priority,
                                             candidate_key: format!(
                                                 "{}\u{0}{}\u{0}{}",
                                                 window_application_key(win),
@@ -5153,17 +5516,37 @@ impl eframe::App for App {
                                         })
                                     })
                                     .collect();
-		                                sort_ranked_matches(
+		                                sort_ranked_matches_with_visible(
 		                                    &mut ranked_windows,
-                                    |item| &item.candidate_key,
-	                                    |item| item.candidate_score,
-	                                    |item| &item.rank,
+                                            |item| item.visible_match_priority,
+	                                    |item| &item.candidate_key,
+		                                    |item| item.candidate_score,
+		                                    |item| &item.rank,
 	                                );
                                         filtered_window_title_is_typos = ranked_windows
                                             .iter()
                                             .map(|item| item.title_is_typo)
                                             .collect();
-		                                filtered_windows =
+                                        filtered_window_display_titles = ranked_windows
+                                            .iter()
+                                            .map(|item| {
+                                                search_visible_window_title(
+                                                    &item.window,
+                                                    &search_query,
+                                                )
+                                            })
+                                            .collect();
+                                        filtered_window_highlight_segments =
+                                            filtered_window_display_titles
+                                                .iter()
+                                                .map(|title| {
+                                                    title_highlight_segments(
+                                                        title,
+                                                        &search_query,
+                                                    )
+                                                })
+                                                .collect();
+			                                filtered_windows =
 		                                    ranked_windows.into_iter().map(|item| item.window).collect();
 	                            } else {
                                     filtered_windows.clear();
@@ -5171,7 +5554,7 @@ impl eframe::App for App {
 	                        }
 	                    }
 
-	                    if self.mode == LauncherMode::Windows {
+		                    if self.mode == LauncherMode::Windows {
 		                        if !has_search_query {
 		                            filtered_apps = self.apps
 	                                .iter()
@@ -5181,22 +5564,20 @@ impl eframe::App for App {
 	                                    (app.clone(), is_pinned)
 	                                })
 	                                .collect();
-		                            filtered_apps.sort_by(|a, b| {
-	                                a.0.is_settings_module
-	                                    .cmp(&b.0.is_settings_module)
-	                                    .then_with(|| match (a.1, b.1) {
+			                            filtered_apps.sort_by(|a, b| {
+		                                a.0.is_settings_module
+		                                    .cmp(&b.0.is_settings_module)
+		                                    .then_with(|| match (a.1, b.1) {
 	                                        (true, false) => std::cmp::Ordering::Less,
 	                                        (false, true) => std::cmp::Ordering::Greater,
 	                                        (true, true) => {
                                             pinned_app_position(&self.pinned_apps, &a.0)
                                                 .cmp(&pinned_app_position(&self.pinned_apps, &b.0))
-	                                        }
-	                                        (false, false) => a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()),
-	                                    })
-		                            });
-                                        filtered_app_title_is_typos =
-                                            vec![false; filtered_apps.len()];
-			                        } else if let (Some(base_query), Some(typo_query)) = (
+			                    }
+		                                        (false, false) => a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()),
+		                                    })
+				                            });
+				                        } else if let (Some(base_query), Some(typo_query)) = (
                                 MetadataQuery::new(&search_query),
                                 MetadataQuery::new(&search_query).map(|q| q.with_typo_fallback(true)),
                             ) {
@@ -5219,6 +5600,10 @@ impl eframe::App for App {
 		                                        &full_search_visible_app_title(app),
 		                                        &search_query,
 		                                    );
+		                                    let visible_match_priority = visible_match_priority(
+		                                        &full_search_visible_app_title(app),
+		                                        &search_query,
+		                                    );
 		                                    let pin_position = pinned_app_position(&self.pinned_apps, app);
 		                                    let candidate_score = if is_pinned {
 		                                        2_000_000.0 - pin_position as f64
@@ -5231,6 +5616,7 @@ impl eframe::App for App {
 		                                        app: app.clone(),
 		                                        rank,
 		                                        title_is_typo,
+		                                        visible_match_priority,
 		                                        is_pinned,
 		                                        candidate_key: format!(
 		                                            "{}\u{0}{}",
@@ -5241,26 +5627,69 @@ impl eframe::App for App {
 	                                    })
 		                                })
 		                                .collect();
-			                            sort_ranked_matches(
+			                            sort_ranked_matches_with_visible(
 			                                &mut ranked_apps,
+                                            |item| item.visible_match_priority,
 		                                |item| &item.candidate_key,
-		                                |item| item.candidate_score,
-		                                |item| &item.rank,
+			                                |item| item.candidate_score,
+			                                |item| &item.rank,
 		                            );
 	                                    filtered_app_title_is_typos = ranked_apps
 	                                        .iter()
 	                                        .map(|item| item.title_is_typo)
 	                                        .collect();
-		                            filtered_apps = ranked_apps
+                                        filtered_app_display_titles = ranked_apps
+                                            .iter()
+                                            .map(|item| {
+                                                search_visible_app_title(
+                                                    &item.app,
+                                                    &search_query,
+                                                )
+                                            })
+                                            .collect();
+                                        filtered_app_highlight_segments =
+                                            filtered_app_display_titles
+                                                .iter()
+                                                .map(|title| {
+                                                    title_highlight_segments(
+                                                        title,
+                                                        &search_query,
+                                                    )
+                                                })
+                                                .collect();
+			                            filtered_apps = ranked_apps
 		                                .into_iter()
 		                                .map(|item| (item.app, item.is_pinned))
 	                                .collect();
-	                        } else {
-                                filtered_apps.clear();
-                            }
-	                    }
+		                        } else {
+	                                filtered_apps.clear();
+	                            }
+		                    }
 
-	                    if self.mode == LauncherMode::Windows {
+                            if let Some(cache_key) = filter_cache_key {
+                                self.filtered_search_cache = Some(FilteredSearchCache {
+                                    key: cache_key,
+                                    results: FilteredSearchResults {
+                                        apps: filtered_apps.clone(),
+                                        windows: filtered_windows.clone(),
+                                        app_display_titles: filtered_app_display_titles.clone(),
+                                        window_display_titles: filtered_window_display_titles
+                                            .clone(),
+                                        app_highlight_segments: filtered_app_highlight_segments
+                                            .clone(),
+                                        window_highlight_segments:
+                                            filtered_window_highlight_segments.clone(),
+                                        app_title_is_typos: filtered_app_title_is_typos.clone(),
+                                        window_title_is_typos: filtered_window_title_is_typos
+                                            .clone(),
+                                    },
+                                });
+                            } else {
+                                self.filtered_search_cache = None;
+                            }
+                        }
+
+		                    if self.mode == LauncherMode::Windows {
                             if search_query_changed {
                                 self.selected_index = 0;
                                 self.last_selected_window_id = None;
@@ -5503,7 +5932,11 @@ impl eframe::App for App {
                         if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
                             match self.mode {
                                 LauncherMode::Apps => self.refresh_apps(),
-                                LauncherMode::Windows => self.refresh_windows(),
+                                LauncherMode::Windows => {
+                                    self.refresh_windows();
+                                    self.start_background_app_load();
+                                    self.start_background_window_enrichment();
+                                }
                             }
                         }
                         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::P)) && total_items > 0 {
@@ -6005,12 +6438,14 @@ impl eframe::App for App {
 
                                             child_ui.add_space(10.0);
 
-			                                            let display_title =
-			                                                search_visible_app_title(app, &search_query);
+			                                            let display_title = filtered_app_display_titles
+			                                                .get(index)
+			                                                .cloned()
+			                                                .unwrap_or_else(|| app.name.clone());
 			                                            let show_search_metadata =
 			                                                !search_query.trim().is_empty();
 			                                            let mut label_clicked = false;
-                                                let title_is_typo = filtered_app_title_is_typos
+                                                let _title_is_typo = filtered_app_title_is_typos
                                                     .get(index)
                                                     .copied()
                                                     .unwrap_or(false);
@@ -6042,16 +6477,20 @@ impl eframe::App for App {
 		                                                        .max(0.0),
 		                                                );
 
-                                                let title_response = text_ui.add(
-	                                                    egui::Label::new(highlighted_title_job(
-	                                                        &display_title,
-	                                                        &search_query,
-	                                                        self.win_title_size,
-	                                                        title_is_typo,
-                                                    ))
-                                                    .sense(egui::Sense::click())
-                                                    .truncate(),
-                                                );
+	                                                let title_response = text_ui.add(
+		                                                    egui::Label::new(
+                                                                highlighted_title_job_from_segments(
+                                                                    &display_title,
+                                                                    self.win_title_size,
+                                                                    filtered_app_highlight_segments
+                                                                        .get(index)
+                                                                        .map(|segments| segments.as_slice())
+                                                                        .unwrap_or(&[]),
+                                                                ),
+                                                            )
+	                                                    .sense(egui::Sense::click())
+	                                                    .truncate(),
+	                                                );
                                                 if title_response.clicked() {
                                                     label_clicked = true;
                                                 }
@@ -6101,16 +6540,20 @@ impl eframe::App for App {
                                                     );
                                                 }
                                             } else {
-                                                let title_response = child_ui.add(
-	                                                    egui::Label::new(highlighted_title_job(
-	                                                        &display_title,
-	                                                        &search_query,
-	                                                        self.win_title_size,
-	                                                        title_is_typo,
-                                                    ))
-                                                    .sense(egui::Sense::click())
-                                                    .truncate(),
-                                                );
+	                                                let title_response = child_ui.add(
+		                                                    egui::Label::new(
+                                                                highlighted_title_job_from_segments(
+                                                                    &display_title,
+                                                                    self.win_title_size,
+                                                                    filtered_app_highlight_segments
+                                                                        .get(index)
+                                                                        .map(|segments| segments.as_slice())
+                                                                        .unwrap_or(&[]),
+                                                                ),
+                                                            )
+	                                                    .sense(egui::Sense::click())
+	                                                    .truncate(),
+	                                                );
                                                 if title_response.clicked() {
                                                     label_clicked = true;
                                                 }
@@ -6235,32 +6678,35 @@ impl eframe::App for App {
 
                                             child_ui.add_space(10.0);
 
-		                                            let display_title = if search_query.trim().is_empty() {
-		                                                truncate_chars(&win.title, 65)
-		                                            } else {
-		                                                search_visible_window_title(win, &search_query)
-		                                            };
+		                                            let display_title = filtered_window_display_titles
+		                                                .get(index)
+		                                                .cloned()
+		                                                .unwrap_or_else(|| truncate_chars(&win.title, 65));
 		                                            let show_search_metadata =
 		                                                !search_query.trim().is_empty();
-	                                                let title_is_typo = filtered_window_title_is_typos
-	                                                    .get(index)
-	                                                    .copied()
+                                                let _title_is_typo = filtered_window_title_is_typos
+                                                    .get(index)
+                                                    .copied()
                                                     .unwrap_or(false);
 
                                             if self.win_show_path {
                                                 child_ui.vertical(|ui| {
                                                     ui.spacing_mut().item_spacing.y = 0.0;
 
-                                                    let title_response = ui.add(
-                                                        egui::Label::new(highlighted_title_job(
-                                                            &display_title,
-                                                            &search_query,
-                                                            self.win_title_size,
-                                                            title_is_typo,
-                                                        ))
-                                                        .sense(egui::Sense::hover())
-                                                        .truncate(),
-                                                    );
+	                                                    let title_response = ui.add(
+	                                                        egui::Label::new(
+                                                                    highlighted_title_job_from_segments(
+                                                                        &display_title,
+                                                                        self.win_title_size,
+                                                                        filtered_window_highlight_segments
+                                                                            .get(index)
+                                                                            .map(|segments| segments.as_slice())
+                                                                            .unwrap_or(&[]),
+                                                                    ),
+                                                                )
+	                                                        .sense(egui::Sense::hover())
+	                                                        .truncate(),
+	                                                    );
                                                     if self.disable_ibeam
                                                         && title_response.hovered()
                                                     {
@@ -6333,16 +6779,20 @@ impl eframe::App for App {
                                                     }
                                                 });
                                             } else {
-                                                let title_response = child_ui.add(
-                                                    egui::Label::new(highlighted_title_job(
-                                                        &display_title,
-                                                        &search_query,
-                                                        self.win_title_size,
-                                                        title_is_typo,
-                                                    ))
-                                                    .sense(egui::Sense::hover())
-                                                    .truncate(),
-                                                );
+	                                                let title_response = child_ui.add(
+	                                                    egui::Label::new(
+                                                                highlighted_title_job_from_segments(
+                                                                    &display_title,
+                                                                    self.win_title_size,
+                                                                    filtered_window_highlight_segments
+                                                                        .get(index)
+                                                                        .map(|segments| segments.as_slice())
+                                                                        .unwrap_or(&[]),
+                                                                ),
+                                                            )
+	                                                    .sense(egui::Sense::hover())
+	                                                    .truncate(),
+	                                                );
 	                                                if self.disable_ibeam && title_response.hovered() {
 	                                                    child_ui
 	                                                        .ctx()
@@ -6758,10 +7208,10 @@ impl eframe::App for App {
                                                             if self.app_icon_show_name {
                                                                 let label =
                                                                     truncate_tile_label(&app.name, tile_size);
-                                                                let title_is_typo =
-                                                                    filtered_app_title_is_typos
-                                                                        .get(index)
-                                                                        .copied()
+                                                            let title_is_typo =
+                                                                filtered_app_title_is_typos
+                                                                    .get(index)
+                                                                    .copied()
                                                                         .unwrap_or(false);
                                                                 paint_centered_title_job(
                                                                     ui,
@@ -6871,16 +7321,13 @@ impl eframe::App for App {
                                                             );
                                                         child_ui.add_space(10.0);
 
-		                                                        let display_title =
-		                                                            search_visible_app_title(app, &search_query);
+		                                                        let display_title = filtered_app_display_titles
+		                                                            .get(index)
+		                                                            .cloned()
+		                                                            .unwrap_or_else(|| app.name.clone());
 		                                                        let show_search_metadata =
 		                                                            !search_query.trim().is_empty();
 		                                                        let mut label_clicked = false;
-		                                                            let title_is_typo =
-                                                                filtered_app_title_is_typos
-                                                                    .get(index)
-                                                                    .copied()
-                                                                    .unwrap_or(false);
 	                                                        if self.win_show_path {
                                                             let text_min_x =
                                                                 content_rect.min.x + app_icon_size.x + 10.0;
@@ -6908,18 +7355,20 @@ impl eframe::App for App {
 	                                                                    .max(0.0),
 	                                                            );
 
-                                                            let title_response = text_ui.add(
-                                                                egui::Label::new(
-	                                                                    highlighted_title_job(
-	                                                                        &display_title,
-	                                                                        &search_query,
-	                                                                        self.win_title_size,
-	                                                                        title_is_typo,
-                                                                    ),
-                                                                )
-                                                                .sense(egui::Sense::click())
-                                                                .truncate(),
-                                                            );
+	                                                            let title_response = text_ui.add(
+	                                                                egui::Label::new(
+                                                                            highlighted_title_job_from_segments(
+                                                                                &display_title,
+                                                                                self.win_title_size,
+                                                                                filtered_app_highlight_segments
+                                                                                    .get(index)
+                                                                                    .map(|segments| segments.as_slice())
+                                                                                    .unwrap_or(&[]),
+                                                                            ),
+                                                                        )
+	                                                                .sense(egui::Sense::click())
+	                                                                .truncate(),
+	                                                            );
                                                             if title_response.clicked() {
                                                                 label_clicked = true;
                                                             }
@@ -6968,18 +7417,20 @@ impl eframe::App for App {
 	                                                            }
                                                             }
                                                         } else {
-                                                            let title_response = child_ui.add(
-                                                                egui::Label::new(
-	                                                                    highlighted_title_job(
-	                                                                        &display_title,
-	                                                                        &search_query,
-	                                                                        self.win_title_size,
-	                                                                        title_is_typo,
-                                                                    ),
-                                                                )
-                                                                .sense(egui::Sense::click())
-                                                                .truncate(),
-                                                            );
+	                                                            let title_response = child_ui.add(
+	                                                                egui::Label::new(
+                                                                            highlighted_title_job_from_segments(
+                                                                                &display_title,
+                                                                                self.win_title_size,
+                                                                                filtered_app_highlight_segments
+                                                                                    .get(index)
+                                                                                    .map(|segments| segments.as_slice())
+                                                                                    .unwrap_or(&[]),
+                                                                            ),
+                                                                        )
+	                                                                .sense(egui::Sense::click())
+	                                                                .truncate(),
+	                                                            );
                                                             if title_response.clicked() {
                                                                 label_clicked = true;
                                                             }
