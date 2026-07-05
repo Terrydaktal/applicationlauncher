@@ -2,7 +2,7 @@ use eframe::egui;
 use fuzzy_rank::metadata::{
     MetadataCandidate, MetadataQuery, SearchField, dedup_push_search_field,
 };
-use fuzzy_rank::ranking::{SearchRank, compare_search_results};
+use fuzzy_rank::ranking::SearchRank;
 use serde::Deserialize;
 use std::backtrace::Backtrace;
 use std::collections::{HashMap, HashSet};
@@ -25,7 +25,6 @@ const AUDIO_SINK_POLL_MS: u128 = 200;
 const AUDIO_ACTIVITY_GRACE_MS: u128 = 350;
 const PIPEWIRE_ACTIVE_US_THRESHOLD: f32 = 10.0;
 const PIPEWIRE_ACTIVE_TOTAL_US_THRESHOLD: f32 = 20.0;
-const AUDIO_IDLE_REPAINT_MS: u64 = 200;
 const AUDIO_ACTIVE_REPAINT_MS: u64 = 80;
 const WINDOW_FEED_EVENTS_PER_FRAME: usize = 512;
 const WINDOW_SNAPSHOTS_PER_FRAME: usize = 4;
@@ -92,6 +91,7 @@ struct RankedAppMatch {
     title_is_typo: bool,
     visible_match_priority: u8,
     is_pinned: bool,
+    search_values: Vec<(u8, String)>,
     candidate_key: String,
     candidate_score: f64,
 }
@@ -102,6 +102,9 @@ struct RankedWindowMatch {
     rank: SearchRank,
     title_is_typo: bool,
     visible_match_priority: u8,
+    display_title: String,
+    highlight_segments: Vec<(usize, usize, bool)>,
+    search_values: Vec<(u8, String)>,
     candidate_key: String,
     candidate_score: f64,
 }
@@ -157,6 +160,12 @@ struct AudioCacheUpdate {
     observed_pipewire_node_ids: HashSet<u32>,
     active_pipewire_node_ids: HashSet<u32>,
     pipewire_activity_cache_valid: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct WindowAudioCache {
+    sink_matches: HashMap<String, Vec<PactlSinkInput>>,
+    level_buckets: HashMap<String, u8>,
 }
 
 struct SnapshotWindowDetails {
@@ -230,6 +239,8 @@ struct App {
     win_text_spacing: f32,
     win_line_height: f32,
     win_show_path: bool,
+    show_run_in_terminal: bool,
+    show_cd_in_terminal: bool,
     win_title_size: f32,
     win_path_size: f32,
     app_icon_size: f32,
@@ -252,6 +263,8 @@ struct App {
     observed_pipewire_node_ids: HashSet<u32>,
     active_pipewire_node_ids: HashSet<u32>,
     pipewire_activity_cache_valid: bool,
+    window_audio_cache: WindowAudioCache,
+    has_active_audio: bool,
     app_scroll_sensitivity: f32,
     win_scroll_sensitivity: f32,
     last_stale_prune: Option<Instant>,
@@ -299,6 +312,8 @@ struct LauncherSettings {
     win_text_spacing: f32,
     win_line_height: f32,
     win_show_path: bool,
+    show_run_in_terminal: bool,
+    show_cd_in_terminal: bool,
     win_title_size: f32,
     win_path_size: f32,
     app_icon_size: f32,
@@ -321,6 +336,8 @@ impl Default for LauncherSettings {
             win_text_spacing: 2.0,
             win_line_height: 14.0,
             win_show_path: true,
+            show_run_in_terminal: true,
+            show_cd_in_terminal: true,
             win_title_size: 13.0,
             win_path_size: 10.5,
             app_icon_size: 32.0,
@@ -519,6 +536,16 @@ fn load_launcher_settings() -> LauncherSettings {
                             settings.win_show_path =
                                 value.parse::<bool>().unwrap_or(settings.win_show_path);
                         }
+                        "show_run_in_terminal" => {
+                            settings.show_run_in_terminal = value
+                                .parse::<bool>()
+                                .unwrap_or(settings.show_run_in_terminal);
+                        }
+                        "show_cd_in_terminal" => {
+                            settings.show_cd_in_terminal = value
+                                .parse::<bool>()
+                                .unwrap_or(settings.show_cd_in_terminal);
+                        }
                         "win_title_size" => {
                             settings.win_title_size = value
                                 .parse::<f32>()
@@ -585,7 +612,7 @@ fn save_launcher_settings(settings: LauncherSettings) {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("settings.txt");
         let content = format!(
-            "show_system_settings_modules={}\napp_icon_mode={}\nwin_icon_size={:.1}\nwin_padding={:.1}\nwin_row_height={:.1}\nwin_text_spacing={:.1}\nwin_line_height={:.1}\nwin_show_path={}\nwin_title_size={:.1}\nwin_path_size={:.1}\napp_icon_size={:.1}\napp_icon_tile_size={:.1}\napp_icon_show_name={}\napp_icon_name_size={:.1}\ndisable_ibeam={}\napp_scroll_sensitivity={:.2}\nwin_scroll_sensitivity={:.2}\n",
+            "show_system_settings_modules={}\napp_icon_mode={}\nwin_icon_size={:.1}\nwin_padding={:.1}\nwin_row_height={:.1}\nwin_text_spacing={:.1}\nwin_line_height={:.1}\nwin_show_path={}\nshow_run_in_terminal={}\nshow_cd_in_terminal={}\nwin_title_size={:.1}\nwin_path_size={:.1}\napp_icon_size={:.1}\napp_icon_tile_size={:.1}\napp_icon_show_name={}\napp_icon_name_size={:.1}\ndisable_ibeam={}\napp_scroll_sensitivity={:.2}\nwin_scroll_sensitivity={:.2}\n",
             settings.show_system_settings_modules,
             settings.app_icon_mode,
             settings.win_icon_size,
@@ -594,6 +621,8 @@ fn save_launcher_settings(settings: LauncherSettings) {
             settings.win_text_spacing,
             settings.win_line_height,
             settings.win_show_path,
+            settings.show_run_in_terminal,
+            settings.show_cd_in_terminal,
             settings.win_title_size,
             settings.win_path_size,
             settings.app_icon_size,
@@ -753,7 +782,24 @@ fn find_icon(theme: &str, class: &str) -> Option<PathBuf> {
     None
 }
 
-fn app_search_rank(query: &MetadataQuery, app: &AppInfo) -> Option<SearchRank> {
+fn dedup_search_values(values: Vec<(u8, String)>) -> Vec<(u8, String)> {
+    let mut deduped: Vec<(u8, String)> = Vec::new();
+    for (priority, value) in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if deduped.iter().any(|(existing_priority, existing_value)| {
+            *existing_priority == priority && existing_value.eq_ignore_ascii_case(trimmed)
+        }) {
+            continue;
+        }
+        deduped.push((priority, trimmed.to_string()));
+    }
+    deduped
+}
+
+fn app_search_values(app: &AppInfo) -> Vec<(u8, String)> {
     let cleaned_exec = clean_exec_cmd(&app.exec);
     let exec_basename = command_basename(&app.exec);
     let desktop_stem = app
@@ -775,11 +821,19 @@ fn app_search_rank(query: &MetadataQuery, app: &AppInfo) -> Option<SearchRank> {
     }
     owned_values.push((4, normalize_metadata_search_value(&cleaned_exec)));
 
+    dedup_search_values(owned_values)
+}
+
+fn metadata_fields_for_values<'a>(values: &'a [(u8, String)]) -> Vec<SearchField<'a>> {
     let mut fields = Vec::new();
-    for (priority, value) in &owned_values {
+    for (priority, value) in values {
         dedup_push_search_field(&mut fields, *priority, Some(value.as_str()));
     }
+    fields
+}
 
+fn search_rank_for_values(query: &MetadataQuery, values: &[(u8, String)]) -> Option<SearchRank> {
+    let fields = metadata_fields_for_values(values);
     query.search_rank(MetadataCandidate {
         key: "",
         fields: &fields,
@@ -787,7 +841,7 @@ fn app_search_rank(query: &MetadataQuery, app: &AppInfo) -> Option<SearchRank> {
     })
 }
 
-fn window_search_rank(query: &MetadataQuery, win: &WindowInfo) -> Option<SearchRank> {
+fn window_search_values(win: &WindowInfo) -> Vec<(u8, String)> {
     let app_key = window_application_key(win);
     let exe_basename = win
         .exe_path
@@ -818,43 +872,20 @@ fn window_search_rank(query: &MetadataQuery, win: &WindowInfo) -> Option<SearchR
         owned_values.push((7, normalize_metadata_search_value(&value)));
     }
 
-    let mut fields = Vec::new();
-    for (priority, value) in &owned_values {
-        dedup_push_search_field(&mut fields, *priority, Some(value.as_str()));
-    }
-
-    query.search_rank(MetadataCandidate {
-        key: "",
-        fields: &fields,
-        score: 0.0,
-    })
+    dedup_search_values(owned_values)
 }
 
-fn sort_ranked_matches_with_visible<T, FVisible, FKey, FScore, FRank>(
+fn sort_ranked_matches_with_visible<T, FVisible, FCompare>(
     items: &mut [T],
     visible_priority_fn: FVisible,
-    key_fn: FKey,
-    score_fn: FScore,
-    rank_fn: FRank,
+    compare_fn: FCompare,
 ) where
     FVisible: Fn(&T) -> u8,
-    FKey: Fn(&T) -> &str,
-    FScore: Fn(&T) -> f64,
-    FRank: Fn(&T) -> &SearchRank,
+    FCompare: Fn(&T, &T) -> std::cmp::Ordering,
 {
     items.sort_unstable_by(|left, right| {
-        visible_priority_fn(left)
-            .cmp(&visible_priority_fn(right))
-            .then_with(|| {
-                compare_search_results(
-                    rank_fn(left),
-                    score_fn(left),
-                    key_fn(left),
-                    rank_fn(right),
-                    score_fn(right),
-                    key_fn(right),
-                )
-            })
+        compare_fn(left, right)
+            .then_with(|| visible_priority_fn(left).cmp(&visible_priority_fn(right)))
     });
 }
 
@@ -1031,6 +1062,19 @@ fn source_terminal_title_for_clone(win: &WindowInfo) -> String {
 
     for sep in [" - ", " — ", " – ", " : ", " | "] {
         let parts: Vec<&str> = win.title.split(sep).collect();
+        if parts.len() >= 3
+            && parts
+                .first()
+                .is_some_and(|part| normalize_app_match_key(part) == proc_key)
+        {
+            return parts
+                .iter()
+                .skip(1)
+                .map(|part| part.trim())
+                .collect::<Vec<_>>()
+                .join(sep);
+        }
+
         if parts.len() >= 3 && normalize_app_match_key(parts[1]) == proc_key {
             let mut rebuilt = Vec::with_capacity(parts.len() - 1);
             rebuilt.push(parts[0].trim());
@@ -1399,22 +1443,25 @@ fn full_search_visible_window_title(win: &WindowInfo) -> String {
     }
 }
 
-fn search_visible_app_title(app: &AppInfo, query: &str) -> String {
+fn ranked_field_value<'a>(values: &'a [(u8, String)], rank: &SearchRank) -> Option<&'a str> {
+    values
+        .get(rank.provenance().field_index)
+        .map(|(_, value)| value.as_str())
+}
+
+fn search_visible_app_title_with_rank(app: &AppInfo, query: &str, rank: &SearchRank) -> String {
     if query.trim().is_empty() {
         return app.name.clone();
     }
+    let values = app_search_values(app);
     let full_text = full_search_visible_app_title(app);
-    let typo_match = visible_title_has_typo_match(&full_text, query);
-    focus_text_around_match(&full_text, query, typo_match, 110)
-}
-
-fn search_visible_window_title(win: &WindowInfo, query: &str) -> String {
-    if query.trim().is_empty() {
-        return win.title.clone();
-    }
-    let full_text = full_search_visible_window_title(win);
-    let typo_match = visible_title_has_typo_match(&full_text, query);
-    focus_text_around_match(&full_text, query, typo_match, 120)
+    focus_text_around_match(
+        &full_text,
+        query,
+        ranked_field_value(&values, rank),
+        Some(rank),
+        110,
+    )
 }
 
 fn launch_dolphin_app() -> bool {
@@ -1507,6 +1554,29 @@ fn window_application_key(win: &WindowInfo) -> String {
     String::new()
 }
 
+fn window_grouping_key(win: &WindowInfo) -> String {
+    normalize_app_match_key(&window_application_key(win))
+}
+
+fn terminal_window_subgroup_key(win: &WindowInfo) -> String {
+    if is_terminal_class(&win.class.trim().to_lowercase()) {
+        if let Some(proc_name) = win.active_process.as_deref() {
+            let primary_title = terminal_primary_title(proc_name, win.command_summary.as_deref());
+            let primary_key = normalize_app_match_key(&primary_title);
+            if !primary_key.is_empty() {
+                return primary_key;
+            }
+
+            let proc_key = normalize_app_match_key(proc_name);
+            if !proc_key.is_empty() {
+                return proc_key;
+            }
+        }
+    }
+
+    window_sort_title_key(win)
+}
+
 fn duplicate_window_title_key(win: &WindowInfo) -> Option<String> {
     let mut title = win.title.trim();
     if title.is_empty() {
@@ -1534,7 +1604,7 @@ fn duplicate_window_title_key(win: &WindowInfo) -> Option<String> {
 
 fn duplicate_window_group_key(win: &WindowInfo) -> Option<(String, String)> {
     let title = duplicate_window_title_key(win)?;
-    let app_key = normalize_app_match_key(&window_application_key(win));
+    let app_key = window_grouping_key(win);
     (!app_key.is_empty()).then_some((app_key, title))
 }
 
@@ -1607,17 +1677,115 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn focus_text_around_match(text: &str, query: &str, typo_match: bool, max_chars: usize) -> String {
+fn focus_match_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
+    let query_terms = normalized_query_terms(query);
+    if query_terms.len() == 1 {
+        let ranked_ranges = valid_match_ranges(text, fuzzy_rank_visible_match_ranges(text, query));
+        if !ranked_ranges.is_empty() {
+            return ranked_ranges;
+        }
+    }
+
+    let highlighted_ranges = title_highlight_segments(text, query)
+        .into_iter()
+        .map(|(start, end, _)| (start, end));
+    valid_match_ranges(text, highlighted_ranges)
+}
+
+fn ranked_field_focus_ranges(text: &str, query: &str, ranked_field: &str) -> Vec<(usize, usize)> {
+    let field_ranges = valid_match_ranges(text, title_match_ranges(text, ranked_field));
+    if field_ranges.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    for (field_start, field_end) in field_ranges {
+        let field_text = &text[field_start..field_end];
+        let inner_ranges = focus_match_ranges(field_text, query);
+        if inner_ranges.is_empty() {
+            ranges.push((field_start, field_end));
+            continue;
+        }
+        ranges.extend(
+            inner_ranges
+                .into_iter()
+                .map(|(start, end)| (field_start + start, field_start + end)),
+        );
+    }
+    valid_match_ranges(text, ranges)
+}
+
+fn rank_provenance_ranges_in_field(field_text: &str, rank: &SearchRank) -> Vec<(usize, usize)> {
+    let provenance = rank.provenance();
+    match provenance.variant_scope {
+        Some(1) | Some(2) => alnum_tokens_with_ranges(field_text)
+            .into_iter()
+            .nth(provenance.token_index)
+            .map(|(start, end, _)| vec![(start, end)])
+            .unwrap_or_default(),
+        _ => char_span_to_byte_range(
+            field_text,
+            provenance.start_idx,
+            provenance.matched_char_len,
+        )
+        .and_then(|(start, end)| expand_range_to_token_boundaries(field_text, start, end))
+        .map(|range| vec![range])
+        .unwrap_or_default(),
+    }
+}
+
+fn ranked_field_rank_ranges(
+    text: &str,
+    ranked_field: &str,
+    rank: &SearchRank,
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for (field_start, field_end) in valid_match_ranges(text, title_match_ranges(text, ranked_field))
+    {
+        let field_text = &text[field_start..field_end];
+        ranges.extend(
+            rank_provenance_ranges_in_field(field_text, rank)
+                .into_iter()
+                .map(|(start, end)| (field_start + start, field_start + end)),
+        );
+    }
+    valid_match_ranges(text, ranges)
+}
+
+fn ranked_field_rank_token_ranges_in_text(
+    text: &str,
+    ranked_field: &str,
+    rank: &SearchRank,
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for (start, end) in rank_provenance_ranges_in_field(ranked_field, rank) {
+        let Some(token) = ranked_field.get(start..end) else {
+            continue;
+        };
+        ranges.extend(title_match_ranges(text, token));
+    }
+    valid_match_ranges(text, ranges)
+}
+
+fn focus_text_around_match(
+    text: &str,
+    query: &str,
+    ranked_field: Option<&str>,
+    rank: Option<&SearchRank>,
+    max_chars: usize,
+) -> String {
     let char_count = text.chars().count();
     if char_count <= max_chars {
         return text.to_string();
     }
 
-    let ranges = if typo_match {
-        typo_title_match_ranges(text, query)
-    } else {
-        title_match_ranges(text, query)
-    };
+    let ranges = ranked_field
+        .zip(rank)
+        .map(|(field, rank)| ranked_field_rank_ranges(text, field, rank))
+        .filter(|ranges| !ranges.is_empty())
+        .or_else(|| ranked_field.map(|field| ranked_field_focus_ranges(text, query, field)))
+        .filter(|ranges| !ranges.is_empty())
+        .unwrap_or_else(|| focus_match_ranges(text, query));
     let Some((match_start_byte, match_end_byte)) = ranges.first().copied() else {
         return truncate_chars(text, max_chars);
     };
@@ -2024,6 +2192,23 @@ fn app_audio_level(
     )
 }
 
+fn quantize_audio_level(level: f32) -> u8 {
+    (level.clamp(0.0, 1.0) * 100.0).round() as u8
+}
+
+fn sink_match_signature(cache: &WindowAudioCache) -> HashMap<String, Vec<u32>> {
+    cache
+        .sink_matches
+        .iter()
+        .map(|(window_id, sinks)| {
+            (
+                window_id.clone(),
+                sinks.iter().map(|sink| sink.index).collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
 fn fetch_sink_inputs() -> Vec<PactlSinkInput> {
     let output = Command::new("pactl")
         .args(["--format=json", "list", "sink-inputs"])
@@ -2245,6 +2430,82 @@ fn replace_terminal_suffix_path(original_suffix: &str, cwd: &str) -> String {
     }
 }
 
+fn push_unique_terminal_segment(segments: &mut Vec<String>, value: impl Into<String>) {
+    let value = value.into();
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let key = normalize_app_match_key(trimmed);
+    if key.is_empty()
+        || segments
+            .iter()
+            .any(|existing| normalize_app_match_key(existing) == key)
+    {
+        return;
+    }
+
+    segments.push(trimmed.to_string());
+}
+
+fn is_generic_terminal_process(proc_name: &str) -> bool {
+    matches!(
+        normalize_app_match_key(proc_name).as_str(),
+        "bash" | "fish" | "sh" | "zsh" | "python" | "python3" | "node" | "ruby" | "perl"
+    )
+}
+
+fn terminal_primary_title(proc_name: &str, command_summary: Option<&str>) -> String {
+    let proc_name = proc_name.trim();
+    let Some(command_summary) = command_summary
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return proc_name.to_string();
+    };
+
+    if is_generic_terminal_process(proc_name)
+        && normalize_app_match_key(command_summary) != normalize_app_match_key(proc_name)
+    {
+        command_summary.to_string()
+    } else {
+        proc_name.to_string()
+    }
+}
+
+fn terminal_context_looks_path_like(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && (trimmed.starts_with('~')
+            || trimmed.starts_with('/')
+            || trimmed == "."
+            || trimmed == ".."
+            || trimmed.contains('/'))
+}
+
+fn strip_leading_braille_spinner(value: &str) -> &str {
+    value.trim_start_matches(|ch: char| is_braille_spinner_char(ch) || ch.is_whitespace())
+}
+
+fn terminal_path_basename(value: &str) -> Option<&str> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    trimmed.rsplit('/').next().filter(|part| !part.is_empty())
+}
+
+fn terminal_segment_matches_cwd_basename(part: &str, cwd: &str) -> bool {
+    let part = strip_leading_braille_spinner(part).trim();
+    let Some(cwd_basename) = terminal_path_basename(cwd) else {
+        return false;
+    };
+
+    !part.is_empty() && normalize_app_match_key(part) == normalize_app_match_key(cwd_basename)
+}
+
 fn is_terminal_title_marker(value: &str) -> bool {
     let key = normalize_app_match_key(value);
     key == "terminal"
@@ -2257,39 +2518,88 @@ fn is_terminal_title_marker(value: &str) -> bool {
         || key.ends_with("terminal")
 }
 
-fn terminal_title_segments(dynamic_title: &str, proc_name: &str, cwd: Option<&str>) -> Vec<String> {
+fn terminal_title_segments(
+    dynamic_title: &str,
+    proc_name: &str,
+    command_summary: Option<&str>,
+    cwd: Option<&str>,
+) -> Vec<String> {
     let dynamic_title = dynamic_title.trim();
     let mut segments = Vec::new();
-    let mut after_process = Vec::new();
+    let primary_title = terminal_primary_title(proc_name, command_summary);
+    push_unique_terminal_segment(&mut segments, primary_title.clone());
 
-    match cwd {
-        Some(cwd) if !cwd.trim().is_empty() => {
-            let cwd = cwd.trim();
+    let primary_key = normalize_app_match_key(&primary_title);
+    let proc_key = normalize_app_match_key(proc_name);
+    let cwd = cwd.map(str::trim).filter(|value| !value.is_empty());
+    let cwd_key = cwd.map(normalize_app_match_key);
+    let separators = [" - ", " — ", " – ", " : ", " | "];
+    let mut has_cwd_segment = false;
+    let prefer_cwd_over_dynamic_path =
+        cwd.is_some() && terminal_context_looks_path_like(dynamic_title);
+
+    let title_parts: Vec<&str> = separators
+        .iter()
+        .find_map(|sep| {
+            dynamic_title
+                .contains(sep)
+                .then(|| dynamic_title.split(sep).map(str::trim).collect())
+        })
+        .unwrap_or_else(|| {
             if dynamic_title.is_empty() {
-                after_process.push(cwd.to_string());
+                Vec::new()
             } else {
-                let cwd_context = replace_terminal_suffix_path(dynamic_title, cwd);
-                if dynamic_title == cwd || dynamic_title == cwd_context {
-                    segments.push(dynamic_title.to_string());
-                } else if dynamic_title.chars().any(char::is_whitespace) {
-                    segments.push(cwd_context);
-                } else {
-                    segments.push(dynamic_title.to_string());
-                    after_process.push(cwd_context);
-                }
+                vec![dynamic_title]
             }
+        });
+
+    for part in title_parts {
+        let part = part.trim();
+        if part.is_empty() || is_terminal_title_marker(part) {
+            continue;
         }
-        _ if !dynamic_title.is_empty() => segments.push(dynamic_title.to_string()),
-        _ => {}
+
+        if prefer_cwd_over_dynamic_path && terminal_context_looks_path_like(part) {
+            continue;
+        }
+
+        if cwd.is_some_and(|cwd| terminal_segment_matches_cwd_basename(part, cwd)) {
+            continue;
+        }
+
+        let part_key = normalize_app_match_key(part);
+        if part_key.is_empty() || part_key == primary_key || part_key == proc_key {
+            continue;
+        }
+
+        if cwd_key.as_ref().is_some_and(|cwd_key| *cwd_key == part_key) {
+            has_cwd_segment = true;
+        }
+
+        push_unique_terminal_segment(&mut segments, part.to_string());
     }
 
-    segments.push(proc_name.trim().to_string());
-    segments.extend(after_process);
+    if let Some(cwd) = cwd {
+        if !has_cwd_segment {
+            let cwd_context = if dynamic_title.is_empty() {
+                cwd.to_string()
+            } else {
+                replace_terminal_suffix_path(dynamic_title, cwd)
+            };
+            push_unique_terminal_segment(&mut segments, cwd_context);
+        }
+    }
+
     segments.push("Terminal".to_string());
     segments
 }
 
-fn terminal_display_title(raw_title: &str, proc_name: &str, cwd: Option<&str>) -> String {
+fn terminal_display_title(
+    raw_title: &str,
+    proc_name: &str,
+    command_summary: Option<&str>,
+    cwd: Option<&str>,
+) -> String {
     let separators = [" - ", " — ", " – ", " : ", " | "];
 
     for sep in separators {
@@ -2303,7 +2613,7 @@ fn terminal_display_title(raw_title: &str, proc_name: &str, cwd: Option<&str>) -
             .is_some_and(|part| is_terminal_title_marker(part))
         {
             let suffix = parts[1..].join(sep);
-            return terminal_title_segments(&suffix, proc_name, cwd).join(sep);
+            return terminal_title_segments(&suffix, proc_name, command_summary, cwd).join(sep);
         }
 
         if parts
@@ -2311,11 +2621,11 @@ fn terminal_display_title(raw_title: &str, proc_name: &str, cwd: Option<&str>) -
             .is_some_and(|part| is_terminal_title_marker(part))
         {
             let suffix = parts[..parts.len() - 1].join(sep);
-            return terminal_title_segments(&suffix, proc_name, cwd).join(sep);
+            return terminal_title_segments(&suffix, proc_name, command_summary, cwd).join(sep);
         }
     }
 
-    terminal_title_segments(raw_title, proc_name, cwd).join(" - ")
+    terminal_title_segments(raw_title, proc_name, command_summary, cwd).join(" - ")
 }
 
 fn normalize_terminal_title_marker_position(raw_title: &str) -> String {
@@ -2511,21 +2821,231 @@ fn alnum_tokens_with_ranges(text: &str) -> Vec<(usize, usize, String)> {
     tokens
 }
 
-fn typo_title_match_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
-    let Some(rank) = visible_title_match_provenance(text, query) else {
+fn char_span_to_byte_range(
+    text: &str,
+    start_idx: usize,
+    char_len: usize,
+) -> Option<(usize, usize)> {
+    if char_len == 0 {
+        return None;
+    }
+    let start = text
+        .char_indices()
+        .nth(start_idx)
+        .map(|(idx, _)| idx)
+        .or_else(|| (start_idx == text.chars().count()).then_some(text.len()))?;
+    let end_char_idx = start_idx.saturating_add(char_len);
+    let end = text
+        .char_indices()
+        .nth(end_char_idx)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+    (start < end).then_some((start, end))
+}
+
+fn valid_byte_range(text: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+    (start < end && end <= text.len() && text.is_char_boundary(start) && text.is_char_boundary(end))
+        .then_some((start, end))
+}
+
+fn valid_match_ranges<I>(text: &str, ranges: I) -> Vec<(usize, usize)>
+where
+    I: IntoIterator<Item = (usize, usize)>,
+{
+    ranges
+        .into_iter()
+        .filter_map(|(start, end)| valid_byte_range(text, start, end))
+        .collect()
+}
+
+fn expand_range_to_token_boundaries(
+    text: &str,
+    start: usize,
+    end: usize,
+) -> Option<(usize, usize)> {
+    let (mut start, mut end) = valid_byte_range(text, start, end)?;
+
+    while start > 0 {
+        let Some((previous_idx, previous_ch)) = text[..start].char_indices().next_back() else {
+            break;
+        };
+        if !previous_ch.is_ascii_alphanumeric() {
+            break;
+        }
+        start = previous_idx;
+    }
+
+    while end < text.len() {
+        let Some(next_ch) = text[end..].chars().next() else {
+            break;
+        };
+        if !next_ch.is_ascii_alphanumeric() {
+            break;
+        }
+        end += next_ch.len_utf8();
+    }
+
+    valid_byte_range(text, start, end)
+}
+
+fn fuzzy_rank_visible_match_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
+    let Some(query) = MetadataQuery::new(query).map(|query| query.with_typo_fallback(true)) else {
         return Vec::new();
     };
-    let Some((_, _, winning_token)) = alnum_tokens_with_ranges(text)
-        .into_iter()
-        .nth(rank.provenance().token_index)
-    else {
+    let field = SearchField {
+        priority: 0,
+        value: text,
+    };
+    let fields = [field];
+    let candidate = MetadataCandidate {
+        key: "",
+        fields: &fields,
+        score: 0.0,
+    };
+    let Some(rank) = query.search_rank(candidate) else {
+        return Vec::new();
+    };
+    let provenance = rank.provenance();
+
+    match provenance.variant_scope {
+        Some(1) => alnum_tokens_with_ranges(text)
+            .into_iter()
+            .nth(provenance.token_index)
+            .map(|(token_start, token_end, _)| vec![(token_start, token_end)])
+            .unwrap_or_default(),
+        Some(2) => alnum_tokens_with_ranges(text)
+            .into_iter()
+            .nth(provenance.token_index)
+            .map(|(start, end, _)| vec![(start, end)])
+            .unwrap_or_default(),
+        _ => char_span_to_byte_range(text, provenance.start_idx, provenance.matched_char_len)
+            .and_then(|(start, end)| expand_range_to_token_boundaries(text, start, end))
+            .map(|range| vec![range])
+            .unwrap_or_default(),
+    }
+}
+
+fn bounded_damerau_levenshtein(left: &str, right: &str, limit: usize) -> Option<usize> {
+    let left_chars: Vec<char> = left.chars().collect();
+    let right_chars: Vec<char> = right.chars().collect();
+    if left_chars.len().abs_diff(right_chars.len()) > limit {
+        return None;
+    }
+
+    let mut previous_previous = Vec::new();
+    let mut previous: Vec<usize> = (0..=right_chars.len()).collect();
+    let mut current = vec![0; right_chars.len() + 1];
+
+    for (left_idx, left_ch) in left_chars.iter().enumerate() {
+        current[0] = left_idx + 1;
+        let mut row_min = current[0];
+        for (right_idx, right_ch) in right_chars.iter().enumerate() {
+            let cost = usize::from(left_ch != right_ch);
+            let deletion = previous[right_idx + 1] + 1;
+            let insertion = current[right_idx] + 1;
+            let substitution = previous[right_idx] + cost;
+            let mut value = deletion.min(insertion).min(substitution);
+            if left_idx > 0
+                && right_idx > 0
+                && *left_ch == right_chars[right_idx - 1]
+                && left_chars[left_idx - 1] == *right_ch
+            {
+                value = value.min(previous_previous[right_idx - 1] + 1);
+            }
+            current[right_idx + 1] = value;
+            row_min = row_min.min(value);
+        }
+
+        if row_min > limit {
+            return None;
+        }
+        previous_previous.clone_from(&previous);
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    let distance = previous[right_chars.len()];
+    (distance <= limit).then_some(distance)
+}
+
+fn visible_typo_distance(query: &str, candidate: &str) -> Option<(usize, usize)> {
+    if query.is_empty() || candidate.is_empty() || query == candidate {
+        return None;
+    }
+    let query_len = query.chars().count();
+    let candidate_len = candidate.chars().count();
+    let limit = (query_len / 2).max(1);
+    let distance = bounded_damerau_levenshtein(query, candidate, limit)?;
+    let ratio = distance * 1000 / query_len.max(candidate_len);
+    Some((distance, ratio))
+}
+
+fn best_visible_typo_match_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
+    let normalized_query = normalize_metadata_search_value(query).to_lowercase();
+    if normalized_query.is_empty() {
+        return Vec::new();
+    }
+    let tokens = alnum_tokens_with_ranges(text);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut best: Option<(usize, usize, usize, usize, String)> = None;
+    for span_len in 1..=4 {
+        for start in 0..tokens.len() {
+            if start + span_len > tokens.len() {
+                break;
+            }
+            let mut combined = String::new();
+            for token in tokens.iter().skip(start).take(span_len) {
+                combined.push_str(&token.2);
+            }
+            let Some((distance, ratio)) = visible_typo_distance(&normalized_query, &combined)
+            else {
+                continue;
+            };
+            let is_better = best.as_ref().is_none_or(
+                |(best_distance, best_ratio, best_span_len, best_start, ..)| {
+                    (distance, ratio, span_len, start)
+                        < (*best_distance, *best_ratio, *best_span_len, *best_start)
+                },
+            );
+            if is_better {
+                best = Some((distance, ratio, span_len, start, combined));
+            }
+        }
+        if best.is_some() {
+            break;
+        }
+    }
+
+    let Some((_, _, span_len, _, best_key)) = best else {
         return Vec::new();
     };
 
-    alnum_tokens_with_ranges(text)
-        .into_iter()
-        .filter_map(|(start, end, token)| (token == winning_token).then_some((start, end)))
-        .collect()
+    let mut ranges = Vec::new();
+    for start in 0..tokens.len() {
+        if start + span_len > tokens.len() {
+            break;
+        }
+        let mut combined = String::new();
+        for idx in start..start + span_len {
+            combined.push_str(&tokens[idx].2);
+        }
+        if combined == best_key {
+            ranges.push((tokens[start].0, tokens[start + span_len - 1].1));
+        }
+    }
+    ranges
+}
+
+fn typo_title_match_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
+    let ranges = fuzzy_rank_visible_match_ranges(text, query);
+    let ranges = valid_match_ranges(text, ranges);
+    if ranges.is_empty() {
+        best_visible_typo_match_ranges(text, query)
+    } else {
+        ranges
+    }
 }
 
 fn title_highlight_segments(text: &str, query: &str) -> Vec<(usize, usize, bool)> {
@@ -2533,7 +3053,7 @@ fn title_highlight_segments(text: &str, query: &str) -> Vec<(usize, usize, bool)
     let mut red_ranges = Vec::new();
     let mut matched_terms = HashSet::new();
     for term in &query_terms {
-        let ranges = title_match_ranges(text, term);
+        let ranges = valid_match_ranges(text, title_match_ranges(text, term));
         if !ranges.is_empty() {
             matched_terms.insert(term.clone());
             red_ranges.extend(ranges);
@@ -2556,7 +3076,7 @@ fn title_highlight_segments(text: &str, query: &str) -> Vec<(usize, usize, bool)
         if matched_terms.contains(term) {
             continue;
         }
-        if let Some((start, end)) = typo_title_match_ranges(text, term).into_iter().next() {
+        for (start, end) in valid_match_ranges(text, typo_title_match_ranges(text, term)) {
             let overlaps_red = merged_red_ranges
                 .iter()
                 .any(|(red_start, red_end)| start < *red_end && end > *red_start);
@@ -2589,6 +3109,30 @@ fn title_highlight_segments(text: &str, query: &str) -> Vec<(usize, usize, bool)
     segments
 }
 
+fn title_highlight_segments_with_ranked_field(
+    text: &str,
+    query: &str,
+    ranked_field: Option<&str>,
+    rank: Option<&SearchRank>,
+) -> Vec<(usize, usize, bool)> {
+    let mut segments = title_highlight_segments(text, query);
+    let Some((ranked_field, rank)) = ranked_field.zip(rank) else {
+        return segments;
+    };
+
+    let field_ranges = ranked_field_rank_token_ranges_in_text(text, ranked_field, rank);
+    for (start, end) in field_ranges {
+        let already_highlighted = segments
+            .iter()
+            .any(|(segment_start, segment_end, _)| start < *segment_end && end > *segment_start);
+        if !already_highlighted {
+            segments.push((start, end, false));
+        }
+    }
+    segments.sort_by_key(|(start, end, is_red)| (*start, *end, !*is_red));
+    segments
+}
+
 fn highlighted_title_job_from_segments(
     text: &str,
     font_size: f32,
@@ -2612,13 +3156,24 @@ fn highlighted_title_job_from_segments(
 
     let mut job = egui::text::LayoutJob::default();
 
-    if segments.is_empty() {
+    let valid_segments: Vec<_> = segments
+        .iter()
+        .copied()
+        .filter_map(|(start, end, is_red)| {
+            valid_byte_range(text, start, end).map(|(start, end)| (start, end, is_red))
+        })
+        .collect();
+
+    if valid_segments.is_empty() {
         job.append(text, 0.0, default_format);
         return job;
     }
 
     let mut cursor = 0usize;
-    for &(start, end, is_red) in segments {
+    for (start, end, is_red) in valid_segments {
+        if start < cursor {
+            continue;
+        }
         if cursor < start {
             job.append(&text[cursor..start], 0.0, default_format.clone());
         }
@@ -2650,10 +3205,6 @@ fn highlighted_title_job(
     highlighted_title_job_from_segments(text, font_size, &segments)
 }
 
-fn rank_matches_visible_title_via_typo(rank: &SearchRank) -> bool {
-    rank.provenance().field_priority == 0
-}
-
 fn pick_better_rank(left: SearchRank, right: SearchRank) -> SearchRank {
     if left <= right { left } else { right }
 }
@@ -2662,38 +3213,17 @@ fn visible_title_has_typo_match(title: &str, query: &str) -> bool {
     if query.trim().is_empty() || !title_match_ranges(title, query).is_empty() {
         return false;
     }
-    visible_title_match_provenance(title, query).is_some()
+    !typo_title_match_ranges(title, query).is_empty()
 }
 
 fn visible_match_priority(title: &str, query: &str) -> u8 {
     if query.trim().is_empty() {
         0
-    } else if !title_match_ranges(title, query).is_empty()
-        || visible_title_has_typo_match(title, query)
-    {
+    } else if !title_match_ranges(title, query).is_empty() {
         0
     } else {
         1
     }
-}
-
-fn visible_title_match_provenance(text: &str, query: &str) -> Option<SearchRank> {
-    let typo_query = MetadataQuery::new(query)?.with_typo_fallback(true);
-    let normalized = normalize_metadata_search_value(text);
-    if normalized.is_empty() {
-        return None;
-    }
-    let fields = [SearchField {
-        priority: 0,
-        value: normalized.as_str(),
-    }];
-    let candidate = MetadataCandidate {
-        key: "",
-        fields: &fields,
-        score: 0.0,
-    };
-    let rank = typo_query.search_rank(candidate)?;
-    rank_matches_visible_title_via_typo(&rank).then_some(rank)
 }
 
 fn paint_centered_title_job(
@@ -3246,8 +3776,12 @@ fn build_window_info(
     if let Some(ref proc_name) = active_process {
         if is_terminal_class(&class_lower) {
             let terminal_suffix = cwd_path.as_ref().map(|path| display_path(path));
-            final_title =
-                terminal_display_title(&final_title, proc_name, terminal_suffix.as_deref());
+            final_title = terminal_display_title(
+                &final_title,
+                proc_name,
+                command_summary.as_deref(),
+                terminal_suffix.as_deref(),
+            );
         } else {
             let separators = [" - ", " — ", " – ", " : ", " | "];
             let mut split_found = false;
@@ -3805,7 +4339,6 @@ impl App {
         let (audio_cache_tx, audio_cache_rx) = std::sync::mpsc::channel();
         let (kwin_window_feed_setup_tx, kwin_window_feed_setup_rx) = std::sync::mpsc::channel();
         let rapid_polling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let audio_repaint_ctx = cc.egui_ctx.clone();
         let kwin_window_feed_repaint_ctx = cc.egui_ctx.clone();
 
         std::thread::spawn(move || {
@@ -3855,6 +4388,8 @@ impl App {
             win_text_spacing: settings.win_text_spacing,
             win_line_height: settings.win_line_height,
             win_show_path: settings.win_show_path,
+            show_run_in_terminal: settings.show_run_in_terminal,
+            show_cd_in_terminal: settings.show_cd_in_terminal,
             win_title_size: settings.win_title_size,
             win_path_size: settings.win_path_size,
             app_icon_size: settings.app_icon_size,
@@ -3877,6 +4412,8 @@ impl App {
             observed_pipewire_node_ids: HashSet::new(),
             active_pipewire_node_ids: HashSet::new(),
             pipewire_activity_cache_valid: false,
+            window_audio_cache: WindowAudioCache::default(),
+            has_active_audio: false,
             app_scroll_sensitivity: settings.app_scroll_sensitivity,
             win_scroll_sensitivity: settings.win_scroll_sensitivity,
             last_stale_prune: None,
@@ -3926,7 +4463,6 @@ impl App {
                 {
                     break;
                 }
-                audio_repaint_ctx.request_repaint();
                 std::thread::sleep(std::time::Duration::from_millis(AUDIO_SINK_POLL_MS as u64));
             }
         });
@@ -3936,7 +4472,6 @@ impl App {
             LauncherMode::Windows => {
                 app.refresh_windows();
                 app.start_background_app_load();
-                app.start_background_window_enrichment();
             }
         }
 
@@ -3963,6 +4498,8 @@ impl App {
             win_text_spacing: self.win_text_spacing,
             win_line_height: self.win_line_height,
             win_show_path: self.win_show_path,
+            show_run_in_terminal: self.show_run_in_terminal,
+            show_cd_in_terminal: self.show_cd_in_terminal,
             win_title_size: self.win_title_size,
             win_path_size: self.win_path_size,
             app_icon_size: self.app_icon_size,
@@ -4219,6 +4756,28 @@ impl App {
                 let mut show_path = self.win_show_path;
                 if ui.checkbox(&mut show_path, "").changed() {
                     self.win_show_path = show_path;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Show Run in Terminal:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut show_run_in_terminal = self.show_run_in_terminal;
+                if ui.checkbox(&mut show_run_in_terminal, "").changed() {
+                    self.show_run_in_terminal = show_run_in_terminal;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Show CD in Terminal:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut show_cd_in_terminal = self.show_cd_in_terminal;
+                if ui.checkbox(&mut show_cd_in_terminal, "").changed() {
+                    self.show_cd_in_terminal = show_cd_in_terminal;
                     self.save_settings();
                 }
                 ui.end_row();
@@ -4548,6 +5107,7 @@ impl App {
             self.windows = new_windows;
             self.missing_window_counts.clear();
             self.windows_generation = self.windows_generation.wrapping_add(1);
+            self.refresh_window_audio_cache();
             return;
         }
 
@@ -4641,6 +5201,7 @@ impl App {
 
         if changed {
             self.windows_generation = self.windows_generation.wrapping_add(1);
+            self.refresh_window_audio_cache();
         }
     }
 
@@ -4670,6 +5231,7 @@ impl App {
         self.missing_window_counts
             .retain(|window_id, _| !stale_ids.contains(window_id));
         self.windows_generation = self.windows_generation.wrapping_add(1);
+        self.refresh_window_audio_cache();
 
         if self
             .last_selected_window_id
@@ -4678,6 +5240,50 @@ impl App {
         {
             self.last_selected_window_id = None;
         }
+    }
+
+    fn refresh_window_audio_cache(&mut self) -> bool {
+        let previous_level_buckets = self.window_audio_cache.level_buckets.clone();
+        let previous_sink_signature = sink_match_signature(&self.window_audio_cache);
+        let mut new_cache = WindowAudioCache::default();
+        for window in &self.windows {
+            let sink_matches = find_sink_inputs_for_window(window, &self.cached_sink_inputs);
+            if !sink_matches.is_empty() {
+                new_cache.sink_matches.insert(
+                    window.id.clone(),
+                    dedup_sink_inputs_for_controls(&sink_matches),
+                );
+            }
+
+            if let Some(level) = active_audio_level_for_sinks(
+                &sink_matches,
+                &self.active_media_app_keys,
+                &self.observed_pipewire_node_ids,
+                &self.active_pipewire_node_ids,
+                self.pipewire_activity_cache_valid,
+            ) {
+                new_cache
+                    .level_buckets
+                    .insert(window.id.clone(), quantize_audio_level(level));
+            }
+        }
+
+        let changed = previous_level_buckets != new_cache.level_buckets
+            || previous_sink_signature != sink_match_signature(&new_cache);
+        self.window_audio_cache = new_cache;
+        changed
+    }
+
+    fn has_any_active_audio(&self) -> bool {
+        self.cached_sink_inputs.iter().any(|sink| {
+            sink_input_level(
+                sink,
+                &self.active_media_app_keys,
+                &self.observed_pipewire_node_ids,
+                &self.active_pipewire_node_ids,
+                self.pipewire_activity_cache_valid,
+            ) > 0.0
+        })
     }
 
     fn refresh_windows(&mut self) {
@@ -5017,6 +5623,7 @@ impl eframe::App for App {
                     } else {
                         ActivePane::Apps
                     };
+                    self.start_background_app_load();
                 }
             }
         }
@@ -5133,9 +5740,11 @@ impl eframe::App for App {
                             self.windows = windows;
                             self.missing_window_counts.clear();
                             self.windows_generation = self.windows_generation.wrapping_add(1);
+                            self.refresh_window_audio_cache();
                             self.selected_index = 0;
                             self.side_panel_selected_index = 0;
                             self.active_pane = ActivePane::Windows;
+                            self.start_background_window_enrichment();
                         }
                         LoadResult::Error(err) => {
                             self.error_message = Some(err);
@@ -5148,43 +5757,33 @@ impl eframe::App for App {
 
         if !handled_focus_launcher {
             let mut latest_audio_update = None;
-            let mut audio_update_count = 0;
             for _ in 0..AUDIO_UPDATES_PER_FRAME {
                 match self.audio_cache_receiver.try_recv() {
                     Ok(update) => {
                         latest_audio_update = Some(update);
-                        audio_update_count += 1;
                     }
                     Err(_) => break,
                 }
             }
             if let Some(update) = latest_audio_update {
+                let previous_has_active_audio = self.has_active_audio;
                 self.cached_sink_inputs = update.sink_inputs;
                 self.active_media_app_keys = update.active_media_app_keys;
                 self.observed_pipewire_node_ids = update.observed_pipewire_node_ids;
                 self.active_pipewire_node_ids = update.active_pipewire_node_ids;
                 self.pipewire_activity_cache_valid = update.pipewire_activity_cache_valid;
-            }
-            if audio_update_count == AUDIO_UPDATES_PER_FRAME {
-                ctx.request_repaint();
+                self.has_active_audio = self.has_any_active_audio();
+                let window_audio_changed = self.refresh_window_audio_cache();
+                if window_audio_changed || self.has_active_audio != previous_has_active_audio {
+                    ctx.request_repaint();
+                }
             }
         }
 
-        let has_active_audio = self.cached_sink_inputs.iter().any(|sink| {
-            sink_input_level(
-                sink,
-                &self.active_media_app_keys,
-                &self.observed_pipewire_node_ids,
-                &self.active_pipewire_node_ids,
-                self.pipewire_activity_cache_valid,
-            ) > 0.0
-        });
-        let audio_repaint_ms = if has_active_audio {
-            AUDIO_ACTIVE_REPAINT_MS
-        } else {
-            AUDIO_IDLE_REPAINT_MS
-        };
-        ctx.request_repaint_after(std::time::Duration::from_millis(audio_repaint_ms));
+        if self.has_active_audio {
+            let audio_repaint_ms = AUDIO_ACTIVE_REPAINT_MS;
+            ctx.request_repaint_after(std::time::Duration::from_millis(audio_repaint_ms));
+        }
 
         if !handled_focus_launcher {
             self.prune_stale_windows();
@@ -5386,8 +5985,9 @@ impl eframe::App for App {
                                     .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
                                     .filter_map(|app| {
                                         let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
-                                        let base_rank = app_search_rank(&base_query, app);
-                                        let typo_rank = app_search_rank(&typo_query, app);
+	                                        let search_values = app_search_values(app);
+	                                        let base_rank = search_rank_for_values(&base_query, &search_values);
+	                                        let typo_rank = search_rank_for_values(&typo_query, &search_values);
                                         let rank = match (base_rank, typo_rank) {
                                             (Some(base_rank), Some(typo_rank)) => {
                                                 pick_better_rank(base_rank, typo_rank)
@@ -5412,28 +6012,46 @@ impl eframe::App for App {
                                         } else {
                                             0.0
                                         };
-                                        Some(RankedAppMatch {
-                                            app: app.clone(),
-                                            rank,
-                                            title_is_typo,
-                                            visible_match_priority,
-                                            is_pinned,
-                                            candidate_key: format!(
-                                                "{}\u{0}{}",
-                                                app.name.to_lowercase(),
+	                                        Some(RankedAppMatch {
+	                                            app: app.clone(),
+	                                            rank,
+	                                            title_is_typo,
+	                                            visible_match_priority,
+	                                            is_pinned,
+	                                            search_values,
+	                                            candidate_key: format!(
+	                                                "{}\u{0}{}",
+	                                                app.name.to_lowercase(),
                                                 app.desktop_file_path.to_string_lossy()
                                             ),
                                             candidate_score,
 	                                        })
 		                                    })
 		                                    .collect();
-		                                sort_ranked_matches_with_visible(
-		                                    &mut ranked_apps,
-                                            |item| item.visible_match_priority,
-	                                    |item| &item.candidate_key,
-		                                    |item| item.candidate_score,
-		                                    |item| &item.rank,
-	                                );
+			                                sort_ranked_matches_with_visible(
+	                                    &mut ranked_apps,
+	                                            |item| item.visible_match_priority,
+		                                    |left, right| {
+		                                        let left_fields =
+		                                            metadata_fields_for_values(&left.search_values);
+		                                        let right_fields =
+		                                            metadata_fields_for_values(&right.search_values);
+		                                        typo_query.compare_candidates(
+		                                            MetadataCandidate {
+		                                                key: &left.candidate_key,
+		                                                fields: &left_fields,
+		                                                score: left.candidate_score,
+		                                            },
+		                                            &left.rank,
+		                                            MetadataCandidate {
+		                                                key: &right.candidate_key,
+		                                                fields: &right_fields,
+		                                                score: right.candidate_score,
+		                                            },
+		                                            &right.rank,
+		                                        )
+		                                    },
+		                                );
                                         filtered_app_title_is_typos = ranked_apps
                                             .iter()
                                             .map(|item| item.title_is_typo)
@@ -5441,19 +6059,24 @@ impl eframe::App for App {
                                         filtered_app_display_titles = ranked_apps
                                             .iter()
                                             .map(|item| {
-                                                search_visible_app_title(
+                                                search_visible_app_title_with_rank(
                                                     &item.app,
                                                     &search_query,
+                                                    &item.rank,
                                                 )
                                             })
                                             .collect();
                                         filtered_app_highlight_segments =
                                             filtered_app_display_titles
                                                 .iter()
-                                                .map(|title| {
-                                                    title_highlight_segments(
+                                                .zip(ranked_apps.iter())
+                                                .map(|(title, item)| {
+                                                    let values = app_search_values(&item.app);
+                                                    title_highlight_segments_with_ranked_field(
                                                         title,
                                                         &search_query,
+                                                        ranked_field_value(&values, &item.rank),
+                                                        Some(&item.rank),
                                                     )
                                                 })
                                                 .collect();
@@ -5465,27 +6088,77 @@ impl eframe::App for App {
                                     filtered_apps.clear();
                                 }
 	                        }
-	                        LauncherMode::Windows => {
+		                        LauncherMode::Windows => {
 		                            if !has_search_query {
 	                                filtered_windows = self.windows.clone();
-		                                filtered_windows.sort_by(|a, b| {
-                                    window_application_key(a)
-                                        .cmp(&window_application_key(b))
-                                        .then_with(|| {
-                                            window_sort_title_key(a).cmp(&window_sort_title_key(b))
-                                        })
-                                        .then_with(|| a.id.cmp(&b.id))
-				                                });
-			                            } else if let (Some(base_query), Some(typo_query)) = (
+	                                let mut app_window_counts: HashMap<String, usize> =
+	                                    HashMap::new();
+	                                let mut terminal_subgroup_counts: HashMap<String, usize> =
+	                                    HashMap::new();
+	                                for win in &filtered_windows {
+	                                    *app_window_counts
+	                                        .entry(window_grouping_key(win))
+	                                        .or_default() += 1;
+	                                    if is_terminal_class(&win.class.trim().to_lowercase()) {
+	                                        *terminal_subgroup_counts
+	                                            .entry(terminal_window_subgroup_key(win))
+	                                            .or_default() += 1;
+	                                    }
+	                                }
+				                                filtered_windows.sort_by(|a, b| {
+	                                    let app_key_a = window_grouping_key(a);
+	                                    let app_key_b = window_grouping_key(b);
+	                                    let count_a =
+                                        app_window_counts.get(&app_key_a).copied().unwrap_or(0);
+                                    let count_b =
+                                        app_window_counts.get(&app_key_b).copied().unwrap_or(0);
+	                                    count_a
+	                                        .cmp(&count_b)
+	                                        .then_with(|| app_key_a.cmp(&app_key_b))
+	                                        .then_with(|| {
+	                                            let a_is_terminal =
+	                                                is_terminal_class(&a.class.trim().to_lowercase());
+	                                            let b_is_terminal =
+	                                                is_terminal_class(&b.class.trim().to_lowercase());
+	                                            match (a_is_terminal, b_is_terminal) {
+	                                                (true, true) if app_key_a == app_key_b => {
+	                                                    let subgroup_key_a =
+	                                                        terminal_window_subgroup_key(a);
+	                                                    let subgroup_key_b =
+	                                                        terminal_window_subgroup_key(b);
+	                                                    let subgroup_count_a = terminal_subgroup_counts
+	                                                        .get(&subgroup_key_a)
+	                                                        .copied()
+	                                                        .unwrap_or(0);
+	                                                    let subgroup_count_b = terminal_subgroup_counts
+	                                                        .get(&subgroup_key_b)
+	                                                        .copied()
+	                                                        .unwrap_or(0);
+	                                                    subgroup_count_a
+	                                                        .cmp(&subgroup_count_b)
+	                                                        .then_with(|| {
+	                                                            subgroup_key_a.cmp(&subgroup_key_b)
+	                                                        })
+	                                                }
+	                                                _ => std::cmp::Ordering::Equal,
+	                                            }
+	                                        })
+	                                        .then_with(|| {
+	                                            window_sort_title_key(a).cmp(&window_sort_title_key(b))
+	                                        })
+	                                        .then_with(|| a.id.cmp(&b.id))
+					                                });
+				                            } else if let (Some(base_query), Some(typo_query)) = (
                                     MetadataQuery::new(&search_query),
                                     MetadataQuery::new(&search_query).map(|q| q.with_typo_fallback(true)),
                                 ) {
 		                                let mut ranked_windows: Vec<RankedWindowMatch> = self.windows
                                     .iter()
                                     .filter_map(|win| {
-                                        let base_rank = window_search_rank(&base_query, win);
-                                        let typo_rank = window_search_rank(&typo_query, win);
-                                        let rank = match (base_rank, typo_rank) {
+	                                        let search_values = window_search_values(win);
+	                                        let base_rank = search_rank_for_values(&base_query, &search_values);
+	                                        let typo_rank = search_rank_for_values(&typo_query, &search_values);
+	                                        let rank = match (base_rank, typo_rank) {
                                             (Some(base_rank), Some(typo_rank)) => {
                                                 pick_better_rank(base_rank, typo_rank)
                                             }
@@ -5493,57 +6166,91 @@ impl eframe::App for App {
                                             (None, Some(typo_rank)) => typo_rank,
                                             (None, None) => return None,
                                         };
-                                        let title_is_typo = visible_title_has_typo_match(
-                                            &full_search_visible_window_title(win),
-                                            &search_query,
-                                        );
-                                        let visible_match_priority = visible_match_priority(
-                                            &full_search_visible_window_title(win),
-                                            &search_query,
-                                        );
-                                        Some(RankedWindowMatch {
-                                            window: win.clone(),
-                                            rank,
+	                                        let display_title = focus_text_around_match(
+	                                            &full_search_visible_window_title(win),
+	                                            &search_query,
+	                                            ranked_field_value(&search_values, &rank),
+	                                            Some(&rank),
+	                                            120,
+	                                        );
+	                                        let highlight_segments =
+	                                            title_highlight_segments_with_ranked_field(
+	                                                &display_title,
+	                                                &search_query,
+	                                                ranked_field_value(&search_values, &rank),
+	                                                Some(&rank),
+	                                            );
+                                        if highlight_segments.is_empty() {
+                                            return None;
+                                        }
+                                        let title_is_typo = highlight_segments
+                                            .iter()
+                                            .any(|(_, _, is_red)| !*is_red);
+                                        let visible_match_priority = 0;
+	                                        Some(RankedWindowMatch {
+	                                            window: win.clone(),
+	                                            rank,
                                             title_is_typo,
-                                            visible_match_priority,
-                                            candidate_key: format!(
-                                                "{}\u{0}{}\u{0}{}",
-                                                window_application_key(win),
-                                                window_sort_title_key(win),
-                                                win.id
-                                            ),
+	                                            visible_match_priority,
+	                                            display_title,
+	                                            highlight_segments,
+	                                            search_values,
+	                                            candidate_key: format!(
+	                                                "{}\u{0}{}\u{0}{}",
+	                                                window_grouping_key(win),
+	                                                window_sort_title_key(win),
+	                                                win.id
+	                                            ),
                                             candidate_score: 0.0,
                                         })
                                     })
                                     .collect();
-		                                sort_ranked_matches_with_visible(
-		                                    &mut ranked_windows,
-                                            |item| item.visible_match_priority,
-	                                    |item| &item.candidate_key,
-		                                    |item| item.candidate_score,
-		                                    |item| &item.rank,
-	                                );
+			                                sort_ranked_matches_with_visible(
+	                                    &mut ranked_windows,
+	                                            |item| item.visible_match_priority,
+		                                    |left, right| {
+		                                        let left_fields =
+		                                            metadata_fields_for_values(&left.search_values);
+		                                        let right_fields =
+		                                            metadata_fields_for_values(&right.search_values);
+		                                        typo_query.compare_candidates(
+		                                            MetadataCandidate {
+		                                                key: &left.candidate_key,
+		                                                fields: &left_fields,
+		                                                score: left.candidate_score,
+		                                            },
+		                                            &left.rank,
+		                                            MetadataCandidate {
+		                                                key: &right.candidate_key,
+		                                                fields: &right_fields,
+		                                                score: right.candidate_score,
+		                                            },
+		                                            &right.rank,
+		                                        )
+		                                    },
+		                                );
                                         filtered_window_title_is_typos = ranked_windows
                                             .iter()
                                             .map(|item| item.title_is_typo)
                                             .collect();
                                         filtered_window_display_titles = ranked_windows
                                             .iter()
-                                            .map(|item| {
-                                                search_visible_window_title(
-                                                    &item.window,
-                                                    &search_query,
-                                                )
-                                            })
+                                            .map(|item| item.display_title.clone())
                                             .collect();
                                         filtered_window_highlight_segments =
                                             filtered_window_display_titles
                                                 .iter()
-                                                .map(|title| {
-                                                    title_highlight_segments(
-                                                        title,
-                                                        &search_query,
-                                                    )
+                                                .enumerate()
+                                                .map(|(index, title)| {
+                                                    ranked_windows
+                                                        .get(index)
+                                                        .map(|item| item.highlight_segments.clone())
+                                                        .unwrap_or_else(|| {
+                                                            title_highlight_segments(
+                                                                title,
+                                                                &search_query,
+                                                            )
+                                                        })
                                                 })
                                                 .collect();
 			                                filtered_windows =
@@ -5586,8 +6293,9 @@ impl eframe::App for App {
 		                                .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
 		                                .filter_map(|app| {
 		                                    let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
-		                                    let base_rank = app_search_rank(&base_query, app);
-		                                    let typo_rank = app_search_rank(&typo_query, app);
+			                                    let search_values = app_search_values(app);
+			                                    let base_rank = search_rank_for_values(&base_query, &search_values);
+			                                    let typo_rank = search_rank_for_values(&typo_query, &search_values);
 		                                    let rank = match (base_rank, typo_rank) {
 		                                        (Some(base_rank), Some(typo_rank)) => {
 		                                            pick_better_rank(base_rank, typo_rank)
@@ -5612,13 +6320,14 @@ impl eframe::App for App {
 	                                    } else {
 	                                        0.0
 	                                    };
-		                                    Some(RankedAppMatch {
-		                                        app: app.clone(),
-		                                        rank,
-		                                        title_is_typo,
-		                                        visible_match_priority,
-		                                        is_pinned,
-		                                        candidate_key: format!(
+			                                    Some(RankedAppMatch {
+			                                        app: app.clone(),
+			                                        rank,
+			                                        title_is_typo,
+			                                        visible_match_priority,
+			                                        is_pinned,
+			                                        search_values,
+			                                        candidate_key: format!(
 		                                            "{}\u{0}{}",
 	                                            app.name.to_lowercase(),
 	                                            app.desktop_file_path.to_string_lossy()
@@ -5627,13 +6336,30 @@ impl eframe::App for App {
 	                                    })
 		                                })
 		                                .collect();
-			                            sort_ranked_matches_with_visible(
-			                                &mut ranked_apps,
-                                            |item| item.visible_match_priority,
-		                                |item| &item.candidate_key,
-			                                |item| item.candidate_score,
-			                                |item| &item.rank,
-		                            );
+				                            sort_ranked_matches_with_visible(
+				                                &mut ranked_apps,
+	                                            |item| item.visible_match_priority,
+			                                |left, right| {
+			                                    let left_fields =
+			                                        metadata_fields_for_values(&left.search_values);
+			                                    let right_fields =
+			                                        metadata_fields_for_values(&right.search_values);
+			                                    typo_query.compare_candidates(
+			                                        MetadataCandidate {
+			                                            key: &left.candidate_key,
+			                                            fields: &left_fields,
+			                                            score: left.candidate_score,
+			                                        },
+			                                        &left.rank,
+			                                        MetadataCandidate {
+			                                            key: &right.candidate_key,
+			                                            fields: &right_fields,
+			                                            score: right.candidate_score,
+			                                        },
+			                                        &right.rank,
+			                                    )
+			                                },
+			                            );
 	                                    filtered_app_title_is_typos = ranked_apps
 	                                        .iter()
 	                                        .map(|item| item.title_is_typo)
@@ -5641,19 +6367,24 @@ impl eframe::App for App {
                                         filtered_app_display_titles = ranked_apps
                                             .iter()
                                             .map(|item| {
-                                                search_visible_app_title(
+                                                search_visible_app_title_with_rank(
                                                     &item.app,
                                                     &search_query,
+                                                    &item.rank,
                                                 )
                                             })
                                             .collect();
                                         filtered_app_highlight_segments =
                                             filtered_app_display_titles
                                                 .iter()
-                                                .map(|title| {
-                                                    title_highlight_segments(
+                                                .zip(ranked_apps.iter())
+                                                .map(|(title, item)| {
+                                                    let values = app_search_values(&item.app);
+                                                    title_highlight_segments_with_ranked_field(
                                                         title,
                                                         &search_query,
+                                                        ranked_field_value(&values, &item.rank),
+                                                        Some(&item.rank),
                                                     )
                                                 })
                                                 .collect();
@@ -5701,16 +6432,22 @@ impl eframe::App for App {
 	                        }
                     }
 
-                    let show_terminal_actions =
-                        self.mode == LauncherMode::Windows && has_search_query;
-                    let terminal_run_result_index = filtered_windows.len();
-                    let terminal_cd_result_index = filtered_windows.len() + 1;
+                    let show_run_in_terminal_action = self.mode == LauncherMode::Windows
+                        && has_search_query
+                        && self.show_run_in_terminal;
+                    let show_cd_in_terminal_action = self.mode == LauncherMode::Windows
+                        && has_search_query
+                        && self.show_cd_in_terminal;
+                    let terminal_run_result_index =
+                        show_run_in_terminal_action.then_some(filtered_windows.len());
+                    let terminal_cd_result_index = show_cd_in_terminal_action
+                        .then_some(filtered_windows.len() + usize::from(show_run_in_terminal_action));
+                    let terminal_action_count =
+                        usize::from(show_run_in_terminal_action) + usize::from(show_cd_in_terminal_action);
 
                     let total_items = match self.mode {
                         LauncherMode::Apps => filtered_apps.len(),
-                        LauncherMode::Windows => {
-                            filtered_windows.len() + if show_terminal_actions { 2 } else { 0 }
-                        }
+                        LauncherMode::Windows => filtered_windows.len() + terminal_action_count,
                     };
 
                     // Safety bounds check for list changes (run early to prevent index out of bounds)
@@ -5912,13 +6649,11 @@ impl eframe::App for App {
                                         {
                                             self.launch_app_and_exit(app, ctx);
                                         }
-                                    } else if show_terminal_actions
-                                        && self.selected_index == terminal_run_result_index
+                                    } else if terminal_run_result_index == Some(self.selected_index)
                                     {
                                         launch_terminal_command(&search_query);
                                         ctx.request_repaint();
-                                    } else if show_terminal_actions
-                                        && self.selected_index == terminal_cd_result_index
+                                    } else if terminal_cd_result_index == Some(self.selected_index)
                                     {
                                         launch_terminal_cd(&search_query);
                                         ctx.request_repaint();
@@ -5935,7 +6670,6 @@ impl eframe::App for App {
                                 LauncherMode::Windows => {
                                     self.refresh_windows();
                                     self.start_background_app_load();
-                                    self.start_background_window_enrichment();
                                 }
                             }
                         }
@@ -6304,13 +7038,11 @@ impl eframe::App for App {
 				                                for index in 0..total_items {
                                             let terminal_action_label =
                                                 if self.mode == LauncherMode::Windows
-                                                    && show_terminal_actions
-                                                    && index == terminal_run_result_index
+                                                    && terminal_run_result_index == Some(index)
                                                 {
                                                     Some("run in Terminal")
                                                 } else if self.mode == LauncherMode::Windows
-                                                    && show_terminal_actions
-                                                    && index == terminal_cd_result_index
+                                                    && terminal_cd_result_index == Some(index)
                                                 {
                                                     Some("cd in Terminal")
                                                 } else {
@@ -6644,17 +7376,11 @@ impl eframe::App for App {
                                                     }
                                                 } else {
 		                                            let win = &filtered_windows[index];
-	                                                let audio_level =
-	                                                    active_audio_level_for_sinks(
-	                                                        &find_sink_inputs_for_window(
-                                                            win,
-                                                            &self.cached_sink_inputs,
-                                                        ),
-                                                        &self.active_media_app_keys,
-                                                        &self.observed_pipewire_node_ids,
-                                                        &self.active_pipewire_node_ids,
-                                                        self.pipewire_activity_cache_valid,
-                                                    );
+	                                                let audio_level = self
+                                                        .window_audio_cache
+                                                        .level_buckets
+                                                        .get(&win.id)
+                                                        .map(|level| *level as f32 / 100.0);
 
 		                                            // Icon render
                                                 let (icon_rect, _) = child_ui.allocate_exact_size(
@@ -6872,20 +7598,14 @@ impl eframe::App for App {
                                                         self.process_chain_popup = Some(win.clone());
                                                         ui.close();
                                                     }
-                                                    ui.separator();
-                                                    if ui.button("Close application").clicked() {
-                                                        self.close_window_and_exit(win.id.clone(), ctx);
-                                                        ui.close();
-                                                    }
 
                                                     // Volume Control
                                                     let matching_sinks =
-                                                        dedup_sink_inputs_for_controls(
-                                                            &find_sink_inputs_for_window(
-                                                                win,
-                                                                &self.cached_sink_inputs,
-                                                            ),
-                                                        );
+                                                        self.window_audio_cache
+                                                            .sink_matches
+                                                            .get(&win.id)
+                                                            .cloned()
+                                                            .unwrap_or_default();
                                                     if !matching_sinks.is_empty() {
                                                         ui.separator();
                                                         ui.label("🔊 Volume Control");
@@ -6962,6 +7682,12 @@ impl eframe::App for App {
                                                             });
                                                         }
                                                     }
+
+                                                    ui.separator();
+                                                    if ui.button("Close application").clicked() {
+                                                        self.close_window_and_exit(win.id.clone(), ctx);
+                                                        ui.close();
+                                                    }
                                                 }
                                             }
                                         });
@@ -6981,13 +7707,11 @@ impl eframe::App for App {
                                                     LauncherMode::Windows => {
 		                                                self.active_pane = ActivePane::Windows;
 		                                                self.selected_index = index;
-                                                    if show_terminal_actions
-                                                        && index == terminal_run_result_index
+                                                    if terminal_run_result_index == Some(index)
                                                     {
                                                         launch_terminal_command(&search_query);
                                                         ctx.request_repaint();
-                                                    } else if show_terminal_actions
-                                                        && index == terminal_cd_result_index
+                                                    } else if terminal_cd_result_index == Some(index)
                                                     {
                                                         launch_terminal_cd(&search_query);
                                                         ctx.request_repaint();
@@ -7719,6 +8443,78 @@ fn get_monitors() -> Vec<MonitorInfo> {
         }
     }
     monitors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typo_highlight_for_mpv_has_visible_yellow_word() {
+        let title = "what is the generic term for a movie and an episode - Google Search";
+        let segments = title_highlight_segments(title, "mpv");
+
+        assert!(
+            segments
+                .iter()
+                .any(|(start, end, is_red)| !*is_red && &title[*start..*end] == "movie"),
+            "expected mpv typo match to visibly highlight movie, got {segments:?}"
+        );
+    }
+
+    #[test]
+    fn focus_text_around_typo_match_does_not_panic() {
+        let title = "python3 whisper_service.py faster-whisper | /home/lewis/Dev/assistant/.venv/bin/python3 whisper_service.py";
+        let focused = focus_text_around_match(title, "whipser", None, None, 40);
+
+        assert!(focused.contains("whisper"));
+    }
+
+    #[test]
+    fn focused_title_uses_ranked_visible_match_for_mpv_gimp_match() {
+        let title = "colour 8-bit non-linear integer, sRGB IEC61966-2.1, 1 layer, 3840x2160, imported image metadata for a screenshot edited in GIMP";
+        let fields = [SearchField {
+            priority: 0,
+            value: "gimp",
+        }];
+        let candidate = MetadataCandidate {
+            key: "gimp",
+            fields: &fields,
+            score: 0.0,
+        };
+        let rank = MetadataQuery::new("mpv")
+            .unwrap()
+            .with_typo_fallback(true)
+            .search_rank(candidate)
+            .unwrap();
+        let focused = focus_text_around_match(title, "mpv", Some("gimp"), Some(&rank), 70);
+
+        assert!(
+            focused.to_lowercase().contains("gimp"),
+            "expected focused title to include GIMP match, got {focused}"
+        );
+        let segments =
+            title_highlight_segments_with_ranked_field(&focused, "mpv", Some("gimp"), Some(&rank));
+        assert!(
+            segments.iter().any(|(start, end, is_red)| !*is_red
+                && focused[*start..*end].eq_ignore_ascii_case("gimp")),
+            "expected focused title to visibly highlight GIMP, got {focused}"
+        );
+        assert!(
+            segments
+                .iter()
+                .all(|(start, end, _)| end.saturating_sub(*start) < focused.len()),
+            "should not highlight the whole focused title: {segments:?}"
+        );
+    }
+
+    #[test]
+    fn highlighted_title_job_ignores_invalid_ranges() {
+        let title = "movie";
+        let segments = [(0, title.len() + 10, false), (1, 3, false)];
+
+        highlighted_title_job_from_segments(title, 12.0, &segments);
+    }
 }
 
 fn main() -> eframe::Result {
