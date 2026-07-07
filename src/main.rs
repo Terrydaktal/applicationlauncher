@@ -1,6 +1,6 @@
 use eframe::egui;
 use fuzzy_rank::metadata::{
-    MetadataCandidate, MetadataQuery, SearchField, dedup_push_search_field,
+    MetadataCandidate, MetadataQuery, SearchField, dedup_push_search_field, MatchedFieldHighlight,
 };
 use fuzzy_rank::ranking::SearchRank;
 use serde::Deserialize;
@@ -91,6 +91,8 @@ struct RankedAppMatch {
     title_is_typo: bool,
     visible_match_priority: u8,
     is_pinned: bool,
+    display_title: String,
+    highlight_segments: Vec<(usize, usize, bool)>,
     search_values: Vec<(u8, String)>,
     candidate_key: String,
     candidate_score: f64,
@@ -809,17 +811,17 @@ fn app_search_values(app: &AppInfo) -> Vec<(u8, String)> {
         .map(|stem| stem.to_string());
 
     let mut owned_values = Vec::new();
-    owned_values.push((0, normalize_metadata_search_value(&app.name)));
+    owned_values.push((0, app.name.clone()));
     if let Some(value) = exec_basename {
-        owned_values.push((1, normalize_metadata_search_value(&value)));
+        owned_values.push((1, value));
     }
     if let Some(value) = desktop_stem {
-        owned_values.push((2, normalize_metadata_search_value(&value)));
+        owned_values.push((2, value));
     }
     if let Some(value) = app.comment.clone() {
-        owned_values.push((3, normalize_metadata_search_value(&value)));
+        owned_values.push((3, value));
     }
-    owned_values.push((4, normalize_metadata_search_value(&cleaned_exec)));
+    owned_values.push((4, cleaned_exec));
 
     dedup_search_values(owned_values)
 }
@@ -832,6 +834,7 @@ fn metadata_fields_for_values<'a>(values: &'a [(u8, String)]) -> Vec<SearchField
     fields
 }
 
+#[allow(dead_code)]
 fn search_rank_for_values(query: &MetadataQuery, values: &[(u8, String)]) -> Option<SearchRank> {
     let fields = metadata_fields_for_values(values);
     query.search_rank(MetadataCandidate {
@@ -851,25 +854,25 @@ fn window_search_values(win: &WindowInfo) -> Vec<(u8, String)> {
     let cwd_display = win.cwd_path.as_ref().map(|path| display_path(path));
 
     let mut owned_values = Vec::new();
-    owned_values.push((0, normalize_metadata_search_value(&win.title)));
-    owned_values.push((1, normalize_metadata_search_value(&app_key)));
+    owned_values.push((0, win.title.clone()));
+    owned_values.push((1, app_key.clone()));
     if !win.class.eq_ignore_ascii_case(&app_key) {
-        owned_values.push((2, normalize_metadata_search_value(&win.class)));
+        owned_values.push((2, win.class.clone()));
     }
     if let Some(value) = win.active_process.clone() {
-        owned_values.push((3, normalize_metadata_search_value(&value)));
+        owned_values.push((3, value));
     }
     if let Some(value) = win.command_summary.clone() {
-        owned_values.push((4, normalize_metadata_search_value(&value)));
+        owned_values.push((4, value));
     }
     if let Some(value) = win.command_line.clone() {
-        owned_values.push((5, normalize_metadata_search_value(&value)));
+        owned_values.push((5, value));
     }
     if let Some(value) = exe_basename {
-        owned_values.push((6, normalize_metadata_search_value(&value)));
+        owned_values.push((6, value));
     }
     if let Some(value) = cwd_display {
-        owned_values.push((7, normalize_metadata_search_value(&value)));
+        owned_values.push((7, value));
     }
 
     dedup_search_values(owned_values)
@@ -1443,12 +1446,14 @@ fn full_search_visible_window_title(win: &WindowInfo) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn ranked_field_value<'a>(values: &'a [(u8, String)], rank: &SearchRank) -> Option<&'a str> {
     values
         .get(rank.provenance().field_index)
         .map(|(_, value)| value.as_str())
 }
 
+#[allow(dead_code)]
 fn search_visible_app_title_with_rank(app: &AppInfo, query: &str, rank: &SearchRank) -> String {
     if query.trim().is_empty() {
         return app.name.clone();
@@ -1460,7 +1465,7 @@ fn search_visible_app_title_with_rank(app: &AppInfo, query: &str, rank: &SearchR
         query,
         ranked_field_value(&values, rank),
         Some(rank),
-        110,
+        70,
     )
 }
 
@@ -1819,6 +1824,223 @@ fn focus_text_around_match(
         result.push_str("...");
     }
     result
+}
+
+fn map_field_highlights_to_full_text(
+    full_text: &str,
+    fields: &[SearchField<'_>],
+    highlights: &[MatchedFieldHighlight],
+) -> (Vec<(usize, usize, bool)>, Option<(usize, usize)>) {
+    let mut full_ranges = Vec::new();
+    let mut strongest_focus: Option<(usize, usize, bool, usize)> = None;
+
+    for hl in highlights {
+        let Some(field) = fields.get(hl.field_index) else {
+            continue;
+        };
+        let field_val_lower = field.value.to_lowercase();
+        let full_text_lower = full_text.to_lowercase();
+        
+        for (match_start, _) in full_text_lower.match_indices(&field_val_lower) {
+            for &(r_start, r_end, is_exact) in &hl.ranges {
+                let mapped_start = match_start + r_start;
+                let mapped_end = match_start + r_end;
+                if mapped_end <= full_text.len() {
+                    full_ranges.push((mapped_start, mapped_end, is_exact));
+                }
+            }
+
+            if let Some((f_start, f_end)) = hl.focus_range {
+                let mapped_f_start = match_start + f_start;
+                let mapped_f_end = match_start + f_end;
+                if mapped_f_end <= full_text.len() {
+                    let is_exact = hl.ranges.iter().any(|&(s, e, ex)| s <= f_start && e >= f_end && ex);
+                    let priority = if is_exact { 0 } else { 1 };
+                    
+                    let is_better = match strongest_focus {
+                        None => true,
+                        Some((_, _, strong_exact, strong_priority)) => {
+                            if strong_exact != is_exact {
+                                is_exact
+                            } else {
+                                priority < strong_priority
+                            }
+                        }
+                    };
+                    if is_better {
+                        strongest_focus = Some((mapped_f_start, mapped_f_end, is_exact, priority));
+                    }
+                }
+            }
+        }
+    }
+
+    let char_count = full_text.chars().count();
+    let mut char_status = vec![None; char_count];
+
+    for (start, end, is_exact) in full_ranges {
+        let start_char = full_text[..start].chars().count();
+        let end_char = full_text[..end].chars().count();
+        for idx in start_char..end_char {
+            if idx < char_count {
+                if char_status[idx].is_none() || char_status[idx] == Some(false) {
+                    char_status[idx] = Some(is_exact);
+                }
+            }
+        }
+    }
+
+    let mut merged_ranges = Vec::new();
+    let mut current_segment: Option<(usize, bool)> = None;
+
+    for char_idx in 0..char_count {
+        let status = char_status[char_idx];
+        if let Some(is_exact) = status {
+            if let Some((start_char, seg_exact)) = current_segment {
+                if seg_exact == is_exact {
+                    // Continue segment
+                } else {
+                    let (byte_start, byte_end) = char_indices_to_byte_range_main(full_text, start_char, char_idx);
+                    merged_ranges.push((byte_start, byte_end, seg_exact));
+                    current_segment = Some((char_idx, is_exact));
+                }
+            } else {
+                current_segment = Some((char_idx, is_exact));
+            }
+        } else {
+            if let Some((start_char, seg_exact)) = current_segment {
+                let (byte_start, byte_end) = char_indices_to_byte_range_main(full_text, start_char, char_idx);
+                merged_ranges.push((byte_start, byte_end, seg_exact));
+                current_segment = None;
+            }
+        }
+    }
+    if let Some((start_char, seg_exact)) = current_segment {
+        let (byte_start, byte_end) = char_indices_to_byte_range_main(full_text, start_char, char_count);
+        merged_ranges.push((byte_start, byte_end, seg_exact));
+    }
+
+    let focus = strongest_focus.map(|(s, e, _, _)| (s, e));
+    (merged_ranges, focus)
+}
+
+fn char_indices_to_byte_range_main(text: &str, start_char: usize, end_char: usize) -> (usize, usize) {
+    let mut byte_start = 0;
+    let mut byte_end = 0;
+    for (char_idx, (byte_idx, _)) in text.char_indices().enumerate() {
+        if char_idx == start_char {
+            byte_start = byte_idx;
+        }
+        if char_idx == end_char {
+            byte_end = byte_idx;
+            break;
+        }
+    }
+    if end_char >= text.chars().count() {
+        byte_end = text.len();
+    }
+    (byte_start, byte_end)
+}
+
+fn focus_text_around_byte_range(
+    text: &str,
+    focus: Option<(usize, usize)>,
+    highlight_segments: &[(usize, usize, bool)],
+    max_chars: usize,
+) -> (String, Vec<(usize, usize, bool)>) {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return (text.to_string(), highlight_segments.to_vec());
+    }
+
+    let (match_start_char, match_end_char) = if let Some((start_byte, end_byte)) = focus {
+        let s_char = text[..start_byte].chars().count();
+        let e_char = text[..end_byte].chars().count();
+        (s_char, e_char)
+    } else {
+        (0, 0)
+    };
+
+    let match_len = match_end_char.saturating_sub(match_start_char).max(1);
+    let available_context = max_chars.saturating_sub(match_len);
+    let left_context = available_context.min(24);
+
+    let mut start_char = match_start_char.saturating_sub(left_context);
+    let mut end_char = (start_char + max_chars).min(char_count);
+    if end_char.saturating_sub(start_char) < max_chars {
+        start_char = end_char.saturating_sub(max_chars);
+    }
+    if match_end_char > end_char {
+        end_char = match_end_char.min(char_count);
+        start_char = end_char.saturating_sub(max_chars);
+    }
+
+    let mut result = String::new();
+    if start_char > 0 {
+        result.push_str("...");
+    }
+    let slice_content: String = text.chars().skip(start_char).take(end_char - start_char).collect();
+    result.push_str(&slice_content);
+    if end_char < char_count {
+        result.push_str("...");
+    }
+
+    let mut adjusted = Vec::new();
+    let prefix_len = if start_char > 0 { 3 } else { 0 };
+
+    for &(start_byte, end_byte, is_exact) in highlight_segments {
+        let s_char = text[..start_byte].chars().count();
+        let e_char = text[..end_byte].chars().count();
+
+        if e_char > start_char && s_char < end_char {
+            let visible_s_char = s_char.max(start_char) - start_char;
+            let visible_e_char = e_char.min(end_char) - start_char;
+
+            let s_byte = slice_content.chars().take(visible_s_char).map(|c| c.len_utf8()).sum::<usize>();
+            let e_byte = s_byte + slice_content.chars().skip(visible_s_char).take(visible_e_char - visible_s_char).map(|c| c.len_utf8()).sum::<usize>();
+
+            adjusted.push((prefix_len + s_byte, prefix_len + e_byte, is_exact));
+        }
+    }
+
+    (result, adjusted)
+}
+
+fn compute_display_title_and_highlights(
+    full_text: &str,
+    search_values: &[(u8, String)],
+    base_query: &MetadataQuery,
+    typo_query: &MetadataQuery,
+    max_chars: usize,
+) -> Option<(SearchRank, String, Vec<(usize, usize, bool)>, bool)> {
+    let fields = metadata_fields_for_values(search_values);
+    let candidate = MetadataCandidate {
+        key: "",
+        fields: &fields,
+        score: 0.0,
+    };
+    let base_res = base_query.search_rank_with_highlights(candidate);
+    let typo_res = typo_query.search_rank_with_highlights(candidate);
+
+    let (rank, highlights) = match (base_res, typo_res) {
+        (Some((base_rank, base_high)), Some((typo_rank, typo_high))) => {
+            if pick_better_rank(base_rank.clone(), typo_rank.clone()) == base_rank {
+                (base_rank, base_high)
+            } else {
+                (typo_rank, typo_high)
+            }
+        }
+        (Some((base_rank, base_high)), None) => (base_rank, base_high),
+        (None, Some((typo_rank, typo_high))) => (typo_rank, typo_high),
+        (None, None) => return None,
+    };
+
+    let (full_ranges, focus) = map_field_highlights_to_full_text(full_text, &fields, &highlights);
+    let (display_title, highlight_segments) = focus_text_around_byte_range(full_text, focus, &full_ranges, max_chars);
+
+    let title_is_typo = highlight_segments.iter().any(|(_, _, is_red)| !*is_red);
+
+    Some((rank, display_title, highlight_segments, title_is_typo))
 }
 
 fn effective_list_row_height(
@@ -3209,6 +3431,7 @@ fn pick_better_rank(left: SearchRank, right: SearchRank) -> SearchRank {
     if left <= right { left } else { right }
 }
 
+#[allow(dead_code)]
 fn visible_title_has_typo_match(title: &str, query: &str) -> bool {
     if query.trim().is_empty() || !title_match_ranges(title, query).is_empty() {
         return false;
@@ -5986,20 +6209,14 @@ impl eframe::App for App {
                                     .filter_map(|app| {
                                         let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
 	                                        let search_values = app_search_values(app);
-	                                        let base_rank = search_rank_for_values(&base_query, &search_values);
-	                                        let typo_rank = search_rank_for_values(&typo_query, &search_values);
-                                        let rank = match (base_rank, typo_rank) {
-                                            (Some(base_rank), Some(typo_rank)) => {
-                                                pick_better_rank(base_rank, typo_rank)
-                                            }
-                                            (Some(base_rank), None) => base_rank,
-                                            (None, Some(typo_rank)) => typo_rank,
-                                            (None, None) => return None,
-                                        };
-                                        let title_is_typo = visible_title_has_typo_match(
-                                            &full_search_visible_app_title(app),
-                                            &search_query,
-                                        );
+                                        let (rank, display_title, highlight_segments, title_is_typo) =
+                                            compute_display_title_and_highlights(
+                                                &full_search_visible_app_title(app),
+                                                &search_values,
+                                                &base_query,
+                                                &typo_query,
+                                                70,
+                                            )?;
                                         let visible_match_priority = visible_match_priority(
                                             &full_search_visible_app_title(app),
                                             &search_query,
@@ -6018,6 +6235,8 @@ impl eframe::App for App {
 	                                            title_is_typo,
 	                                            visible_match_priority,
 	                                            is_pinned,
+                                                display_title,
+                                                highlight_segments,
 	                                            search_values,
 	                                            candidate_key: format!(
 	                                                "{}\u{0}{}",
@@ -6058,28 +6277,12 @@ impl eframe::App for App {
                                             .collect();
                                         filtered_app_display_titles = ranked_apps
                                             .iter()
-                                            .map(|item| {
-                                                search_visible_app_title_with_rank(
-                                                    &item.app,
-                                                    &search_query,
-                                                    &item.rank,
-                                                )
-                                            })
+                                            .map(|item| item.display_title.clone())
                                             .collect();
-                                        filtered_app_highlight_segments =
-                                            filtered_app_display_titles
-                                                .iter()
-                                                .zip(ranked_apps.iter())
-                                                .map(|(title, item)| {
-                                                    let values = app_search_values(&item.app);
-                                                    title_highlight_segments_with_ranked_field(
-                                                        title,
-                                                        &search_query,
-                                                        ranked_field_value(&values, &item.rank),
-                                                        Some(&item.rank),
-                                                    )
-                                                })
-                                                .collect();
+                                        filtered_app_highlight_segments = ranked_apps
+                                            .iter()
+                                            .map(|item| item.highlight_segments.clone())
+                                            .collect();
 			                                filtered_apps = ranked_apps
 		                                    .into_iter()
 		                                    .map(|item| (item.app, item.is_pinned))
@@ -6155,52 +6358,30 @@ impl eframe::App for App {
 		                                let mut ranked_windows: Vec<RankedWindowMatch> = self.windows
                                     .iter()
                                     .filter_map(|win| {
-	                                        let search_values = window_search_values(win);
-	                                        let base_rank = search_rank_for_values(&base_query, &search_values);
-	                                        let typo_rank = search_rank_for_values(&typo_query, &search_values);
-	                                        let rank = match (base_rank, typo_rank) {
-                                            (Some(base_rank), Some(typo_rank)) => {
-                                                pick_better_rank(base_rank, typo_rank)
-                                            }
-                                            (Some(base_rank), None) => base_rank,
-                                            (None, Some(typo_rank)) => typo_rank,
-                                            (None, None) => return None,
-                                        };
-	                                        let display_title = focus_text_around_match(
-	                                            &full_search_visible_window_title(win),
-	                                            &search_query,
-	                                            ranked_field_value(&search_values, &rank),
-	                                            Some(&rank),
-	                                            120,
-	                                        );
-	                                        let highlight_segments =
-	                                            title_highlight_segments_with_ranked_field(
-	                                                &display_title,
-	                                                &search_query,
-	                                                ranked_field_value(&search_values, &rank),
-	                                                Some(&rank),
-	                                            );
-                                        if highlight_segments.is_empty() {
-                                            return None;
-                                        }
-                                        let title_is_typo = highlight_segments
-                                            .iter()
-                                            .any(|(_, _, is_red)| !*is_red);
+                                        let search_values = window_search_values(win);
+                                        let (rank, display_title, highlight_segments, title_is_typo) =
+                                            compute_display_title_and_highlights(
+                                                &full_search_visible_window_title(win),
+                                                &search_values,
+                                                &base_query,
+                                                &typo_query,
+                                                70,
+                                            )?;
                                         let visible_match_priority = 0;
-	                                        Some(RankedWindowMatch {
-	                                            window: win.clone(),
-	                                            rank,
+                                        Some(RankedWindowMatch {
+                                            window: win.clone(),
+                                            rank,
                                             title_is_typo,
-	                                            visible_match_priority,
-	                                            display_title,
-	                                            highlight_segments,
-	                                            search_values,
-	                                            candidate_key: format!(
-	                                                "{}\u{0}{}\u{0}{}",
-	                                                window_grouping_key(win),
-	                                                window_sort_title_key(win),
-	                                                win.id
-	                                            ),
+                                            visible_match_priority,
+                                            display_title,
+                                            highlight_segments,
+                                            search_values,
+                                            candidate_key: format!(
+                                                "{}\u{0}{}\u{0}{}",
+                                                window_grouping_key(win),
+                                                window_sort_title_key(win),
+                                                win.id
+                                            ),
                                             candidate_score: 0.0,
                                         })
                                     })
@@ -6237,22 +6418,10 @@ impl eframe::App for App {
                                             .iter()
                                             .map(|item| item.display_title.clone())
                                             .collect();
-                                        filtered_window_highlight_segments =
-                                            filtered_window_display_titles
-                                                .iter()
-                                                .enumerate()
-                                                .map(|(index, title)| {
-                                                    ranked_windows
-                                                        .get(index)
-                                                        .map(|item| item.highlight_segments.clone())
-                                                        .unwrap_or_else(|| {
-                                                            title_highlight_segments(
-                                                                title,
-                                                                &search_query,
-                                                            )
-                                                        })
-                                                })
-                                                .collect();
+                                        filtered_window_highlight_segments = ranked_windows
+                                            .iter()
+                                            .map(|item| item.highlight_segments.clone())
+                                            .collect();
 			                                filtered_windows =
 		                                    ranked_windows.into_iter().map(|item| item.window).collect();
 	                            } else {
@@ -6294,20 +6463,14 @@ impl eframe::App for App {
 		                                .filter_map(|app| {
 		                                    let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
 			                                    let search_values = app_search_values(app);
-			                                    let base_rank = search_rank_for_values(&base_query, &search_values);
-			                                    let typo_rank = search_rank_for_values(&typo_query, &search_values);
-		                                    let rank = match (base_rank, typo_rank) {
-		                                        (Some(base_rank), Some(typo_rank)) => {
-		                                            pick_better_rank(base_rank, typo_rank)
-		                                        }
-		                                        (Some(base_rank), None) => base_rank,
-		                                        (None, Some(typo_rank)) => typo_rank,
-		                                        (None, None) => return None,
-		                                    };
-		                                    let title_is_typo = visible_title_has_typo_match(
-		                                        &full_search_visible_app_title(app),
-		                                        &search_query,
-		                                    );
+                                            let (rank, display_title, highlight_segments, title_is_typo) =
+                                                compute_display_title_and_highlights(
+                                                    &full_search_visible_app_title(app),
+                                                    &search_values,
+                                                    &base_query,
+                                                    &typo_query,
+                                                    70,
+                                                )?;
 		                                    let visible_match_priority = visible_match_priority(
 		                                        &full_search_visible_app_title(app),
 		                                        &search_query,
@@ -6326,6 +6489,8 @@ impl eframe::App for App {
 			                                        title_is_typo,
 			                                        visible_match_priority,
 			                                        is_pinned,
+                                                    display_title,
+                                                    highlight_segments,
 			                                        search_values,
 			                                        candidate_key: format!(
 		                                            "{}\u{0}{}",
@@ -6366,28 +6531,12 @@ impl eframe::App for App {
 	                                        .collect();
                                         filtered_app_display_titles = ranked_apps
                                             .iter()
-                                            .map(|item| {
-                                                search_visible_app_title_with_rank(
-                                                    &item.app,
-                                                    &search_query,
-                                                    &item.rank,
-                                                )
-                                            })
+                                            .map(|item| item.display_title.clone())
                                             .collect();
-                                        filtered_app_highlight_segments =
-                                            filtered_app_display_titles
-                                                .iter()
-                                                .zip(ranked_apps.iter())
-                                                .map(|(title, item)| {
-                                                    let values = app_search_values(&item.app);
-                                                    title_highlight_segments_with_ranked_field(
-                                                        title,
-                                                        &search_query,
-                                                        ranked_field_value(&values, &item.rank),
-                                                        Some(&item.rank),
-                                                    )
-                                                })
-                                                .collect();
+                                        filtered_app_highlight_segments = ranked_apps
+                                            .iter()
+                                            .map(|item| item.highlight_segments.clone())
+                                            .collect();
 			                            filtered_apps = ranked_apps
 		                                .into_iter()
 		                                .map(|item| (item.app, item.is_pinned))
@@ -8514,6 +8663,21 @@ mod tests {
         let segments = [(0, title.len() + 10, false), (1, 3, false)];
 
         highlighted_title_job_from_segments(title, 12.0, &segments);
+    }
+
+    #[test]
+    fn test_compute_display_title_and_highlights_typo() {
+        let base_query = MetadataQuery::new("fiom").unwrap();
+        let typo_query = MetadataQuery::new("fiom").unwrap().with_typo_fallback(true);
+        let search_values = vec![(0, "fish".to_string())];
+        let (_rank, display_title, highlights, title_is_typo) =
+            compute_display_title_and_highlights("fish", &search_values, &base_query, &typo_query, 70).unwrap();
+        println!("display_title: {}", display_title);
+        println!("highlights: {:?}", highlights);
+        println!("title_is_typo: {}", title_is_typo);
+        assert_eq!(display_title, "fish");
+        assert_eq!(highlights, vec![(0, 4, false)]);
+        assert!(title_is_typo);
     }
 }
 
