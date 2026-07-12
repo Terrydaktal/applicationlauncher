@@ -1,6 +1,6 @@
 use eframe::egui;
 use fuzzy_rank::metadata::{
-    MetadataCandidate, MetadataQuery, SearchField, dedup_push_search_field, MatchedFieldHighlight,
+    MatchedFieldHighlight, MetadataCandidate, MetadataQuery, SearchField, dedup_push_search_field,
 };
 use fuzzy_rank::ranking::SearchRank;
 use serde::Deserialize;
@@ -28,6 +28,8 @@ const PIPEWIRE_ACTIVE_TOTAL_US_THRESHOLD: f32 = 20.0;
 const AUDIO_ACTIVE_REPAINT_MS: u64 = 80;
 const WINDOW_FEED_EVENTS_PER_FRAME: usize = 512;
 const WINDOW_SNAPSHOTS_PER_FRAME: usize = 4;
+const SETTINGS_VIEWPORT_SIZE: [f32; 2] = [380.0, 760.0];
+const SETTINGS_VIEWPORT_MIN_SIZE: [f32; 2] = [340.0, 500.0];
 const AUDIO_UPDATES_PER_FRAME: usize = 32;
 const UI_EVENTS_PER_FRAME: usize = 8;
 
@@ -63,6 +65,7 @@ struct WindowInfo {
     class: String,
     desktop_file_name: Option<String>,
     minimized: Option<bool>,
+    demands_attention: bool,
     icon_path: Option<PathBuf>,
     active_process: Option<String>,
     exe_path: Option<PathBuf>,
@@ -147,6 +150,8 @@ struct KWinWindowPayload {
     height: i32,
     #[serde(default)]
     minimized: bool,
+    #[serde(default)]
+    demands_attention: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -230,13 +235,20 @@ struct App {
     background_window_enrichment_receiver: Option<Receiver<Vec<WindowInfo>>>,
     ui_event_rx: std::sync::mpsc::Receiver<UiEvent>,
     kwin_window_feed_setup_rx: Option<Receiver<Result<(), String>>>,
+    repaint_ctx: egui::Context,
     width: f32,
     height: f32,
+    ui_scale: f32,
+    pending_ui_scale: f32,
+    settings_menu_scale_anchor: f32,
     icon_only: bool,
     show_settings_menu: bool,
     show_system_settings_modules: bool,
     win_icon_size: f32,
-    win_padding: f32,
+    win_top_padding: f32,
+    win_bottom_padding: f32,
+    win_left_padding: f32,
+    win_right_padding: f32,
     win_row_height: f32,
     win_text_spacing: f32,
     win_line_height: f32,
@@ -247,10 +259,15 @@ struct App {
     win_path_size: f32,
     app_icon_size: f32,
     app_icon_tile_size: f32,
+    app_top_padding: f32,
+    app_bottom_padding: f32,
+    app_left_padding: f32,
+    app_right_padding: f32,
     app_icon_show_name: bool,
     app_icon_name_size: f32,
     disable_ibeam: bool,
     process_chain_popup: Option<WindowInfo>,
+    app_info_popup: Option<AppInfo>,
     window_sender: Sender<Vec<WindowInfo>>,
     window_receiver: Receiver<Vec<WindowInfo>>,
     window_feed_receiver: Receiver<WindowFeedEvent>,
@@ -309,7 +326,10 @@ struct LauncherSettings {
     show_system_settings_modules: bool,
     app_icon_mode: bool,
     win_icon_size: f32,
-    win_padding: f32,
+    win_top_padding: f32,
+    win_bottom_padding: f32,
+    win_left_padding: f32,
+    win_right_padding: f32,
     win_row_height: f32,
     win_text_spacing: f32,
     win_line_height: f32,
@@ -320,11 +340,16 @@ struct LauncherSettings {
     win_path_size: f32,
     app_icon_size: f32,
     app_icon_tile_size: f32,
+    app_top_padding: f32,
+    app_bottom_padding: f32,
+    app_left_padding: f32,
+    app_right_padding: f32,
     app_icon_show_name: bool,
     app_icon_name_size: f32,
     disable_ibeam: bool,
     app_scroll_sensitivity: f32,
     win_scroll_sensitivity: f32,
+    ui_scale: f32,
 }
 
 impl Default for LauncherSettings {
@@ -333,7 +358,10 @@ impl Default for LauncherSettings {
             show_system_settings_modules: true,
             app_icon_mode: false,
             win_icon_size: 32.0,
-            win_padding: 6.0,
+            win_top_padding: 6.0,
+            win_bottom_padding: 6.0,
+            win_left_padding: 12.0,
+            win_right_padding: 12.0,
             win_row_height: 52.0,
             win_text_spacing: 2.0,
             win_line_height: 14.0,
@@ -344,11 +372,16 @@ impl Default for LauncherSettings {
             win_path_size: 10.5,
             app_icon_size: 32.0,
             app_icon_tile_size: 68.0,
+            app_top_padding: 6.0,
+            app_bottom_padding: 6.0,
+            app_left_padding: 12.0,
+            app_right_padding: 12.0,
             app_icon_show_name: true,
             app_icon_name_size: 10.5,
             disable_ibeam: false,
             app_scroll_sensitivity: 1.0,
             win_scroll_sensitivity: 1.0,
+            ui_scale: 1.0,
         }
     }
 }
@@ -489,6 +522,10 @@ fn load_launcher_settings() -> LauncherSettings {
         let path = PathBuf::from(format!("{}/.config/applicationlauncher/settings.txt", home));
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(path) {
+                let mut saw_win_top_padding = false;
+                let mut saw_win_bottom_padding = false;
+                let mut saw_app_top_padding = false;
+                let mut saw_app_bottom_padding = false;
                 for line in content.lines() {
                     let mut parts = line.splitn(2, '=');
                     let key = parts.next().unwrap_or("").trim();
@@ -511,10 +548,56 @@ fn load_launcher_settings() -> LauncherSettings {
                                 .unwrap_or(settings.win_icon_size);
                         }
                         "win_padding" => {
-                            settings.win_padding = value
+                            let padding = value
                                 .parse::<f32>()
                                 .map(|v| v.clamp(0.0, 24.0))
-                                .unwrap_or(settings.win_padding);
+                                .unwrap_or(settings.win_top_padding);
+                            if !saw_win_top_padding {
+                                settings.win_top_padding = padding;
+                            }
+                            if !saw_win_bottom_padding {
+                                settings.win_bottom_padding = padding;
+                            }
+                            if !saw_app_top_padding {
+                                settings.app_top_padding = padding;
+                            }
+                            if !saw_app_bottom_padding {
+                                settings.app_bottom_padding = padding;
+                            }
+                        }
+                        "win_horizontal_padding" => {
+                            let padding = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(0.0, 32.0))
+                                .unwrap_or(settings.win_left_padding);
+                            settings.win_left_padding = padding;
+                            settings.win_right_padding = padding;
+                        }
+                        "win_top_padding" => {
+                            settings.win_top_padding = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(0.0, 24.0))
+                                .unwrap_or(settings.win_top_padding);
+                            saw_win_top_padding = true;
+                        }
+                        "win_bottom_padding" => {
+                            settings.win_bottom_padding = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(0.0, 24.0))
+                                .unwrap_or(settings.win_bottom_padding);
+                            saw_win_bottom_padding = true;
+                        }
+                        "win_left_padding" => {
+                            settings.win_left_padding = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(0.0, 32.0))
+                                .unwrap_or(settings.win_left_padding);
+                        }
+                        "win_right_padding" => {
+                            settings.win_right_padding = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(0.0, 32.0))
+                                .unwrap_or(settings.win_right_padding);
                         }
                         "win_row_height" => {
                             settings.win_row_height = value
@@ -572,6 +655,40 @@ fn load_launcher_settings() -> LauncherSettings {
                                 .map(|v| v.clamp(48.0, 128.0))
                                 .unwrap_or(settings.app_icon_tile_size);
                         }
+                        "app_horizontal_padding" => {
+                            let padding = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(0.0, 32.0))
+                                .unwrap_or(settings.app_left_padding);
+                            settings.app_left_padding = padding;
+                            settings.app_right_padding = padding;
+                        }
+                        "app_top_padding" => {
+                            settings.app_top_padding = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(0.0, 24.0))
+                                .unwrap_or(settings.app_top_padding);
+                            saw_app_top_padding = true;
+                        }
+                        "app_bottom_padding" => {
+                            settings.app_bottom_padding = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(0.0, 24.0))
+                                .unwrap_or(settings.app_bottom_padding);
+                            saw_app_bottom_padding = true;
+                        }
+                        "app_left_padding" => {
+                            settings.app_left_padding = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(0.0, 32.0))
+                                .unwrap_or(settings.app_left_padding);
+                        }
+                        "app_right_padding" => {
+                            settings.app_right_padding = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(0.0, 32.0))
+                                .unwrap_or(settings.app_right_padding);
+                        }
                         "app_icon_show_name" => {
                             settings.app_icon_show_name =
                                 value.parse::<bool>().unwrap_or(settings.app_icon_show_name);
@@ -598,6 +715,12 @@ fn load_launcher_settings() -> LauncherSettings {
                                 .map(|v| v.clamp(0.1, 10.0))
                                 .unwrap_or(settings.win_scroll_sensitivity);
                         }
+                        "ui_scale" => {
+                            settings.ui_scale = value
+                                .parse::<f32>()
+                                .map(|v| v.clamp(0.5, 2.5))
+                                .unwrap_or(settings.ui_scale);
+                        }
                         _ => {}
                     }
                 }
@@ -614,11 +737,14 @@ fn save_launcher_settings(settings: LauncherSettings) {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("settings.txt");
         let content = format!(
-            "show_system_settings_modules={}\napp_icon_mode={}\nwin_icon_size={:.1}\nwin_padding={:.1}\nwin_row_height={:.1}\nwin_text_spacing={:.1}\nwin_line_height={:.1}\nwin_show_path={}\nshow_run_in_terminal={}\nshow_cd_in_terminal={}\nwin_title_size={:.1}\nwin_path_size={:.1}\napp_icon_size={:.1}\napp_icon_tile_size={:.1}\napp_icon_show_name={}\napp_icon_name_size={:.1}\ndisable_ibeam={}\napp_scroll_sensitivity={:.2}\nwin_scroll_sensitivity={:.2}\n",
+            "show_system_settings_modules={}\napp_icon_mode={}\nwin_icon_size={:.1}\nwin_top_padding={:.1}\nwin_bottom_padding={:.1}\nwin_left_padding={:.1}\nwin_right_padding={:.1}\nwin_row_height={:.1}\nwin_text_spacing={:.1}\nwin_line_height={:.1}\nwin_show_path={}\nshow_run_in_terminal={}\nshow_cd_in_terminal={}\nwin_title_size={:.1}\nwin_path_size={:.1}\napp_icon_size={:.1}\napp_icon_tile_size={:.1}\napp_top_padding={:.1}\napp_bottom_padding={:.1}\napp_left_padding={:.1}\napp_right_padding={:.1}\napp_icon_show_name={}\napp_icon_name_size={:.1}\ndisable_ibeam={}\napp_scroll_sensitivity={:.2}\nwin_scroll_sensitivity={:.2}\nui_scale={:.2}\n",
             settings.show_system_settings_modules,
             settings.app_icon_mode,
             settings.win_icon_size,
-            settings.win_padding,
+            settings.win_top_padding,
+            settings.win_bottom_padding,
+            settings.win_left_padding,
+            settings.win_right_padding,
             settings.win_row_height,
             settings.win_text_spacing,
             settings.win_line_height,
@@ -629,11 +755,16 @@ fn save_launcher_settings(settings: LauncherSettings) {
             settings.win_path_size,
             settings.app_icon_size,
             settings.app_icon_tile_size,
+            settings.app_top_padding,
+            settings.app_bottom_padding,
+            settings.app_left_padding,
+            settings.app_right_padding,
             settings.app_icon_show_name,
             settings.app_icon_name_size,
             settings.disable_ibeam,
             settings.app_scroll_sensitivity,
-            settings.win_scroll_sensitivity
+            settings.win_scroll_sensitivity,
+            settings.ui_scale
         );
         let _ = std::fs::write(path, content);
     }
@@ -1613,6 +1744,10 @@ fn duplicate_window_group_key(win: &WindowInfo) -> Option<(String, String)> {
     (!app_key.is_empty()).then_some((app_key, title))
 }
 
+fn window_requires_attention(win: &WindowInfo) -> bool {
+    win.demands_attention || win.title.to_lowercase().contains("action required")
+}
+
 fn is_braille_spinner_char(ch: char) -> bool {
     ('\u{2800}'..='\u{28ff}').contains(&ch)
 }
@@ -1840,7 +1975,7 @@ fn map_field_highlights_to_full_text(
         };
         let field_val_lower = field.value.to_lowercase();
         let full_text_lower = full_text.to_lowercase();
-        
+
         for (match_start, _) in full_text_lower.match_indices(&field_val_lower) {
             for &(r_start, r_end, is_exact) in &hl.ranges {
                 let mapped_start = match_start + r_start;
@@ -1854,9 +1989,12 @@ fn map_field_highlights_to_full_text(
                 let mapped_f_start = match_start + f_start;
                 let mapped_f_end = match_start + f_end;
                 if mapped_f_end <= full_text.len() {
-                    let is_exact = hl.ranges.iter().any(|&(s, e, ex)| s <= f_start && e >= f_end && ex);
+                    let is_exact = hl
+                        .ranges
+                        .iter()
+                        .any(|&(s, e, ex)| s <= f_start && e >= f_end && ex);
                     let priority = if is_exact { 0 } else { 1 };
-                    
+
                     let is_better = match strongest_focus {
                         None => true,
                         Some((_, _, strong_exact, strong_priority)) => {
@@ -1900,7 +2038,8 @@ fn map_field_highlights_to_full_text(
                 if seg_exact == is_exact {
                     // Continue segment
                 } else {
-                    let (byte_start, byte_end) = char_indices_to_byte_range_main(full_text, start_char, char_idx);
+                    let (byte_start, byte_end) =
+                        char_indices_to_byte_range_main(full_text, start_char, char_idx);
                     merged_ranges.push((byte_start, byte_end, seg_exact));
                     current_segment = Some((char_idx, is_exact));
                 }
@@ -1909,14 +2048,16 @@ fn map_field_highlights_to_full_text(
             }
         } else {
             if let Some((start_char, seg_exact)) = current_segment {
-                let (byte_start, byte_end) = char_indices_to_byte_range_main(full_text, start_char, char_idx);
+                let (byte_start, byte_end) =
+                    char_indices_to_byte_range_main(full_text, start_char, char_idx);
                 merged_ranges.push((byte_start, byte_end, seg_exact));
                 current_segment = None;
             }
         }
     }
     if let Some((start_char, seg_exact)) = current_segment {
-        let (byte_start, byte_end) = char_indices_to_byte_range_main(full_text, start_char, char_count);
+        let (byte_start, byte_end) =
+            char_indices_to_byte_range_main(full_text, start_char, char_count);
         merged_ranges.push((byte_start, byte_end, seg_exact));
     }
 
@@ -1924,7 +2065,11 @@ fn map_field_highlights_to_full_text(
     (merged_ranges, focus)
 }
 
-fn char_indices_to_byte_range_main(text: &str, start_char: usize, end_char: usize) -> (usize, usize) {
+fn char_indices_to_byte_range_main(
+    text: &str,
+    start_char: usize,
+    end_char: usize,
+) -> (usize, usize) {
     let mut byte_start = 0;
     let mut byte_end = 0;
     for (char_idx, (byte_idx, _)) in text.char_indices().enumerate() {
@@ -1979,7 +2124,11 @@ fn focus_text_around_byte_range(
     if start_char > 0 {
         result.push_str("...");
     }
-    let slice_content: String = text.chars().skip(start_char).take(end_char - start_char).collect();
+    let slice_content: String = text
+        .chars()
+        .skip(start_char)
+        .take(end_char - start_char)
+        .collect();
     result.push_str(&slice_content);
     if end_char < char_count {
         result.push_str("...");
@@ -1996,8 +2145,18 @@ fn focus_text_around_byte_range(
             let visible_s_char = s_char.max(start_char) - start_char;
             let visible_e_char = e_char.min(end_char) - start_char;
 
-            let s_byte = slice_content.chars().take(visible_s_char).map(|c| c.len_utf8()).sum::<usize>();
-            let e_byte = s_byte + slice_content.chars().skip(visible_s_char).take(visible_e_char - visible_s_char).map(|c| c.len_utf8()).sum::<usize>();
+            let s_byte = slice_content
+                .chars()
+                .take(visible_s_char)
+                .map(|c| c.len_utf8())
+                .sum::<usize>();
+            let e_byte = s_byte
+                + slice_content
+                    .chars()
+                    .skip(visible_s_char)
+                    .take(visible_e_char - visible_s_char)
+                    .map(|c| c.len_utf8())
+                    .sum::<usize>();
 
             adjusted.push((prefix_len + s_byte, prefix_len + e_byte, is_exact));
         }
@@ -2036,7 +2195,8 @@ fn compute_display_title_and_highlights(
     };
 
     let (full_ranges, focus) = map_field_highlights_to_full_text(full_text, &fields, &highlights);
-    let (display_title, highlight_segments) = focus_text_around_byte_range(full_text, focus, &full_ranges, max_chars);
+    let (display_title, highlight_segments) =
+        focus_text_around_byte_range(full_text, focus, &full_ranges, max_chars);
 
     let title_is_typo = highlight_segments.iter().any(|(_, _, is_red)| !*is_red);
 
@@ -2046,7 +2206,7 @@ fn compute_display_title_and_highlights(
 fn effective_list_row_height(
     configured_height: f32,
     icon_height: f32,
-    vertical_padding: f32,
+    vertical_padding_total: f32,
     line_height: f32,
     text_spacing: f32,
     show_path: bool,
@@ -2058,8 +2218,18 @@ fn effective_list_row_height(
     };
 
     configured_height
-        .max(icon_height + vertical_padding * 2.0)
-        .max(text_height + vertical_padding * 2.0)
+        .max(icon_height + vertical_padding_total)
+        .max(text_height + vertical_padding_total)
+}
+
+fn inset_rect(rect: egui::Rect, left: f32, right: f32, top: f32, bottom: f32) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(rect.min.x + left, rect.min.y + top),
+        egui::pos2(
+            (rect.max.x - right).max(rect.min.x + left),
+            (rect.max.y - bottom).max(rect.min.y + top),
+        ),
+    )
 }
 
 fn display_path(path: &Path) -> String {
@@ -2678,13 +2848,22 @@ fn is_generic_terminal_process(proc_name: &str) -> bool {
     )
 }
 
+fn terminal_process_display_name(proc_name: &str) -> &str {
+    let normalized = normalize_app_match_key(proc_name);
+    if normalized == "codex" || normalized.starts_with("codexcodemode") {
+        "codex"
+    } else {
+        proc_name.trim()
+    }
+}
+
 fn terminal_primary_title(proc_name: &str, command_summary: Option<&str>) -> String {
     let proc_name = proc_name.trim();
     let Some(command_summary) = command_summary
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return proc_name.to_string();
+        return terminal_process_display_name(proc_name).to_string();
     };
 
     if is_generic_terminal_process(proc_name)
@@ -2692,7 +2871,7 @@ fn terminal_primary_title(proc_name: &str, command_summary: Option<&str>) -> Str
     {
         command_summary.to_string()
     } else {
-        proc_name.to_string()
+        terminal_process_display_name(proc_name).to_string()
     }
 }
 
@@ -3943,6 +4122,7 @@ fn build_window_info(
     if class_lower.contains("plasmashell")
         || class_lower == "kwin_wayland"
         || class_lower.is_empty()
+        || title.trim().is_empty()
         || class_lower == "applicationlauncher"
         || title == "Open Application Windows"
         || pid == Some(my_pid)
@@ -3956,11 +4136,7 @@ fn build_window_info(
         }
     }
 
-    let display_title = if title.is_empty() {
-        class.clone()
-    } else {
-        title
-    };
+    let display_title = title;
 
     let mut active_process = None;
     let mut exe_path = None;
@@ -4068,6 +4244,7 @@ fn build_window_info(
         class,
         desktop_file_name,
         minimized,
+        demands_attention: false,
         icon_path,
         active_process,
         exe_path,
@@ -4209,7 +4386,7 @@ fn window_info_from_kwin_payload(
         payload.height,
     ));
     let minimized = Some(payload.minimized);
-    build_window_info(
+    let mut window = build_window_info(
         payload.id,
         payload.title,
         class,
@@ -4222,7 +4399,9 @@ fn window_info_from_kwin_payload(
         ppid_to_children,
         pid_to_name,
         pid_to_ppid,
-    )
+    )?;
+    window.demands_attention = payload.demands_attention;
+    Some(window)
 }
 
 fn coalesce_window_feed_events(events: Vec<WindowFeedEvent>) -> Vec<WindowFeedEvent> {
@@ -4522,6 +4701,62 @@ fn get_snapshot_window_details(id: &str) -> SnapshotWindowDetails {
 }
 
 impl App {
+    fn scaled_style(style: &egui::Style, factor: f32) -> egui::Style {
+        let mut style = style.clone();
+
+        for font_id in style.text_styles.values_mut() {
+            font_id.size *= factor;
+        }
+
+        style.spacing.item_spacing *= factor;
+        style.spacing.window_margin = style.spacing.window_margin * factor;
+        style.spacing.menu_margin = style.spacing.menu_margin * factor;
+        style.spacing.button_padding *= factor;
+        style.spacing.indent *= factor;
+        style.spacing.interact_size *= factor;
+        style.spacing.slider_width *= factor;
+        style.spacing.slider_rail_height *= factor;
+        style.spacing.combo_width *= factor;
+        style.spacing.text_edit_width *= factor;
+        style.spacing.icon_width *= factor;
+        style.spacing.icon_width_inner *= factor;
+        style.spacing.icon_spacing *= factor;
+        style.spacing.default_area_size *= factor;
+        style.spacing.tooltip_width *= factor;
+        style.spacing.menu_width *= factor;
+        style.spacing.menu_spacing *= factor;
+        style.spacing.combo_height *= factor;
+        style.interaction.interact_radius *= factor;
+        style.interaction.resize_grab_radius_side *= factor;
+        style.interaction.resize_grab_radius_corner *= factor;
+
+        style
+    }
+
+    fn apply_ui_scale(&mut self, ctx: &egui::Context, ui_scale: f32) {
+        let clamped = ui_scale.clamp(0.5, 2.5);
+        if (self.ui_scale - clamped).abs() < f32::EPSILON {
+            return;
+        }
+
+        self.ui_scale = clamped;
+        ctx.set_zoom_factor(clamped);
+        self.save_settings();
+        ctx.request_repaint();
+    }
+
+    fn open_settings_menu(&mut self) {
+        self.settings_menu_scale_anchor = self.ui_scale;
+        self.pending_ui_scale = self.ui_scale;
+        self.show_settings_menu = true;
+    }
+
+    fn close_settings_menu(&mut self) {
+        self.settings_menu_scale_anchor = self.ui_scale;
+        self.pending_ui_scale = self.ui_scale;
+        self.show_settings_menu = false;
+    }
+
     fn new(
         cc: &eframe::CreationContext<'_>,
         close_on_blur: bool,
@@ -4556,6 +4791,7 @@ impl App {
         let (width, height) = load_window_size();
         let pinned_apps = load_pinned_apps();
         let settings = load_launcher_settings();
+        cc.egui_ctx.set_zoom_factor(settings.ui_scale);
 
         let (window_tx, window_rx) = std::sync::mpsc::channel();
         let (window_feed_tx, window_feed_rx) = std::sync::mpsc::channel();
@@ -4600,13 +4836,20 @@ impl App {
             background_window_enrichment_receiver: None,
             ui_event_rx,
             kwin_window_feed_setup_rx: Some(kwin_window_feed_setup_rx),
+            repaint_ctx: cc.egui_ctx.clone(),
             width,
             height,
+            ui_scale: settings.ui_scale,
+            pending_ui_scale: settings.ui_scale,
+            settings_menu_scale_anchor: settings.ui_scale,
             icon_only: icon_only || settings.app_icon_mode,
             show_settings_menu: false,
             show_system_settings_modules: settings.show_system_settings_modules,
             win_icon_size: settings.win_icon_size,
-            win_padding: settings.win_padding,
+            win_top_padding: settings.win_top_padding,
+            win_bottom_padding: settings.win_bottom_padding,
+            win_left_padding: settings.win_left_padding,
+            win_right_padding: settings.win_right_padding,
             win_row_height: settings.win_row_height,
             win_text_spacing: settings.win_text_spacing,
             win_line_height: settings.win_line_height,
@@ -4617,10 +4860,15 @@ impl App {
             win_path_size: settings.win_path_size,
             app_icon_size: settings.app_icon_size,
             app_icon_tile_size: settings.app_icon_tile_size,
+            app_top_padding: settings.app_top_padding,
+            app_bottom_padding: settings.app_bottom_padding,
+            app_left_padding: settings.app_left_padding,
+            app_right_padding: settings.app_right_padding,
             app_icon_show_name: settings.app_icon_show_name,
             app_icon_name_size: settings.app_icon_name_size,
             disable_ibeam: settings.disable_ibeam,
             process_chain_popup: None,
+            app_info_popup: None,
             window_sender: window_tx.clone(),
             window_receiver: window_rx,
             window_feed_receiver: window_feed_rx,
@@ -4706,7 +4954,9 @@ impl App {
             let dir = PathBuf::from(format!("{}/.config/applicationlauncher", home));
             let _ = std::fs::create_dir_all(&dir);
             let path = dir.join("window_size.txt");
-            let content = format!("{}\n{}", self.width, self.height);
+            let base_width = (self.width * self.ui_scale).clamp(300.0, 1920.0);
+            let base_height = (self.height * self.ui_scale).clamp(200.0, 1080.0);
+            let content = format!("{}\n{}", base_width, base_height);
             let _ = std::fs::write(path, content);
         }
     }
@@ -4716,7 +4966,10 @@ impl App {
             show_system_settings_modules: self.show_system_settings_modules,
             app_icon_mode: self.icon_only,
             win_icon_size: self.win_icon_size,
-            win_padding: self.win_padding,
+            win_top_padding: self.win_top_padding,
+            win_bottom_padding: self.win_bottom_padding,
+            win_left_padding: self.win_left_padding,
+            win_right_padding: self.win_right_padding,
             win_row_height: self.win_row_height,
             win_text_spacing: self.win_text_spacing,
             win_line_height: self.win_line_height,
@@ -4727,11 +4980,16 @@ impl App {
             win_path_size: self.win_path_size,
             app_icon_size: self.app_icon_size,
             app_icon_tile_size: self.app_icon_tile_size,
+            app_top_padding: self.app_top_padding,
+            app_bottom_padding: self.app_bottom_padding,
+            app_left_padding: self.app_left_padding,
+            app_right_padding: self.app_right_padding,
             app_icon_show_name: self.app_icon_show_name,
             app_icon_name_size: self.app_icon_name_size,
             disable_ibeam: self.disable_ibeam,
             app_scroll_sensitivity: self.app_scroll_sensitivity,
             win_scroll_sensitivity: self.win_scroll_sensitivity,
+            ui_scale: self.ui_scale,
         });
     }
 
@@ -4752,6 +5010,11 @@ impl App {
 
     fn render_settings_panel(&mut self, ui: &mut egui::Ui) -> bool {
         let mut close_requested = false;
+        let scale_factor = (self.settings_menu_scale_anchor / self.ui_scale).clamp(0.2, 5.0);
+        if (scale_factor - 1.0).abs() > 0.001 {
+            let scaled_style = Self::scaled_style(ui.style().as_ref(), scale_factor);
+            ui.set_style(scaled_style);
+        }
 
         ui.add_space(8.0);
         ui.vertical_centered(|ui| {
@@ -4779,6 +5042,39 @@ impl App {
                 self.save_settings();
             }
         });
+
+        ui.add_space(10.0);
+        egui::Grid::new("global_scale_settings_grid")
+            .num_columns(2)
+            .spacing([12.0, 10.0])
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Global Scale:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.pending_ui_scale, 0.5..=2.5).show_value(true),
+                    );
+                    let scale_changed = (self.pending_ui_scale - self.ui_scale).abs() > 0.001;
+                    if ui
+                        .add_enabled(scale_changed, egui::Button::new("Apply"))
+                        .clicked()
+                    {
+                        self.apply_ui_scale(ui.ctx(), self.pending_ui_scale);
+                    }
+                    if ui
+                        .add_enabled(scale_changed, egui::Button::new("Reset"))
+                        .clicked()
+                    {
+                        self.pending_ui_scale = self.ui_scale;
+                    }
+                });
+                if self.pending_ui_scale.is_nan() {
+                    self.pending_ui_scale = self.ui_scale;
+                }
+                ui.end_row();
+            });
 
         ui.add_space(14.0);
         ui.add(egui::Separator::default());
@@ -4842,6 +5138,62 @@ impl App {
                     .changed()
                 {
                     self.app_icon_tile_size = app_tile_size;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Top Padding:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut app_top_padding = self.app_top_padding;
+                if ui
+                    .add(egui::Slider::new(&mut app_top_padding, 0.0..=24.0).show_value(true))
+                    .changed()
+                {
+                    self.app_top_padding = app_top_padding;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Bottom Padding:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut app_bottom_padding = self.app_bottom_padding;
+                if ui
+                    .add(egui::Slider::new(&mut app_bottom_padding, 0.0..=24.0).show_value(true))
+                    .changed()
+                {
+                    self.app_bottom_padding = app_bottom_padding;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Left Padding:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut app_left_padding = self.app_left_padding;
+                if ui
+                    .add(egui::Slider::new(&mut app_left_padding, 0.0..=32.0).show_value(true))
+                    .changed()
+                {
+                    self.app_left_padding = app_left_padding;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Right Padding:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut app_right_padding = self.app_right_padding;
+                if ui
+                    .add(egui::Slider::new(&mut app_right_padding, 0.0..=32.0).show_value(true))
+                    .changed()
+                {
+                    self.app_right_padding = app_right_padding;
                     self.save_settings();
                 }
                 ui.end_row();
@@ -4917,15 +5269,57 @@ impl App {
                 ui.end_row();
 
                 ui.label(
-                    egui::RichText::new("Padding:")
+                    egui::RichText::new("Top Padding:")
                         .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
                 );
-                let mut padding = self.win_padding;
+                let mut win_top_padding = self.win_top_padding;
                 if ui
-                    .add(egui::Slider::new(&mut padding, 0.0..=24.0).show_value(true))
+                    .add(egui::Slider::new(&mut win_top_padding, 0.0..=24.0).show_value(true))
                     .changed()
                 {
-                    self.win_padding = padding;
+                    self.win_top_padding = win_top_padding;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Bottom Padding:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut win_bottom_padding = self.win_bottom_padding;
+                if ui
+                    .add(egui::Slider::new(&mut win_bottom_padding, 0.0..=24.0).show_value(true))
+                    .changed()
+                {
+                    self.win_bottom_padding = win_bottom_padding;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Left Padding:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut win_left_padding = self.win_left_padding;
+                if ui
+                    .add(egui::Slider::new(&mut win_left_padding, 0.0..=32.0).show_value(true))
+                    .changed()
+                {
+                    self.win_left_padding = win_left_padding;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Right Padding:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut win_right_padding = self.win_right_padding;
+                if ui
+                    .add(egui::Slider::new(&mut win_right_padding, 0.0..=32.0).show_value(true))
+                    .changed()
+                {
+                    self.win_right_padding = win_right_padding;
                     self.save_settings();
                 }
                 ui.end_row();
@@ -5071,10 +5465,18 @@ impl App {
 
     fn show_settings_popup(&mut self, ctx: &egui::Context) {
         let viewport_id = egui::ViewportId::from_hash_of("launcher_settings_popup");
+        let viewport_scale_factor =
+            (self.settings_menu_scale_anchor / self.ui_scale).clamp(0.2, 5.0);
         let builder = egui::ViewportBuilder::default()
             .with_title("Launcher Settings")
-            .with_inner_size([380.0, 760.0])
-            .with_min_inner_size([340.0, 500.0])
+            .with_inner_size([
+                (SETTINGS_VIEWPORT_SIZE[0] + 20.0) * viewport_scale_factor,
+                (SETTINGS_VIEWPORT_SIZE[1] + 80.0) * viewport_scale_factor,
+            ])
+            .with_min_inner_size([
+                SETTINGS_VIEWPORT_MIN_SIZE[0] * viewport_scale_factor,
+                SETTINGS_VIEWPORT_MIN_SIZE[1] * viewport_scale_factor,
+            ])
             .with_resizable(true);
 
         let mut should_close = false;
@@ -5101,14 +5503,18 @@ impl App {
                         .corner_radius(egui::CornerRadius::same(12)),
                 )
                 .show(ctx, |ui| {
-                    if self.render_settings_panel(ui) {
-                        should_close = true;
-                    }
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if self.render_settings_panel(ui) {
+                                should_close = true;
+                            }
+                        });
                 });
         });
 
         if should_close {
-            self.show_settings_menu = false;
+            self.close_settings_menu();
         }
     }
 
@@ -5325,6 +5731,140 @@ impl App {
         }
     }
 
+    fn show_app_info_popup(&mut self, ctx: &egui::Context) {
+        let Some(app_info) = self.app_info_popup.clone() else {
+            return;
+        };
+
+        let viewport_id = egui::ViewportId::from_hash_of("launcher_app_info_popup");
+        let builder = egui::ViewportBuilder::default()
+            .with_title(format!("Application Info: {}", app_info.name))
+            .with_inner_size([720.0, 520.0])
+            .with_min_inner_size([480.0, 320.0])
+            .with_resizable(true);
+
+        let mut should_close = false;
+        ctx.show_viewport_immediate(viewport_id, builder, |ctx, _class| {
+            if ctx.input(|i| i.viewport().close_requested()) {
+                should_close = true;
+                return;
+            }
+
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                should_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::window(&ctx.style())
+                        .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 240))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+                        ))
+                        .corner_radius(egui::CornerRadius::same(12)),
+                )
+                .show(ctx, |ui| {
+                    let searchable_label_color = egui::Color32::from_rgb(214, 184, 86);
+                    let searchable_value_color = egui::Color32::from_rgb(255, 236, 170);
+                    let neutral_label_color =
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170);
+                    let neutral_value_color = egui::Color32::WHITE;
+                    let desktop_stem = app_info
+                        .desktop_file_path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or("Unavailable")
+                        .to_string();
+                    let executable_basename = command_basename(&app_info.exec)
+                        .unwrap_or_else(|| "Unavailable".to_string());
+                    let icon_path = app_info
+                        .icon_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Unavailable".to_string());
+                    let is_pinned = self.pinned_apps.contains(&app_info.desktop_file_path);
+
+                    let info_row =
+                        |ui: &mut egui::Ui, label: &str, value: String, searched: bool| {
+                            let label_color = if searched {
+                                searchable_label_color
+                            } else {
+                                neutral_label_color
+                            };
+                            let value_color = if searched {
+                                searchable_value_color
+                            } else {
+                                neutral_value_color
+                            };
+                            ui.label(egui::RichText::new(label).color(label_color).strong());
+                            ui.label(egui::RichText::new(value).color(value_color).monospace());
+                            ui.end_row();
+                        };
+
+                    ui.heading(
+                        egui::RichText::new(&app_info.name)
+                            .color(egui::Color32::WHITE)
+                            .strong(),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("Desktop-entry and application search metadata")
+                            .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170)),
+                    );
+                    ui.add_space(10.0);
+
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        egui::Grid::new("app_info_grid")
+                            .num_columns(2)
+                            .spacing([14.0, 8.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                info_row(ui, "Name", app_info.name.clone(), true);
+                                info_row(ui, "Executable basename", executable_basename, true);
+                                info_row(ui, "Desktop file stem", desktop_stem, true);
+                                info_row(
+                                    ui,
+                                    "Comment",
+                                    app_info
+                                        .comment
+                                        .clone()
+                                        .unwrap_or_else(|| "Unavailable".to_string()),
+                                    true,
+                                );
+                                info_row(
+                                    ui,
+                                    "Cleaned command",
+                                    clean_exec_cmd(&app_info.exec),
+                                    true,
+                                );
+                                info_row(ui, "Raw Exec", app_info.exec.clone(), false);
+                                info_row(
+                                    ui,
+                                    "Desktop file",
+                                    app_info.desktop_file_path.to_string_lossy().to_string(),
+                                    false,
+                                );
+                                info_row(ui, "Icon path", icon_path, false);
+                                info_row(ui, "Pinned", is_pinned.to_string(), false);
+                                info_row(
+                                    ui,
+                                    "System settings module",
+                                    app_info.is_settings_module.to_string(),
+                                    false,
+                                );
+                            });
+                    });
+                });
+        });
+
+        if should_close {
+            self.app_info_popup = None;
+        }
+    }
+
     fn apply_window_snapshot(&mut self, new_windows: Vec<WindowInfo>) {
         if self.windows.is_empty() {
             self.windows = new_windows;
@@ -5395,6 +5935,7 @@ impl App {
         for event in events {
             match event {
                 WindowFeedEvent::Upsert(payload) => {
+                    let window_id = payload.id.clone();
                     if let Some(window) = window_info_from_kwin_payload(
                         payload,
                         &theme,
@@ -5411,6 +5952,11 @@ impl App {
                             self.windows.push(window);
                         }
                         changed = true;
+                    } else {
+                        self.missing_window_counts.remove(&window_id);
+                        let previous_len = self.windows.len();
+                        self.windows.retain(|window| window.id != window_id);
+                        changed |= self.windows.len() != previous_len;
                     }
                 }
                 WindowFeedEvent::Remove(id) => {
@@ -5562,12 +6108,14 @@ impl App {
             .as_deref()
             .unwrap_or("breeze-dark")
             .to_string();
+        let repaint_ctx = self.repaint_ctx.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         self.background_apps_receiver = Some(rx);
 
         std::thread::spawn(move || {
             let apps = get_installed_apps(&theme);
             let _ = tx.send(apps);
+            repaint_ctx.request_repaint();
         });
     }
 
@@ -5642,6 +6190,31 @@ impl App {
             launch_app(&app.exec);
         }
         ctx.request_repaint();
+    }
+
+    fn open_window_for_app_and_exit(&self, app: &AppInfo, ctx: &egui::Context) {
+        let Some(window_id) = self
+            .windows
+            .iter()
+            .find(|window| {
+                self.desktop_file_path_for_window(window).as_ref() == Some(&app.desktop_file_path)
+            })
+            .map(|window| window.id.clone())
+        else {
+            return;
+        };
+
+        self.activate_and_exit(window_id, ctx);
+    }
+
+    fn open_or_launch_app_and_exit(&self, app: &AppInfo, ctx: &egui::Context) {
+        if self.windows.iter().any(|window| {
+            self.desktop_file_path_for_window(window).as_ref() == Some(&app.desktop_file_path)
+        }) {
+            self.open_window_for_app_and_exit(app, ctx);
+        } else {
+            self.launch_app_and_exit(app, ctx);
+        }
     }
 
     fn find_app_for_window<'a>(&'a self, win: &WindowInfo) -> Option<&'a AppInfo> {
@@ -5926,23 +6499,24 @@ impl eframe::App for App {
             }
         }
 
-        if !handled_focus_launcher {
-            match self
-                .background_apps_receiver
-                .as_ref()
-                .map(|rx| rx.try_recv())
-            {
-                Some(Ok(apps)) => {
-                    self.apps = apps;
-                    self.apps_generation = self.apps_generation.wrapping_add(1);
-                    self.background_apps_receiver = None;
-                    ctx.request_repaint();
-                }
-                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
-                    self.background_apps_receiver = None;
-                }
-                _ => {}
+        if self.background_apps_receiver.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+        match self
+            .background_apps_receiver
+            .as_ref()
+            .map(|rx| rx.try_recv())
+        {
+            Some(Ok(apps)) => {
+                self.apps = apps;
+                self.apps_generation = self.apps_generation.wrapping_add(1);
+                self.background_apps_receiver = None;
+                ctx.request_repaint();
             }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.background_apps_receiver = None;
+            }
+            _ => {}
         }
 
         // Check background receiver for window query results
@@ -6018,6 +6592,7 @@ impl eframe::App for App {
             && !ctx.input(|i| i.focused)
             && !self.show_settings_menu
             && self.process_chain_popup.is_none()
+            && self.app_info_popup.is_none()
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
@@ -6113,7 +6688,11 @@ impl eframe::App for App {
                                 .on_hover_text("Settings")
                                 .clicked()
                             {
-                                self.show_settings_menu = !self.show_settings_menu;
+                                if self.show_settings_menu {
+                                    self.close_settings_menu();
+                                } else {
+                                    self.open_settings_menu();
+                                }
                             }
                         });
                     });
@@ -6642,12 +7221,16 @@ impl eframe::App for App {
                     };
 
                     if ctx.input(|i| i.key_pressed(egui::Key::F10)) {
-                        self.show_settings_menu = !self.show_settings_menu;
+                        if self.show_settings_menu {
+                            self.close_settings_menu();
+                        } else {
+                            self.open_settings_menu();
+                        }
                     }
 
                     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                         if self.show_settings_menu {
-                            self.show_settings_menu = false;
+                            self.close_settings_menu();
                         } else {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
@@ -6668,7 +7251,8 @@ impl eframe::App for App {
                                                     let row_height = effective_list_row_height(
                                                         self.win_row_height,
                                                         self.win_icon_size,
-                                                        self.win_padding,
+                                                        self.win_top_padding
+                                                            + self.win_bottom_padding,
                                                         self.win_line_height,
                                                         self.win_text_spacing,
                                                         self.win_show_path,
@@ -6789,14 +7373,14 @@ impl eframe::App for App {
                             match self.mode {
                                 LauncherMode::Apps => {
                                     let app = &filtered_apps[self.selected_index].0;
-                                    self.launch_app_and_exit(app, ctx);
+                                    self.open_or_launch_app_and_exit(app, ctx);
                                 }
                                 LauncherMode::Windows => {
                                     if render_side_panel && self.icon_only && self.active_pane == ActivePane::Apps {
                                         if let Some(app) =
                                             filtered_apps.get(self.side_panel_selected_index).map(|item| &item.0)
                                         {
-                                            self.launch_app_and_exit(app, ctx);
+                                            self.open_or_launch_app_and_exit(app, ctx);
                                         }
                                     } else if terminal_run_result_index == Some(self.selected_index)
                                     {
@@ -6914,7 +7498,7 @@ impl eframe::App for App {
                         let window_row_height = effective_list_row_height(
                             self.win_row_height,
                             window_icon_size.y,
-                            self.win_padding,
+                            self.win_top_padding + self.win_bottom_padding,
                             self.win_line_height,
                             self.win_text_spacing,
                             self.win_show_path,
@@ -6922,7 +7506,7 @@ impl eframe::App for App {
                         let app_row_height = effective_list_row_height(
                             self.win_row_height,
                             app_icon_size.y,
-                            self.win_padding,
+                            self.app_top_padding + self.app_bottom_padding,
                             self.win_line_height,
                             self.win_text_spacing,
                             self.win_show_path,
@@ -7060,13 +7644,35 @@ impl eframe::App for App {
                                                     }
                                                 }
                                             }
+                                            ui.separator();
+                                            let has_open_window = self.windows.iter().any(|window| {
+                                                self.desktop_file_path_for_window(window).as_ref()
+                                                    == Some(&app.desktop_file_path)
+                                            });
+                                            if ui
+                                                .add_enabled(has_open_window, egui::Button::new("Open window"))
+                                                .clicked()
+                                            {
+                                                self.open_window_for_app_and_exit(app, ctx);
+                                                ui.close();
+                                            }
+                                            if ui.button("Open new window").clicked() {
+                                                self.launch_app_and_exit(app, ctx);
+                                                ui.close();
+                                            }
+                                            if ui.button("Show info").clicked() {
+                                                self.app_info_popup = Some(app.clone());
+                                                ui.close();
+                                            }
                                         });
 
                                         if is_selected && scroll_to_selected {
                                             response.scroll_to_me(None);
                                         }
 
-                                        if response.clicked() || response.middle_clicked() {
+                                        if response.clicked() {
+                                            self.open_or_launch_app_and_exit(app, ctx);
+                                        } else if response.middle_clicked() {
                                             self.launch_app_and_exit(app, ctx);
                                         }
 
@@ -7211,6 +7817,11 @@ impl eframe::App for App {
                                                             .copied()
                                                     })
                                                     .is_some_and(|count| count > 1);
+                                            let demands_attention = self.mode
+                                                == LauncherMode::Windows
+                                                && filtered_windows
+                                                    .get(index)
+                                                    .is_some_and(window_requires_attention);
 
 		                                    let (rect, response) = ui.allocate_exact_size(
 	                                        egui::vec2(ui.available_width(), row_height),
@@ -7225,7 +7836,13 @@ impl eframe::App for App {
                                          response.scroll_to_me(None);
                                      }
 
-		                                    let bg_color = if is_selected && has_duplicate_window_title {
+		                                    let bg_color = if is_selected && demands_attention {
+		                                        egui::Color32::from_rgba_unmultiplied(235, 64, 64, 96)
+		                                    } else if demands_attention && response.hovered() {
+		                                        egui::Color32::from_rgba_unmultiplied(235, 64, 64, 82)
+		                                    } else if demands_attention {
+		                                        egui::Color32::from_rgba_unmultiplied(235, 64, 64, 64)
+		                                    } else if is_selected && has_duplicate_window_title {
 		                                        egui::Color32::from_rgba_unmultiplied(255, 214, 92, 48)
 		                                    } else if is_selected {
 		                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18)
@@ -7276,8 +7893,13 @@ impl eframe::App for App {
                                     }
 
                                     // Content placement
-                                    let content_rect =
-                                        rect.shrink2(egui::vec2(12.0, self.win_padding));
+                                    let content_rect = inset_rect(
+                                        rect,
+                                        self.win_left_padding,
+                                        self.win_right_padding,
+                                        self.win_top_padding,
+                                        self.win_bottom_padding,
+                                    );
                                     let mut child_ui = ui.new_child(
                                         egui::UiBuilder::new()
                                             .max_rect(content_rect)
@@ -7454,7 +8076,7 @@ impl eframe::App for App {
                                             }
 
                                             if label_clicked {
-                                                self.launch_app_and_exit(app, ctx);
+                                                self.open_or_launch_app_and_exit(app, ctx);
                                             }
 	                                        }
 		                                        LauncherMode::Windows => {
@@ -7722,6 +8344,26 @@ impl eframe::App for App {
                                                             }
                                                         }
                                                     }
+                                                    ui.separator();
+                                                    let has_open_window = self.windows.iter().any(|window| {
+                                                        self.desktop_file_path_for_window(window).as_ref()
+                                                            == Some(&app.desktop_file_path)
+                                                    });
+                                                    if ui
+                                                        .add_enabled(has_open_window, egui::Button::new("Open window"))
+                                                        .clicked()
+                                                    {
+                                                        self.open_window_for_app_and_exit(app, ctx);
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Open new window").clicked() {
+                                                        self.launch_app_and_exit(app, ctx);
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Show info").clicked() {
+                                                        self.app_info_popup = Some(app.clone());
+                                                        ui.close();
+                                                    }
                                                 }
                                                 LauncherMode::Windows => {
                                                     let win = &filtered_windows[index];
@@ -7737,14 +8379,14 @@ impl eframe::App for App {
                                                         self.launch_window_app_and_exit(win, ctx);
                                                         ui.close();
                                                     }
+                                                    if ui.button("Show info").clicked() {
+                                                        self.process_chain_popup = Some(win.clone());
+                                                        ui.close();
+                                                    }
                                                     if ui.button("Open window").clicked() {
                                                         self.active_pane = ActivePane::Windows;
                                                         self.selected_index = index;
                                                         self.activate_and_exit(win.id.clone(), ctx);
-                                                        ui.close();
-                                                    }
-                                                    if ui.button("Show info").clicked() {
-                                                        self.process_chain_popup = Some(win.clone());
                                                         ui.close();
                                                     }
 
@@ -8005,11 +8647,35 @@ impl eframe::App for App {
                                                                         }
                                                                     }
                                                                 }
+	                                                ui.separator();
+	                                                let has_open_window = self.windows.iter().any(|window| {
+	                                                    self.desktop_file_path_for_window(window).as_ref()
+	                                                        == Some(&app.desktop_file_path)
+	                                                });
+	                                                if ui
+	                                                    .add_enabled(has_open_window, egui::Button::new("Open window"))
+	                                                    .clicked()
+	                                                {
+	                                                    self.open_window_for_app_and_exit(app, ctx);
+	                                                    ui.close();
+	                                                }
+	                                                if ui.button("Open new window").clicked() {
+	                                                    self.launch_app_and_exit(app, ctx);
+	                                                    ui.close();
+	                                                }
+	                                                if ui.button("Show info").clicked() {
+                                                                    self.app_info_popup = Some(app.clone());
+                                                                    ui.close();
+                                                                }
 		                                                    });
 			                                                    if response.clicked() || response.middle_clicked() {
 		                                                                self.active_pane = ActivePane::Apps;
 		                                                                self.side_panel_selected_index = index;
-			                                                        self.launch_app_and_exit(app, ctx);
+			                                                        if response.clicked() {
+			                                                            self.open_or_launch_app_and_exit(app, ctx);
+			                                                        } else if response.middle_clicked() {
+			                                                            self.launch_app_and_exit(app, ctx);
+			                                                        }
 			                                                    }
 		                                                    ui.painter().rect_filled(
 		                                                        rect,
@@ -8156,19 +8822,48 @@ impl eframe::App for App {
                                                                 }
                                                             }
                                                         }
-	                                                });
+	                                                    ui.separator();
+	                                                    let has_open_window = self.windows.iter().any(|window| {
+	                                                        self.desktop_file_path_for_window(window).as_ref()
+	                                                            == Some(&app.desktop_file_path)
+	                                                    });
+	                                                    if ui
+	                                                        .add_enabled(has_open_window, egui::Button::new("Open window"))
+	                                                        .clicked()
+	                                                    {
+	                                                        self.open_window_for_app_and_exit(app, ctx);
+	                                                        ui.close();
+	                                                    }
+	                                                    if ui.button("Open new window").clicked() {
+	                                                        self.launch_app_and_exit(app, ctx);
+	                                                        ui.close();
+	                                                    }
+	                                                    if ui.button("Show info").clicked() {
+		                                                    self.app_info_popup = Some(app.clone());
+		                                                    ui.close();
+		                                                }
+		                                                });
 		                                                if response.clicked() || response.middle_clicked() {
-		                                                    self.launch_app_and_exit(app, ctx);
+		                                                    if response.clicked() {
+		                                                        self.open_or_launch_app_and_exit(app, ctx);
+		                                                    } else if response.middle_clicked() {
+		                                                        self.launch_app_and_exit(app, ctx);
+		                                                    }
 		                                                }
                                                         if response.hovered() {
                                                             ui.painter().rect_filled(
                                                                 rect,
-	                                                        egui::CornerRadius::same(8),
+		                                                        egui::CornerRadius::same(8),
                                                                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12),
                                                             );
                                                         }
-                                                        let content_rect =
-                                                            rect.shrink2(egui::vec2(12.0, self.win_padding));
+                                                        let content_rect = inset_rect(
+                                                            rect,
+                                                            self.app_left_padding,
+                                                            self.app_right_padding,
+                                                            self.app_top_padding,
+                                                            self.app_bottom_padding,
+                                                        );
                                                         let mut child_ui = ui.new_child(
                                                             egui::UiBuilder::new()
                                                                 .max_rect(content_rect)
@@ -8314,7 +9009,7 @@ impl eframe::App for App {
                                                             }
                                                         }
                                                         if label_clicked {
-                                                            self.launch_app_and_exit(app, ctx);
+                                                            self.open_or_launch_app_and_exit(app, ctx);
                                                         }
                                                     }
                                                 }
@@ -8362,6 +9057,9 @@ impl eframe::App for App {
                     }
                     if self.process_chain_popup.is_some() {
                         self.show_window_info_popup(ctx);
+                    }
+                    if self.app_info_popup.is_some() {
+                        self.show_app_info_popup(ctx);
                     }
 
                     if let Some(ref resp) = text_edit_response {
@@ -8599,6 +9297,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn codex_code_mode_uses_codex_terminal_title() {
+        assert_eq!(terminal_primary_title("codex-code-mode", None), "codex");
+        assert_eq!(terminal_primary_title("codex", None), "codex");
+    }
+
+    #[test]
     fn typo_highlight_for_mpv_has_visible_yellow_word() {
         let title = "what is the generic term for a movie and an episode - Google Search";
         let segments = title_highlight_segments(title, "mpv");
@@ -8666,12 +9370,43 @@ mod tests {
     }
 
     #[test]
+    fn titleless_application_clients_are_not_listed_as_windows() {
+        let mut icon_cache = HashMap::new();
+        let ppid_to_children = HashMap::new();
+        let pid_to_name = HashMap::new();
+        let pid_to_ppid = HashMap::new();
+        let window = build_window_info(
+            "mousepad-internal-client".to_string(),
+            String::new(),
+            "Org.xfce.mousepad".to_string(),
+            Some("org.xfce.mousepad".to_string()),
+            None,
+            None,
+            Some(false),
+            "breeze-dark",
+            &mut icon_cache,
+            &ppid_to_children,
+            &pid_to_name,
+            &pid_to_ppid,
+        );
+
+        assert!(window.is_none());
+    }
+
+    #[test]
     fn test_compute_display_title_and_highlights_typo() {
         let base_query = MetadataQuery::new("fiom").unwrap();
         let typo_query = MetadataQuery::new("fiom").unwrap().with_typo_fallback(true);
         let search_values = vec![(0, "fish".to_string())];
         let (_rank, display_title, highlights, title_is_typo) =
-            compute_display_title_and_highlights("fish", &search_values, &base_query, &typo_query, 70).unwrap();
+            compute_display_title_and_highlights(
+                "fish",
+                &search_values,
+                &base_query,
+                &typo_query,
+                70,
+            )
+            .unwrap();
         println!("display_title: {}", display_title);
         println!("highlights: {:?}", highlights);
         println!("title_is_typo: {}", title_is_typo);

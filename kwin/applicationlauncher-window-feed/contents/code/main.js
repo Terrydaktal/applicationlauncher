@@ -37,7 +37,8 @@ function serializeWindow(window) {
         y: geometry ? Math.round(geometry.y) : 0,
         width: geometry ? Math.round(geometry.width) : 0,
         height: geometry ? Math.round(geometry.height) : 0,
-        minimized: !!window.minimized
+        minimized: !!window.minimized,
+        demandsAttention: !!window.demandsAttention
     };
 }
 
@@ -109,6 +110,11 @@ function trackWindow(window) {
     }
     if (window.activeChanged) {
         window.activeChanged.connect(function () {
+            sendUpsert(window);
+        });
+    }
+    if (window.demandsAttentionChanged) {
+        window.demandsAttentionChanged.connect(function () {
             sendUpsert(window);
         });
     }
