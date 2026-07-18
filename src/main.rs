@@ -6,9 +6,14 @@ use fuzzy_rank::ranking::SearchRank;
 use serde::Deserialize;
 use std::backtrace::Backtrace;
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{
+    Arc,
+    mpsc::{Receiver, Sender},
+};
 use std::time::{Duration, Instant};
 use zbus::interface;
 
@@ -26,12 +31,15 @@ const AUDIO_ACTIVITY_GRACE_MS: u128 = 350;
 const PIPEWIRE_ACTIVE_US_THRESHOLD: f32 = 10.0;
 const PIPEWIRE_ACTIVE_TOTAL_US_THRESHOLD: f32 = 20.0;
 const AUDIO_ACTIVE_REPAINT_MS: u64 = 80;
+const WINDOW_SEARCH_REFRESH_INTERVAL_MS: u64 = 180;
 const WINDOW_FEED_EVENTS_PER_FRAME: usize = 512;
 const WINDOW_SNAPSHOTS_PER_FRAME: usize = 4;
 const SETTINGS_VIEWPORT_SIZE: [f32; 2] = [380.0, 760.0];
 const SETTINGS_VIEWPORT_MIN_SIZE: [f32; 2] = [340.0, 500.0];
 const AUDIO_UPDATES_PER_FRAME: usize = 32;
 const UI_EVENTS_PER_FRAME: usize = 8;
+const CONTROL_REQUEST_LIMIT: usize = 128;
+const DEBUG_ATTACH_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Clone, Debug)]
 struct ProcessChainEntry {
@@ -212,6 +220,7 @@ enum ActivePane {
 struct App {
     mode: LauncherMode,
     windows: Vec<WindowInfo>,
+    window_icon_cache: HashMap<String, Option<PathBuf>>,
     apps: Vec<AppInfo>,
     pinned_apps: Vec<PathBuf>,
     search_query: String,
@@ -288,6 +297,7 @@ struct App {
     win_scroll_sensitivity: f32,
     last_stale_prune: Option<Instant>,
     filtered_search_cache: Option<FilteredSearchCache>,
+    pending_window_search_refresh_at: Option<Instant>,
     apps_generation: u64,
     windows_generation: u64,
     pinned_apps_generation: u64,
@@ -295,14 +305,15 @@ struct App {
 
 #[derive(Clone, Debug)]
 struct FilteredSearchResults {
-    apps: Vec<(AppInfo, bool)>,
-    windows: Vec<WindowInfo>,
-    app_display_titles: Vec<String>,
-    window_display_titles: Vec<String>,
-    app_highlight_segments: Vec<Vec<(usize, usize, bool)>>,
-    window_highlight_segments: Vec<Vec<(usize, usize, bool)>>,
-    app_title_is_typos: Vec<bool>,
-    window_title_is_typos: Vec<bool>,
+    apps: Arc<Vec<(AppInfo, bool)>>,
+    windows: Arc<Vec<WindowInfo>>,
+    app_display_titles: Arc<Vec<String>>,
+    window_display_titles: Arc<Vec<String>>,
+    app_highlight_segments: Arc<Vec<Vec<(usize, usize, bool)>>>,
+    app_name_highlight_segments: Arc<Vec<Vec<(usize, usize, bool)>>>,
+    window_highlight_segments: Arc<Vec<Vec<(usize, usize, bool)>>>,
+    app_title_is_typos: Arc<Vec<bool>>,
+    window_title_is_typos: Arc<Vec<bool>>,
 }
 
 #[derive(Clone, Debug)]
@@ -428,6 +439,11 @@ OPTIONS
     --theme <THEME>
         Force a specific icon theme (default: automatically detected).
 
+    --diagnose
+        Ask the running launcher to permit a temporary debugger attachment,
+        capture all thread stacks, and write a hang report. This option does
+        not start another launcher instance.
+
 OPERATION
     When launched, the application retrieves a list of all open windows using
     kdotool and installed desktop applications from the local system. It renders
@@ -449,6 +465,9 @@ EXAMPLES
     applicationlauncher --no-close-on-blur
         Launch the application launcher without closing on focus loss.
 
+    applicationlauncher --diagnose
+        Capture a report from a currently running, unresponsive launcher.
+
 FILES
     $HOME/.config/applicationlauncher/config.toml
         Optional configuration file (reserved for future use).
@@ -458,6 +477,12 @@ FILES
 
     $HOME/.config/applicationlauncher/pinned_apps.txt
         Stores absolute paths of pinned desktop applications.
+
+    $XDG_STATE_HOME/applicationlauncher/hang-latest.log
+        Contains the most recently captured hang report.
+
+    $XDG_STATE_HOME/applicationlauncher/panic-latest.log
+        Contains the most recently captured Rust panic and backtrace.
 
 PATHS
     /usr/share/icons
@@ -469,6 +494,10 @@ SECURITY NOTES
     Wayland isolates windows from querying each other directly. This tool relies on
     kdotool, which utilizes internal KWin D-Bus scripting interfaces to securely
     interact with KWin.
+
+    --diagnose temporarily allows another same-user process to attach with ptrace.
+    The permission is revoked after capture and automatically expires after 60
+    seconds if the diagnostic client is interrupted.
 
 EXIT STATUS
     0   Success.
@@ -602,7 +631,7 @@ fn load_launcher_settings() -> LauncherSettings {
                         "win_row_height" => {
                             settings.win_row_height = value
                                 .parse::<f32>()
-                                .map(|v| v.clamp(30.0, 100.0))
+                                .map(|v| v.clamp(12.0, 100.0))
                                 .unwrap_or(settings.win_row_height);
                         }
                         "win_text_spacing" => {
@@ -614,7 +643,7 @@ fn load_launcher_settings() -> LauncherSettings {
                         "win_line_height" => {
                             settings.win_line_height = value
                                 .parse::<f32>()
-                                .map(|v| v.clamp(8.0, 30.0))
+                                .map(|v| v.clamp(6.0, 30.0))
                                 .unwrap_or(settings.win_line_height);
                         }
                         "win_show_path" => {
@@ -634,13 +663,13 @@ fn load_launcher_settings() -> LauncherSettings {
                         "win_title_size" => {
                             settings.win_title_size = value
                                 .parse::<f32>()
-                                .map(|v| v.clamp(8.0, 24.0))
+                                .map(|v| v.clamp(6.0, 24.0))
                                 .unwrap_or(settings.win_title_size);
                         }
                         "win_path_size" => {
                             settings.win_path_size = value
                                 .parse::<f32>()
-                                .map(|v| v.clamp(8.0, 20.0))
+                                .map(|v| v.clamp(6.0, 20.0))
                                 .unwrap_or(settings.win_path_size);
                         }
                         "app_icon_size" => {
@@ -1038,6 +1067,22 @@ fn clean_exec_cmd(exec: &str) -> String {
         cleaned = cleaned.replace(placeholder, "");
     }
     cleaned.trim().to_string()
+}
+
+fn executable_path_from_exec(exec: &str) -> Option<PathBuf> {
+    let command = clean_exec_cmd(exec);
+    let executable = command.split_whitespace().next()?.trim_matches('"');
+    if executable.is_empty() {
+        None
+    } else if executable.contains('/') {
+        Some(PathBuf::from(executable))
+    } else {
+        let path_value = std::env::var_os("PATH")?;
+        std::env::split_paths(&path_value)
+            .map(|directory| directory.join(executable))
+            .find(|path| path.is_file())
+            .or_else(|| Some(PathBuf::from(executable)))
+    }
 }
 
 fn launch_app(exec: &str) {
@@ -1752,6 +1797,51 @@ fn is_braille_spinner_char(ch: char) -> bool {
     ('\u{2800}'..='\u{28ff}').contains(&ch)
 }
 
+fn window_search_metadata_equal(left: &WindowInfo, right: &WindowInfo) -> bool {
+    let titles_match = left.title == right.title
+        || (left.title.len() == right.title.len()
+            && normalize_window_sort_title(&left.title)
+                == normalize_window_sort_title(&right.title));
+    if !titles_match {
+        return false;
+    }
+
+    let without_title = |window: &WindowInfo| {
+        window_search_values(window)
+            .into_iter()
+            .filter(|(priority, _)| *priority != 0)
+            .collect::<Vec<_>>()
+    };
+
+    without_title(left) == without_title(right)
+        && window_grouping_key(left) == window_grouping_key(right)
+        && terminal_window_subgroup_key(left) == terminal_window_subgroup_key(right)
+        && window_sort_title_key(left) == window_sort_title_key(right)
+}
+
+fn refresh_cached_spinner_title(display_title: &mut String, old_title: &str, new_title: &str) {
+    if old_title == new_title || old_title.len() != new_title.len() {
+        return;
+    }
+    let Some(new_spinner) = new_title.chars().find(|ch| is_braille_spinner_char(*ch)) else {
+        return;
+    };
+    if !old_title.chars().any(is_braille_spinner_char) {
+        return;
+    }
+
+    *display_title = display_title
+        .chars()
+        .map(|ch| {
+            if is_braille_spinner_char(ch) {
+                new_spinner
+            } else {
+                ch
+            }
+        })
+        .collect();
+}
+
 fn normalize_window_sort_title(title: &str) -> String {
     let without_spinners: String = title
         .chars()
@@ -2222,6 +2312,15 @@ fn effective_list_row_height(
         .max(text_height + vertical_padding_total)
 }
 
+fn selected_row_accent_size(row_height: f32) -> egui::Vec2 {
+    let row_height = row_height.max(0.0);
+    egui::vec2((row_height * 0.1).min(3.0), (row_height * 0.65).min(28.0))
+}
+
+fn window_search_refresh_deadline(current: Option<Instant>, now: Instant) -> Instant {
+    current.unwrap_or(now + Duration::from_millis(WINDOW_SEARCH_REFRESH_INTERVAL_MS))
+}
+
 fn inset_rect(rect: egui::Rect, left: f32, right: f32, top: f32, bottom: f32) -> egui::Rect {
     egui::Rect::from_min_max(
         egui::pos2(rect.min.x + left, rect.min.y + top),
@@ -2346,7 +2445,13 @@ fn install_panic_hook() {
             panic_entry.push_str("\n==== applicationlauncher panic ====\n");
             panic_entry.push_str(&format!("{:?}\n", std::time::SystemTime::now()));
             panic_entry.push_str(&message);
-            let _ = std::fs::write(&panic_log, panic_entry.as_bytes());
+            if let Ok(mut file) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&panic_log)
+            {
+                let _ = file.write_all(panic_entry.as_bytes());
+            }
             let latest_log = state_dir.join("panic-latest.log");
             let _ = std::fs::write(latest_log, message.as_bytes());
         }
@@ -3596,16 +3701,6 @@ fn highlighted_title_job_from_segments(
     job
 }
 
-fn highlighted_title_job(
-    text: &str,
-    query: &str,
-    font_size: f32,
-    _typo_match: bool,
-) -> egui::text::LayoutJob {
-    let segments = title_highlight_segments(text, query);
-    highlighted_title_job_from_segments(text, font_size, &segments)
-}
-
 fn pick_better_rank(left: SearchRank, right: SearchRank) -> SearchRank {
     if left <= right { left } else { right }
 }
@@ -3631,14 +3726,17 @@ fn visible_match_priority(title: &str, query: &str) -> u8 {
 fn paint_centered_title_job(
     ui: &egui::Ui,
     rect: egui::Rect,
-    query: &str,
     text: &str,
     font_size: f32,
-    typo_match: bool,
+    highlight_segments: &[(usize, usize, bool)],
     fallback_color: egui::Color32,
 ) {
     let galley = ui.ctx().fonts_mut(|fonts| {
-        fonts.layout_job(highlighted_title_job(text, query, font_size, typo_match))
+        fonts.layout_job(highlighted_title_job_from_segments(
+            text,
+            font_size,
+            highlight_segments,
+        ))
     });
     let position = egui::pos2(
         rect.center().x - galley.size().x / 2.0,
@@ -4365,11 +4463,11 @@ fn setup_kwin_window_feed(
 fn window_info_from_kwin_payload(
     payload: KWinWindowPayload,
     theme: &str,
+    icon_cache: &mut HashMap<String, Option<PathBuf>>,
     ppid_to_children: &HashMap<i32, Vec<i32>>,
     pid_to_name: &HashMap<i32, String>,
     pid_to_ppid: &HashMap<i32, i32>,
 ) -> Option<WindowInfo> {
-    let mut icon_cache = HashMap::new();
     let desktop_file_name_value = payload.desktop_file_name.trim().to_string();
     let class = if payload.class.trim().is_empty() {
         desktop_file_name_value.clone()
@@ -4395,7 +4493,7 @@ fn window_info_from_kwin_payload(
         geometry,
         minimized,
         theme,
-        &mut icon_cache,
+        icon_cache,
         ppid_to_children,
         pid_to_name,
         pid_to_ppid,
@@ -4809,6 +4907,7 @@ impl App {
         let mut app = Self {
             mode,
             windows: Vec::new(),
+            window_icon_cache: HashMap::new(),
             apps: Vec::new(),
             pinned_apps,
             search_query: String::new(),
@@ -4889,6 +4988,7 @@ impl App {
             win_scroll_sensitivity: settings.win_scroll_sensitivity,
             last_stale_prune: None,
             filtered_search_cache: None,
+            pending_window_search_refresh_at: None,
             apps_generation: 0,
             windows_generation: 0,
             pinned_apps_generation: 0,
@@ -5330,7 +5430,7 @@ impl App {
                 );
                 let mut row_height = self.win_row_height;
                 if ui
-                    .add(egui::Slider::new(&mut row_height, 30.0..=100.0).show_value(true))
+                    .add(egui::Slider::new(&mut row_height, 12.0..=100.0).show_value(true))
                     .changed()
                 {
                     self.win_row_height = row_height;
@@ -5358,7 +5458,7 @@ impl App {
                 );
                 let mut line_height = self.win_line_height;
                 if ui
-                    .add(egui::Slider::new(&mut line_height, 8.0..=30.0).show_value(true))
+                    .add(egui::Slider::new(&mut line_height, 6.0..=30.0).show_value(true))
                     .changed()
                 {
                     self.win_line_height = line_height;
@@ -5400,12 +5500,12 @@ impl App {
                 ui.end_row();
 
                 ui.label(
-                    egui::RichText::new("Title Size:")
+                    egui::RichText::new("Window Title Font Size:")
                         .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
                 );
                 let mut title_size = self.win_title_size;
                 if ui
-                    .add(egui::Slider::new(&mut title_size, 8.0..=24.0).show_value(true))
+                    .add(egui::Slider::new(&mut title_size, 6.0..=24.0).show_value(true))
                     .changed()
                 {
                     self.win_title_size = title_size;
@@ -5414,12 +5514,12 @@ impl App {
                 ui.end_row();
 
                 ui.label(
-                    egui::RichText::new("Path Size:")
+                    egui::RichText::new("Window Path Font Size:")
                         .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
                 );
                 let mut path_size = self.win_path_size;
                 if ui
-                    .add(egui::Slider::new(&mut path_size, 8.0..=20.0).show_value(true))
+                    .add(egui::Slider::new(&mut path_size, 6.0..=20.0).show_value(true))
                     .changed()
                 {
                     self.win_path_size = path_size;
@@ -5566,6 +5666,17 @@ impl App {
                         .and_then(|path| path.file_name().and_then(|name| name.to_str()))
                         .map(|name| name.to_string())
                         .unwrap_or_else(|| "Unavailable".to_string());
+                    let active_process_exe_path = window_info
+                        .active_process
+                        .as_ref()
+                        .and_then(|_| window_info.process_chain.first())
+                        .and_then(|entry| entry.exe_path.clone());
+                    let active_process_desktop_file = window_info
+                        .active_process
+                        .as_deref()
+                        .and_then(|process| self.desktop_file_path_for_process(process))
+                        .map(|path| path.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Unavailable".to_string());
                     let desktop_file_path = self
                         .desktop_file_path_for_window(&window_info)
                         .map(|path| path.to_string_lossy().to_string())
@@ -5617,10 +5728,10 @@ impl App {
                             info_row(ui, "Application key", app_key.clone(), true);
                             info_row(ui, "Window ID", window_info.id.clone(), false);
                             info_row(ui, "Class", window_info.class.clone(), class_is_searched);
-                            info_row(ui, "Desktop file", desktop_file_path, false);
+                            info_row(ui, "Window desktop file", desktop_file_path, false);
                             info_row(
                                 ui,
-                                "PID",
+                                "Window PID",
                                 window_info
                                     .pid
                                     .map(|pid| pid.to_string())
@@ -5636,15 +5747,30 @@ impl App {
                                     .unwrap_or_else(|| "Unavailable".to_string()),
                                 true,
                             );
-                            info_row(ui, "Executable basename", exe_basename, true);
+                            info_row(ui, "Window executable", exe_basename, true);
                             info_row(
                                 ui,
-                                "Executable path",
+                                "Window executable path",
                                 window_info
                                     .exe_path
                                     .as_ref()
                                     .map(|path| path.to_string_lossy().to_string())
                                     .unwrap_or_else(|| "Unavailable".to_string()),
+                                false,
+                            );
+                            info_row(
+                                ui,
+                                "Active process executable path",
+                                active_process_exe_path
+                                    .as_ref()
+                                    .map(|path| path.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "Unavailable".to_string()),
+                                false,
+                            );
+                            info_row(
+                                ui,
+                                "Active process desktop file",
+                                active_process_desktop_file,
                                 false,
                             );
                             info_row(ui, "Working directory", cwd_search_value, true);
@@ -5780,6 +5906,14 @@ impl App {
                         .to_string();
                     let executable_basename = command_basename(&app_info.exec)
                         .unwrap_or_else(|| "Unavailable".to_string());
+                    let executable_path = executable_path_from_exec(&app_info.exec);
+                    let executable_path_display = executable_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Unavailable".to_string());
+                    let executable_exists =
+                        executable_path.as_ref().is_some_and(|path| path.is_file());
+                    let desktop_file_exists = app_info.desktop_file_path.exists();
                     let icon_path = app_info
                         .icon_path
                         .as_ref()
@@ -5840,11 +5974,24 @@ impl App {
                                     clean_exec_cmd(&app_info.exec),
                                     true,
                                 );
+                                info_row(ui, "Executable path", executable_path_display, false);
+                                info_row(
+                                    ui,
+                                    "Executable exists",
+                                    executable_exists.to_string(),
+                                    false,
+                                );
                                 info_row(ui, "Raw Exec", app_info.exec.clone(), false);
                                 info_row(
                                     ui,
                                     "Desktop file",
                                     app_info.desktop_file_path.to_string_lossy().to_string(),
+                                    false,
+                                );
+                                info_row(
+                                    ui,
+                                    "Desktop file exists",
+                                    desktop_file_exists.to_string(),
                                     false,
                                 );
                                 info_row(ui, "Icon path", icon_path, false);
@@ -5865,15 +6012,73 @@ impl App {
         }
     }
 
+    fn update_cached_windows_without_rerank(&mut self, updates: &[(WindowInfo, WindowInfo)]) {
+        let Some(cache) = self.filtered_search_cache.as_mut() else {
+            return;
+        };
+        let cached_windows = Arc::make_mut(&mut cache.results.windows);
+        let display_titles = Arc::make_mut(&mut cache.results.window_display_titles);
+
+        for (old_window, new_window) in updates {
+            let Some(index) = cached_windows
+                .iter()
+                .position(|window| window.id == new_window.id)
+            else {
+                continue;
+            };
+            if let Some(display_title) = display_titles.get_mut(index) {
+                refresh_cached_spinner_title(display_title, &old_window.title, &new_window.title);
+            }
+            cached_windows[index] = new_window.clone();
+        }
+    }
+
+    fn seed_window_icon_cache(&mut self) {
+        for window in &self.windows {
+            let icon_key = window
+                .active_process
+                .as_ref()
+                .unwrap_or(&window.class)
+                .clone();
+            self.window_icon_cache
+                .entry(icon_key)
+                .or_insert_with(|| window.icon_path.clone());
+        }
+    }
+
+    fn schedule_window_search_refresh(&mut self) {
+        if self.search_query.trim().is_empty() {
+            self.pending_window_search_refresh_at = None;
+            self.windows_generation = self.windows_generation.wrapping_add(1);
+            return;
+        }
+
+        self.pending_window_search_refresh_at = Some(window_search_refresh_deadline(
+            self.pending_window_search_refresh_at,
+            Instant::now(),
+        ));
+    }
+
+    fn flush_pending_window_search_refresh(&mut self) -> bool {
+        if self.pending_window_search_refresh_at.take().is_none() {
+            return false;
+        }
+
+        self.windows_generation = self.windows_generation.wrapping_add(1);
+        true
+    }
+
     fn apply_window_snapshot(&mut self, new_windows: Vec<WindowInfo>) {
         if self.windows.is_empty() {
             self.windows = new_windows;
+            self.seed_window_icon_cache();
             self.missing_window_counts.clear();
             self.windows_generation = self.windows_generation.wrapping_add(1);
             self.refresh_window_audio_cache();
             return;
         }
 
+        let old_windows = self.windows.clone();
         let mut new_by_id: HashMap<String, WindowInfo> = new_windows
             .iter()
             .cloned()
@@ -5886,7 +6091,7 @@ impl App {
             .collect();
         let mut merged = Vec::new();
 
-        for old_window in &self.windows {
+        for old_window in &old_windows {
             if let Some(new_window) = new_by_id.remove(&old_window.id) {
                 self.missing_window_counts.remove(&old_window.id);
                 merged.push(new_window);
@@ -5914,8 +6119,36 @@ impl App {
         let retained_ids: HashSet<String> = merged.iter().map(|window| window.id.clone()).collect();
         self.missing_window_counts
             .retain(|window_id, _| retained_ids.contains(window_id));
+
+        let old_by_id: HashMap<&str, &WindowInfo> = old_windows
+            .iter()
+            .map(|window| (window.id.as_str(), window))
+            .collect();
+        let search_changed = old_windows.len() != merged.len()
+            || merged.iter().any(|window| {
+                old_by_id
+                    .get(window.id.as_str())
+                    .is_none_or(|old| !window_search_metadata_equal(old, window))
+            });
+        let cache_updates = if search_changed {
+            Vec::new()
+        } else {
+            merged
+                .iter()
+                .filter_map(|window| {
+                    old_by_id
+                        .get(window.id.as_str())
+                        .map(|old| ((*old).clone(), window.clone()))
+                })
+                .collect()
+        };
         self.windows = merged;
-        self.windows_generation = self.windows_generation.wrapping_add(1);
+        self.seed_window_icon_cache();
+        if search_changed {
+            self.schedule_window_search_refresh();
+        } else {
+            self.update_cached_windows_without_rerank(&cache_updates);
+        }
     }
 
     fn apply_window_feed_events(&mut self, events: Vec<WindowFeedEvent>) {
@@ -5931,6 +6164,8 @@ impl App {
             .to_string();
         let (ppid_to_children, pid_to_name, pid_to_ppid) = get_process_tree();
         let mut changed = false;
+        let mut search_changed = false;
+        let mut cache_updates = Vec::new();
 
         for event in events {
             match event {
@@ -5939,6 +6174,7 @@ impl App {
                     if let Some(window) = window_info_from_kwin_payload(
                         payload,
                         &theme,
+                        &mut self.window_icon_cache,
                         &ppid_to_children,
                         &pid_to_name,
                         &pid_to_ppid,
@@ -5947,29 +6183,41 @@ impl App {
                         if let Some(existing) =
                             self.windows.iter_mut().find(|item| item.id == window.id)
                         {
-                            *existing = window;
+                            let old_window = existing.clone();
+                            search_changed |= !window_search_metadata_equal(&old_window, &window);
+                            *existing = window.clone();
+                            cache_updates.push((old_window, window));
                         } else {
                             self.windows.push(window);
+                            search_changed = true;
                         }
                         changed = true;
                     } else {
                         self.missing_window_counts.remove(&window_id);
                         let previous_len = self.windows.len();
                         self.windows.retain(|window| window.id != window_id);
-                        changed |= self.windows.len() != previous_len;
+                        let removed = self.windows.len() != previous_len;
+                        changed |= removed;
+                        search_changed |= removed;
                     }
                 }
                 WindowFeedEvent::Remove(id) => {
                     self.missing_window_counts.remove(&id);
                     let previous_len = self.windows.len();
                     self.windows.retain(|window| window.id != id);
-                    changed |= self.windows.len() != previous_len;
+                    let removed = self.windows.len() != previous_len;
+                    changed |= removed;
+                    search_changed |= removed;
                 }
             }
         }
 
         if changed {
-            self.windows_generation = self.windows_generation.wrapping_add(1);
+            if search_changed {
+                self.schedule_window_search_refresh();
+            } else {
+                self.update_cached_windows_without_rerank(&cache_updates);
+            }
             self.refresh_window_audio_cache();
         }
     }
@@ -5999,7 +6247,7 @@ impl App {
             .retain(|window| !stale_ids.contains(&window.id));
         self.missing_window_counts
             .retain(|window_id, _| !stale_ids.contains(window_id));
-        self.windows_generation = self.windows_generation.wrapping_add(1);
+        self.schedule_window_search_refresh();
         self.refresh_window_audio_cache();
 
         if self
@@ -6261,6 +6509,46 @@ impl App {
 
         self.find_app_for_window(win)
             .map(|app| app.desktop_file_path.clone())
+    }
+
+    fn desktop_file_path_for_process(&self, process_name: &str) -> Option<PathBuf> {
+        let process_key = normalize_app_match_key(process_name);
+        if process_key.is_empty() {
+            return None;
+        }
+
+        let matching_app = self
+            .apps
+            .iter()
+            .filter_map(|app| {
+                let exec_matches = command_basename(&app.exec)
+                    .is_some_and(|name| normalize_app_match_key(&name) == process_key);
+                let stem_matches = app
+                    .desktop_file_path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| normalize_app_match_key(stem) == process_key);
+                let name_matches = normalize_app_match_key(&app.name) == process_key;
+                let score = if exec_matches {
+                    0
+                } else if stem_matches {
+                    1
+                } else if name_matches {
+                    2
+                } else {
+                    return None;
+                };
+                Some((score, app))
+            })
+            .min_by_key(|(score, app)| (*score, app.is_settings_module))
+            .map(|(_, app)| app.desktop_file_path.clone());
+
+        matching_app.or_else(|| {
+            let executable_name = Path::new(process_name)
+                .file_name()
+                .and_then(|name| name.to_str())?;
+            resolve_desktop_file_path(&format!("{executable_name}.desktop"))
+        })
     }
 
     fn launch_window_app_and_exit(&self, win: &WindowInfo, ctx: &egui::Context) {
@@ -6535,6 +6823,7 @@ impl eframe::App for App {
                         }
                         LoadResult::WindowsSuccess(windows) => {
                             self.windows = windows;
+                            self.seed_window_icon_cache();
                             self.missing_window_counts.clear();
                             self.windows_generation = self.windows_generation.wrapping_add(1);
                             self.refresh_window_audio_cache();
@@ -6584,6 +6873,17 @@ impl eframe::App for App {
 
         if !handled_focus_launcher {
             self.prune_stale_windows();
+        }
+
+        if let Some(deadline) = self.pending_window_search_refresh_at {
+            let now = Instant::now();
+            if self.search_query.trim().is_empty() || now >= deadline {
+                if self.flush_pending_window_search_refresh() {
+                    ctx.request_repaint();
+                }
+            } else {
+                ctx.request_repaint_after(deadline.saturating_duration_since(now));
+            }
         }
 
         // Focus loss auto-close
@@ -6710,21 +7010,27 @@ impl eframe::App for App {
                         }
                     }
 
+                    if search_query_changed && self.flush_pending_window_search_refresh() {
+                        ctx.request_repaint();
+                    }
+
                     ui.add_space(10.0);
 
 	                    // 2. Filtering list
-	                    let mut filtered_apps: Vec<(AppInfo, bool)> = Vec::new();
-	                    let mut filtered_windows: Vec<WindowInfo> = Vec::new();
-                        let mut filtered_app_display_titles: Vec<String> = Vec::new();
-                        let mut filtered_window_display_titles: Vec<String> = Vec::new();
-                        let mut filtered_app_highlight_segments: Vec<Vec<(usize, usize, bool)>> =
-                            Vec::new();
-                        let mut filtered_window_highlight_segments: Vec<Vec<(usize, usize, bool)>> =
-                            Vec::new();
+	                    let mut filtered_apps: Arc<Vec<(AppInfo, bool)>> = Arc::new(Vec::new());
+	                    let mut filtered_windows: Arc<Vec<WindowInfo>> = Arc::new(Vec::new());
+                        let mut filtered_app_display_titles: Arc<Vec<String>> = Arc::new(Vec::new());
+                        let mut filtered_window_display_titles: Arc<Vec<String>> = Arc::new(Vec::new());
+	                        let mut filtered_app_highlight_segments: Arc<Vec<Vec<(usize, usize, bool)>>> =
+	                            Arc::new(Vec::new());
+	                        let mut filtered_app_name_highlight_segments: Arc<Vec<Vec<(usize, usize, bool)>>> =
+	                            Arc::new(Vec::new());
+	                        let mut filtered_window_highlight_segments: Arc<Vec<Vec<(usize, usize, bool)>>> =
+                            Arc::new(Vec::new());
                         let search_query = self.search_query.trim().to_string();
                         let has_search_query = !search_query.is_empty();
-                        let mut filtered_app_title_is_typos: Vec<bool> = Vec::new();
-                        let mut filtered_window_title_is_typos: Vec<bool> = Vec::new();
+	                    let mut filtered_app_title_is_typos: Arc<Vec<bool>> = Arc::new(Vec::new());
+	                    let mut filtered_window_title_is_typos: Arc<Vec<bool>> = Arc::new(Vec::new());
                         let filter_cache_key = has_search_query.then(|| {
                             filtered_search_cache_key(
                                 self.mode,
@@ -6741,31 +7047,33 @@ impl eframe::App for App {
                                 .as_ref()
                                 .filter(|cache| cache.key == *cache_key)
                         }) {
-                            filtered_apps = cache.results.apps.clone();
-                            filtered_windows = cache.results.windows.clone();
-                            filtered_app_display_titles = cache.results.app_display_titles.clone();
+	                            filtered_apps = Arc::clone(&cache.results.apps);
+	                            filtered_windows = Arc::clone(&cache.results.windows);
+                            filtered_app_display_titles = Arc::clone(&cache.results.app_display_titles);
                             filtered_window_display_titles =
-                                cache.results.window_display_titles.clone();
-                            filtered_app_highlight_segments =
-                                cache.results.app_highlight_segments.clone();
-                            filtered_window_highlight_segments =
-                                cache.results.window_highlight_segments.clone();
-                            filtered_app_title_is_typos = cache.results.app_title_is_typos.clone();
+                                Arc::clone(&cache.results.window_display_titles);
+	                            filtered_app_highlight_segments =
+	                                Arc::clone(&cache.results.app_highlight_segments);
+	                            filtered_app_name_highlight_segments =
+	                                Arc::clone(&cache.results.app_name_highlight_segments);
+	                            filtered_window_highlight_segments =
+                                Arc::clone(&cache.results.window_highlight_segments);
+                            filtered_app_title_is_typos = Arc::clone(&cache.results.app_title_is_typos);
                             filtered_window_title_is_typos =
-                                cache.results.window_title_is_typos.clone();
+                                Arc::clone(&cache.results.window_title_is_typos);
                         } else {
 		                    match self.mode {
 	                        LauncherMode::Apps => {
 		                            if !has_search_query {
-	                                filtered_apps = self.apps
+	                                filtered_apps = Arc::new(self.apps
                                     .iter()
                                     .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
                                     .map(|app| {
                                         let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
                                         (app.clone(), is_pinned)
                                     })
-                                    .collect();
-		                                filtered_apps.sort_by(|a, b| {
+                                    .collect());
+	                                Arc::make_mut(&mut filtered_apps).sort_by(|a, b| {
                                     a.0.is_settings_module
                                         .cmp(&b.0.is_settings_module)
                                         .then_with(|| match (a.1, b.1) {
@@ -6850,34 +7158,38 @@ impl eframe::App for App {
 		                                        )
 		                                    },
 		                                );
-                                        filtered_app_title_is_typos = ranked_apps
+                                        filtered_app_title_is_typos = Arc::new(ranked_apps
                                             .iter()
                                             .map(|item| item.title_is_typo)
-                                            .collect();
-                                        filtered_app_display_titles = ranked_apps
+                                            .collect());
+                                        filtered_app_display_titles = Arc::new(ranked_apps
                                             .iter()
                                             .map(|item| item.display_title.clone())
-                                            .collect();
-                                        filtered_app_highlight_segments = ranked_apps
+                                            .collect());
+                                        filtered_app_highlight_segments = Arc::new(ranked_apps
                                             .iter()
                                             .map(|item| item.highlight_segments.clone())
-                                            .collect();
-			                                filtered_apps = ranked_apps
-		                                    .into_iter()
-		                                    .map(|item| (item.app, item.is_pinned))
-	                                    .collect();
+                                            .collect());
+	                                    filtered_app_name_highlight_segments = Arc::new(ranked_apps
+	                                        .iter()
+	                                        .map(|item| title_highlight_segments(&item.app.name, &search_query))
+	                                        .collect());
+	                                filtered_apps = Arc::new(ranked_apps
+                                    .into_iter()
+                                    .map(|item| (item.app, item.is_pinned))
+                                    .collect());
 	                            } else {
-                                    filtered_apps.clear();
+	                                    filtered_apps = Arc::new(Vec::new());
                                 }
 	                        }
 		                        LauncherMode::Windows => {
 		                            if !has_search_query {
-	                                filtered_windows = self.windows.clone();
+	                                filtered_windows = Arc::new(self.windows.clone());
 	                                let mut app_window_counts: HashMap<String, usize> =
 	                                    HashMap::new();
 	                                let mut terminal_subgroup_counts: HashMap<String, usize> =
 	                                    HashMap::new();
-	                                for win in &filtered_windows {
+	                                for win in filtered_windows.iter() {
 	                                    *app_window_counts
 	                                        .entry(window_grouping_key(win))
 	                                        .or_default() += 1;
@@ -6887,7 +7199,7 @@ impl eframe::App for App {
 	                                            .or_default() += 1;
 	                                    }
 	                                }
-				                                filtered_windows.sort_by(|a, b| {
+	                                Arc::make_mut(&mut filtered_windows).sort_by(|a, b| {
 	                                    let app_key_a = window_grouping_key(a);
 	                                    let app_key_b = window_grouping_key(b);
 	                                    let count_a =
@@ -6989,37 +7301,38 @@ impl eframe::App for App {
 		                                        )
 		                                    },
 		                                );
-                                        filtered_window_title_is_typos = ranked_windows
+                                        filtered_window_title_is_typos = Arc::new(ranked_windows
                                             .iter()
                                             .map(|item| item.title_is_typo)
-                                            .collect();
-                                        filtered_window_display_titles = ranked_windows
+                                            .collect());
+                                        filtered_window_display_titles = Arc::new(ranked_windows
                                             .iter()
                                             .map(|item| item.display_title.clone())
-                                            .collect();
-                                        filtered_window_highlight_segments = ranked_windows
+                                            .collect());
+                                        filtered_window_highlight_segments = Arc::new(ranked_windows
                                             .iter()
                                             .map(|item| item.highlight_segments.clone())
-                                            .collect();
-			                                filtered_windows =
-		                                    ranked_windows.into_iter().map(|item| item.window).collect();
+                                            .collect());
+	                                filtered_windows = Arc::new(
+	                                    ranked_windows.into_iter().map(|item| item.window).collect(),
+                                );
 	                            } else {
-                                    filtered_windows.clear();
+	                                    filtered_windows = Arc::new(Vec::new());
                                 }
 	                        }
 	                    }
 
 		                    if self.mode == LauncherMode::Windows {
 		                        if !has_search_query {
-		                            filtered_apps = self.apps
-	                                .iter()
-	                                .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
-	                                .map(|app| {
-	                                    let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
-	                                    (app.clone(), is_pinned)
-	                                })
-	                                .collect();
-			                            filtered_apps.sort_by(|a, b| {
+	                            filtered_apps = Arc::new(self.apps
+                                .iter()
+                                .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
+                                .map(|app| {
+                                    let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
+                                    (app.clone(), is_pinned)
+                                })
+                                .collect());
+	                            Arc::make_mut(&mut filtered_apps).sort_by(|a, b| {
 		                                a.0.is_settings_module
 		                                    .cmp(&b.0.is_settings_module)
 		                                    .then_with(|| match (a.1, b.1) {
@@ -7104,24 +7417,28 @@ impl eframe::App for App {
 			                                    )
 			                                },
 			                            );
-	                                    filtered_app_title_is_typos = ranked_apps
+	                                    filtered_app_title_is_typos = Arc::new(ranked_apps
+                                        .iter()
+                                        .map(|item| item.title_is_typo)
+                                        .collect());
+                                    filtered_app_display_titles = Arc::new(ranked_apps
+                                        .iter()
+                                        .map(|item| item.display_title.clone())
+                                        .collect());
+	                                    filtered_app_highlight_segments = Arc::new(ranked_apps
 	                                        .iter()
-	                                        .map(|item| item.title_is_typo)
-	                                        .collect();
-                                        filtered_app_display_titles = ranked_apps
-                                            .iter()
-                                            .map(|item| item.display_title.clone())
-                                            .collect();
-                                        filtered_app_highlight_segments = ranked_apps
-                                            .iter()
-                                            .map(|item| item.highlight_segments.clone())
-                                            .collect();
-			                            filtered_apps = ranked_apps
-		                                .into_iter()
-		                                .map(|item| (item.app, item.is_pinned))
-	                                .collect();
+	                                        .map(|item| item.highlight_segments.clone())
+	                                        .collect());
+	                                filtered_app_name_highlight_segments = Arc::new(ranked_apps
+	                                    .iter()
+	                                    .map(|item| title_highlight_segments(&item.app.name, &search_query))
+	                                    .collect());
+	                            filtered_apps = Arc::new(ranked_apps
+                                .into_iter()
+                                .map(|item| (item.app, item.is_pinned))
+                                .collect());
 		                        } else {
-	                                filtered_apps.clear();
+	                                filtered_apps = Arc::new(Vec::new());
 	                            }
 		                    }
 
@@ -7129,18 +7446,15 @@ impl eframe::App for App {
                                 self.filtered_search_cache = Some(FilteredSearchCache {
                                     key: cache_key,
                                     results: FilteredSearchResults {
-                                        apps: filtered_apps.clone(),
-                                        windows: filtered_windows.clone(),
-                                        app_display_titles: filtered_app_display_titles.clone(),
-                                        window_display_titles: filtered_window_display_titles
-                                            .clone(),
-                                        app_highlight_segments: filtered_app_highlight_segments
-                                            .clone(),
-                                        window_highlight_segments:
-                                            filtered_window_highlight_segments.clone(),
-                                        app_title_is_typos: filtered_app_title_is_typos.clone(),
-                                        window_title_is_typos: filtered_window_title_is_typos
-                                            .clone(),
+                                        apps: Arc::clone(&filtered_apps),
+                                        windows: Arc::clone(&filtered_windows),
+                                        app_display_titles: Arc::clone(&filtered_app_display_titles),
+                                        window_display_titles: Arc::clone(&filtered_window_display_titles),
+                                        app_highlight_segments: Arc::clone(&filtered_app_highlight_segments),
+                                        app_name_highlight_segments: Arc::clone(&filtered_app_name_highlight_segments),
+                                        window_highlight_segments: Arc::clone(&filtered_window_highlight_segments),
+                                        app_title_is_typos: Arc::clone(&filtered_app_title_is_typos),
+                                        window_title_is_typos: Arc::clone(&filtered_window_title_is_typos),
                                     },
                                 });
                             } else {
@@ -7190,7 +7504,7 @@ impl eframe::App for App {
                         == LauncherMode::Windows
                     {
                         let mut counts = HashMap::new();
-                        for window in &filtered_windows {
+                        for window in filtered_windows.iter() {
                             if let Some(key) = duplicate_window_group_key(window) {
                                 *counts.entry(key).or_insert(0) += 1;
                             }
@@ -7751,17 +8065,15 @@ impl eframe::App for App {
 
                                         if self.app_icon_show_name {
                                             let label = truncate_tile_label(&app.name, tile_size);
-                                            let title_is_typo = filtered_app_title_is_typos
-                                                .get(index)
-                                                .copied()
-                                                .unwrap_or(false);
                                             paint_centered_title_job(
                                                 ui,
                                                 label_rect,
-                                                &search_query,
                                                 &label,
                                                 self.app_icon_name_size,
-                                                title_is_typo,
+                                                filtered_app_name_highlight_segments
+                                                    .get(index)
+                                                    .map(Vec::as_slice)
+                                                    .unwrap_or(&[]),
                                                 egui::Color32::from_rgba_unmultiplied(
                                                     255,
                                                     255,
@@ -7877,13 +8189,14 @@ impl eframe::App for App {
 
                                     // Premium left accent highlight bar
                                     if is_selected {
-                                        let accent_rect = egui::Rect::from_min_size(
+                                        let accent_size =
+                                            selected_row_accent_size(row_visual_rect.height());
+                                        let accent_rect = egui::Rect::from_center_size(
                                             egui::pos2(
-                                                row_visual_rect.min.x + 2.0,
-                                                row_visual_rect.min.y
-                                                    + (row_visual_rect.height() - 28.0) / 2.0,
+                                                row_visual_rect.min.x + 2.0 + accent_size.x / 2.0,
+                                                row_visual_rect.center().y,
                                             ),
-                                            egui::vec2(3.0, 28.0),
+                                            accent_size,
                                         );
                                         ui.painter().rect_filled(
                                             accent_rect,
@@ -7941,10 +8254,10 @@ impl eframe::App for App {
 
                                             child_ui.add_space(10.0);
 
-			                                            let display_title = filtered_app_display_titles
-			                                                .get(index)
-			                                                .cloned()
-			                                                .unwrap_or_else(|| app.name.clone());
+	                                            let display_title = filtered_app_display_titles
+	                                                .get(index)
+	                                                .map(String::as_str)
+	                                                .unwrap_or(&app.name);
 			                                            let show_search_metadata =
 			                                                !search_query.trim().is_empty();
 			                                            let mut label_clicked = false;
@@ -8175,10 +8488,10 @@ impl eframe::App for App {
 
                                             child_ui.add_space(10.0);
 
-		                                            let display_title = filtered_window_display_titles
-		                                                .get(index)
-		                                                .cloned()
-		                                                .unwrap_or_else(|| truncate_chars(&win.title, 65));
+                                            let display_title = filtered_window_display_titles
+                                                .get(index)
+                                                .map(String::as_str)
+                                                .unwrap_or(win.title.as_str());
 		                                            let show_search_metadata =
 		                                                !search_query.trim().is_empty();
                                                 let _title_is_typo = filtered_window_title_is_typos
@@ -8747,18 +9060,15 @@ impl eframe::App for App {
                                                             if self.app_icon_show_name {
                                                                 let label =
                                                                     truncate_tile_label(&app.name, tile_size);
-                                                            let title_is_typo =
-                                                                filtered_app_title_is_typos
-                                                                    .get(index)
-                                                                    .copied()
-                                                                        .unwrap_or(false);
                                                                 paint_centered_title_job(
                                                                     ui,
                                                                     label_rect,
-                                                                    &search_query,
                                                                     &label,
                                                                     self.app_icon_name_size,
-                                                                    title_is_typo,
+                                                                    filtered_app_name_highlight_segments
+                                                                        .get(index)
+                                                                        .map(Vec::as_slice)
+                                                                        .unwrap_or(&[]),
                                                                     egui::Color32::from_rgba_unmultiplied(
                                                                         255, 255, 255, 210,
                                                                     ),
@@ -8889,10 +9199,10 @@ impl eframe::App for App {
                                                             );
                                                         child_ui.add_space(10.0);
 
-		                                                        let display_title = filtered_app_display_titles
-		                                                            .get(index)
-		                                                            .cloned()
-		                                                            .unwrap_or_else(|| app.name.clone());
+	                                                        let display_title = filtered_app_display_titles
+	                                                            .get(index)
+	                                                            .map(String::as_str)
+	                                                            .unwrap_or(&app.name);
 		                                                        let show_search_metadata =
 		                                                            !search_query.trim().is_empty();
 		                                                        let mut label_clicked = false;
@@ -9089,6 +9399,187 @@ struct SingleInstanceLock {
 impl Drop for SingleInstanceLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_debugger_attach_enabled(enabled: bool) -> Result<(), String> {
+    use rustix::process::{PTracer, set_ptracer};
+
+    let tracer = if enabled { PTracer::Any } else { PTracer::None };
+    set_ptracer(tracer).map_err(|err| format!("failed to update ptrace permission: {err}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_debugger_attach_enabled(_enabled: bool) -> Result<(), String> {
+    Err("on-demand debugger attachment is only supported on Linux".to_string())
+}
+
+fn send_launcher_control_request(
+    socket_path: &Path,
+    request: &str,
+    wait_for_response: bool,
+) -> Result<String, String> {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket_path)
+        .map_err(|err| format!("failed to connect to the running launcher: {err}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|err| format!("failed to configure launcher control socket: {err}"))?;
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| format!("failed to send launcher control request: {err}"))?;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+
+    if !wait_for_response {
+        return Ok(String::new());
+    }
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|err| format!("failed to read launcher control response: {err}"))?;
+    Ok(response.trim().to_string())
+}
+
+fn capture_running_launcher_diagnostics(socket_path: &Path) -> Result<PathBuf, String> {
+    let response = send_launcher_control_request(socket_path, "diagnose\n", true)?;
+    let pid = response
+        .strip_prefix("debug-ready ")
+        .ok_or_else(|| {
+            if response.is_empty() {
+                "the running launcher did not support diagnostic attachment".to_string()
+            } else {
+                response.clone()
+            }
+        })?
+        .parse::<u32>()
+        .map_err(|err| format!("invalid launcher PID in diagnostic response: {err}"))?;
+
+    let result = (|| {
+        let state_dir = launcher_state_dir();
+        std::fs::create_dir_all(&state_dir)
+            .map_err(|err| format!("failed to create launcher state directory: {err}"))?;
+
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .unwrap_or_else(|err| format!("unable to read process status: {err}\n"));
+        let thread_snapshot = Command::new("ps")
+            .args([
+                "-L",
+                "-p",
+                &pid.to_string(),
+                "-o",
+                "pid=,tid=,psr=,stat=,pcpu=,time=,wchan:32=,comm=",
+            ])
+            .output();
+        let stack_output = Command::new("timeout")
+            .args(["5s", "eu-stack", "-p", &pid.to_string(), "-n", "48", "-s"])
+            .output();
+        let stack_output = match stack_output {
+            Ok(output) if output.status.success() || !output.stdout.is_empty() => Ok(output),
+            _ => Command::new("timeout")
+                .env("DEBUGINFOD_URLS", "")
+                .args([
+                    "10s",
+                    "gdb",
+                    "-q",
+                    "-batch",
+                    "-iex",
+                    "set pagination off",
+                    "-iex",
+                    "set debuginfod enabled off",
+                    "-ex",
+                    "set print thread-events off",
+                    "-ex",
+                    "info threads",
+                    "-ex",
+                    "thread apply all bt 40",
+                    &format!("/proc/{pid}/exe"),
+                    "-p",
+                    &pid.to_string(),
+                ])
+                .output(),
+        };
+
+        let mut report = String::new();
+        report.push_str("==== applicationlauncher hang report ====\n");
+        report.push_str(&format!(
+            "captured: {:?}\npid: {pid}\n\n",
+            std::time::SystemTime::now()
+        ));
+        report.push_str("---- /proc status ----\n");
+        report.push_str(&status);
+        report.push_str("\n---- thread snapshot ----\n");
+        match thread_snapshot {
+            Ok(output) => {
+                report.push_str(&String::from_utf8_lossy(&output.stdout));
+                report.push_str(&String::from_utf8_lossy(&output.stderr));
+            }
+            Err(err) => report.push_str(&format!("failed to run ps: {err}\n")),
+        }
+        report.push_str("\n---- all-thread backtrace ----\n");
+        match stack_output {
+            Ok(output) => {
+                report.push_str(&format!("exit status: {}\n", output.status));
+                report.push_str(&String::from_utf8_lossy(&output.stdout));
+                report.push_str(&String::from_utf8_lossy(&output.stderr));
+            }
+            Err(err) => report.push_str(&format!("failed to capture thread stacks: {err}\n")),
+        }
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let report_path = state_dir.join(format!("hang-{timestamp}.log"));
+        std::fs::write(&report_path, report.as_bytes())
+            .map_err(|err| format!("failed to write hang report: {err}"))?;
+        std::fs::write(state_dir.join("hang-latest.log"), report.as_bytes())
+            .map_err(|err| format!("failed to write latest hang report: {err}"))?;
+        Ok(report_path)
+    })();
+
+    let _ = send_launcher_control_request(socket_path, "diagnose-done\n", true);
+    result
+}
+
+fn handle_launcher_control_connection(
+    mut stream: std::os::unix::net::UnixStream,
+    ui_event_tx: &Sender<UiEvent>,
+    repaint_ctx: &egui::Context,
+) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+    let mut request = [0_u8; CONTROL_REQUEST_LIMIT];
+    let request_len = stream.read(&mut request).unwrap_or(0);
+    let request = std::str::from_utf8(&request[..request_len])
+        .unwrap_or_default()
+        .trim();
+
+    match request {
+        "diagnose" => {
+            let response = match set_debugger_attach_enabled(true) {
+                Ok(()) => {
+                    std::thread::spawn(|| {
+                        std::thread::sleep(Duration::from_secs(DEBUG_ATTACH_TIMEOUT_SECS));
+                        let _ = set_debugger_attach_enabled(false);
+                    });
+                    format!("debug-ready {}\n", std::process::id())
+                }
+                Err(err) => format!("debug-error {err}\n"),
+            };
+            let _ = stream.write_all(response.as_bytes());
+        }
+        "diagnose-done" => {
+            let response = match set_debugger_attach_enabled(false) {
+                Ok(()) => "debug-disabled\n".to_string(),
+                Err(err) => format!("debug-error {err}\n"),
+            };
+            let _ = stream.write_all(response.as_bytes());
+        }
+        _ => {
+            let _ = ui_event_tx.send(UiEvent::FocusLauncher);
+            repaint_ctx.request_repaint();
+            let _ = stream.write_all(b"focus-requested\n");
+        }
     }
 }
 
@@ -9296,6 +9787,91 @@ fn get_monitors() -> Vec<MonitorInfo> {
 mod tests {
     use super::*;
 
+    fn test_window_info(title: &str) -> WindowInfo {
+        WindowInfo {
+            id: "test-window".to_string(),
+            title: title.to_string(),
+            class: "xfce4-terminal".to_string(),
+            desktop_file_name: Some("xfce4-terminal.desktop".to_string()),
+            minimized: Some(false),
+            demands_attention: false,
+            icon_path: None,
+            active_process: Some("codex".to_string()),
+            exe_path: Some(PathBuf::from("/usr/bin/xfce4-terminal")),
+            cwd_path: Some(PathBuf::from("/home/lewis/Dev/applicationlauncher")),
+            command_line: Some("codex resume".to_string()),
+            command_summary: Some("codex resume".to_string()),
+            geometry: Some((0, 0, 800, 600)),
+            process_chain: Vec::new(),
+            pid: Some(1234),
+        }
+    }
+
+    #[test]
+    fn spinner_and_geometry_updates_do_not_invalidate_window_search() {
+        let old = test_window_info("codex - ⠇ applicationlauncher - Terminal");
+        let mut new = test_window_info("codex - ⠧ applicationlauncher - Terminal");
+        new.geometry = Some((100, 80, 1200, 900));
+        new.minimized = Some(true);
+        new.demands_attention = true;
+
+        assert!(window_search_metadata_equal(&old, &new));
+    }
+
+    #[test]
+    fn searchable_window_changes_still_invalidate_search() {
+        let old = test_window_info("codex - ⠇ applicationlauncher - Terminal");
+        let renamed = test_window_info("codex - ⠧ fuzzy-rank - Terminal");
+        let mut changed_process = old.clone();
+        changed_process.active_process = Some("htop".to_string());
+
+        assert!(!window_search_metadata_equal(&old, &renamed));
+        assert!(!window_search_metadata_equal(&old, &changed_process));
+    }
+
+    #[test]
+    fn repeated_window_changes_do_not_extend_search_refresh_deadline() {
+        let now = Instant::now();
+        let first_deadline = window_search_refresh_deadline(None, now);
+        let later_event = now + Duration::from_millis(50);
+
+        assert_eq!(
+            first_deadline,
+            now + Duration::from_millis(WINDOW_SEARCH_REFRESH_INTERVAL_MS)
+        );
+        assert_eq!(
+            window_search_refresh_deadline(Some(first_deadline), later_event),
+            first_deadline
+        );
+    }
+
+    #[test]
+    fn unicode_window_title_is_safe_in_typo_visibility_check() {
+        let title = "videos — pcmanfm | pcmanfm | /usr/bin/pcmanfm | ~";
+
+        assert!(!visible_title_has_typo_match(title, "mp"));
+    }
+
+    #[test]
+    fn row_height_can_be_configured_below_thirty_when_content_fits() {
+        assert_eq!(
+            effective_list_row_height(18.0, 14.0, 2.0, 8.0, 0.0, false),
+            18.0
+        );
+        assert_eq!(
+            effective_list_row_height(12.0, 14.0, 4.0, 8.0, 0.0, false),
+            18.0
+        );
+    }
+
+    #[test]
+    fn selection_accent_scales_with_compact_rows() {
+        let compact = selected_row_accent_size(12.0);
+        assert!(compact.x < 3.0);
+        assert!(compact.y < 12.0);
+        assert_eq!(selected_row_accent_size(52.0), egui::vec2(3.0, 28.0));
+    }
+
     #[test]
     fn codex_code_mode_uses_codex_terminal_title() {
         assert_eq!(terminal_primary_title("codex-code-mode", None), "codex");
@@ -9479,15 +10055,33 @@ fn main() -> eframe::Result {
     }
 
     let mode = LauncherMode::Windows;
+    let diagnose_requested = args.iter().any(|arg| arg == "--diagnose");
 
     // Single instance check using Unix domain socket
     let socket_path = get_socket_path(mode);
     if socket_path.exists() {
-        if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+        if diagnose_requested {
+            match capture_running_launcher_diagnostics(&socket_path) {
+                Ok(path) => {
+                    println!("Hang report written to {}", path.display());
+                    return Ok(());
+                }
+                Err(err) => {
+                    eprintln!("Diagnostic capture failed: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        if send_launcher_control_request(&socket_path, "focus\n", false).is_ok() {
             focus_existing_launcher_window();
             return Ok(());
         }
         let _ = std::fs::remove_file(&socket_path);
+    }
+
+    if diagnose_requested {
+        eprintln!("Diagnostic capture failed: no running launcher was found");
+        std::process::exit(1);
     }
 
     let listener = match std::os::unix::net::UnixListener::bind(&socket_path) {
@@ -9554,9 +10148,8 @@ fn main() -> eframe::Result {
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     match stream {
-                        Ok(_) => {
-                            let _ = ui_event_tx.send(UiEvent::FocusLauncher);
-                            repaint_ctx.request_repaint();
+                        Ok(stream) => {
+                            handle_launcher_control_connection(stream, &ui_event_tx, &repaint_ctx)
                         }
                         Err(_) => break,
                     }
