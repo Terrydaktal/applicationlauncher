@@ -2935,11 +2935,16 @@ fn push_unique_terminal_segment(segments: &mut Vec<String>, value: impl Into<Str
     }
 
     let key = normalize_app_match_key(trimmed);
-    if key.is_empty()
-        || segments
+    let already_present = if key.is_empty() {
+        segments
+            .iter()
+            .any(|existing| existing.trim().eq_ignore_ascii_case(trimmed))
+    } else {
+        segments
             .iter()
             .any(|existing| normalize_app_match_key(existing) == key)
-    {
+    };
+    if already_present {
         return;
     }
 
@@ -2954,12 +2959,31 @@ fn is_generic_terminal_process(proc_name: &str) -> bool {
 }
 
 fn terminal_process_display_name(proc_name: &str) -> &str {
-    let normalized = normalize_app_match_key(proc_name);
-    if normalized == "codex" || normalized.starts_with("codexcodemode") {
+    if is_codex_process(proc_name) {
         "codex"
     } else {
         proc_name.trim()
     }
+}
+
+fn is_codex_process(proc_name: &str) -> bool {
+    let normalized = normalize_app_match_key(proc_name);
+    normalized == "codex" || normalized.starts_with("codexcodemode")
+}
+
+fn terminal_parent_program(
+    proc_name: &str,
+    process_chain: &[ProcessChainEntry],
+) -> Option<&'static str> {
+    if is_codex_process(proc_name) {
+        return None;
+    }
+
+    process_chain
+        .iter()
+        .skip(1)
+        .any(|entry| is_codex_process(&entry.name))
+        .then_some("codex")
 }
 
 fn terminal_primary_title(proc_name: &str, command_summary: Option<&str>) -> String {
@@ -2992,6 +3016,15 @@ fn terminal_context_looks_path_like(value: &str) -> bool {
 
 fn strip_leading_braille_spinner(value: &str) -> &str {
     value.trim_start_matches(|ch: char| is_braille_spinner_char(ch) || ch.is_whitespace())
+}
+
+fn terminal_segment_has_labeled_spinner(value: &str) -> bool {
+    value
+        .trim_start()
+        .chars()
+        .next()
+        .is_some_and(is_braille_spinner_char)
+        && !terminal_context_looks_path_like(strip_leading_braille_spinner(value))
 }
 
 fn terminal_path_basename(value: &str) -> Option<&str> {
@@ -3029,14 +3062,21 @@ fn terminal_title_segments(
     proc_name: &str,
     command_summary: Option<&str>,
     cwd: Option<&str>,
+    parent_program: Option<&str>,
 ) -> Vec<String> {
     let dynamic_title = dynamic_title.trim();
     let mut segments = Vec::new();
     let primary_title = terminal_primary_title(proc_name, command_summary);
-    push_unique_terminal_segment(&mut segments, primary_title.clone());
+    if let Some(parent_program) = parent_program {
+        push_unique_terminal_segment(&mut segments, parent_program);
+        push_unique_terminal_segment(&mut segments, terminal_process_display_name(proc_name));
+    } else {
+        push_unique_terminal_segment(&mut segments, primary_title.clone());
+    }
 
     let primary_key = normalize_app_match_key(&primary_title);
     let proc_key = normalize_app_match_key(proc_name);
+    let parent_key = parent_program.map(normalize_app_match_key);
     let cwd = cwd.map(str::trim).filter(|value| !value.is_empty());
     let cwd_key = cwd.map(normalize_app_match_key);
     let separators = [" - ", " — ", " – ", " : ", " | "];
@@ -3069,12 +3109,22 @@ fn terminal_title_segments(
             continue;
         }
 
-        if cwd.is_some_and(|cwd| terminal_segment_matches_cwd_basename(part, cwd)) {
+        if let Some(cwd) = cwd.filter(|cwd| terminal_segment_matches_cwd_basename(part, cwd)) {
+            if terminal_segment_has_labeled_spinner(part) {
+                push_unique_terminal_segment(&mut segments, part);
+            } else {
+                push_unique_terminal_segment(&mut segments, cwd);
+                has_cwd_segment = true;
+            }
             continue;
         }
 
         let part_key = normalize_app_match_key(part);
-        if part_key.is_empty() || part_key == primary_key || part_key == proc_key {
+        if part_key.is_empty()
+            || part_key == primary_key
+            || part_key == proc_key
+            || parent_key.as_ref().is_some_and(|key| *key == part_key)
+        {
             continue;
         }
 
@@ -3087,7 +3137,10 @@ fn terminal_title_segments(
 
     if let Some(cwd) = cwd {
         if !has_cwd_segment {
-            let cwd_context = if dynamic_title.is_empty() {
+            let cwd_context = if dynamic_title.is_empty()
+                || parent_program.is_some()
+                || !terminal_context_looks_path_like(dynamic_title)
+            {
                 cwd.to_string()
             } else {
                 replace_terminal_suffix_path(dynamic_title, cwd)
@@ -3105,6 +3158,7 @@ fn terminal_display_title(
     proc_name: &str,
     command_summary: Option<&str>,
     cwd: Option<&str>,
+    parent_program: Option<&str>,
 ) -> String {
     let separators = [" - ", " — ", " – ", " : ", " | "];
 
@@ -3119,7 +3173,14 @@ fn terminal_display_title(
             .is_some_and(|part| is_terminal_title_marker(part))
         {
             let suffix = parts[1..].join(sep);
-            return terminal_title_segments(&suffix, proc_name, command_summary, cwd).join(sep);
+            return terminal_title_segments(
+                &suffix,
+                proc_name,
+                command_summary,
+                cwd,
+                parent_program,
+            )
+            .join(sep);
         }
 
         if parts
@@ -3127,11 +3188,18 @@ fn terminal_display_title(
             .is_some_and(|part| is_terminal_title_marker(part))
         {
             let suffix = parts[..parts.len() - 1].join(sep);
-            return terminal_title_segments(&suffix, proc_name, command_summary, cwd).join(sep);
+            return terminal_title_segments(
+                &suffix,
+                proc_name,
+                command_summary,
+                cwd,
+                parent_program,
+            )
+            .join(sep);
         }
     }
 
-    terminal_title_segments(raw_title, proc_name, command_summary, cwd).join(" - ")
+    terminal_title_segments(raw_title, proc_name, command_summary, cwd, parent_program).join(" - ")
 }
 
 fn normalize_terminal_title_marker_position(raw_title: &str) -> String {
@@ -4032,7 +4100,18 @@ fn resolve_desktop_file_path(desktop_file_name: &str) -> Option<PathBuf> {
 
     None
 }
-fn parse_proc_stat(stat_content: &str) -> Option<(i32, String, i32)> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProcessStat {
+    pid: i32,
+    name: String,
+    ppid: i32,
+    process_group: i32,
+    session: i32,
+    tty: i32,
+    foreground_process_group: i32,
+}
+
+fn parse_proc_stat(stat_content: &str) -> Option<ProcessStat> {
     let last_paren = stat_content.rfind(')')?;
     let (left, right) = stat_content.split_at(last_paren);
 
@@ -4043,12 +4122,32 @@ fn parse_proc_stat(stat_content: &str) -> Option<(i32, String, i32)> {
     let name = left[name_start..].to_string();
 
     let tokens: Vec<&str> = right[1..].split_whitespace().collect();
-    if tokens.len() < 2 {
+    if tokens.len() < 6 {
         return None;
     }
-    let ppid: i32 = tokens[1].parse().ok()?;
 
-    Some((pid, name, ppid))
+    Some(ProcessStat {
+        pid,
+        name,
+        ppid: tokens[1].parse().ok()?,
+        process_group: tokens[2].parse().ok()?,
+        session: tokens[3].parse().ok()?,
+        tty: tokens[4].parse().ok()?,
+        foreground_process_group: tokens[5].parse().ok()?,
+    })
+}
+
+fn read_process_stat(pid: i32) -> Option<ProcessStat> {
+    let content = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_proc_stat(&content)
+}
+
+fn is_terminal_foreground_process(process: &ProcessStat, terminal: &ProcessStat) -> bool {
+    terminal.tty > 0
+        && terminal.foreground_process_group > 0
+        && process.session == terminal.session
+        && process.tty == terminal.tty
+        && process.process_group == terminal.foreground_process_group
 }
 
 fn get_process_tree() -> (
@@ -4069,13 +4168,13 @@ fn get_process_tree() -> (
                         if name.chars().all(|c| c.is_ascii_digit()) {
                             let stat_path = path.join("stat");
                             if let Ok(content) = std::fs::read_to_string(stat_path) {
-                                if let Some((pid, proc_name, ppid)) = parse_proc_stat(&content) {
-                                    pid_to_name.insert(pid, proc_name);
-                                    pid_to_ppid.insert(pid, ppid);
+                                if let Some(stat) = parse_proc_stat(&content) {
+                                    pid_to_name.insert(stat.pid, stat.name);
+                                    pid_to_ppid.insert(stat.pid, stat.ppid);
                                     ppid_to_children
-                                        .entry(ppid)
+                                        .entry(stat.ppid)
                                         .or_insert_with(Vec::new)
-                                        .push(pid);
+                                        .push(stat.pid);
                                 }
                             }
                         }
@@ -4104,62 +4203,70 @@ fn find_terminal_leaf(
     ppid_to_children: &HashMap<i32, Vec<i32>>,
     pid_to_name: &HashMap<i32, String>,
 ) -> Option<(i32, String)> {
-    let mut current_pid = terminal_pid;
+    find_terminal_leaf_with_stat_reader(
+        terminal_pid,
+        ppid_to_children,
+        pid_to_name,
+        read_process_stat,
+    )
+}
 
-    // First, try to locate a shell among the direct children of the terminal emulator.
-    // If one is found, we start our search for commands run inside the shell from there,
-    // which prevents being distracted by background helper processes spawned directly by the terminal.
-    if let Some(children) = ppid_to_children.get(&terminal_pid) {
-        for &child in children {
-            if let Some(name) = pid_to_name.get(&child) {
-                if is_shell(name) {
-                    current_pid = child;
-                    break;
+fn find_terminal_leaf_with_stat_reader(
+    terminal_pid: i32,
+    ppid_to_children: &HashMap<i32, Vec<i32>>,
+    pid_to_name: &HashMap<i32, String>,
+    mut stat_for_pid: impl FnMut(i32) -> Option<ProcessStat>,
+) -> Option<(i32, String)> {
+    let children = ppid_to_children.get(&terminal_pid)?;
+    let root_pid = children
+        .iter()
+        .filter_map(|pid| pid_to_name.get(pid).map(|name| (*pid, name)))
+        .min_by_key(|(pid, name)| (!is_shell(name), *pid))
+        .map(|(pid, _)| pid)?;
+    let root_name = pid_to_name.get(&root_pid)?.clone();
+    let Some(terminal_stat) = stat_for_pid(root_pid) else {
+        return Some((root_pid, root_name));
+    };
+
+    let mut best_foreground = is_terminal_foreground_process(&terminal_stat, &terminal_stat)
+        .then(|| (0_usize, root_pid, root_name.clone()));
+    let mut pending = ppid_to_children
+        .get(&root_pid)
+        .into_iter()
+        .flatten()
+        .map(|pid| (*pid, 1_usize))
+        .collect::<Vec<_>>();
+
+    while let Some((pid, depth)) = pending.pop() {
+        let Some(process_stat) = stat_for_pid(pid) else {
+            continue;
+        };
+
+        // A process cannot return to the terminal's session after detaching from it,
+        // so its entire subtree is irrelevant to foreground command selection.
+        if process_stat.session != terminal_stat.session || process_stat.tty != terminal_stat.tty {
+            continue;
+        }
+
+        if is_terminal_foreground_process(&process_stat, &terminal_stat) {
+            let replace_best = best_foreground
+                .as_ref()
+                .is_none_or(|(best_depth, best_pid, _)| (depth, pid) > (*best_depth, *best_pid));
+            if replace_best {
+                if let Some(name) = pid_to_name.get(&pid) {
+                    best_foreground = Some((depth, pid, name.clone()));
                 }
             }
         }
-    }
 
-    loop {
-        if let Some(children) = ppid_to_children.get(&current_pid) {
-            let mut valid_children = Vec::new();
-            for &child in children {
-                if let Some(name) = pid_to_name.get(&child) {
-                    valid_children.push((child, name.clone()));
-                }
-            }
-
-            if valid_children.is_empty() {
-                break;
-            }
-
-            valid_children.sort_by(|a, b| {
-                let a_is_shell = is_shell(&a.1);
-                let b_is_shell = is_shell(&b.1);
-                match (a_is_shell, b_is_shell) {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    _ => a.0.cmp(&b.0),
-                }
-            });
-
-            if let Some(&(best_child, _)) = valid_children.last() {
-                current_pid = best_child;
-            } else {
-                break;
-            }
-        } else {
-            break;
+        if let Some(children) = ppid_to_children.get(&pid) {
+            pending.extend(children.iter().map(|child| (*child, depth + 1)));
         }
     }
 
-    if current_pid == terminal_pid {
-        None
-    } else {
-        pid_to_name
-            .get(&current_pid)
-            .map(|name| (current_pid, name.clone()))
-    }
+    best_foreground
+        .map(|(_, pid, name)| (pid, name))
+        .or(Some((root_pid, root_name)))
 }
 
 fn build_process_chain(
@@ -4273,11 +4380,13 @@ fn build_window_info(
     if let Some(ref proc_name) = active_process {
         if is_terminal_class(&class_lower) {
             let terminal_suffix = cwd_path.as_ref().map(|path| display_path(path));
+            let parent_program = terminal_parent_program(proc_name, &process_chain);
             final_title = terminal_display_title(
                 &final_title,
                 proc_name,
                 command_summary.as_deref(),
                 terminal_suffix.as_deref(),
+                parent_program,
             );
         } else {
             let separators = [" - ", " — ", " – ", " : ", " | "];
@@ -6560,6 +6669,13 @@ impl App {
             return;
         }
 
+        if let Some(desktop_file_path) = self.desktop_file_path_for_window(win) {
+            if launch_desktop_entry(&desktop_file_path) {
+                ctx.request_repaint();
+                return;
+            }
+        }
+
         if let Some(exe_path) = &win.exe_path {
             let exe = exe_path.clone();
             std::thread::spawn(move || {
@@ -8836,11 +8952,11 @@ impl eframe::App for App {
                                                     if terminal_action_label.is_some() {
                                                         continue;
                                                     }
-			                                            self.active_pane = ActivePane::Windows;
-			                                            self.selected_index = index;
-			                                            let win = &filtered_windows[index];
-		                                            self.launch_window_app_and_exit(win, ctx);
-		                                        }
+											self.active_pane = ActivePane::Windows;
+											self.selected_index = index;
+											let win = &filtered_windows[index];
+											self.clone_window_and_exit(win, ctx);
+										}
 			                                    }
 		                                }
                                     ui.spacing_mut().item_spacing = previous_item_spacing;
@@ -9876,6 +9992,166 @@ mod tests {
     fn codex_code_mode_uses_codex_terminal_title() {
         assert_eq!(terminal_primary_title("codex-code-mode", None), "codex");
         assert_eq!(terminal_primary_title("codex", None), "codex");
+    }
+
+    #[test]
+    fn fish_home_directory_keeps_tilde_in_terminal_title() {
+        assert_eq!(
+            terminal_display_title("~ - Terminal", "fish", Some("fish"), Some("~"), None),
+            "fish - ~ - Terminal"
+        );
+    }
+
+    #[test]
+    fn nested_shell_does_not_hide_foreground_codex_process() {
+        let ppid_to_children =
+            HashMap::from([(1, vec![2]), (2, vec![3]), (3, vec![4]), (4, vec![5])]);
+        let pid_to_name = HashMap::from([
+            (2, "fish".to_string()),
+            (3, "fish".to_string()),
+            (4, "codex".to_string()),
+            (5, "plasma-browser-".to_string()),
+        ]);
+        let stats = HashMap::from([
+            (
+                2,
+                ProcessStat {
+                    pid: 2,
+                    name: "fish".to_string(),
+                    ppid: 1,
+                    process_group: 2,
+                    session: 2,
+                    tty: 10,
+                    foreground_process_group: 4,
+                },
+            ),
+            (
+                3,
+                ProcessStat {
+                    pid: 3,
+                    name: "fish".to_string(),
+                    ppid: 2,
+                    process_group: 3,
+                    session: 2,
+                    tty: 10,
+                    foreground_process_group: 4,
+                },
+            ),
+            (
+                4,
+                ProcessStat {
+                    pid: 4,
+                    name: "codex".to_string(),
+                    ppid: 3,
+                    process_group: 4,
+                    session: 2,
+                    tty: 10,
+                    foreground_process_group: 4,
+                },
+            ),
+            (
+                5,
+                ProcessStat {
+                    pid: 5,
+                    name: "plasma-browser-".to_string(),
+                    ppid: 4,
+                    process_group: 5,
+                    session: 5,
+                    tty: 11,
+                    foreground_process_group: 5,
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            find_terminal_leaf_with_stat_reader(1, &ppid_to_children, &pid_to_name, |pid| stats
+                .get(&pid)
+                .cloned(),),
+            Some((4, "codex".to_string()))
+        );
+    }
+
+    #[test]
+    fn spinner_is_not_duplicated_on_terminal_cwd_segment() {
+        assert_eq!(
+            terminal_display_title(
+                "⠋ dictai - ⠋ ~ - Terminal",
+                "codex",
+                Some("codex resume --last"),
+                Some("~"),
+                None,
+            ),
+            "codex - ⠋ dictai - ~ - Terminal"
+        );
+    }
+
+    #[test]
+    fn spinner_on_cwd_basename_is_preserved_as_codex_status() {
+        assert_eq!(
+            terminal_display_title(
+                "⠸ dictai - Terminal",
+                "codex",
+                Some("codex resume --last"),
+                Some("~/Dev/sites/dictai"),
+                None,
+            ),
+            "codex - ⠸ dictai - ~/Dev/sites/dictai - Terminal"
+        );
+    }
+
+    #[test]
+    fn action_required_status_is_not_duplicated_when_adding_cwd() {
+        assert_eq!(
+            terminal_display_title(
+                "[ . ] Action Required | dictionary-extension - Terminal",
+                "codex",
+                Some("codex resume --last"),
+                Some("~"),
+                None,
+            ),
+            "codex - [ . ] Action Required - dictionary-extension - ~ - Terminal"
+        );
+    }
+
+    #[test]
+    fn codex_child_process_keeps_codex_in_terminal_title() {
+        let process_chain = vec![
+            ProcessChainEntry {
+                pid: 20,
+                name: "curl".to_string(),
+                exe_path: None,
+            },
+            ProcessChainEntry {
+                pid: 19,
+                name: "codex-code-mode".to_string(),
+                exe_path: None,
+            },
+        ];
+
+        let parent_program = terminal_parent_program("curl", &process_chain);
+        assert_eq!(parent_program, Some("codex"));
+        assert_eq!(
+            terminal_display_title(
+                "codex - ~/Dev/applicationlauncher - Terminal",
+                "curl",
+                Some("curl https://example.com"),
+                Some("~/Dev/applicationlauncher"),
+                parent_program,
+            ),
+            "codex - curl - ~/Dev/applicationlauncher - Terminal"
+        );
+    }
+
+    #[test]
+    fn terminal_leaf_filter_rejects_detached_browser_helpers() {
+        let shell = parse_proc_stat("100 (fish) S 10 100 100 34840 200").unwrap();
+        let codex = parse_proc_stat("200 (codex) S 100 200 100 34840 200").unwrap();
+        let curl = parse_proc_stat("201 (curl) S 200 200 100 34840 200").unwrap();
+        let browser = parse_proc_stat("300 (plasma-browser-) S 200 300 300 34841 300").unwrap();
+
+        assert!(is_terminal_foreground_process(&codex, &shell));
+        assert!(is_terminal_foreground_process(&curl, &shell));
+        assert!(!is_terminal_foreground_process(&browser, &shell));
     }
 
     #[test]
