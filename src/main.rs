@@ -32,6 +32,8 @@ const PIPEWIRE_ACTIVE_US_THRESHOLD: f32 = 10.0;
 const PIPEWIRE_ACTIVE_TOTAL_US_THRESHOLD: f32 = 20.0;
 const AUDIO_ACTIVE_REPAINT_MS: u64 = 80;
 const WINDOW_SEARCH_REFRESH_INTERVAL_MS: u64 = 180;
+const WINDOW_RECONCILIATION_INTERVAL_SECS: u64 = 30;
+const WINDOW_RECONCILIATION_RETRY_SECS: u64 = 2;
 const WINDOW_FEED_EVENTS_PER_FRAME: usize = 512;
 const WINDOW_SNAPSHOTS_PER_FRAME: usize = 4;
 const SETTINGS_VIEWPORT_SIZE: [f32; 2] = [380.0, 760.0];
@@ -40,8 +42,13 @@ const AUDIO_UPDATES_PER_FRAME: usize = 32;
 const UI_EVENTS_PER_FRAME: usize = 8;
 const CONTROL_REQUEST_LIMIT: usize = 128;
 const DEBUG_ATTACH_TIMEOUT_SECS: u64 = 60;
+const TERMINAL_DBUS_SERVICE: &str = "org.xfce.Terminal5";
+const TERMINAL_DBUS_PATH: &str = "/org/xfce/Terminal";
+const TERMINAL_DBUS_INTERFACE: &str = "org.xfce.Terminal5";
+const TERMINAL_ACTION_MESSAGE_SECS: u64 = 4;
+const AUTO_SEND_ENTER_DELAY_SECS: u64 = 5;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ProcessChainEntry {
     pid: i32,
     name: String,
@@ -66,10 +73,11 @@ struct PactlSinkInput {
     properties: HashMap<String, String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct WindowInfo {
     id: String,
     title: String,
+    raw_title: String,
     class: String,
     desktop_file_name: Option<String>,
     minimized: Option<bool>,
@@ -83,6 +91,36 @@ struct WindowInfo {
     geometry: Option<(i32, i32, i32, i32)>,
     process_chain: Vec<ProcessChainEntry>,
     pid: Option<i32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct WindowIconCacheKey {
+    class: String,
+    desktop_file_name: Option<String>,
+    active_process: Option<String>,
+    executable: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TerminalDbusRecord {
+    window_uuid: String,
+    tab_uuid: String,
+    active: bool,
+    window_title: String,
+    working_directory: String,
+    child_pid: u32,
+    foreground_pid: u32,
+    foreground_pgid: u32,
+    pty: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TerminalWindowIdentity {
+    normalized_title: String,
+    cwd: Option<PathBuf>,
+    process_pids: HashSet<u32>,
+    process_groups: HashSet<u32>,
+    ptys: HashSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -220,7 +258,7 @@ enum ActivePane {
 struct App {
     mode: LauncherMode,
     windows: Vec<WindowInfo>,
-    window_icon_cache: HashMap<String, Option<PathBuf>>,
+    window_icon_cache: HashMap<WindowIconCacheKey, Option<PathBuf>>,
     apps: Vec<AppInfo>,
     pinned_apps: Vec<PathBuf>,
     search_query: String,
@@ -242,6 +280,8 @@ struct App {
     receiver: Option<std::sync::mpsc::Receiver<LoadResult>>,
     background_apps_receiver: Option<Receiver<Vec<AppInfo>>>,
     background_window_enrichment_receiver: Option<Receiver<Vec<WindowInfo>>>,
+    background_window_reconciliation_receiver: Option<Receiver<Option<Vec<WindowInfo>>>>,
+    next_window_reconciliation_at: Option<Instant>,
     ui_event_rx: std::sync::mpsc::Receiver<UiEvent>,
     kwin_window_feed_setup_rx: Option<Receiver<Result<(), String>>>,
     repaint_ctx: egui::Context,
@@ -264,6 +304,7 @@ struct App {
     win_show_path: bool,
     show_run_in_terminal: bool,
     show_cd_in_terminal: bool,
+    auto_send_enter_on_attention: bool,
     win_title_size: f32,
     win_path_size: f32,
     app_icon_size: f32,
@@ -277,10 +318,22 @@ struct App {
     disable_ibeam: bool,
     process_chain_popup: Option<WindowInfo>,
     app_info_popup: Option<AppInfo>,
+    settings_popup_state: Option<Arc<std::sync::Mutex<SettingsWindowState>>>,
+    settings_popup_applied_revision: u64,
+    popup_event_sender: Sender<PopupEvent>,
+    popup_event_receiver: Receiver<PopupEvent>,
     window_sender: Sender<Vec<WindowInfo>>,
     window_receiver: Receiver<Vec<WindowInfo>>,
     window_feed_receiver: Receiver<WindowFeedEvent>,
     audio_cache_receiver: Receiver<AudioCacheUpdate>,
+    terminal_action_sender: Sender<Result<String, String>>,
+    terminal_action_receiver: Receiver<Result<String, String>>,
+    terminal_action_message: Option<(String, bool, Instant)>,
+    terminal_attention_deadlines: HashMap<String, Instant>,
+    terminal_attention_handled: HashSet<String>,
+    terminal_records: Vec<TerminalDbusRecord>,
+    terminal_records_receiver: Option<Receiver<Result<Vec<TerminalDbusRecord>, String>>>,
+    terminal_metadata_refresh_queued: bool,
     rapid_polling: std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_selected_window_id: Option<String>,
     missing_window_counts: HashMap<String, usize>,
@@ -347,6 +400,7 @@ struct LauncherSettings {
     win_show_path: bool,
     show_run_in_terminal: bool,
     show_cd_in_terminal: bool,
+    auto_send_enter_on_attention: bool,
     win_title_size: f32,
     win_path_size: f32,
     app_icon_size: f32,
@@ -379,6 +433,7 @@ impl Default for LauncherSettings {
             win_show_path: true,
             show_run_in_terminal: true,
             show_cd_in_terminal: true,
+            auto_send_enter_on_attention: false,
             win_title_size: 13.0,
             win_path_size: 10.5,
             app_icon_size: 32.0,
@@ -395,6 +450,53 @@ impl Default for LauncherSettings {
             ui_scale: 1.0,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+enum PopupEvent {
+    CloseSettings,
+    CloseWindowInfo,
+    CloseAppInfo,
+}
+
+#[derive(Clone)]
+struct SettingsWindowState {
+    settings: LauncherSettings,
+    pending_ui_scale: f32,
+    scale_anchor: f32,
+    revision: u64,
+}
+
+impl SettingsWindowState {
+    fn new(settings: LauncherSettings) -> Self {
+        Self {
+            pending_ui_scale: settings.ui_scale,
+            scale_anchor: settings.ui_scale,
+            settings,
+            revision: 0,
+        }
+    }
+
+    fn save_changed_settings(&mut self) {
+        save_launcher_settings(self.settings);
+        self.revision = self.revision.wrapping_add(1);
+    }
+}
+
+#[derive(Clone)]
+struct InfoPopupRow {
+    label: String,
+    value: String,
+    searched: bool,
+}
+
+#[derive(Clone)]
+struct InfoPopupData {
+    title: String,
+    heading: String,
+    subtitle: String,
+    rows: Vec<InfoPopupRow>,
+    execution_chain: Vec<(String, String)>,
 }
 
 fn filtered_search_cache_key(
@@ -660,6 +762,11 @@ fn load_launcher_settings() -> LauncherSettings {
                                 .parse::<bool>()
                                 .unwrap_or(settings.show_cd_in_terminal);
                         }
+                        "auto_send_enter_on_attention" => {
+                            settings.auto_send_enter_on_attention = value
+                                .parse::<bool>()
+                                .unwrap_or(settings.auto_send_enter_on_attention);
+                        }
                         "win_title_size" => {
                             settings.win_title_size = value
                                 .parse::<f32>()
@@ -766,7 +873,7 @@ fn save_launcher_settings(settings: LauncherSettings) {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("settings.txt");
         let content = format!(
-            "show_system_settings_modules={}\napp_icon_mode={}\nwin_icon_size={:.1}\nwin_top_padding={:.1}\nwin_bottom_padding={:.1}\nwin_left_padding={:.1}\nwin_right_padding={:.1}\nwin_row_height={:.1}\nwin_text_spacing={:.1}\nwin_line_height={:.1}\nwin_show_path={}\nshow_run_in_terminal={}\nshow_cd_in_terminal={}\nwin_title_size={:.1}\nwin_path_size={:.1}\napp_icon_size={:.1}\napp_icon_tile_size={:.1}\napp_top_padding={:.1}\napp_bottom_padding={:.1}\napp_left_padding={:.1}\napp_right_padding={:.1}\napp_icon_show_name={}\napp_icon_name_size={:.1}\ndisable_ibeam={}\napp_scroll_sensitivity={:.2}\nwin_scroll_sensitivity={:.2}\nui_scale={:.2}\n",
+            "show_system_settings_modules={}\napp_icon_mode={}\nwin_icon_size={:.1}\nwin_top_padding={:.1}\nwin_bottom_padding={:.1}\nwin_left_padding={:.1}\nwin_right_padding={:.1}\nwin_row_height={:.1}\nwin_text_spacing={:.1}\nwin_line_height={:.1}\nwin_show_path={}\nshow_run_in_terminal={}\nshow_cd_in_terminal={}\nauto_send_enter_on_attention={}\nwin_title_size={:.1}\nwin_path_size={:.1}\napp_icon_size={:.1}\napp_icon_tile_size={:.1}\napp_top_padding={:.1}\napp_bottom_padding={:.1}\napp_left_padding={:.1}\napp_right_padding={:.1}\napp_icon_show_name={}\napp_icon_name_size={:.1}\ndisable_ibeam={}\napp_scroll_sensitivity={:.2}\nwin_scroll_sensitivity={:.2}\nui_scale={:.2}\n",
             settings.show_system_settings_modules,
             settings.app_icon_mode,
             settings.win_icon_size,
@@ -780,6 +887,7 @@ fn save_launcher_settings(settings: LauncherSettings) {
             settings.win_show_path,
             settings.show_run_in_terminal,
             settings.show_cd_in_terminal,
+            settings.auto_send_enter_on_attention,
             settings.win_title_size,
             settings.win_path_size,
             settings.app_icon_size,
@@ -797,6 +905,398 @@ fn save_launcher_settings(settings: LauncherSettings) {
         );
         let _ = std::fs::write(path, content);
     }
+}
+
+fn settings_row_label(ui: &mut egui::Ui, label: &str) {
+    ui.label(
+        egui::RichText::new(label).color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+    );
+}
+
+fn settings_checkbox_row(ui: &mut egui::Ui, label: &str, value: &mut bool) -> bool {
+    settings_row_label(ui, label);
+    let changed = ui.checkbox(value, "").changed();
+    ui.end_row();
+    changed
+}
+
+fn settings_slider_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+) -> bool {
+    settings_row_label(ui, label);
+    let changed = ui
+        .add(egui::Slider::new(value, range).show_value(true))
+        .changed();
+    ui.end_row();
+    changed
+}
+
+fn render_deferred_settings_panel(ui: &mut egui::Ui, state: &mut SettingsWindowState) -> bool {
+    let scale_factor = (state.scale_anchor / state.settings.ui_scale).clamp(0.2, 5.0);
+    if (scale_factor - 1.0).abs() > 0.001 {
+        ui.set_style(App::scaled_style(ui.style().as_ref(), scale_factor));
+    }
+
+    let mut settings_changed = false;
+    ui.add_space(8.0);
+    ui.vertical_centered(|ui| {
+        ui.heading(
+            egui::RichText::new("Launcher Settings")
+                .color(egui::Color32::WHITE)
+                .strong(),
+        );
+    });
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(12.0);
+
+    settings_changed |= ui
+        .checkbox(
+            &mut state.settings.disable_ibeam,
+            egui::RichText::new("Disable text select cursor (I-beam)")
+                .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220))
+                .size(13.0),
+        )
+        .changed();
+
+    ui.add_space(10.0);
+    egui::Grid::new("deferred_global_scale_settings_grid")
+        .num_columns(2)
+        .spacing([12.0, 10.0])
+        .show(ui, |ui| {
+            settings_row_label(ui, "Global Scale:");
+            ui.horizontal(|ui| {
+                ui.add(egui::Slider::new(&mut state.pending_ui_scale, 0.5..=2.5).show_value(true));
+                let scale_changed =
+                    (state.pending_ui_scale - state.settings.ui_scale).abs() > 0.001;
+                if ui
+                    .add_enabled(scale_changed, egui::Button::new("Apply"))
+                    .clicked()
+                {
+                    state.settings.ui_scale = state.pending_ui_scale.clamp(0.5, 2.5);
+                    settings_changed = true;
+                }
+                if ui
+                    .add_enabled(scale_changed, egui::Button::new("Reset"))
+                    .clicked()
+                {
+                    state.pending_ui_scale = state.settings.ui_scale;
+                }
+            });
+            if state.pending_ui_scale.is_nan() {
+                state.pending_ui_scale = state.settings.ui_scale;
+            }
+            ui.end_row();
+        });
+
+    ui.add_space(14.0);
+    ui.separator();
+    ui.add_space(10.0);
+    ui.label(
+        egui::RichText::new("Application panel")
+            .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220))
+            .strong()
+            .size(13.0),
+    );
+    ui.add_space(6.0);
+    egui::Grid::new("deferred_app_panel_settings_grid")
+        .num_columns(2)
+        .spacing([12.0, 10.0])
+        .show(ui, |ui| {
+            settings_changed |= settings_checkbox_row(
+                ui,
+                "Show System Modules:",
+                &mut state.settings.show_system_settings_modules,
+            );
+            settings_changed |=
+                settings_checkbox_row(ui, "Icon Grid Mode:", &mut state.settings.app_icon_mode);
+            settings_changed |= settings_slider_row(
+                ui,
+                "Icon Size:",
+                &mut state.settings.app_icon_size,
+                16.0..=64.0,
+            );
+            settings_changed |= settings_slider_row(
+                ui,
+                "Tile Size:",
+                &mut state.settings.app_icon_tile_size,
+                48.0..=128.0,
+            );
+            settings_changed |= settings_slider_row(
+                ui,
+                "Top Padding:",
+                &mut state.settings.app_top_padding,
+                0.0..=24.0,
+            );
+            settings_changed |= settings_slider_row(
+                ui,
+                "Bottom Padding:",
+                &mut state.settings.app_bottom_padding,
+                0.0..=24.0,
+            );
+            settings_changed |= settings_slider_row(
+                ui,
+                "Left Padding:",
+                &mut state.settings.app_left_padding,
+                0.0..=32.0,
+            );
+            settings_changed |= settings_slider_row(
+                ui,
+                "Right Padding:",
+                &mut state.settings.app_right_padding,
+                0.0..=32.0,
+            );
+            settings_changed |=
+                settings_checkbox_row(ui, "Show Names:", &mut state.settings.app_icon_show_name);
+            settings_changed |= settings_slider_row(
+                ui,
+                "Name Size:",
+                &mut state.settings.app_icon_name_size,
+                8.0..=20.0,
+            );
+            settings_changed |= settings_slider_row(
+                ui,
+                "Scroll Sensitivity:",
+                &mut state.settings.app_scroll_sensitivity,
+                0.1..=5.0,
+            );
+        });
+
+    ui.add_space(14.0);
+    ui.separator();
+    ui.add_space(10.0);
+    ui.label(
+        egui::RichText::new("Open window view")
+            .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220))
+            .strong()
+            .size(13.0),
+    );
+    ui.add_space(6.0);
+    egui::Grid::new("deferred_window_settings_grid")
+        .num_columns(2)
+        .spacing([12.0, 10.0])
+        .show(ui, |ui| {
+            settings_changed |= settings_slider_row(
+                ui,
+                "Icon Size:",
+                &mut state.settings.win_icon_size,
+                16.0..=64.0,
+            );
+            settings_changed |= settings_slider_row(
+                ui,
+                "Top Padding:",
+                &mut state.settings.win_top_padding,
+                0.0..=24.0,
+            );
+            settings_changed |= settings_slider_row(
+                ui,
+                "Bottom Padding:",
+                &mut state.settings.win_bottom_padding,
+                0.0..=24.0,
+            );
+            settings_changed |= settings_slider_row(
+                ui,
+                "Left Padding:",
+                &mut state.settings.win_left_padding,
+                0.0..=32.0,
+            );
+            settings_changed |= settings_slider_row(
+                ui,
+                "Right Padding:",
+                &mut state.settings.win_right_padding,
+                0.0..=32.0,
+            );
+            settings_changed |= settings_slider_row(
+                ui,
+                "Row Height:",
+                &mut state.settings.win_row_height,
+                12.0..=100.0,
+            );
+            settings_changed |= settings_slider_row(
+                ui,
+                "Text Spacing:",
+                &mut state.settings.win_text_spacing,
+                0.0..=12.0,
+            );
+            settings_changed |= settings_slider_row(
+                ui,
+                "Line Height:",
+                &mut state.settings.win_line_height,
+                6.0..=30.0,
+            );
+            settings_changed |=
+                settings_checkbox_row(ui, "Show Path:", &mut state.settings.win_show_path);
+            settings_changed |= settings_checkbox_row(
+                ui,
+                "Show Run in Terminal:",
+                &mut state.settings.show_run_in_terminal,
+            );
+            settings_changed |= settings_checkbox_row(
+                ui,
+                "Show CD in Terminal:",
+                &mut state.settings.show_cd_in_terminal,
+            );
+            settings_changed |= settings_checkbox_row(
+                ui,
+                "Auto-send Enter on Attention (5s):",
+                &mut state.settings.auto_send_enter_on_attention,
+            );
+            settings_changed |= settings_slider_row(
+                ui,
+                "Window Title Font Size:",
+                &mut state.settings.win_title_size,
+                6.0..=24.0,
+            );
+            settings_changed |= settings_slider_row(
+                ui,
+                "Window Path Font Size:",
+                &mut state.settings.win_path_size,
+                6.0..=20.0,
+            );
+            settings_changed |= settings_slider_row(
+                ui,
+                "Scroll Sensitivity:",
+                &mut state.settings.win_scroll_sensitivity,
+                0.1..=5.0,
+            );
+        });
+
+    if settings_changed {
+        state.save_changed_settings();
+    }
+
+    ui.add_space(16.0);
+    let mut close_requested = false;
+    ui.vertical_centered(|ui| {
+        close_requested = ui
+            .add(
+                egui::Button::new(
+                    egui::RichText::new("Close Settings (F10)")
+                        .color(egui::Color32::WHITE)
+                        .size(13.0),
+                )
+                .fill(egui::Color32::from_rgba_unmultiplied(61, 174, 233, 200)),
+            )
+            .clicked();
+    });
+    ui.add_space(8.0);
+    close_requested
+}
+
+fn render_info_popup_panel(ui: &mut egui::Ui, data: &InfoPopupData) {
+    let searchable_label_color = egui::Color32::from_rgb(214, 184, 86);
+    let searchable_value_color = egui::Color32::from_rgb(255, 236, 170);
+    let neutral_label_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170);
+
+    ui.heading(
+        egui::RichText::new(&data.heading)
+            .color(egui::Color32::WHITE)
+            .strong(),
+    );
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(&data.subtitle)
+            .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170)),
+    );
+    ui.add_space(10.0);
+
+    egui::Grid::new("deferred_info_grid")
+        .num_columns(2)
+        .spacing([14.0, 8.0])
+        .striped(true)
+        .show(ui, |ui| {
+            for row in &data.rows {
+                let label_color = if row.searched {
+                    searchable_label_color
+                } else {
+                    neutral_label_color
+                };
+                let value_color = if row.searched {
+                    searchable_value_color
+                } else {
+                    egui::Color32::WHITE
+                };
+                ui.label(egui::RichText::new(&row.label).color(label_color).strong());
+                ui.label(
+                    egui::RichText::new(&row.value)
+                        .color(value_color)
+                        .monospace(),
+                );
+                ui.end_row();
+            }
+        });
+
+    if !data.execution_chain.is_empty() {
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(10.0);
+        ui.label(
+            egui::RichText::new("Execution chain")
+                .color(egui::Color32::WHITE)
+                .strong(),
+        );
+        ui.add_space(6.0);
+        for (process, executable) in &data.execution_chain {
+            ui.group(|ui| {
+                ui.label(
+                    egui::RichText::new(process)
+                        .color(egui::Color32::WHITE)
+                        .strong(),
+                );
+                ui.label(
+                    egui::RichText::new(executable)
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160)),
+                );
+            });
+            ui.add_space(6.0);
+        }
+    }
+}
+
+fn show_deferred_info_popup(
+    ctx: &egui::Context,
+    viewport_id: egui::ViewportId,
+    data: InfoPopupData,
+    inner_size: [f32; 2],
+    min_inner_size: [f32; 2],
+    close_event: PopupEvent,
+    event_sender: Sender<PopupEvent>,
+) {
+    let builder = egui::ViewportBuilder::default()
+        .with_title(data.title.clone())
+        .with_inner_size(inner_size)
+        .with_min_inner_size(min_inner_size)
+        .with_resizable(true)
+        .with_always_on_top();
+
+    ctx.show_viewport_deferred(viewport_id, builder, move |ctx, _class| {
+        let close_requested = ctx.input(|input| {
+            input.viewport().close_requested()
+                || input.key_pressed(egui::Key::Escape)
+                || input.key_pressed(egui::Key::F10)
+        });
+        if close_requested {
+            let _ = event_sender.send(close_event.clone());
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 248))
+                    .inner_margin(egui::Margin::same(16)),
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| render_info_popup_panel(ui, &data));
+            });
+    });
 }
 
 fn parse_icon_from_desktop(path: &Path) -> Option<String> {
@@ -834,6 +1334,11 @@ fn lookup_theme_icon_exact(theme: &str, name: &str) -> Option<PathBuf> {
     pixmap.exists().then_some(pixmap)
 }
 
+fn is_tor_browser_identity(value: &str) -> bool {
+    let lower = value.to_lowercase();
+    lower.contains("tor browser") || lower.contains("tor-browser") || lower.contains("torbrowser")
+}
+
 fn find_icon(theme: &str, class: &str) -> Option<PathBuf> {
     if class.is_empty() {
         return None;
@@ -841,6 +1346,13 @@ fn find_icon(theme: &str, class: &str) -> Option<PathBuf> {
 
     let lower = class.to_lowercase();
     let mut names = vec![lower.clone(), class.to_string()];
+    let is_tor_browser = is_tor_browser_identity(&lower);
+    if is_tor_browser {
+        names.insert(0, "org.torproject.torbrowser-launcher".to_string());
+        names.push("tor-browser".to_string());
+        names.push("tor-browser-alpha".to_string());
+        names.push("torbrowser".to_string());
+    }
 
     // Handle reverse-DNS formats (e.g., org.xfce.mousepad -> mousepad)
     if lower.contains('.') {
@@ -895,17 +1407,9 @@ fn find_icon(theme: &str, class: &str) -> Option<PathBuf> {
         names.push("system-file-manager".to_string());
         names.push("folder-open".to_string());
     }
-    if lower.contains("web") || lower.contains("browser") || lower.contains("firefox") {
-        names.push("web-browser".to_string());
-    }
-    if lower.contains("tor browser")
-        || lower.contains("tor-browser")
-        || lower.contains("torbrowser")
+    if !is_tor_browser
+        && (lower.contains("web") || lower.contains("browser") || lower.contains("firefox"))
     {
-        names.push("tor-browser".to_string());
-        names.push("tor-browser-alpha".to_string());
-        names.push("torbrowser".to_string());
-        names.push("firefox".to_string());
         names.push("web-browser".to_string());
     }
     if lower.contains("copyq") {
@@ -1791,6 +2295,55 @@ fn duplicate_window_group_key(win: &WindowInfo) -> Option<(String, String)> {
 
 fn window_requires_attention(win: &WindowInfo) -> bool {
     win.demands_attention || win.title.to_lowercase().contains("action required")
+}
+
+fn update_terminal_attention_schedule(
+    enabled: bool,
+    windows: &[WindowInfo],
+    deadlines: &mut HashMap<String, Instant>,
+    handled: &mut HashSet<String>,
+    now: Instant,
+) -> (Vec<WindowInfo>, Option<Instant>) {
+    if !enabled {
+        deadlines.clear();
+        handled.clear();
+        return (Vec::new(), None);
+    }
+
+    let eligible_ids: HashSet<String> = windows
+        .iter()
+        .filter(|window| {
+            normalize_app_match_key(&window.class) == "xfce4terminal"
+                && window_requires_attention(window)
+        })
+        .map(|window| window.id.clone())
+        .collect();
+
+    deadlines.retain(|id, _| eligible_ids.contains(id) && !handled.contains(id));
+    handled.retain(|id| eligible_ids.contains(id));
+
+    for id in &eligible_ids {
+        if !handled.contains(id) {
+            deadlines
+                .entry(id.clone())
+                .or_insert(now + Duration::from_secs(AUTO_SEND_ENTER_DELAY_SECS));
+        }
+    }
+
+    let mut due_windows = Vec::new();
+    for window in windows {
+        if deadlines
+            .get(&window.id)
+            .is_some_and(|deadline| now >= *deadline)
+        {
+            deadlines.remove(&window.id);
+            handled.insert(window.id.clone());
+            due_windows.push(window.clone());
+        }
+    }
+
+    let next_deadline = deadlines.values().copied().min();
+    (due_windows, next_deadline)
 }
 
 fn is_braille_spinner_char(ch: char) -> bool {
@@ -4142,6 +4695,241 @@ fn read_process_stat(pid: i32) -> Option<ProcessStat> {
     parse_proc_stat(&content)
 }
 
+fn process_pty_path(pid: i32) -> Option<String> {
+    let path = std::fs::read_link(format!("/proc/{pid}/fd/0")).ok()?;
+    let path = path.to_string_lossy();
+    path.starts_with("/dev/pts/").then(|| path.into_owned())
+}
+
+fn terminal_dbus_string(
+    values: &HashMap<String, zbus::zvariant::OwnedValue>,
+    key: &str,
+) -> Option<String> {
+    let value = zbus::zvariant::Value::try_from(values.get(key)?).ok()?;
+    value.downcast_ref::<String>().ok()
+}
+
+fn terminal_dbus_bool(
+    values: &HashMap<String, zbus::zvariant::OwnedValue>,
+    key: &str,
+) -> Option<bool> {
+    let value = zbus::zvariant::Value::try_from(values.get(key)?).ok()?;
+    value.downcast_ref::<bool>().ok()
+}
+
+fn terminal_dbus_u32(
+    values: &HashMap<String, zbus::zvariant::OwnedValue>,
+    key: &str,
+) -> Option<u32> {
+    let value = zbus::zvariant::Value::try_from(values.get(key)?).ok()?;
+    value.downcast_ref::<u32>().ok()
+}
+
+fn parse_terminal_dbus_records(
+    records: Vec<HashMap<String, zbus::zvariant::OwnedValue>>,
+) -> Vec<TerminalDbusRecord> {
+    records
+        .into_iter()
+        .filter_map(|values| {
+            let tab_uuid = terminal_dbus_string(&values, "tab_uuid")?;
+            if tab_uuid.is_empty() {
+                return None;
+            }
+
+            Some(TerminalDbusRecord {
+                window_uuid: terminal_dbus_string(&values, "window_uuid").unwrap_or_default(),
+                tab_uuid,
+                active: terminal_dbus_bool(&values, "active").unwrap_or(false),
+                window_title: terminal_dbus_string(&values, "window_title").unwrap_or_default(),
+                working_directory: terminal_dbus_string(&values, "working_directory")
+                    .unwrap_or_default(),
+                child_pid: terminal_dbus_u32(&values, "child_pid").unwrap_or(0),
+                foreground_pid: terminal_dbus_u32(&values, "foreground_pid").unwrap_or(0),
+                foreground_pgid: terminal_dbus_u32(&values, "foreground_pgid").unwrap_or(0),
+                pty: terminal_dbus_string(&values, "pty").unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn fetch_terminal_dbus_records() -> Result<Vec<TerminalDbusRecord>, String> {
+    let connection = zbus::blocking::Connection::session()
+        .map_err(|err| format!("Could not connect to the session D-Bus: {err}"))?;
+    let proxy = zbus::blocking::Proxy::new(
+        &connection,
+        TERMINAL_DBUS_SERVICE,
+        TERMINAL_DBUS_PATH,
+        TERMINAL_DBUS_INTERFACE,
+    )
+    .map_err(|err| format!("Could not create the XFCE4 Terminal D-Bus client: {err}"))?;
+    let raw_records: Vec<HashMap<String, zbus::zvariant::OwnedValue>> = proxy
+        .call("ListTerminals", &())
+        .map_err(|err| format!("XFCE4 Terminal's metadata API is unavailable: {err}"))?;
+    Ok(parse_terminal_dbus_records(raw_records))
+}
+
+fn terminal_record_for_window_title<'a>(
+    raw_title: &str,
+    records: &'a [TerminalDbusRecord],
+) -> Option<&'a TerminalDbusRecord> {
+    let normalized_title = normalize_window_sort_title(raw_title);
+    if normalized_title.is_empty() {
+        return None;
+    }
+
+    let mut matches = records.iter().filter(|record| {
+        record.active
+            && normalize_window_sort_title(&record.window_title) == normalized_title
+            && (record.child_pid > 0 || record.foreground_pid > 0)
+    });
+    let matched = matches.next()?;
+    matches.next().is_none().then_some(matched)
+}
+
+fn terminal_server_has_dbus_records(
+    terminal_pid: i32,
+    records: &[TerminalDbusRecord],
+    pid_to_ppid: &HashMap<i32, i32>,
+) -> bool {
+    records.iter().any(|record| {
+        [record.child_pid, record.foreground_pid]
+            .into_iter()
+            .filter_map(|pid| i32::try_from(pid).ok())
+            .any(|mut pid| {
+                let mut visited = HashSet::new();
+                while pid > 0 && visited.insert(pid) {
+                    if pid == terminal_pid {
+                        return true;
+                    }
+                    let Some(parent) = pid_to_ppid.get(&pid).copied() else {
+                        break;
+                    };
+                    pid = parent;
+                }
+                false
+            })
+    })
+}
+
+fn terminal_window_identity(win: &WindowInfo) -> TerminalWindowIdentity {
+    let mut identity = TerminalWindowIdentity {
+        normalized_title: normalize_window_sort_title(&win.raw_title),
+        cwd: win.cwd_path.clone(),
+        ..Default::default()
+    };
+
+    for entry in &win.process_chain {
+        if let Ok(pid) = u32::try_from(entry.pid) {
+            identity.process_pids.insert(pid);
+        }
+        if let Some(stat) = read_process_stat(entry.pid) {
+            if let Ok(process_group) = u32::try_from(stat.process_group) {
+                identity.process_groups.insert(process_group);
+            }
+        }
+        if let Some(pty) = process_pty_path(entry.pid) {
+            identity.ptys.insert(pty);
+        }
+    }
+
+    identity
+}
+
+fn select_terminal_tab(
+    identity: &TerminalWindowIdentity,
+    records: &[TerminalDbusRecord],
+) -> Result<String, String> {
+    let active_records: Vec<&TerminalDbusRecord> =
+        records.iter().filter(|record| record.active).collect();
+    if active_records.is_empty() {
+        return Err("XFCE4 Terminal reported no active terminal tabs".to_string());
+    }
+
+    let matching_title_count = active_records
+        .iter()
+        .filter(|record| {
+            !identity.normalized_title.is_empty()
+                && normalize_window_sort_title(&record.window_title) == identity.normalized_title
+        })
+        .count();
+    let mut candidates = Vec::new();
+
+    for record in active_records {
+        let pty_match = !record.pty.is_empty() && identity.ptys.contains(&record.pty);
+        let child_match = record.child_pid > 0 && identity.process_pids.contains(&record.child_pid);
+        let process_group_match =
+            record.foreground_pgid > 0 && identity.process_groups.contains(&record.foreground_pgid);
+        let title_match = !identity.normalized_title.is_empty()
+            && normalize_window_sort_title(&record.window_title) == identity.normalized_title;
+        let cwd_match = identity.cwd.as_ref().is_some_and(|cwd| {
+            !record.working_directory.is_empty()
+                && Path::new(&record.working_directory) == cwd.as_path()
+        });
+        let has_process_identity = pty_match || child_match || process_group_match;
+
+        if !has_process_identity && !(title_match && matching_title_count == 1) {
+            continue;
+        }
+
+        let score = u32::from(pty_match) * 1000
+            + u32::from(child_match) * 700
+            + u32::from(process_group_match) * 600
+            + u32::from(title_match) * 200
+            + u32::from(cwd_match) * 100;
+        candidates.push((score, record));
+    }
+
+    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    let Some((best_score, best)) = candidates.first() else {
+        return Err(
+            "Could not safely match this window to an active XFCE4 Terminal tab".to_string(),
+        );
+    };
+    if candidates
+        .iter()
+        .skip(1)
+        .any(|(score, _)| score == best_score)
+    {
+        return Err(format!(
+            "Multiple XFCE4 Terminal tabs match this window (window UUID {})",
+            best.window_uuid
+        ));
+    }
+
+    Ok(best.tab_uuid.clone())
+}
+
+fn send_enter_to_terminal_window(win: &WindowInfo) -> Result<String, String> {
+    let class_key = normalize_app_match_key(&win.class);
+    if class_key != "xfce4terminal" {
+        return Err("Background Enter is currently supported only for XFCE4 Terminal".to_string());
+    }
+
+    let connection = zbus::blocking::Connection::session()
+        .map_err(|err| format!("Could not connect to the session D-Bus: {err}"))?;
+    let proxy = zbus::blocking::Proxy::new(
+        &connection,
+        TERMINAL_DBUS_SERVICE,
+        TERMINAL_DBUS_PATH,
+        TERMINAL_DBUS_INTERFACE,
+    )
+    .map_err(|err| format!("Could not create the XFCE4 Terminal D-Bus client: {err}"))?;
+    let raw_records: Vec<HashMap<String, zbus::zvariant::OwnedValue>> = proxy
+        .call("ListTerminals", &())
+        .map_err(|err| {
+            format!(
+                "XFCE4 Terminal's background-input API is unavailable: {err}. Restart all terminal server instances with the patched build"
+            )
+        })?;
+    let records = parse_terminal_dbus_records(raw_records);
+    let tab_uuid = select_terminal_tab(&terminal_window_identity(win), &records)?;
+
+    let _: () = proxy
+        .call("SendEnter", &(tab_uuid.as_str(),))
+        .map_err(|err| format!("XFCE4 Terminal rejected SendEnter: {err}"))?;
+    Ok("Enter sent to XFCE4 Terminal without focusing it".to_string())
+}
+
 fn is_terminal_foreground_process(process: &ProcessStat, terminal: &ProcessStat) -> bool {
     terminal.tty > 0
         && terminal.foreground_process_group > 0
@@ -4307,6 +5095,66 @@ fn is_terminal_class(class_lower: &str) -> bool {
         || class_lower == "foot"
 }
 
+fn window_icon_cache_key(
+    class: &str,
+    desktop_file_name: Option<&str>,
+    active_process: Option<&str>,
+    executable: Option<&Path>,
+) -> WindowIconCacheKey {
+    WindowIconCacheKey {
+        class: class.trim().to_lowercase(),
+        desktop_file_name: desktop_file_name.map(|value| value.trim().to_lowercase()),
+        active_process: active_process.map(|value| value.trim().to_lowercase()),
+        executable: executable.map(Path::to_path_buf),
+    }
+}
+
+fn resolve_window_icon(
+    theme: &str,
+    class: &str,
+    desktop_file_name: Option<&str>,
+    active_process: Option<&str>,
+    executable: Option<&Path>,
+) -> Option<PathBuf> {
+    let terminal_window = is_terminal_class(&class.to_lowercase());
+    let tor_browser_window = is_tor_browser_identity(class);
+    let mut candidates = Vec::new();
+    let mut push_candidate = |candidate: Option<&str>| {
+        let Some(candidate) = candidate.map(str::trim).filter(|value| !value.is_empty()) else {
+            return;
+        };
+        if !terminal_window && is_terminal_app_name(candidate) {
+            return;
+        }
+        if !candidates
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(candidate))
+        {
+            candidates.push(candidate.to_string());
+        }
+    };
+
+    if terminal_window {
+        push_candidate(active_process);
+    }
+    push_candidate(desktop_file_name);
+    if let Some(desktop_stem) = desktop_file_name.and_then(|value| value.strip_suffix(".desktop")) {
+        push_candidate(Some(desktop_stem));
+    }
+    push_candidate(Some(class));
+    if !tor_browser_window {
+        push_candidate(
+            executable
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str()),
+        );
+    }
+
+    candidates
+        .into_iter()
+        .find_map(|candidate| find_icon(theme, &candidate))
+}
+
 fn build_window_info(
     id: String,
     title: String,
@@ -4316,10 +5164,11 @@ fn build_window_info(
     geometry: Option<(i32, i32, i32, i32)>,
     minimized: Option<bool>,
     theme: &str,
-    icon_cache: &mut HashMap<String, Option<PathBuf>>,
+    icon_cache: &mut HashMap<WindowIconCacheKey, Option<PathBuf>>,
     ppid_to_children: &HashMap<i32, Vec<i32>>,
     pid_to_name: &HashMap<i32, String>,
     pid_to_ppid: &HashMap<i32, i32>,
+    terminal_records: &[TerminalDbusRecord],
 ) -> Option<WindowInfo> {
     let class_lower = class.to_lowercase();
     let my_pid = std::process::id() as i32;
@@ -4341,6 +5190,7 @@ fn build_window_info(
         }
     }
 
+    let raw_title = title.clone();
     let display_title = title;
 
     let mut active_process = None;
@@ -4352,8 +5202,24 @@ fn build_window_info(
     if let Some(pid) = pid {
         let mut target_pid = pid;
         if is_terminal_class(&class_lower) {
-            if let Some((leaf_pid, leaf_name)) =
-                find_terminal_leaf(pid, ppid_to_children, pid_to_name)
+            if let Some(record) = terminal_record_for_window_title(&raw_title, terminal_records) {
+                let record_target = [record.foreground_pid, record.child_pid]
+                    .into_iter()
+                    .filter_map(|candidate| i32::try_from(candidate).ok())
+                    .find(|candidate| *candidate > 0 && process_exists(*candidate));
+                if let Some(record_target) = record_target {
+                    target_pid = record_target;
+                    active_process = pid_to_name
+                        .get(&record_target)
+                        .cloned()
+                        .or_else(|| read_process_stat(record_target).map(|stat| stat.name));
+                }
+                if !record.working_directory.is_empty() {
+                    cwd_path = Some(PathBuf::from(&record.working_directory));
+                }
+            } else if !terminal_server_has_dbus_records(pid, terminal_records, pid_to_ppid)
+                && let Some((leaf_pid, leaf_name)) =
+                    find_terminal_leaf(pid, ppid_to_children, pid_to_name)
             {
                 active_process = Some(leaf_name);
                 target_pid = leaf_pid;
@@ -4364,7 +5230,9 @@ fn build_window_info(
             exe_path = Some(path);
         }
 
-        if let Ok(path) = std::fs::read_link(format!("/proc/{}/cwd", target_pid)) {
+        if cwd_path.is_none()
+            && let Ok(path) = std::fs::read_link(format!("/proc/{}/cwd", target_pid))
+        {
             cwd_path = Some(path);
         }
 
@@ -4421,33 +5289,29 @@ fn build_window_info(
         }
     }
 
-    let icon_key = active_process.as_ref().unwrap_or(&class).clone();
+    let icon_key = window_icon_cache_key(
+        &class,
+        desktop_file_name.as_deref(),
+        active_process.as_deref(),
+        exe_path.as_deref(),
+    );
     let icon_path = icon_cache
-        .entry(icon_key.clone())
+        .entry(icon_key)
         .or_insert_with(|| {
-            let mut path = None;
-            if let Some(ref proc_name) = active_process {
-                path = find_icon(theme, proc_name);
-            }
-            if path.is_none() {
-                path = find_icon(theme, &class);
-            }
-            if path.is_none() {
-                if let Some(name) = exe_path
-                    .as_ref()
-                    .and_then(|path| path.file_name())
-                    .and_then(|name| name.to_str())
-                {
-                    path = find_icon(theme, name);
-                }
-            }
-            path
+            resolve_window_icon(
+                theme,
+                &class,
+                desktop_file_name.as_deref(),
+                active_process.as_deref(),
+                exe_path.as_deref(),
+            )
         })
         .clone();
 
     Some(WindowInfo {
         id,
         title: final_title,
+        raw_title,
         class,
         desktop_file_name,
         minimized,
@@ -4572,10 +5436,11 @@ fn setup_kwin_window_feed(
 fn window_info_from_kwin_payload(
     payload: KWinWindowPayload,
     theme: &str,
-    icon_cache: &mut HashMap<String, Option<PathBuf>>,
+    icon_cache: &mut HashMap<WindowIconCacheKey, Option<PathBuf>>,
     ppid_to_children: &HashMap<i32, Vec<i32>>,
     pid_to_name: &HashMap<i32, String>,
     pid_to_ppid: &HashMap<i32, i32>,
+    terminal_records: &[TerminalDbusRecord],
 ) -> Option<WindowInfo> {
     let desktop_file_name_value = payload.desktop_file_name.trim().to_string();
     let class = if payload.class.trim().is_empty() {
@@ -4606,6 +5471,7 @@ fn window_info_from_kwin_payload(
         ppid_to_children,
         pid_to_name,
         pid_to_ppid,
+        terminal_records,
     )?;
     window.demands_attention = payload.demands_attention;
     Some(window)
@@ -4653,6 +5519,11 @@ fn get_open_windows_with_snapshot_mode(
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
+        eprintln!(
+            "kdotool window search failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
         return None;
     }
 
@@ -4694,6 +5565,11 @@ fn get_open_windows_with_snapshot_mode(
     };
 
     if !meta_output.status.success() {
+        eprintln!(
+            "kdotool window metadata query failed with {}: {}",
+            meta_output.status,
+            String::from_utf8_lossy(&meta_output.stderr).trim()
+        );
         return None;
     }
 
@@ -4702,6 +5578,7 @@ fn get_open_windows_with_snapshot_mode(
 
     // 3. Scan /proc once to build process tree before querying PIDs
     let (ppid_to_children, pid_to_name, pid_to_ppid) = get_process_tree();
+    let terminal_records = fetch_terminal_dbus_records().unwrap_or_default();
 
     let mut windows = Vec::new();
     let theme_str = theme.to_string();
@@ -4776,6 +5653,7 @@ fn get_open_windows_with_snapshot_mode(
             &ppid_to_children,
             &pid_to_name,
             &pid_to_ppid,
+            &terminal_records,
         ) {
             windows.push(window);
         }
@@ -4790,6 +5668,58 @@ fn get_open_windows(kdotool_path: &Path, theme: &str) -> Option<Vec<WindowInfo>>
 
 fn get_open_windows_fast(kdotool_path: &Path, theme: &str) -> Option<Vec<WindowInfo>> {
     get_open_windows_with_snapshot_mode(kdotool_path, theme, false)
+}
+
+fn merge_reconciled_window(existing: &WindowInfo, mut discovered: WindowInfo) -> WindowInfo {
+    if discovered.desktop_file_name.is_none() {
+        discovered.desktop_file_name = existing.desktop_file_name.clone();
+    }
+    if discovered.geometry.is_none() {
+        discovered.geometry = existing.geometry;
+    }
+    if discovered.minimized.is_none() {
+        discovered.minimized = existing.minimized;
+    }
+    if discovered.icon_path.is_none() {
+        discovered.icon_path = existing.icon_path.clone();
+    }
+    // Fast snapshots cannot inspect these KWin-only state fields.
+    discovered.demands_attention = existing.demands_attention;
+    discovered
+}
+
+fn merge_reconciled_windows(
+    current: &mut Vec<WindowInfo>,
+    discovered: Vec<WindowInfo>,
+) -> (bool, bool, Vec<(WindowInfo, WindowInfo)>) {
+    let mut changed = false;
+    let mut search_changed = false;
+    let mut cache_updates = Vec::new();
+    let mut index_by_id: HashMap<String, usize> = current
+        .iter()
+        .enumerate()
+        .map(|(index, window)| (window.id.clone(), index))
+        .collect();
+
+    for discovered_window in discovered {
+        if let Some(index) = index_by_id.get(&discovered_window.id).copied() {
+            let old_window = current[index].clone();
+            let merged_window = merge_reconciled_window(&old_window, discovered_window);
+            if old_window != merged_window {
+                search_changed |= !window_search_metadata_equal(&old_window, &merged_window);
+                current[index] = merged_window.clone();
+                cache_updates.push((old_window, merged_window));
+                changed = true;
+            }
+        } else {
+            index_by_id.insert(discovered_window.id.clone(), current.len());
+            current.push(discovered_window);
+            changed = true;
+            search_changed = true;
+        }
+    }
+
+    (changed, search_changed, cache_updates)
 }
 
 fn load_pinned_apps() -> Vec<PathBuf> {
@@ -4955,12 +5885,21 @@ impl App {
     fn open_settings_menu(&mut self) {
         self.settings_menu_scale_anchor = self.ui_scale;
         self.pending_ui_scale = self.ui_scale;
+        self.settings_popup_state = Some(Arc::new(std::sync::Mutex::new(
+            SettingsWindowState::new(self.launcher_settings_snapshot()),
+        )));
+        self.settings_popup_applied_revision = 0;
         self.show_settings_menu = true;
     }
 
     fn close_settings_menu(&mut self) {
+        self.repaint_ctx.send_viewport_cmd_to(
+            egui::ViewportId::from_hash_of("launcher_settings_popup"),
+            egui::ViewportCommand::Close,
+        );
         self.settings_menu_scale_anchor = self.ui_scale;
         self.pending_ui_scale = self.ui_scale;
+        self.settings_popup_state = None;
         self.show_settings_menu = false;
     }
 
@@ -5003,6 +5942,8 @@ impl App {
         let (window_tx, window_rx) = std::sync::mpsc::channel();
         let (window_feed_tx, window_feed_rx) = std::sync::mpsc::channel();
         let (audio_cache_tx, audio_cache_rx) = std::sync::mpsc::channel();
+        let (terminal_action_tx, terminal_action_rx) = std::sync::mpsc::channel();
+        let (popup_event_tx, popup_event_rx) = std::sync::mpsc::channel();
         let (kwin_window_feed_setup_tx, kwin_window_feed_setup_rx) = std::sync::mpsc::channel();
         let rapid_polling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let kwin_window_feed_repaint_ctx = cc.egui_ctx.clone();
@@ -5042,6 +5983,8 @@ impl App {
             receiver: None,
             background_apps_receiver: None,
             background_window_enrichment_receiver: None,
+            background_window_reconciliation_receiver: None,
+            next_window_reconciliation_at: None,
             ui_event_rx,
             kwin_window_feed_setup_rx: Some(kwin_window_feed_setup_rx),
             repaint_ctx: cc.egui_ctx.clone(),
@@ -5064,6 +6007,7 @@ impl App {
             win_show_path: settings.win_show_path,
             show_run_in_terminal: settings.show_run_in_terminal,
             show_cd_in_terminal: settings.show_cd_in_terminal,
+            auto_send_enter_on_attention: settings.auto_send_enter_on_attention,
             win_title_size: settings.win_title_size,
             win_path_size: settings.win_path_size,
             app_icon_size: settings.app_icon_size,
@@ -5077,10 +6021,22 @@ impl App {
             disable_ibeam: settings.disable_ibeam,
             process_chain_popup: None,
             app_info_popup: None,
+            settings_popup_state: None,
+            settings_popup_applied_revision: 0,
+            popup_event_sender: popup_event_tx,
+            popup_event_receiver: popup_event_rx,
             window_sender: window_tx.clone(),
             window_receiver: window_rx,
             window_feed_receiver: window_feed_rx,
             audio_cache_receiver: audio_cache_rx,
+            terminal_action_sender: terminal_action_tx,
+            terminal_action_receiver: terminal_action_rx,
+            terminal_action_message: None,
+            terminal_attention_deadlines: HashMap::new(),
+            terminal_attention_handled: HashSet::new(),
+            terminal_records: Vec::new(),
+            terminal_records_receiver: None,
+            terminal_metadata_refresh_queued: false,
             rapid_polling: std::sync::Arc::clone(&rapid_polling),
             last_selected_window_id: None,
             missing_window_counts: HashMap::new(),
@@ -5154,6 +6110,7 @@ impl App {
                 app.start_background_app_load();
             }
         }
+        app.start_terminal_metadata_refresh();
 
         app
     }
@@ -5170,8 +6127,8 @@ impl App {
         }
     }
 
-    fn save_settings(&self) {
-        save_launcher_settings(LauncherSettings {
+    fn launcher_settings_snapshot(&self) -> LauncherSettings {
+        LauncherSettings {
             show_system_settings_modules: self.show_system_settings_modules,
             app_icon_mode: self.icon_only,
             win_icon_size: self.win_icon_size,
@@ -5185,6 +6142,7 @@ impl App {
             win_show_path: self.win_show_path,
             show_run_in_terminal: self.show_run_in_terminal,
             show_cd_in_terminal: self.show_cd_in_terminal,
+            auto_send_enter_on_attention: self.auto_send_enter_on_attention,
             win_title_size: self.win_title_size,
             win_path_size: self.win_path_size,
             app_icon_size: self.app_icon_size,
@@ -5199,7 +6157,56 @@ impl App {
             app_scroll_sensitivity: self.app_scroll_sensitivity,
             win_scroll_sensitivity: self.win_scroll_sensitivity,
             ui_scale: self.ui_scale,
-        });
+        }
+    }
+
+    fn save_settings(&self) {
+        save_launcher_settings(self.launcher_settings_snapshot());
+    }
+
+    fn apply_launcher_settings_snapshot(
+        &mut self,
+        settings: LauncherSettings,
+        ctx: &egui::Context,
+    ) {
+        let disable_attention_automation =
+            self.auto_send_enter_on_attention && !settings.auto_send_enter_on_attention;
+        self.show_system_settings_modules = settings.show_system_settings_modules;
+        self.icon_only = settings.app_icon_mode;
+        self.win_icon_size = settings.win_icon_size;
+        self.win_top_padding = settings.win_top_padding;
+        self.win_bottom_padding = settings.win_bottom_padding;
+        self.win_left_padding = settings.win_left_padding;
+        self.win_right_padding = settings.win_right_padding;
+        self.win_row_height = settings.win_row_height;
+        self.win_text_spacing = settings.win_text_spacing;
+        self.win_line_height = settings.win_line_height;
+        self.win_show_path = settings.win_show_path;
+        self.show_run_in_terminal = settings.show_run_in_terminal;
+        self.show_cd_in_terminal = settings.show_cd_in_terminal;
+        self.auto_send_enter_on_attention = settings.auto_send_enter_on_attention;
+        self.win_title_size = settings.win_title_size;
+        self.win_path_size = settings.win_path_size;
+        self.app_icon_size = settings.app_icon_size;
+        self.app_icon_tile_size = settings.app_icon_tile_size;
+        self.app_top_padding = settings.app_top_padding;
+        self.app_bottom_padding = settings.app_bottom_padding;
+        self.app_left_padding = settings.app_left_padding;
+        self.app_right_padding = settings.app_right_padding;
+        self.app_icon_show_name = settings.app_icon_show_name;
+        self.app_icon_name_size = settings.app_icon_name_size;
+        self.disable_ibeam = settings.disable_ibeam;
+        self.app_scroll_sensitivity = settings.app_scroll_sensitivity;
+        self.win_scroll_sensitivity = settings.win_scroll_sensitivity;
+        if disable_attention_automation {
+            self.terminal_attention_deadlines.clear();
+            self.terminal_attention_handled.clear();
+        }
+        if (self.ui_scale - settings.ui_scale).abs() > 0.001 {
+            self.ui_scale = settings.ui_scale;
+            ctx.set_zoom_factor(settings.ui_scale);
+        }
+        ctx.request_repaint();
     }
 
     fn save_pinned_apps(&mut self) {
@@ -5609,6 +6616,21 @@ impl App {
                 ui.end_row();
 
                 ui.label(
+                    egui::RichText::new("Auto-send Enter on Attention (5s):")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut auto_send_enter = self.auto_send_enter_on_attention;
+                if ui.checkbox(&mut auto_send_enter, "").changed() {
+                    self.auto_send_enter_on_attention = auto_send_enter;
+                    if !auto_send_enter {
+                        self.terminal_attention_deadlines.clear();
+                        self.terminal_attention_handled.clear();
+                    }
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
                     egui::RichText::new("Window Title Font Size:")
                         .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
                 );
@@ -5672,10 +6694,178 @@ impl App {
         close_requested
     }
 
-    fn show_settings_popup(&mut self, ctx: &egui::Context) {
-        let viewport_id = egui::ViewportId::from_hash_of("launcher_settings_popup");
-        let viewport_scale_factor =
-            (self.settings_menu_scale_anchor / self.ui_scale).clamp(0.2, 5.0);
+    fn send_enter_without_focus(&self, window: &WindowInfo) {
+        let window = window.clone();
+        let result_sender = self.terminal_action_sender.clone();
+        let repaint_ctx = self.repaint_ctx.clone();
+        std::thread::spawn(move || {
+            let result = send_enter_to_terminal_window(&window);
+            let _ = result_sender.send(result);
+            repaint_ctx.request_repaint();
+        });
+    }
+
+    fn update_terminal_attention_automation(&mut self, ctx: &egui::Context) {
+        let (due_windows, next_deadline) = update_terminal_attention_schedule(
+            self.auto_send_enter_on_attention,
+            &self.windows,
+            &mut self.terminal_attention_deadlines,
+            &mut self.terminal_attention_handled,
+            Instant::now(),
+        );
+
+        for window in due_windows {
+            self.send_enter_without_focus(&window);
+        }
+        if let Some(deadline) = next_deadline {
+            ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
+        }
+    }
+
+    fn start_terminal_metadata_refresh(&mut self) {
+        if self.terminal_records_receiver.is_some() {
+            self.terminal_metadata_refresh_queued = true;
+            return;
+        }
+
+        let repaint_ctx = self.repaint_ctx.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.terminal_records_receiver = Some(rx);
+        self.terminal_metadata_refresh_queued = false;
+        std::thread::spawn(move || {
+            let _ = tx.send(fetch_terminal_dbus_records());
+            repaint_ctx.request_repaint();
+        });
+    }
+
+    fn apply_terminal_metadata_records(&mut self, records: Vec<TerminalDbusRecord>) {
+        self.terminal_records = records;
+        if self.terminal_records.is_empty() {
+            return;
+        }
+
+        let terminal_windows = self
+            .windows
+            .iter()
+            .filter(|window| is_terminal_class(&window.class.to_lowercase()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if terminal_windows.is_empty() {
+            return;
+        }
+
+        let theme = self
+            .force_theme
+            .as_deref()
+            .unwrap_or("breeze-dark")
+            .to_string();
+        let records = self.terminal_records.clone();
+        let (ppid_to_children, pid_to_name, pid_to_ppid) = get_process_tree();
+        let mut rebuilt = Vec::new();
+        for old_window in terminal_windows {
+            let demands_attention = old_window.demands_attention;
+            if let Some(mut window) = build_window_info(
+                old_window.id,
+                old_window.raw_title,
+                old_window.class,
+                old_window.desktop_file_name,
+                old_window.pid,
+                old_window.geometry,
+                old_window.minimized,
+                &theme,
+                &mut self.window_icon_cache,
+                &ppid_to_children,
+                &pid_to_name,
+                &pid_to_ppid,
+                &records,
+            ) {
+                window.demands_attention = demands_attention;
+                rebuilt.push(window);
+            }
+        }
+        self.apply_window_reconciliation(rebuilt);
+    }
+
+    fn show_terminal_action_message(&mut self, ctx: &egui::Context) {
+        while let Ok(result) = self.terminal_action_receiver.try_recv() {
+            let (message, success) = match result {
+                Ok(message) => (message, true),
+                Err(message) => (message, false),
+            };
+            self.terminal_action_message = Some((message, success, Instant::now()));
+        }
+
+        let Some((message, success, created_at)) = self.terminal_action_message.clone() else {
+            return;
+        };
+        let lifetime = Duration::from_secs(TERMINAL_ACTION_MESSAGE_SECS);
+        let elapsed = created_at.elapsed();
+        if elapsed >= lifetime {
+            self.terminal_action_message = None;
+            return;
+        }
+
+        ctx.request_repaint_after(lifetime.saturating_sub(elapsed));
+        egui::Area::new(egui::Id::new("terminal_action_message"))
+            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -18.0])
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                let color = if success {
+                    egui::Color32::from_rgb(98, 205, 142)
+                } else {
+                    egui::Color32::from_rgb(244, 112, 112)
+                };
+                egui::Frame::popup(&ctx.style())
+                    .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 24, 245))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(message).color(color).strong());
+                    });
+            });
+    }
+
+    fn process_popup_events(&mut self) {
+        let mut restore_launcher_focus = false;
+        while let Ok(event) = self.popup_event_receiver.try_recv() {
+            match event {
+                PopupEvent::CloseSettings => self.close_settings_menu(),
+                PopupEvent::CloseWindowInfo => self.process_chain_popup = None,
+                PopupEvent::CloseAppInfo => self.app_info_popup = None,
+            }
+            restore_launcher_focus = true;
+        }
+        if restore_launcher_focus {
+            self.start_time = Instant::now();
+            self.repaint_ctx.send_viewport_cmd_to(
+                egui::ViewportId::ROOT,
+                egui::ViewportCommand::Focus,
+            );
+        }
+    }
+
+    fn show_settings_native_viewport(&mut self, ctx: &egui::Context) {
+        let Some(shared_state) = self.settings_popup_state.clone() else {
+            self.settings_popup_state = Some(Arc::new(std::sync::Mutex::new(
+                SettingsWindowState::new(self.launcher_settings_snapshot()),
+            )));
+            ctx.request_repaint();
+            return;
+        };
+
+        let state_snapshot = shared_state.lock().ok().map(|state| {
+            (
+                state.settings,
+                state.revision,
+                (state.scale_anchor / state.settings.ui_scale).clamp(0.2, 5.0),
+            )
+        });
+        let Some((settings, revision, viewport_scale_factor)) = state_snapshot else {
+            return;
+        };
+        if revision != self.settings_popup_applied_revision {
+            self.apply_launcher_settings_snapshot(settings, ctx);
+            self.settings_popup_applied_revision = revision;
+        }
+
         let builder = egui::ViewportBuilder::default()
             .with_title("Launcher Settings")
             .with_inner_size([
@@ -5686,282 +6876,538 @@ impl App {
                 SETTINGS_VIEWPORT_MIN_SIZE[0] * viewport_scale_factor,
                 SETTINGS_VIEWPORT_MIN_SIZE[1] * viewport_scale_factor,
             ])
-            .with_resizable(true);
-
-        let mut should_close = false;
-        ctx.show_viewport_immediate(viewport_id, builder, |ctx, _class| {
-            if ctx.input(|i| i.viewport().close_requested()) {
-                should_close = true;
-                return;
-            }
-
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                should_close = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                return;
-            }
-
-            egui::CentralPanel::default()
-                .frame(
-                    egui::Frame::window(&ctx.style())
-                        .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 240))
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20),
-                        ))
-                        .corner_radius(egui::CornerRadius::same(12)),
-                )
-                .show(ctx, |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            if self.render_settings_panel(ui) {
-                                should_close = true;
-                            }
-                        });
+            .with_resizable(true)
+            .with_always_on_top();
+        let event_sender = self.popup_event_sender.clone();
+        ctx.show_viewport_deferred(
+            egui::ViewportId::from_hash_of("launcher_settings_popup"),
+            builder,
+            move |ctx, _class| {
+                let close_requested = ctx.input(|input| {
+                    input.viewport().close_requested()
+                        || input.key_pressed(egui::Key::Escape)
+                        || input.key_pressed(egui::Key::F10)
                 });
-        });
+                if close_requested {
+                    let _ = event_sender.send(PopupEvent::CloseSettings);
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
+                }
 
-        if should_close {
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 248))
+                            .inner_margin(egui::Margin::same(12)),
+                    )
+                    .show(ctx, |ui| {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let Ok(mut state) = shared_state.lock() else {
+                                    return;
+                                };
+                                let previous_revision = state.revision;
+                                if render_deferred_settings_panel(ui, &mut state) {
+                                    let _ = event_sender.send(PopupEvent::CloseSettings);
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                                if state.revision != previous_revision {
+                                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                                }
+                            });
+                    });
+            },
+        );
+    }
+
+    fn window_info_popup_data(&self, window_info: &WindowInfo) -> InfoPopupData {
+        let app_key = window_application_key(window_info);
+        let exe_basename = window_info
+            .exe_path
+            .as_ref()
+            .and_then(|path| path.file_name().and_then(|name| name.to_str()))
+            .unwrap_or("Unavailable")
+            .to_string();
+        let active_process_exe_path = window_info
+            .active_process
+            .as_ref()
+            .and_then(|_| window_info.process_chain.first())
+            .and_then(|entry| entry.exe_path.clone())
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Unavailable".to_string());
+        let active_process_desktop_file = window_info
+            .active_process
+            .as_deref()
+            .and_then(|process| self.desktop_file_path_for_process(process))
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Unavailable".to_string());
+        let desktop_file_path = self
+            .desktop_file_path_for_window(window_info)
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Unavailable".to_string());
+        let cwd_search_value = window_info
+            .cwd_path
+            .as_ref()
+            .map(|path| display_path(path))
+            .unwrap_or_else(|| "Unavailable".to_string());
+        let class_is_searched = !window_info.class.eq_ignore_ascii_case(&app_key);
+        let row = |label: &str, value: String, searched: bool| InfoPopupRow {
+            label: label.to_string(),
+            value,
+            searched,
+        };
+
+        InfoPopupData {
+            title: format!("Window Info: {}", window_info.title),
+            heading: window_info.title.clone(),
+            subtitle: "Window metadata, process details, and execution chain".to_string(),
+            rows: vec![
+                row("Title", window_info.title.clone(), true),
+                row("Raw window title", window_info.raw_title.clone(), false),
+                row("Application key", app_key, true),
+                row("Window ID", window_info.id.clone(), false),
+                row("Class", window_info.class.clone(), class_is_searched),
+                row("Window desktop file", desktop_file_path, false),
+                row(
+                    "Window PID",
+                    window_info
+                        .pid
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "Unavailable".to_string()),
+                    false,
+                ),
+                row(
+                    "Active process",
+                    window_info
+                        .active_process
+                        .clone()
+                        .unwrap_or_else(|| "Unavailable".to_string()),
+                    true,
+                ),
+                row("Window executable", exe_basename, true),
+                row(
+                    "Window executable path",
+                    window_info
+                        .exe_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Unavailable".to_string()),
+                    false,
+                ),
+                row(
+                    "Active process executable path",
+                    active_process_exe_path,
+                    false,
+                ),
+                row(
+                    "Active process desktop file",
+                    active_process_desktop_file,
+                    false,
+                ),
+                row("Working directory", cwd_search_value, true),
+                row(
+                    "Command summary",
+                    window_info
+                        .command_summary
+                        .clone()
+                        .unwrap_or_else(|| "Unavailable".to_string()),
+                    true,
+                ),
+                row(
+                    "Command line",
+                    window_info
+                        .command_line
+                        .clone()
+                        .unwrap_or_else(|| "Unavailable".to_string()),
+                    true,
+                ),
+                row(
+                    "Geometry",
+                    window_info
+                        .geometry
+                        .map(|(x, y, width, height)| {
+                            format!("x={x}, y={y}, width={width}, height={height}")
+                        })
+                        .unwrap_or_else(|| "Unavailable".to_string()),
+                    false,
+                ),
+                row(
+                    "Minimized",
+                    window_info
+                        .minimized
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "Unavailable".to_string()),
+                    false,
+                ),
+            ],
+            execution_chain: window_info
+                .process_chain
+                .iter()
+                .map(|entry| {
+                    (
+                        format!("{} (pid {})", entry.name, entry.pid),
+                        entry
+                            .exe_path
+                            .as_ref()
+                            .map(|path| path.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "Executable path unavailable".to_string()),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn app_info_popup_data(&self, app_info: &AppInfo) -> InfoPopupData {
+        let desktop_stem = app_info
+            .desktop_file_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("Unavailable")
+            .to_string();
+        let executable_basename =
+            command_basename(&app_info.exec).unwrap_or_else(|| "Unavailable".to_string());
+        let executable_path = executable_path_from_exec(&app_info.exec);
+        let executable_path_display = executable_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Unavailable".to_string());
+        let executable_exists = executable_path.as_ref().is_some_and(|path| path.is_file());
+        let desktop_file_exists = app_info.desktop_file_path.exists();
+        let icon_path = app_info
+            .icon_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Unavailable".to_string());
+        let is_pinned = self.pinned_apps.contains(&app_info.desktop_file_path);
+        let row = |label: &str, value: String, searched: bool| InfoPopupRow {
+            label: label.to_string(),
+            value,
+            searched,
+        };
+
+        InfoPopupData {
+            title: format!("Application Info: {}", app_info.name),
+            heading: app_info.name.clone(),
+            subtitle: "Desktop-entry and application search metadata".to_string(),
+            rows: vec![
+                row("Name", app_info.name.clone(), true),
+                row("Executable basename", executable_basename, true),
+                row("Desktop file stem", desktop_stem, true),
+                row(
+                    "Comment",
+                    app_info
+                        .comment
+                        .clone()
+                        .unwrap_or_else(|| "Unavailable".to_string()),
+                    true,
+                ),
+                row("Cleaned command", clean_exec_cmd(&app_info.exec), true),
+                row("Executable path", executable_path_display, false),
+                row("Executable exists", executable_exists.to_string(), false),
+                row("Raw Exec", app_info.exec.clone(), false),
+                row(
+                    "Desktop file",
+                    app_info.desktop_file_path.to_string_lossy().to_string(),
+                    false,
+                ),
+                row(
+                    "Desktop file exists",
+                    desktop_file_exists.to_string(),
+                    false,
+                ),
+                row("Icon path", icon_path, false),
+                row("Pinned", is_pinned.to_string(), false),
+                row(
+                    "System settings module",
+                    app_info.is_settings_module.to_string(),
+                    false,
+                ),
+            ],
+            execution_chain: Vec::new(),
+        }
+    }
+
+    fn show_settings_popup(&mut self, ctx: &egui::Context) {
+        if !ctx.embed_viewports() {
+            self.show_settings_native_viewport(ctx);
+            return;
+        }
+        let viewport_scale_factor =
+            (self.settings_menu_scale_anchor / self.ui_scale).clamp(0.2, 5.0);
+        let mut is_open = true;
+        let mut should_close = false;
+        egui::Window::new("Launcher Settings")
+            .id(egui::Id::new("launcher_settings_popup"))
+            .default_size([
+                (SETTINGS_VIEWPORT_SIZE[0] + 20.0) * viewport_scale_factor,
+                (SETTINGS_VIEWPORT_SIZE[1] + 80.0) * viewport_scale_factor,
+            ])
+            .min_size([
+                SETTINGS_VIEWPORT_MIN_SIZE[0] * viewport_scale_factor,
+                SETTINGS_VIEWPORT_MIN_SIZE[1] * viewport_scale_factor,
+            ])
+            .resizable(true)
+            .collapsible(false)
+            .order(egui::Order::Foreground)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 240))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+                    ))
+                    .corner_radius(egui::CornerRadius::same(12)),
+            )
+            .open(&mut is_open)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if self.render_settings_panel(ui) {
+                            should_close = true;
+                        }
+                    });
+            });
+
+        if should_close || !is_open {
             self.close_settings_menu();
         }
     }
 
     fn show_window_info_popup(&mut self, ctx: &egui::Context) {
-        let Some(window_info) = self.process_chain_popup.clone() else {
+        let Some(window_snapshot) = self.process_chain_popup.clone() else {
             return;
         };
+        let window_info = self
+            .windows
+            .iter()
+            .find(|window| window.id == window_snapshot.id)
+            .cloned()
+            .unwrap_or(window_snapshot);
 
-        let viewport_id = egui::ViewportId::from_hash_of("launcher_process_chain_popup");
-        let builder = egui::ViewportBuilder::default()
-            .with_title(format!("Window Info: {}", window_info.title))
-            .with_inner_size([760.0, 680.0])
-            .with_min_inner_size([520.0, 360.0])
-            .with_resizable(true);
+        if !ctx.embed_viewports() {
+            show_deferred_info_popup(
+                ctx,
+                egui::ViewportId::from_hash_of("launcher_process_chain_popup"),
+                self.window_info_popup_data(&window_info),
+                [760.0, 680.0],
+                [520.0, 360.0],
+                PopupEvent::CloseWindowInfo,
+                self.popup_event_sender.clone(),
+            );
+            return;
+        }
 
-        let mut should_close = false;
-        ctx.show_viewport_immediate(viewport_id, builder, |ctx, _class| {
-            if ctx.input(|i| i.viewport().close_requested()) {
-                should_close = true;
-                return;
-            }
+        let mut is_open = true;
+        egui::Window::new(format!("Window Info: {}", window_info.title))
+            .id(egui::Id::new("launcher_process_chain_popup"))
+            .default_size([760.0, 680.0])
+            .min_size([520.0, 360.0])
+            .resizable(true)
+            .collapsible(false)
+            .vscroll(true)
+            .order(egui::Order::Foreground)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 240))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+                    ))
+                    .corner_radius(egui::CornerRadius::same(12)),
+            )
+            .open(&mut is_open)
+            .show(ctx, |ui| {
+                let searchable_label_color = egui::Color32::from_rgb(214, 184, 86);
+                let searchable_value_color = egui::Color32::from_rgb(255, 236, 170);
+                let neutral_label_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170);
+                let neutral_value_color = egui::Color32::WHITE;
+                let app_key = window_application_key(&window_info);
+                let exe_basename = window_info
+                    .exe_path
+                    .as_ref()
+                    .and_then(|path| path.file_name().and_then(|name| name.to_str()))
+                    .map(|name| name.to_string())
+                    .unwrap_or_else(|| "Unavailable".to_string());
+                let active_process_exe_path = window_info
+                    .active_process
+                    .as_ref()
+                    .and_then(|_| window_info.process_chain.first())
+                    .and_then(|entry| entry.exe_path.clone());
+                let active_process_desktop_file = window_info
+                    .active_process
+                    .as_deref()
+                    .and_then(|process| self.desktop_file_path_for_process(process))
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Unavailable".to_string());
+                let desktop_file_path = self
+                    .desktop_file_path_for_window(&window_info)
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Unavailable".to_string());
+                let cwd_search_value = window_info
+                    .cwd_path
+                    .as_ref()
+                    .map(|path| display_path(path))
+                    .unwrap_or_else(|| "Unavailable".to_string());
+                let class_is_searched = !window_info.class.eq_ignore_ascii_case(&app_key);
 
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                should_close = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                return;
-            }
+                let info_row = |ui: &mut egui::Ui, label: &str, value: String, searched: bool| {
+                    let label_color = if searched {
+                        searchable_label_color
+                    } else {
+                        neutral_label_color
+                    };
+                    let value_color = if searched {
+                        searchable_value_color
+                    } else {
+                        neutral_value_color
+                    };
+                    ui.label(egui::RichText::new(label).color(label_color).strong());
+                    ui.label(egui::RichText::new(value).color(value_color).monospace());
+                    ui.end_row();
+                };
 
-            egui::CentralPanel::default()
-                .frame(
-                    egui::Frame::window(&ctx.style())
-                        .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 240))
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20),
-                        ))
-                        .corner_radius(egui::CornerRadius::same(12)),
-                )
-                .show(ctx, |ui| {
-                    let searchable_label_color = egui::Color32::from_rgb(214, 184, 86);
-                    let searchable_value_color = egui::Color32::from_rgb(255, 236, 170);
-                    let neutral_label_color =
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170);
-                    let neutral_value_color = egui::Color32::WHITE;
-                    let app_key = window_application_key(&window_info);
-                    let exe_basename = window_info
-                        .exe_path
-                        .as_ref()
-                        .and_then(|path| path.file_name().and_then(|name| name.to_str()))
-                        .map(|name| name.to_string())
-                        .unwrap_or_else(|| "Unavailable".to_string());
-                    let active_process_exe_path = window_info
-                        .active_process
-                        .as_ref()
-                        .and_then(|_| window_info.process_chain.first())
-                        .and_then(|entry| entry.exe_path.clone());
-                    let active_process_desktop_file = window_info
-                        .active_process
-                        .as_deref()
-                        .and_then(|process| self.desktop_file_path_for_process(process))
-                        .map(|path| path.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "Unavailable".to_string());
-                    let desktop_file_path = self
-                        .desktop_file_path_for_window(&window_info)
-                        .map(|path| path.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "Unavailable".to_string());
-                    let cwd_search_value = window_info
-                        .cwd_path
-                        .as_ref()
-                        .map(|path| display_path(path))
-                        .unwrap_or_else(|| "Unavailable".to_string());
-                    let class_is_searched = !window_info.class.eq_ignore_ascii_case(&app_key);
-
-                    let info_row =
-                        |ui: &mut egui::Ui, label: &str, value: String, searched: bool| {
-                            let label_color = if searched {
-                                searchable_label_color
-                            } else {
-                                neutral_label_color
-                            };
-                            let value_color = if searched {
-                                searchable_value_color
-                            } else {
-                                neutral_value_color
-                            };
-                            ui.label(egui::RichText::new(label).color(label_color).strong());
-                            ui.label(egui::RichText::new(value).color(value_color).monospace());
-                            ui.end_row();
-                        };
-
-                    ui.heading(
-                        egui::RichText::new(&window_info.title)
-                            .color(egui::Color32::WHITE)
-                            .strong(),
-                    );
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "Window metadata, process details, and execution chain",
-                        )
+                ui.heading(
+                    egui::RichText::new(&window_info.title)
+                        .color(egui::Color32::WHITE)
+                        .strong(),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Window metadata, process details, and execution chain")
                         .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170)),
-                    );
-                    ui.add_space(10.0);
+                );
+                ui.add_space(10.0);
 
-                    egui::Grid::new("window_info_grid")
-                        .num_columns(2)
-                        .spacing([14.0, 8.0])
-                        .striped(true)
-                        .show(ui, |ui| {
-                            info_row(ui, "Title", window_info.title.clone(), true);
-                            info_row(ui, "Application key", app_key.clone(), true);
-                            info_row(ui, "Window ID", window_info.id.clone(), false);
-                            info_row(ui, "Class", window_info.class.clone(), class_is_searched);
-                            info_row(ui, "Window desktop file", desktop_file_path, false);
-                            info_row(
-                                ui,
-                                "Window PID",
-                                window_info
-                                    .pid
-                                    .map(|pid| pid.to_string())
-                                    .unwrap_or_else(|| "Unavailable".to_string()),
-                                false,
-                            );
-                            info_row(
-                                ui,
-                                "Active process",
-                                window_info
-                                    .active_process
-                                    .clone()
-                                    .unwrap_or_else(|| "Unavailable".to_string()),
-                                true,
-                            );
-                            info_row(ui, "Window executable", exe_basename, true);
-                            info_row(
-                                ui,
-                                "Window executable path",
-                                window_info
-                                    .exe_path
-                                    .as_ref()
-                                    .map(|path| path.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| "Unavailable".to_string()),
-                                false,
-                            );
-                            info_row(
-                                ui,
-                                "Active process executable path",
-                                active_process_exe_path
-                                    .as_ref()
-                                    .map(|path| path.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| "Unavailable".to_string()),
-                                false,
-                            );
-                            info_row(
-                                ui,
-                                "Active process desktop file",
-                                active_process_desktop_file,
-                                false,
-                            );
-                            info_row(ui, "Working directory", cwd_search_value, true);
-                            info_row(
-                                ui,
-                                "Command summary",
-                                window_info
-                                    .command_summary
-                                    .clone()
-                                    .unwrap_or_else(|| "Unavailable".to_string()),
-                                true,
-                            );
-                            info_row(
-                                ui,
-                                "Command line",
-                                window_info
-                                    .command_line
-                                    .clone()
-                                    .unwrap_or_else(|| "Unavailable".to_string()),
-                                true,
-                            );
-                            info_row(
-                                ui,
-                                "Geometry",
-                                window_info
-                                    .geometry
-                                    .map(|(x, y, width, height)| {
-                                        format!(
-                                            "x={}, y={}, width={}, height={}",
-                                            x, y, width, height
-                                        )
-                                    })
-                                    .unwrap_or_else(|| "Unavailable".to_string()),
-                                false,
-                            );
-                            info_row(
-                                ui,
-                                "Minimized",
-                                window_info
-                                    .minimized
-                                    .map(|value| value.to_string())
-                                    .unwrap_or_else(|| "Unavailable".to_string()),
-                                false,
-                            );
-                        });
-
-                    ui.add_space(14.0);
-                    ui.separator();
-                    ui.add_space(10.0);
-                    ui.label(
-                        egui::RichText::new("Execution chain")
-                            .color(egui::Color32::WHITE)
-                            .strong(),
-                    );
-                    ui.add_space(6.0);
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for entry in &window_info.process_chain {
-                            ui.group(|ui| {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} (pid {})",
-                                        entry.name, entry.pid
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .strong(),
-                                );
-                                let path_text = entry
-                                    .exe_path
-                                    .as_ref()
-                                    .map(|path| path.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| "Executable path unavailable".to_string());
-                                ui.label(egui::RichText::new(path_text).color(
-                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160),
-                                ));
-                            });
-                            ui.add_space(6.0);
-                        }
+                egui::Grid::new("window_info_grid")
+                    .num_columns(2)
+                    .spacing([14.0, 8.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        info_row(ui, "Title", window_info.title.clone(), true);
+                        info_row(ui, "Raw window title", window_info.raw_title.clone(), false);
+                        info_row(ui, "Application key", app_key.clone(), true);
+                        info_row(ui, "Window ID", window_info.id.clone(), false);
+                        info_row(ui, "Class", window_info.class.clone(), class_is_searched);
+                        info_row(ui, "Window desktop file", desktop_file_path, false);
+                        info_row(
+                            ui,
+                            "Window PID",
+                            window_info
+                                .pid
+                                .map(|pid| pid.to_string())
+                                .unwrap_or_else(|| "Unavailable".to_string()),
+                            false,
+                        );
+                        info_row(
+                            ui,
+                            "Active process",
+                            window_info
+                                .active_process
+                                .clone()
+                                .unwrap_or_else(|| "Unavailable".to_string()),
+                            true,
+                        );
+                        info_row(ui, "Window executable", exe_basename, true);
+                        info_row(
+                            ui,
+                            "Window executable path",
+                            window_info
+                                .exe_path
+                                .as_ref()
+                                .map(|path| path.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "Unavailable".to_string()),
+                            false,
+                        );
+                        info_row(
+                            ui,
+                            "Active process executable path",
+                            active_process_exe_path
+                                .as_ref()
+                                .map(|path| path.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "Unavailable".to_string()),
+                            false,
+                        );
+                        info_row(
+                            ui,
+                            "Active process desktop file",
+                            active_process_desktop_file,
+                            false,
+                        );
+                        info_row(ui, "Working directory", cwd_search_value, true);
+                        info_row(
+                            ui,
+                            "Command summary",
+                            window_info
+                                .command_summary
+                                .clone()
+                                .unwrap_or_else(|| "Unavailable".to_string()),
+                            true,
+                        );
+                        info_row(
+                            ui,
+                            "Command line",
+                            window_info
+                                .command_line
+                                .clone()
+                                .unwrap_or_else(|| "Unavailable".to_string()),
+                            true,
+                        );
+                        info_row(
+                            ui,
+                            "Geometry",
+                            window_info
+                                .geometry
+                                .map(|(x, y, width, height)| {
+                                    format!("x={}, y={}, width={}, height={}", x, y, width, height)
+                                })
+                                .unwrap_or_else(|| "Unavailable".to_string()),
+                            false,
+                        );
+                        info_row(
+                            ui,
+                            "Minimized",
+                            window_info
+                                .minimized
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "Unavailable".to_string()),
+                            false,
+                        );
                     });
-                });
-        });
 
-        if should_close {
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new("Execution chain")
+                        .color(egui::Color32::WHITE)
+                        .strong(),
+                );
+                ui.add_space(6.0);
+                for entry in &window_info.process_chain {
+                    ui.group(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{} (pid {})", entry.name, entry.pid))
+                                .color(egui::Color32::WHITE)
+                                .strong(),
+                        );
+                        let path_text = entry
+                            .exe_path
+                            .as_ref()
+                            .map(|path| path.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "Executable path unavailable".to_string());
+                        ui.label(
+                            egui::RichText::new(path_text)
+                                .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160)),
+                        );
+                    });
+                    ui.add_space(6.0);
+                }
+            });
+
+        if !is_open {
             self.process_chain_popup = None;
         }
     }
@@ -5971,152 +7417,144 @@ impl App {
             return;
         };
 
-        let viewport_id = egui::ViewportId::from_hash_of("launcher_app_info_popup");
-        let builder = egui::ViewportBuilder::default()
-            .with_title(format!("Application Info: {}", app_info.name))
-            .with_inner_size([720.0, 520.0])
-            .with_min_inner_size([480.0, 320.0])
-            .with_resizable(true);
+        if !ctx.embed_viewports() {
+            show_deferred_info_popup(
+                ctx,
+                egui::ViewportId::from_hash_of("launcher_app_info_popup"),
+                self.app_info_popup_data(&app_info),
+                [720.0, 520.0],
+                [480.0, 320.0],
+                PopupEvent::CloseAppInfo,
+                self.popup_event_sender.clone(),
+            );
+            return;
+        }
 
-        let mut should_close = false;
-        ctx.show_viewport_immediate(viewport_id, builder, |ctx, _class| {
-            if ctx.input(|i| i.viewport().close_requested()) {
-                should_close = true;
-                return;
-            }
+        let mut is_open = true;
+        egui::Window::new(format!("Application Info: {}", app_info.name))
+            .id(egui::Id::new("launcher_app_info_popup"))
+            .default_size([720.0, 520.0])
+            .min_size([480.0, 320.0])
+            .resizable(true)
+            .collapsible(false)
+            .order(egui::Order::Foreground)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 240))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+                    ))
+                    .corner_radius(egui::CornerRadius::same(12)),
+            )
+            .open(&mut is_open)
+            .show(ctx, |ui| {
+                let searchable_label_color = egui::Color32::from_rgb(214, 184, 86);
+                let searchable_value_color = egui::Color32::from_rgb(255, 236, 170);
+                let neutral_label_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170);
+                let neutral_value_color = egui::Color32::WHITE;
+                let desktop_stem = app_info
+                    .desktop_file_path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("Unavailable")
+                    .to_string();
+                let executable_basename =
+                    command_basename(&app_info.exec).unwrap_or_else(|| "Unavailable".to_string());
+                let executable_path = executable_path_from_exec(&app_info.exec);
+                let executable_path_display = executable_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Unavailable".to_string());
+                let executable_exists = executable_path.as_ref().is_some_and(|path| path.is_file());
+                let desktop_file_exists = app_info.desktop_file_path.exists();
+                let icon_path = app_info
+                    .icon_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Unavailable".to_string());
+                let is_pinned = self.pinned_apps.contains(&app_info.desktop_file_path);
 
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                should_close = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                return;
-            }
+                let info_row = |ui: &mut egui::Ui, label: &str, value: String, searched: bool| {
+                    let label_color = if searched {
+                        searchable_label_color
+                    } else {
+                        neutral_label_color
+                    };
+                    let value_color = if searched {
+                        searchable_value_color
+                    } else {
+                        neutral_value_color
+                    };
+                    ui.label(egui::RichText::new(label).color(label_color).strong());
+                    ui.label(egui::RichText::new(value).color(value_color).monospace());
+                    ui.end_row();
+                };
 
-            egui::CentralPanel::default()
-                .frame(
-                    egui::Frame::window(&ctx.style())
-                        .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 240))
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20),
-                        ))
-                        .corner_radius(egui::CornerRadius::same(12)),
-                )
-                .show(ctx, |ui| {
-                    let searchable_label_color = egui::Color32::from_rgb(214, 184, 86);
-                    let searchable_value_color = egui::Color32::from_rgb(255, 236, 170);
-                    let neutral_label_color =
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170);
-                    let neutral_value_color = egui::Color32::WHITE;
-                    let desktop_stem = app_info
-                        .desktop_file_path
-                        .file_stem()
-                        .and_then(|stem| stem.to_str())
-                        .unwrap_or("Unavailable")
-                        .to_string();
-                    let executable_basename = command_basename(&app_info.exec)
-                        .unwrap_or_else(|| "Unavailable".to_string());
-                    let executable_path = executable_path_from_exec(&app_info.exec);
-                    let executable_path_display = executable_path
-                        .as_ref()
-                        .map(|path| path.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "Unavailable".to_string());
-                    let executable_exists =
-                        executable_path.as_ref().is_some_and(|path| path.is_file());
-                    let desktop_file_exists = app_info.desktop_file_path.exists();
-                    let icon_path = app_info
-                        .icon_path
-                        .as_ref()
-                        .map(|path| path.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "Unavailable".to_string());
-                    let is_pinned = self.pinned_apps.contains(&app_info.desktop_file_path);
+                ui.heading(
+                    egui::RichText::new(&app_info.name)
+                        .color(egui::Color32::WHITE)
+                        .strong(),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Desktop-entry and application search metadata")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170)),
+                );
+                ui.add_space(10.0);
 
-                    let info_row =
-                        |ui: &mut egui::Ui, label: &str, value: String, searched: bool| {
-                            let label_color = if searched {
-                                searchable_label_color
-                            } else {
-                                neutral_label_color
-                            };
-                            let value_color = if searched {
-                                searchable_value_color
-                            } else {
-                                neutral_value_color
-                            };
-                            ui.label(egui::RichText::new(label).color(label_color).strong());
-                            ui.label(egui::RichText::new(value).color(value_color).monospace());
-                            ui.end_row();
-                        };
-
-                    ui.heading(
-                        egui::RichText::new(&app_info.name)
-                            .color(egui::Color32::WHITE)
-                            .strong(),
-                    );
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new("Desktop-entry and application search metadata")
-                            .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170)),
-                    );
-                    ui.add_space(10.0);
-
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        egui::Grid::new("app_info_grid")
-                            .num_columns(2)
-                            .spacing([14.0, 8.0])
-                            .striped(true)
-                            .show(ui, |ui| {
-                                info_row(ui, "Name", app_info.name.clone(), true);
-                                info_row(ui, "Executable basename", executable_basename, true);
-                                info_row(ui, "Desktop file stem", desktop_stem, true);
-                                info_row(
-                                    ui,
-                                    "Comment",
-                                    app_info
-                                        .comment
-                                        .clone()
-                                        .unwrap_or_else(|| "Unavailable".to_string()),
-                                    true,
-                                );
-                                info_row(
-                                    ui,
-                                    "Cleaned command",
-                                    clean_exec_cmd(&app_info.exec),
-                                    true,
-                                );
-                                info_row(ui, "Executable path", executable_path_display, false);
-                                info_row(
-                                    ui,
-                                    "Executable exists",
-                                    executable_exists.to_string(),
-                                    false,
-                                );
-                                info_row(ui, "Raw Exec", app_info.exec.clone(), false);
-                                info_row(
-                                    ui,
-                                    "Desktop file",
-                                    app_info.desktop_file_path.to_string_lossy().to_string(),
-                                    false,
-                                );
-                                info_row(
-                                    ui,
-                                    "Desktop file exists",
-                                    desktop_file_exists.to_string(),
-                                    false,
-                                );
-                                info_row(ui, "Icon path", icon_path, false);
-                                info_row(ui, "Pinned", is_pinned.to_string(), false);
-                                info_row(
-                                    ui,
-                                    "System settings module",
-                                    app_info.is_settings_module.to_string(),
-                                    false,
-                                );
-                            });
-                    });
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::Grid::new("app_info_grid")
+                        .num_columns(2)
+                        .spacing([14.0, 8.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            info_row(ui, "Name", app_info.name.clone(), true);
+                            info_row(ui, "Executable basename", executable_basename, true);
+                            info_row(ui, "Desktop file stem", desktop_stem, true);
+                            info_row(
+                                ui,
+                                "Comment",
+                                app_info
+                                    .comment
+                                    .clone()
+                                    .unwrap_or_else(|| "Unavailable".to_string()),
+                                true,
+                            );
+                            info_row(ui, "Cleaned command", clean_exec_cmd(&app_info.exec), true);
+                            info_row(ui, "Executable path", executable_path_display, false);
+                            info_row(
+                                ui,
+                                "Executable exists",
+                                executable_exists.to_string(),
+                                false,
+                            );
+                            info_row(ui, "Raw Exec", app_info.exec.clone(), false);
+                            info_row(
+                                ui,
+                                "Desktop file",
+                                app_info.desktop_file_path.to_string_lossy().to_string(),
+                                false,
+                            );
+                            info_row(
+                                ui,
+                                "Desktop file exists",
+                                desktop_file_exists.to_string(),
+                                false,
+                            );
+                            info_row(ui, "Icon path", icon_path, false);
+                            info_row(ui, "Pinned", is_pinned.to_string(), false);
+                            info_row(
+                                ui,
+                                "System settings module",
+                                app_info.is_settings_module.to_string(),
+                                false,
+                            );
+                        });
                 });
-        });
+            });
 
-        if should_close {
+        if !is_open {
             self.app_info_popup = None;
         }
     }
@@ -6144,11 +7582,12 @@ impl App {
 
     fn seed_window_icon_cache(&mut self) {
         for window in &self.windows {
-            let icon_key = window
-                .active_process
-                .as_ref()
-                .unwrap_or(&window.class)
-                .clone();
+            let icon_key = window_icon_cache_key(
+                &window.class,
+                window.desktop_file_name.as_deref(),
+                window.active_process.as_deref(),
+                window.exe_path.as_deref(),
+            );
             self.window_icon_cache
                 .entry(icon_key)
                 .or_insert_with(|| window.icon_path.clone());
@@ -6272,14 +7711,29 @@ impl App {
             .unwrap_or("breeze-dark")
             .to_string();
         let (ppid_to_children, pid_to_name, pid_to_ppid) = get_process_tree();
+        let terminal_records = self.terminal_records.clone();
         let mut changed = false;
         let mut search_changed = false;
         let mut cache_updates = Vec::new();
+        let mut needs_terminal_metadata_refresh = false;
 
         for event in events {
             match event {
                 WindowFeedEvent::Upsert(payload) => {
                     let window_id = payload.id.clone();
+                    let payload_class = if payload.class.trim().is_empty() {
+                        payload.desktop_file_name.as_str()
+                    } else {
+                        payload.class.as_str()
+                    };
+                    let terminal_payload = is_terminal_class(&payload_class.to_lowercase())
+                        || self.windows.iter().any(|window| {
+                            window.id == window_id
+                                && is_terminal_class(&window.class.to_lowercase())
+                        });
+                    needs_terminal_metadata_refresh |= terminal_payload
+                        && terminal_record_for_window_title(&payload.title, &terminal_records)
+                            .is_none();
                     if let Some(window) = window_info_from_kwin_payload(
                         payload,
                         &theme,
@@ -6287,6 +7741,7 @@ impl App {
                         &ppid_to_children,
                         &pid_to_name,
                         &pid_to_ppid,
+                        &terminal_records,
                     ) {
                         self.missing_window_counts.remove(&window.id);
                         if let Some(existing) =
@@ -6328,6 +7783,9 @@ impl App {
                 self.update_cached_windows_without_rerank(&cache_updates);
             }
             self.refresh_window_audio_cache();
+        }
+        if needs_terminal_metadata_refresh {
+            self.start_terminal_metadata_refresh();
         }
     }
 
@@ -6457,6 +7915,55 @@ impl App {
             let windows = get_open_windows(&kpath, &theme).unwrap_or_default();
             let _ = tx.send(windows);
         });
+    }
+
+    fn schedule_window_reconciliation(&mut self, delay: Duration) {
+        self.next_window_reconciliation_at = Some(Instant::now() + delay);
+    }
+
+    fn start_window_reconciliation(&mut self) {
+        if self.background_window_reconciliation_receiver.is_some() {
+            return;
+        }
+        let Some(kpath) = self.kdotool_path.clone() else {
+            self.next_window_reconciliation_at = None;
+            return;
+        };
+        let theme = self
+            .force_theme
+            .as_deref()
+            .unwrap_or("breeze-dark")
+            .to_string();
+        let repaint_ctx = self.repaint_ctx.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.background_window_reconciliation_receiver = Some(rx);
+        self.next_window_reconciliation_at = None;
+
+        std::thread::spawn(move || {
+            let windows =
+                get_open_windows_fast(&kpath, &theme).filter(|windows| !windows.is_empty());
+            let _ = tx.send(windows);
+            repaint_ctx.request_repaint();
+        });
+    }
+
+    fn apply_window_reconciliation(&mut self, discovered: Vec<WindowInfo>) {
+        for window in &discovered {
+            self.missing_window_counts.remove(&window.id);
+        }
+        let (changed, search_changed, cache_updates) =
+            merge_reconciled_windows(&mut self.windows, discovered);
+        if !changed {
+            return;
+        }
+
+        self.seed_window_icon_cache();
+        if search_changed {
+            self.schedule_window_search_refresh();
+        } else {
+            self.update_cached_windows_without_rerank(&cache_updates);
+        }
+        self.refresh_window_audio_cache();
     }
 
     fn start_background_app_load(&mut self) {
@@ -6824,11 +8331,41 @@ impl eframe::App for App {
                         ActivePane::Apps
                     };
                     self.start_background_app_load();
+                    self.start_terminal_metadata_refresh();
+                    if self.use_kwin_window_feed {
+                        self.schedule_window_reconciliation(Duration::ZERO);
+                    }
                 }
             }
         }
         if ui_event_count == UI_EVENTS_PER_FRAME || handled_focus_launcher {
             ctx.request_repaint();
+        }
+        self.process_popup_events();
+
+        match self
+            .terminal_records_receiver
+            .as_ref()
+            .map(|rx| rx.try_recv())
+        {
+            Some(Ok(result)) => {
+                self.terminal_records_receiver = None;
+                match result {
+                    Ok(records) => self.apply_terminal_metadata_records(records),
+                    Err(err) => eprintln!("Could not refresh XFCE4 Terminal metadata: {err}"),
+                }
+                if self.terminal_metadata_refresh_queued {
+                    self.start_terminal_metadata_refresh();
+                }
+                ctx.request_repaint();
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.terminal_records_receiver = None;
+                if self.terminal_metadata_refresh_queued {
+                    self.start_terminal_metadata_refresh();
+                }
+            }
+            _ => {}
         }
 
         if let Some(result) = self
@@ -6840,6 +8377,7 @@ impl eframe::App for App {
             match result {
                 Ok(()) => {
                     self.use_kwin_window_feed = true;
+                    self.schedule_window_reconciliation(Duration::from_secs(1));
                     ctx.request_repaint();
                 }
                 Err(err) => {
@@ -6900,6 +8438,42 @@ impl eframe::App for App {
                     self.background_window_enrichment_receiver = None;
                 }
                 _ => {}
+            }
+        }
+
+        match self
+            .background_window_reconciliation_receiver
+            .as_ref()
+            .map(|rx| rx.try_recv())
+        {
+            Some(Ok(Some(windows))) => {
+                self.background_window_reconciliation_receiver = None;
+                self.apply_window_reconciliation(windows);
+                self.schedule_window_reconciliation(Duration::from_secs(
+                    WINDOW_RECONCILIATION_INTERVAL_SECS,
+                ));
+                ctx.request_repaint();
+            }
+            Some(Ok(None)) | Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.background_window_reconciliation_receiver = None;
+                self.schedule_window_reconciliation(Duration::from_secs(
+                    WINDOW_RECONCILIATION_RETRY_SECS,
+                ));
+            }
+            _ => {}
+        }
+
+        if self.use_kwin_window_feed
+            && !self.loading
+            && self.background_window_reconciliation_receiver.is_none()
+        {
+            if let Some(deadline) = self.next_window_reconciliation_at {
+                let now = Instant::now();
+                if now >= deadline {
+                    self.start_window_reconciliation();
+                } else {
+                    ctx.request_repaint_after(deadline.saturating_duration_since(now));
+                }
             }
         }
 
@@ -6990,6 +8564,8 @@ impl eframe::App for App {
         if !handled_focus_launcher {
             self.prune_stale_windows();
         }
+
+        self.update_terminal_attention_automation(ctx);
 
         if let Some(deadline) = self.pending_window_search_refresh_at {
             let now = Instant::now();
@@ -7661,6 +9237,10 @@ impl eframe::App for App {
                     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                         if self.show_settings_menu {
                             self.close_settings_menu();
+                        } else if self.process_chain_popup.is_some() {
+                            self.process_chain_popup = None;
+                        } else if self.app_info_popup.is_some() {
+                            self.app_info_popup = None;
                         } else {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
@@ -8818,7 +10398,6 @@ impl eframe::App for App {
                                                         self.activate_and_exit(win.id.clone(), ctx);
                                                         ui.close();
                                                     }
-
                                                     // Volume Control
                                                     let matching_sinks =
                                                         self.window_audio_cache
@@ -9487,6 +11066,7 @@ impl eframe::App for App {
                     if self.app_info_popup.is_some() {
                         self.show_app_info_popup(ctx);
                     }
+                    self.show_terminal_action_message(ctx);
 
                     if let Some(ref resp) = text_edit_response {
                         if ctx.input(|i| i.focused) {
@@ -9907,6 +11487,7 @@ mod tests {
         WindowInfo {
             id: "test-window".to_string(),
             title: title.to_string(),
+            raw_title: title.to_string(),
             class: "xfce4-terminal".to_string(),
             desktop_file_name: Some("xfce4-terminal.desktop".to_string()),
             minimized: Some(false),
@@ -9921,6 +11502,409 @@ mod tests {
             process_chain: Vec::new(),
             pid: Some(1234),
         }
+    }
+
+    #[test]
+    fn terminal_attention_sends_every_due_window_once() {
+        let now = Instant::now();
+        let mut deadlines = HashMap::new();
+        let mut handled = HashSet::new();
+        let mut windows = (0..5)
+            .map(|index| {
+                let mut window = test_window_info("codex - project - Terminal");
+                window.id = format!("terminal-{index}");
+                window.demands_attention = true;
+                window
+            })
+            .collect::<Vec<_>>();
+        let mut non_terminal = test_window_info("Browser");
+        non_terminal.id = "browser".to_string();
+        non_terminal.class = "firefox".to_string();
+        non_terminal.demands_attention = true;
+        windows.push(non_terminal);
+
+        let (due, next) =
+            update_terminal_attention_schedule(true, &windows, &mut deadlines, &mut handled, now);
+        assert!(due.is_empty());
+        assert_eq!(next, Some(now + Duration::from_secs(5)));
+
+        let (due, next) = update_terminal_attention_schedule(
+            true,
+            &windows,
+            &mut deadlines,
+            &mut handled,
+            now + Duration::from_secs(5),
+        );
+        assert_eq!(due.len(), 5);
+        assert!(next.is_none());
+
+        let (due, _) = update_terminal_attention_schedule(
+            true,
+            &windows,
+            &mut deadlines,
+            &mut handled,
+            now + Duration::from_secs(10),
+        );
+        assert!(due.is_empty());
+    }
+
+    #[test]
+    fn terminal_attention_clear_cancels_and_rearms_delay() {
+        let now = Instant::now();
+        let mut deadlines = HashMap::new();
+        let mut handled = HashSet::new();
+        let mut window = test_window_info("codex - project - Terminal");
+        window.demands_attention = true;
+
+        update_terminal_attention_schedule(
+            true,
+            &[window.clone()],
+            &mut deadlines,
+            &mut handled,
+            now,
+        );
+        window.demands_attention = false;
+        let (due, next) = update_terminal_attention_schedule(
+            true,
+            &[window.clone()],
+            &mut deadlines,
+            &mut handled,
+            now + Duration::from_secs(4),
+        );
+        assert!(due.is_empty());
+        assert!(next.is_none());
+
+        window.demands_attention = true;
+        update_terminal_attention_schedule(
+            true,
+            &[window.clone()],
+            &mut deadlines,
+            &mut handled,
+            now + Duration::from_secs(10),
+        );
+        let (due, _) = update_terminal_attention_schedule(
+            true,
+            &[window],
+            &mut deadlines,
+            &mut handled,
+            now + Duration::from_secs(15),
+        );
+        assert_eq!(due.len(), 1);
+    }
+
+    fn terminal_record(
+        tab_uuid: &str,
+        window_uuid: &str,
+        title: &str,
+        pty: &str,
+    ) -> TerminalDbusRecord {
+        TerminalDbusRecord {
+            window_uuid: window_uuid.to_string(),
+            tab_uuid: tab_uuid.to_string(),
+            active: true,
+            window_title: title.to_string(),
+            working_directory: "/home/lewis/Dev/applicationlauncher".to_string(),
+            child_pid: 0,
+            foreground_pid: 0,
+            foreground_pgid: 0,
+            pty: pty.to_string(),
+        }
+    }
+
+    #[test]
+    fn terminal_tab_matching_prefers_unique_pty_over_duplicate_titles() {
+        let identity = TerminalWindowIdentity {
+            normalized_title: normalize_window_sort_title("⠇ xfce4-terminal - Terminal"),
+            cwd: Some(PathBuf::from("/home/lewis/Dev/applicationlauncher")),
+            ptys: HashSet::from(["/dev/pts/23".to_string()]),
+            ..Default::default()
+        };
+        let records = vec![
+            terminal_record(
+                "tab-a",
+                "window-a",
+                "⠋ xfce4-terminal - Terminal",
+                "/dev/pts/22",
+            ),
+            terminal_record(
+                "tab-b",
+                "window-b",
+                "⠴ xfce4-terminal - Terminal",
+                "/dev/pts/23",
+            ),
+        ];
+
+        assert_eq!(select_terminal_tab(&identity, &records).unwrap(), "tab-b");
+    }
+
+    #[test]
+    fn terminal_tab_matching_allows_a_unique_raw_window_title() {
+        let identity = TerminalWindowIdentity {
+            normalized_title: normalize_window_sort_title("codex - project - Terminal"),
+            ..Default::default()
+        };
+        let records = vec![
+            terminal_record("tab-a", "window-a", "fish - ~ - Terminal", "/dev/pts/22"),
+            terminal_record(
+                "tab-b",
+                "window-b",
+                "codex - project - Terminal",
+                "/dev/pts/23",
+            ),
+        ];
+
+        assert_eq!(select_terminal_tab(&identity, &records).unwrap(), "tab-b");
+    }
+
+    #[test]
+    fn terminal_tab_matching_rejects_ambiguous_titles_without_process_identity() {
+        let identity = TerminalWindowIdentity {
+            normalized_title: normalize_window_sort_title("fish - ~ - Terminal"),
+            ..Default::default()
+        };
+        let records = vec![
+            terminal_record("tab-a", "window-a", "fish - ~ - Terminal", "/dev/pts/22"),
+            terminal_record("tab-b", "window-b", "fish - ~ - Terminal", "/dev/pts/23"),
+        ];
+
+        assert!(select_terminal_tab(&identity, &records).is_err());
+    }
+
+    #[test]
+    fn terminal_metadata_matches_a_unique_raw_window_title() {
+        let mut fish = terminal_record("tab-fish", "window-fish", "~ - Terminal", "/dev/pts/19");
+        fish.child_pid = 4152349;
+        fish.foreground_pid = 4152349;
+        let mut chatgpt = terminal_record(
+            "tab-chatgpt",
+            "window-chatgpt",
+            "npm run build - Terminal",
+            "/dev/pts/17",
+        );
+        chatgpt.child_pid = 4096357;
+        chatgpt.foreground_pid = 4097817;
+        let records = vec![fish, chatgpt];
+
+        let matched = terminal_record_for_window_title("~ - Terminal", &records).unwrap();
+        assert_eq!(matched.tab_uuid, "tab-fish");
+        assert_eq!(matched.foreground_pid, 4152349);
+    }
+
+    #[test]
+    fn terminal_metadata_does_not_guess_between_duplicate_titles() {
+        let mut first = terminal_record("tab-a", "window-a", "~ - Terminal", "/dev/pts/19");
+        first.child_pid = 100;
+        let mut second = terminal_record("tab-b", "window-b", "~ - Terminal", "/dev/pts/20");
+        second.child_pid = 200;
+
+        assert!(terminal_record_for_window_title("~ - Terminal", &[first, second]).is_none());
+    }
+
+    #[test]
+    fn terminal_metadata_identifies_its_own_shared_server_process() {
+        let mut record = terminal_record("tab-a", "window-a", "~ - Terminal", "/dev/pts/19");
+        record.child_pid = 100;
+        record.foreground_pid = 101;
+        let parents = HashMap::from([(101, 100), (100, 10), (10, 1)]);
+
+        assert!(terminal_server_has_dbus_records(
+            10,
+            &[record.clone()],
+            &parents
+        ));
+        assert!(!terminal_server_has_dbus_records(20, &[record], &parents));
+    }
+
+    #[test]
+    #[ignore = "requires the patched XFCE4 Terminal D-Bus service"]
+    fn live_terminal_dbus_schema_deserializes() {
+        let connection = zbus::blocking::Connection::session().unwrap();
+        let proxy = zbus::blocking::Proxy::new(
+            &connection,
+            TERMINAL_DBUS_SERVICE,
+            TERMINAL_DBUS_PATH,
+            TERMINAL_DBUS_INTERFACE,
+        )
+        .unwrap();
+        let raw_records: Vec<HashMap<String, zbus::zvariant::OwnedValue>> =
+            proxy.call("ListTerminals", &()).unwrap();
+        let records = parse_terminal_dbus_records(raw_records);
+
+        assert!(!records.is_empty());
+        assert!(records.iter().all(|record| !record.tab_uuid.is_empty()));
+        assert!(records.iter().all(|record| !record.pty.is_empty()));
+    }
+
+    #[test]
+    #[ignore = "requires a live KWin session and kdotool"]
+    fn live_fast_window_snapshot_reports_discovered_windows() {
+        let kdotool = get_kdotool_path();
+        let probe = Command::new(&kdotool)
+            .args(["search", "--title", ""])
+            .output()
+            .expect("kdotool search should execute");
+        eprintln!(
+            "kdotool={} status={} ids={} stderr={}",
+            kdotool.display(),
+            probe.status,
+            String::from_utf8_lossy(&probe.stdout).lines().count(),
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        let windows = get_open_windows_fast(&kdotool, "breeze-dark")
+            .expect("the live KWin window snapshot should be available");
+
+        eprintln!("discovered {} application windows", windows.len());
+        for window in &windows {
+            eprintln!(
+                "{}\t{}\t{}\tactive={:?}\texe={:?}\ticon={:?}",
+                window.id,
+                window.class,
+                window.raw_title,
+                window.active_process,
+                window.exe_path,
+                window.icon_path
+            );
+        }
+        assert!(!windows.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires a live Tor Browser window, KWin, and kdotool"]
+    fn live_tor_browser_window_uses_tor_icon() {
+        let kdotool = get_kdotool_path();
+        let windows = get_open_windows_fast(&kdotool, "breeze-dark").unwrap();
+        let tor_window = windows
+            .iter()
+            .find(|window| is_tor_browser_identity(&window.class))
+            .expect("a live Tor Browser window should be open");
+        let icon = tor_window
+            .icon_path
+            .as_ref()
+            .expect("the Tor Browser window should resolve a dedicated icon");
+        let icon_name = icon.to_string_lossy().to_lowercase();
+
+        assert!(icon_name.contains("tor"));
+        assert!(!icon_name.contains("firefox"));
+    }
+
+    #[test]
+    #[ignore = "requires a live idle XFCE4 Terminal window, KWin, and the patched D-Bus API"]
+    fn live_idle_terminal_does_not_inherit_electron_process() {
+        let kdotool = get_kdotool_path();
+        let windows = get_open_windows_fast(&kdotool, "breeze-dark").unwrap();
+        let idle_terminals = windows
+            .iter()
+            .filter(|window| {
+                is_terminal_class(&window.class.to_lowercase())
+                    && normalize_window_sort_title(&window.raw_title)
+                        == normalize_window_sort_title("~ - Terminal")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!idle_terminals.is_empty());
+        assert!(idle_terminals.iter().all(|window| {
+            window.active_process.as_deref() != Some("electron")
+                && !window
+                    .command_line
+                    .as_deref()
+                    .is_some_and(|command| command.contains("electron"))
+        }));
+    }
+
+    #[test]
+    fn reconciliation_adds_missing_windows_without_dropping_feed_state() {
+        let mut existing = test_window_info("old title");
+        existing.id = "existing".to_string();
+        existing.demands_attention = true;
+        existing.icon_path = Some(PathBuf::from("/tmp/existing.svg"));
+        let mut feed_only = test_window_info("feed only");
+        feed_only.id = "feed-only".to_string();
+        let mut current = vec![existing.clone(), feed_only];
+
+        let mut refreshed = test_window_info("new title");
+        refreshed.id = "existing".to_string();
+        refreshed.desktop_file_name = None;
+        refreshed.geometry = None;
+        refreshed.minimized = None;
+        refreshed.icon_path = None;
+        let mut newly_discovered = test_window_info("new window");
+        newly_discovered.id = "new".to_string();
+
+        let (changed, search_changed, cache_updates) =
+            merge_reconciled_windows(&mut current, vec![refreshed, newly_discovered]);
+
+        assert!(changed);
+        assert!(search_changed);
+        assert_eq!(cache_updates.len(), 1);
+        assert_eq!(current.len(), 3);
+        let merged = current
+            .iter()
+            .find(|window| window.id == "existing")
+            .unwrap();
+        assert_eq!(merged.title, "new title");
+        assert_eq!(merged.desktop_file_name, existing.desktop_file_name);
+        assert_eq!(merged.geometry, existing.geometry);
+        assert_eq!(merged.minimized, existing.minimized);
+        assert_eq!(merged.icon_path, existing.icon_path);
+        assert!(merged.demands_attention);
+        assert!(current.iter().any(|window| window.id == "feed-only"));
+        assert!(current.iter().any(|window| window.id == "new"));
+    }
+
+    #[test]
+    fn icon_cache_separates_terminal_children_from_standalone_apps() {
+        let terminal_child = window_icon_cache_key(
+            "xfce4-terminal",
+            Some("xfce4-terminal"),
+            Some("electron"),
+            Some(Path::new("/usr/bin/xfce4-terminal")),
+        );
+        let standalone_app = window_icon_cache_key(
+            "electron",
+            None,
+            None,
+            Some(Path::new(
+                "/home/lewis/Dev/chatgpt/node_modules/electron/dist/electron",
+            )),
+        );
+
+        assert_ne!(terminal_child, standalone_app);
+        let mut cache = HashMap::new();
+        cache.insert(
+            terminal_child,
+            Some(PathBuf::from("/usr/share/icons/xfce4-terminal.svg")),
+        );
+        assert!(!cache.contains_key(&standalone_app));
+    }
+
+    #[test]
+    fn non_terminal_window_does_not_use_terminal_executable_fallback() {
+        assert_eq!(
+            resolve_window_icon(
+                "breeze-dark",
+                "application-with-no-installed-icon",
+                None,
+                None,
+                Some(Path::new("/usr/bin/xfce4-terminal")),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn tor_browser_never_uses_firefox_icon_fallback() {
+        let icon = resolve_window_icon(
+            "breeze-dark",
+            "Tor Browser",
+            None,
+            None,
+            Some(Path::new("/opt/tor-browser/Browser/firefox.real")),
+        );
+
+        assert!(
+            icon.as_ref()
+                .is_none_or(|path| { !path.to_string_lossy().to_lowercase().contains("firefox") })
+        );
     }
 
     #[test]
@@ -10240,6 +12224,7 @@ mod tests {
             &ppid_to_children,
             &pid_to_name,
             &pid_to_ppid,
+            &[],
         );
 
         assert!(window.is_none());
