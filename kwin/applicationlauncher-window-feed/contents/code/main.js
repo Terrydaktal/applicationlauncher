@@ -131,6 +131,8 @@ function trackWindow(window) {
     }
 }
 
+callDBus(SERVICE, PATH, INTERFACE, "ResetWindows");
+
 for (var i = 0; i < workspace.stackingOrder.length; ++i) {
     trackWindow(workspace.stackingOrder[i]);
 }
