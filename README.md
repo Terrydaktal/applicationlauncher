@@ -1,19 +1,30 @@
 # applicationlauncher
 
-`applicationlauncher` is a Rust GUI launcher for KDE Plasma on Wayland. It combines two workflows in one frameless window: a searchable list of open windows on the left and a searchable application panel on the right. It uses `kdotool` for KWin window control, scans installed desktop entries, keeps launcher settings on disk, and supports keyboard-first navigation across both panels.
+`applicationlauncher` is a Rust GUI launcher and persistent window-session tracker for KDE Plasma on Wayland. The GUI combines searchable open windows and installed applications. The companion `applicationlauncherd` process records window activation and closure history, maintains crash-recovery and named snapshots, and can restore missing windows without closing unrelated work.
 
 ## Project Structure
 
 ```text
 .
 ├── src/
+│   ├── bin/applicationlauncherd.rs
+│   ├── tracker/
+│   ├── windows/
+│   ├── app.rs
+│   ├── models.rs
 │   └── main.rs
+├── kwin/applicationlauncher-window-feed/
 ├── Cargo.toml
 ├── Cargo.lock
 └── README.md
 ```
 
-- `src/main.rs`: Entire application implementation. This includes window discovery, desktop entry parsing, fuzzy search, icon lookup, process chain inspection, popup windows, single-instance handling, CLI parsing, and all `egui` rendering.
+- `src/main.rs`: GUI CLI parsing, single-instance startup, and native window creation.
+- `src/app.rs`: Launcher state and `eframe` update/render loop, including History/Sessions UI.
+- `src/tracker/`: Daemon client, private SQLite persistence, restore policy, service installation, and D-Bus service.
+- `src/bin/applicationlauncherd.rs`: Persistent background tracker entry point.
+- `src/windows/`: KWin snapshot consumption, process metadata, terminal integration, and icon resolution.
+- `kwin/applicationlauncher-window-feed/`: Transactional KWin script that sends compositor window events to the daemon.
 - `Cargo.toml`: Package metadata and Rust dependencies.
 - `Cargo.lock`: Locked dependency graph for reproducible builds.
 - `README.md`: Project documentation for the current GUI application.
@@ -31,7 +42,16 @@
 
 ## Runtime Architecture
 
-The application is implemented as a single native `eframe` / `egui` binary.
+The project builds a native `eframe` / `egui` GUI and a separate user-session daemon.
+
+- Persistent tracking:
+  `applicationlauncherd` owns the window-feed D-Bus service, records current and closed windows in SQLite WAL mode, and survives GUI closure. The GUI fetches a snapshot only when a generation counter changes.
+- Recovery:
+  State is debounced to disk. An unclean previous boot produces a restore prompt; a same-boot daemon restart does not. The prior recovery snapshot is preserved until restored or dismissed.
+- Restoration:
+  Existing matching windows are reused and repositioned, only missing windows are launched, and unrelated windows are never closed. Terminal replay is restricted to shell/CWD, `codex resume --last`, `agy -c`, `htop`, and `nvtop`.
+- Recent window reopening:
+  The newest recently closed window can be reopened globally with `Ctrl+Shift+T`. The KWin shortcut is ignored while Chrome, Chromium, or Firefox is active, preserving browser tab-reopen behavior. A successful reopen removes that entry from the history list.
 
 - Window loading:
   Uses `kdotool` to query KWin-managed windows, then resolves metadata such as title, class, PID, icon, executable path, and terminal child processes.
@@ -116,6 +136,12 @@ The launcher writes its runtime data to:
   Stores the current launcher window width and height.
 - `$HOME/.config/applicationlauncher/pinned_apps.txt`
   Stores pinned application desktop file paths in display order.
+- `$XDG_STATE_HOME/applicationlauncher/history.sqlite3`
+  Private SQLite WAL database containing current windows, closed-window history, recovery state, and named snapshots. History is retained until manually cleared.
+- `$HOME/.config/systemd/user/applicationlauncherd.service`
+  Auto-installed tracker service with restart-on-failure behavior.
+- `$HOME/.local/bin/applicationlauncherd`
+  Symbolic link to the daemon binary beside the launcher binary.
 
 ## Settings Window
 
@@ -144,6 +170,10 @@ Current settings cover:
   Refreshes the open windows or application data, depending on context.
 - `F10`
   Opens the settings popup window.
+- `F9`
+  Opens the separate Window History and Sessions popup.
+- `Ctrl+Shift+T`
+  Globally reopens the newest recently closed window, except while Chrome, Chromium, or Firefox is active.
 - Mouse:
   Hover highlighting is separate from keyboard selection. Window entries and app tiles support click and context actions across the full entry area.
 
@@ -221,8 +251,6 @@ AUTHORS
     Terrydaktal <9lewis9@gmail.com>
 ```
 
-## Development Notes
+## Session Restore Limits
 
-- The repo currently keeps all application logic in one file: [src/main.rs](/home/lewis/Dev/applicationlauncher/src/main.rs).
-- `target/` is ignored through `.gitignore`.
-- The launcher is stateful across runs because it persists both UI settings and pinned application ordering.
+Browser windows are restored as application windows in the first release; exact tabs and URLs require browser-native session restore or a future browser extension. File-manager paths and terminal working directories are restored when reliable metadata is available. Failed or ambiguous items are reported rather than replaying unsafe commands.

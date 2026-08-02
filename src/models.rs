@@ -47,6 +47,8 @@ pub struct WindowInfo {
     pub geometry: Option<(i32, i32, i32, i32)>,
     pub process_chain: Vec<ProcessChainEntry>,
     pub pid: Option<i32>,
+    pub last_activated_at_ms: Option<i64>,
+    pub activation_sequence: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -154,11 +156,16 @@ pub struct KWinWindowPayload {
     pub minimized: bool,
     #[serde(default)]
     pub demands_attention: bool,
+    #[serde(default)]
+    pub last_activated_at_ms: Option<i64>,
+    #[serde(default)]
+    pub activation_sequence: i64,
 }
 
 #[derive(Clone, Debug)]
 pub enum WindowFeedEvent {
     Reset,
+    Snapshot(Vec<KWinWindowPayload>),
     Upsert(KWinWindowPayload),
     Remove(String),
     RearmAttentionAutomation,
@@ -292,6 +299,7 @@ pub enum PopupEvent {
     CloseSettings,
     CloseWindowInfo,
     CloseAppInfo,
+    CloseHistory,
 }
 
 #[derive(Clone)]

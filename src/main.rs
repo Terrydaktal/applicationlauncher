@@ -24,13 +24,6 @@ const WINDOW_REMOVAL_CONFIRMATION_POLLS: usize = 2;
 const KWIN_DBUS_SERVICE: &str = "org.kde.KWin";
 const KWIN_DBUS_PATH: &str = "/KWin";
 const KWIN_DBUS_INTERFACE: &str = "org.kde.KWin";
-const KWIN_WINDOW_FEED_SERVICE: &str = "com.terrydaktal.ApplicationLauncher";
-const KWIN_WINDOW_FEED_PATH: &str = "/WindowFeed";
-const KWIN_WINDOW_FEED_SCRIPT_ID: &str = "applicationlauncher-window-feed";
-const KWIN_WINDOW_FEED_METADATA: &str =
-    include_str!("../kwin/applicationlauncher-window-feed/metadata.json");
-const KWIN_WINDOW_FEED_MAIN_JS: &str =
-    include_str!("../kwin/applicationlauncher-window-feed/contents/code/main.js");
 const ATSPI_LOCATION_PROBE: &str = include_str!("atspi_location_probe.py");
 const AUDIO_SINK_POLL_MS: u128 = 200;
 const AUDIO_ACTIVITY_GRACE_MS: u128 = 350;
@@ -40,7 +33,6 @@ const AUDIO_ACTIVE_REPAINT_MS: u64 = 80;
 const WINDOW_SEARCH_REFRESH_INTERVAL_MS: u64 = 180;
 const WINDOW_RECONCILIATION_INTERVAL_SECS: u64 = 30;
 const WINDOW_RECONCILIATION_RETRY_SECS: u64 = 2;
-const KWIN_WINDOW_FEED_WATCHDOG_INTERVAL_SECS: u64 = 5;
 const WINDOW_FEED_EVENTS_PER_FRAME: usize = 512;
 const WINDOW_SNAPSHOTS_PER_FRAME: usize = 4;
 const SETTINGS_VIEWPORT_SIZE: [f32; 2] = [380.0, 760.0];
@@ -104,7 +96,10 @@ OPERATION
         - Enter: Activate selected window.
         - Escape: Close launcher.
         - F5: Refresh list.
+        - F9: Open window history and saved sessions.
         - F10: Open launcher settings.
+        - Ctrl+Shift+T: Reopen the newest recently closed window globally,
+          except while Chrome, Chromium, or Firefox is active.
 
 EXAMPLES
     applicationlauncher
@@ -131,6 +126,12 @@ FILES
 
     $XDG_STATE_HOME/applicationlauncher/panic-latest.log
         Contains the most recently captured Rust panic and backtrace.
+
+    $XDG_STATE_HOME/applicationlauncher/history.sqlite3
+        Private window history, crash recovery, and saved-session database.
+
+    $HOME/.config/systemd/user/applicationlauncherd.service
+        Auto-installed persistent window tracker user service.
 
 PATHS
     /usr/share/icons

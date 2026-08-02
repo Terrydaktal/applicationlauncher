@@ -1,8 +1,34 @@
 var SERVICE = "com.terrydaktal.ApplicationLauncher";
 var PATH = "/WindowFeed";
 var INTERFACE = "com.terrydaktal.ApplicationLauncher.WindowFeed";
+var TRACKER_PATH = "/Tracker";
+var TRACKER_INTERFACE = "com.terrydaktal.ApplicationLauncher.Tracker1";
 
 var trackedWindows = {};
+
+function activeWindowIsBrowser() {
+    var window = workspace.activeWindow;
+    if (!window) {
+        return false;
+    }
+    var identity = (windowClass(window) + " " +
+        (window.desktopFileName ? String(window.desktopFileName) : "")).toLowerCase();
+    return identity.indexOf("chrome") !== -1 ||
+        identity.indexOf("chromium") !== -1 ||
+        identity.indexOf("firefox") !== -1;
+}
+
+function reopenLatestClosedWindow() {
+    if (activeWindowIsBrowser()) {
+        return;
+    }
+    callDBus(
+        SERVICE,
+        TRACKER_PATH,
+        TRACKER_INTERFACE,
+        "ReopenLatestHistory"
+    );
+}
 
 function windowClass(window) {
     if (!window) {
@@ -27,6 +53,27 @@ function serializeWindow(window) {
 
     var geometry = window.frameGeometry;
 
+    var desktop = 0;
+    if (typeof window.x11DesktopNumber === "number") {
+        desktop = window.x11DesktopNumber;
+    } else if (window.desktops && window.desktops.length > 0 &&
+               typeof window.desktops[0].x11DesktopNumber === "number") {
+        desktop = window.desktops[0].x11DesktopNumber;
+    } else if (window.desktops && window.desktops.length > 0 && workspace.desktops) {
+        for (var desktopIndex = 0; desktopIndex < workspace.desktops.length; ++desktopIndex) {
+            if (workspace.desktops[desktopIndex] === window.desktops[0] ||
+                (workspace.desktops[desktopIndex].id && window.desktops[0].id &&
+                 workspace.desktops[desktopIndex].id === window.desktops[0].id)) {
+                desktop = desktopIndex + 1;
+                break;
+            }
+        }
+    }
+    var outputName = "";
+    if (window.output && window.output.name) {
+        outputName = String(window.output.name);
+    }
+
     return {
         id: String(window.internalId),
         title: window.caption ? String(window.caption) : "",
@@ -38,7 +85,14 @@ function serializeWindow(window) {
         width: geometry ? Math.round(geometry.width) : 0,
         height: geometry ? Math.round(geometry.height) : 0,
         minimized: !!window.minimized,
-        demandsAttention: !!window.demandsAttention
+        maximized: !!window.maximized ||
+            (!!window.maximizedHorizontally && !!window.maximizedVertically),
+        fullscreen: !!window.fullScreen,
+        demandsAttention: !!window.demandsAttention,
+        active: !!window.active,
+        desktop: desktop,
+        onAllDesktops: !!window.onAllDesktops,
+        output: outputName
     };
 }
 
@@ -69,7 +123,14 @@ function sendRemove(windowOrId) {
     callDBus(SERVICE, PATH, INTERFACE, "RemoveWindow", id);
 }
 
-function trackWindow(window) {
+registerShortcut(
+    "applicationlauncher-reopen-latest",
+    "Reopen recently closed window",
+    "Ctrl+Shift+T",
+    reopenLatestClosedWindow
+);
+
+function trackWindow(window, deferInitialUpsert) {
     if (!window || !window.internalId) {
         return;
     }
@@ -81,7 +142,9 @@ function trackWindow(window) {
     }
 
     trackedWindows[id] = true;
-    sendUpsert(window);
+    if (!deferInitialUpsert) {
+        sendUpsert(window);
+    }
 
     if (window.captionChanged) {
         window.captionChanged.connect(function () {
@@ -131,14 +194,36 @@ function trackWindow(window) {
     }
 }
 
-callDBus(SERVICE, PATH, INTERFACE, "ResetWindows");
-
+var initialWindows = [];
 for (var i = 0; i < workspace.stackingOrder.length; ++i) {
-    trackWindow(workspace.stackingOrder[i]);
+    var initialPayload = serializeWindow(workspace.stackingOrder[i]);
+    if (initialPayload) {
+        initialWindows.push(initialPayload);
+    }
+    trackWindow(workspace.stackingOrder[i], true);
+}
+callDBus(
+    SERVICE,
+    PATH,
+    INTERFACE,
+    "ReplaceSnapshot",
+    JSON.stringify(initialWindows)
+);
+if (workspace.activeWindow) {
+    var activePayload = serializeWindow(workspace.activeWindow);
+    if (activePayload) {
+        callDBus(
+            SERVICE,
+            PATH,
+            INTERFACE,
+            "WindowActivated",
+            JSON.stringify(activePayload)
+        );
+    }
 }
 
 workspace.windowAdded.connect(function (window) {
-    trackWindow(window);
+    trackWindow(window, false);
 });
 
 workspace.windowRemoved.connect(function (window) {
@@ -151,6 +236,15 @@ workspace.windowRemoved.connect(function (window) {
 
 workspace.windowActivated.connect(function (window) {
     if (window) {
-        sendUpsert(window);
+        var payload = serializeWindow(window);
+        if (payload) {
+            callDBus(
+                SERVICE,
+                PATH,
+                INTERFACE,
+                "WindowActivated",
+                JSON.stringify(payload)
+            );
+        }
     }
 });

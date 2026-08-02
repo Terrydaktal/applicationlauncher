@@ -234,6 +234,10 @@ pub(crate) fn terminal_display_title(
     parent_program: Option<&str>,
 ) -> String {
     let separators = [" - ", " — ", " – ", " : ", " | "];
+    let raw_title = raw_title
+        .trim()
+        .strip_prefix("- ")
+        .unwrap_or(raw_title.trim());
 
     for sep in separators {
         let parts: Vec<&str> = raw_title.split(sep).map(str::trim).collect();
@@ -742,6 +746,8 @@ pub(crate) fn reconcile_terminal_attention_windows_from_kwin(
                 height: 0,
                 minimized,
                 demands_attention: existing_attention,
+                last_activated_at_ms: enriched.and_then(|window| window.last_activated_at_ms),
+                activation_sequence: enriched.map_or(0, |window| window.activation_sequence),
             },
         );
     }
@@ -789,6 +795,7 @@ pub(crate) fn run_terminal_attention_worker(
                     feed_last_seen.clear();
                     attention_generations.clear();
                 }
+                Ok(WindowFeedEvent::Snapshot(_)) => {}
                 Ok(WindowFeedEvent::Upsert(payload)) => {
                     let id = payload.id.clone();
                     let attention_cleared = apply_terminal_attention_feed_upsert(
@@ -852,6 +859,7 @@ pub(crate) fn run_terminal_attention_worker(
                         feed_last_seen.clear();
                         attention_generations.clear();
                     }
+                    WindowFeedEvent::Snapshot(_) => {}
                     WindowFeedEvent::Upsert(payload) => {
                         let id = payload.id.clone();
                         let attention_cleared = apply_terminal_attention_feed_upsert(

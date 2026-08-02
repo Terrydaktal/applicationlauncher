@@ -12,6 +12,110 @@ use std::time::{Duration, Instant};
 use crate::models::*;
 use crate::*;
 
+const HISTORY_POPUP_REFRESH_INTERVAL_MS: u64 = 750;
+
+#[derive(Default)]
+struct HistoryPopupState {
+    history: Vec<applicationlauncher::tracker::HistoryEntry>,
+    snapshots: Vec<applicationlauncher::tracker::SnapshotSummary>,
+    snapshot_name: String,
+    show_sessions: bool,
+    loading: bool,
+    action_pending: bool,
+    refresh_in_flight: bool,
+    last_refresh_started: Option<Instant>,
+    message: Option<String>,
+}
+
+fn refresh_history_popup(state: Arc<std::sync::Mutex<HistoryPopupState>>, ctx: egui::Context) {
+    if let Ok(mut state) = state.lock() {
+        state.refresh_in_flight = true;
+        state.last_refresh_started = Some(Instant::now());
+    }
+    std::thread::spawn(move || {
+        let result = applicationlauncher::tracker::TrackerClient::connect()
+            .and_then(|client| Ok((client.history(500)?, client.snapshots()?)));
+        if let Ok(mut state) = state.lock() {
+            state.loading = false;
+            state.refresh_in_flight = false;
+            match result {
+                Ok((history, snapshots)) => {
+                    state.history = history;
+                    state.snapshots = snapshots;
+                }
+                Err(err) => state.message = Some(format!("Tracker unavailable: {err}")),
+            }
+        }
+        ctx.request_repaint();
+    });
+}
+
+fn history_age(timestamp_ms: i64) -> String {
+    let seconds = ((applicationlauncher::tracker::now_ms() - timestamp_ms).max(0) / 1000) as u64;
+    match seconds {
+        0..=59 => format!("{seconds}s ago"),
+        60..=3599 => format!("{}m ago", seconds / 60),
+        3600..=86_399 => format!("{}h ago", seconds / 3600),
+        _ => format!("{}d ago", seconds / 86_400),
+    }
+}
+
+fn format_activation_time(timestamp_ms: Option<i64>) -> String {
+    let Some(timestamp_ms) = timestamp_ms.filter(|timestamp| *timestamp > 0) else {
+        return "Not recorded yet".to_string();
+    };
+    let seconds = timestamp_ms.div_euclid(1000);
+    let milliseconds = timestamp_ms.rem_euclid(1000);
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+    let hour = day_seconds / 3_600;
+    let minute = day_seconds % 3_600 / 60;
+    let second = day_seconds % 60;
+
+    // Convert days since Unix epoch to a proleptic Gregorian UTC date.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+
+    format!(
+        "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{milliseconds:03} UTC ({})",
+        history_age(timestamp_ms)
+    )
+}
+
+fn run_history_action(
+    state: Arc<std::sync::Mutex<HistoryPopupState>>,
+    ctx: egui::Context,
+    action: impl FnOnce(applicationlauncher::tracker::TrackerClient) -> Result<String, String>
+    + Send
+    + 'static,
+) {
+    if let Ok(mut state) = state.lock() {
+        if state.action_pending {
+            return;
+        }
+        state.action_pending = true;
+    }
+    ctx.request_repaint();
+    std::thread::spawn(move || {
+        let result = applicationlauncher::tracker::TrackerClient::connect().and_then(action);
+        if let Ok(mut state) = state.lock() {
+            state.message = Some(result.unwrap_or_else(|err| format!("Failed: {err}")));
+            state.loading = true;
+            state.action_pending = false;
+        }
+        refresh_history_popup(state, ctx);
+    });
+}
+
 pub(crate) struct App {
     mode: LauncherMode,
     windows: Vec<WindowInfo>,
@@ -22,6 +126,7 @@ pub(crate) struct App {
     selected_index: usize,
     side_panel_selected_index: usize,
     active_pane: ActivePane,
+    order_windows_by_last_activation: bool,
     rendered_app_grid_columns: usize,
     rendered_side_panel_grid_columns: usize,
     rendered_window_row_centers: Vec<f32>,
@@ -49,6 +154,10 @@ pub(crate) struct App {
     settings_menu_scale_anchor: f32,
     icon_only: bool,
     show_settings_menu: bool,
+    show_history_popup: bool,
+    history_popup_state: Option<Arc<std::sync::Mutex<HistoryPopupState>>>,
+    tracker_status_receiver: Receiver<applicationlauncher::tracker::TrackerStatus>,
+    recovery_prompt: bool,
     show_system_settings_modules: bool,
     win_icon_size: f32,
     win_top_padding: f32,
@@ -85,10 +194,6 @@ pub(crate) struct App {
     audio_cache_receiver: Receiver<AudioCacheUpdate>,
     terminal_action_receiver: Receiver<Result<String, String>>,
     terminal_action_message: Option<(String, bool, Instant)>,
-    terminal_attention_sender: Sender<WindowFeedEvent>,
-    terminal_attention_automation_enabled: Arc<std::sync::atomic::AtomicBool>,
-    terminal_attention_windows: Arc<std::sync::Mutex<HashMap<String, WindowInfo>>>,
-    terminal_attention_windows_generation: u64,
     terminal_records: Vec<TerminalDbusRecord>,
     terminal_records_receiver: Option<Receiver<Result<Vec<TerminalDbusRecord>, String>>>,
     terminal_metadata_refresh_queued: bool,
@@ -180,6 +285,132 @@ impl App {
         self.show_settings_menu = false;
     }
 
+    fn open_history_popup(&mut self) {
+        let state = Arc::new(std::sync::Mutex::new(HistoryPopupState {
+            loading: true,
+            ..Default::default()
+        }));
+        refresh_history_popup(Arc::clone(&state), self.repaint_ctx.clone());
+        self.history_popup_state = Some(state);
+        self.show_history_popup = true;
+    }
+
+    fn close_history_popup(&mut self) {
+        self.repaint_ctx.send_viewport_cmd_to(
+            egui::ViewportId::from_hash_of("launcher_history_popup"),
+            egui::ViewportCommand::Close,
+        );
+        self.history_popup_state = None;
+        self.show_history_popup = false;
+    }
+
+    fn show_history_native_viewport(&mut self, ctx: &egui::Context) {
+        let Some(shared_state) = self.history_popup_state.clone() else {
+            return;
+        };
+        let event_sender = self.popup_event_sender.clone();
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Window History and Sessions")
+            .with_inner_size([760.0, 620.0])
+            .with_min_inner_size([560.0, 420.0])
+            .with_resizable(true)
+            .with_always_on_top();
+        ctx.show_viewport_deferred(
+            egui::ViewportId::from_hash_of("launcher_history_popup"),
+            builder,
+            move |ctx, _class| {
+                let refresh_due = shared_state
+                    .lock()
+                    .map(|state| {
+                        !state.show_sessions
+                            && !state.loading
+                            && !state.action_pending
+                            && !state.refresh_in_flight
+                            && state.last_refresh_started.is_none_or(|started| {
+                                started.elapsed()
+                                    >= Duration::from_millis(HISTORY_POPUP_REFRESH_INTERVAL_MS)
+                            })
+                    })
+                    .unwrap_or(false);
+                if refresh_due {
+                    refresh_history_popup(Arc::clone(&shared_state), ctx.clone());
+                }
+                ctx.request_repaint_after(Duration::from_millis(
+                    HISTORY_POPUP_REFRESH_INTERVAL_MS,
+                ));
+
+                if ctx.input(|input| input.viewport().close_requested() || input.key_pressed(egui::Key::Escape) || input.key_pressed(egui::Key::F9)) {
+                    let _ = event_sender.send(PopupEvent::CloseHistory);
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
+                }
+
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.heading("Window History and Sessions");
+                    ui.add_space(8.0);
+                    let mut action: Option<Box<dyn FnOnce(applicationlauncher::tracker::TrackerClient) -> Result<String, String> + Send>> = None;
+                    let mut close = false;
+                    if let Ok(mut state) = shared_state.lock() {
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut state.show_sessions, false, "Recently closed");
+                            ui.selectable_value(&mut state.show_sessions, true, "Saved sessions");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Close").clicked() { close = true; }
+                            });
+                        });
+                        ui.separator();
+                        if let Some(message) = &state.message { ui.label(message); ui.separator(); }
+                        if state.loading || state.action_pending { ui.spinner(); }
+
+                        if state.show_sessions {
+                            ui.horizontal(|ui| {
+                                ui.label("Name");
+                                ui.text_edit_singleline(&mut state.snapshot_name);
+                                if ui.button("Save current session").clicked() {
+                                    let name = if state.snapshot_name.trim().is_empty() { format!("Session {}", state.snapshots.len() + 1) } else { state.snapshot_name.trim().to_string() };
+                                    action = Some(Box::new(move |client| client.create_snapshot(&name).map(|_| format!("Saved session '{name}'"))));
+                                    state.snapshot_name.clear();
+                                }
+                            });
+                            ui.add_space(8.0);
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                for snapshot in state.snapshots.clone() {
+                                    if snapshot.kind == "recovery" { continue; }
+                                    ui.horizontal(|ui| {
+                                        ui.label(snapshot.name.clone().unwrap_or_else(|| "Unnamed session".into()));
+                                        ui.label(format!("{} windows, {}", snapshot.window_count, history_age(snapshot.created_at_ms)));
+                                        if ui.add_enabled(!state.action_pending, egui::Button::new("Restore")).clicked() { let id = snapshot.id; action = Some(Box::new(move |client| client.restore_snapshot(id).map(|report| format!("Restored: {} existing, {} launched, {} failures", report.matched, report.launched, report.failures.len())))); }
+                                        if ui.add_enabled(!state.action_pending, egui::Button::new("Delete")).clicked() { let id = snapshot.id; action = Some(Box::new(move |client| client.delete_snapshot(id).map(|_| "Session deleted".into()))); }
+                                    });
+                                    ui.separator();
+                                }
+                            });
+                        } else {
+                            if ui.add_enabled(!state.action_pending, egui::Button::new("Clear history")).clicked() { action = Some(Box::new(|client| client.clear_history().map(|_| "History cleared".into()))); }
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                for entry in state.history.clone() {
+                                    ui.horizontal(|ui| {
+                                        ui.vertical(|ui| { ui.label(&entry.window.title); ui.small(format!("{} | {}", entry.restore.app_key, history_age(entry.closed_at_ms))); });
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if ui.add_enabled(!state.action_pending, egui::Button::new("Reopen")).clicked() { let id = entry.id; action = Some(Box::new(move |client| client.reopen_history(id).map(|report| format!("Reopened: {} existing, {} launched, {} failures", report.matched, report.launched, report.failures.len())))); }
+                                        });
+                                    });
+                                    ui.separator();
+                                }
+                            });
+                        }
+                    }
+                    if close {
+                        let _ = event_sender.send(PopupEvent::CloseHistory);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if let Some(action) = action { run_history_action(Arc::clone(&shared_state), ctx.clone(), action); }
+                });
+            },
+        );
+    }
+
     pub(crate) fn new(
         cc: &eframe::CreationContext<'_>,
         close_on_blur: bool,
@@ -218,34 +449,30 @@ impl App {
 
         let (window_tx, window_rx) = std::sync::mpsc::channel();
         let (window_feed_tx, window_feed_rx) = std::sync::mpsc::channel();
-        let (terminal_attention_tx, terminal_attention_rx) = std::sync::mpsc::channel();
         let (audio_cache_tx, audio_cache_rx) = std::sync::mpsc::channel();
-        let (terminal_action_tx, terminal_action_rx) = std::sync::mpsc::channel();
+        let (_terminal_action_tx, terminal_action_rx) = std::sync::mpsc::channel();
         let (popup_event_tx, popup_event_rx) = std::sync::mpsc::channel();
+        let (tracker_status_tx, tracker_status_rx) = std::sync::mpsc::channel();
         let (kwin_window_feed_setup_tx, kwin_window_feed_setup_rx) = std::sync::mpsc::channel();
         let rapid_polling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let terminal_attention_automation_enabled = Arc::new(std::sync::atomic::AtomicBool::new(
-            settings.auto_send_enter_on_attention,
-        ));
-        let terminal_attention_windows =
-            Arc::new(std::sync::Mutex::new(HashMap::<String, WindowInfo>::new()));
         let kwin_window_feed_repaint_ctx = cc.egui_ctx.clone();
-        start_terminal_attention_worker(
-            terminal_attention_rx,
-            Arc::clone(&terminal_attention_automation_enabled),
-            Arc::clone(&terminal_attention_windows),
-            terminal_action_tx.clone(),
-            cc.egui_ctx.clone(),
-        );
-
-        let setup_terminal_attention_tx = terminal_attention_tx.clone();
         std::thread::spawn(move || {
-            let result = setup_kwin_window_feed(
-                window_feed_tx,
-                setup_terminal_attention_tx,
-                kwin_window_feed_repaint_ctx,
-            );
+            let result = setup_kwin_window_feed(window_feed_tx, kwin_window_feed_repaint_ctx);
             let _ = kwin_window_feed_setup_tx.send(result);
+        });
+
+        let configured_auto_enter = settings.auto_send_enter_on_attention;
+        std::thread::spawn(move || {
+            for _ in 0..30 {
+                if let Ok(client) = applicationlauncher::tracker::TrackerClient::connect()
+                    && let Ok(status) = client.status()
+                {
+                    let _ = client.set_auto_enter(configured_auto_enter);
+                    let _ = tracker_status_tx.send(status);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
         });
 
         let now = Instant::now();
@@ -263,6 +490,7 @@ impl App {
             } else {
                 ActivePane::Apps
             },
+            order_windows_by_last_activation: false,
             rendered_app_grid_columns: 1,
             rendered_side_panel_grid_columns: 1,
             rendered_window_row_centers: Vec::new(),
@@ -290,6 +518,10 @@ impl App {
             settings_menu_scale_anchor: settings.ui_scale,
             icon_only: icon_only || settings.app_icon_mode,
             show_settings_menu: false,
+            show_history_popup: false,
+            history_popup_state: None,
+            tracker_status_receiver: tracker_status_rx,
+            recovery_prompt: false,
             show_system_settings_modules: settings.show_system_settings_modules,
             win_icon_size: settings.win_icon_size,
             win_top_padding: settings.win_top_padding,
@@ -326,10 +558,6 @@ impl App {
             audio_cache_receiver: audio_cache_rx,
             terminal_action_receiver: terminal_action_rx,
             terminal_action_message: None,
-            terminal_attention_sender: terminal_attention_tx,
-            terminal_attention_automation_enabled,
-            terminal_attention_windows,
-            terminal_attention_windows_generation: u64::MAX,
             terminal_records: Vec::new(),
             terminal_records_receiver: None,
             terminal_metadata_refresh_queued: false,
@@ -492,10 +720,12 @@ impl App {
         self.disable_ibeam = settings.disable_ibeam;
         self.app_scroll_sensitivity = settings.app_scroll_sensitivity;
         self.win_scroll_sensitivity = settings.win_scroll_sensitivity;
-        self.terminal_attention_automation_enabled.store(
-            settings.auto_send_enter_on_attention,
-            std::sync::atomic::Ordering::Release,
-        );
+        let enabled = settings.auto_send_enter_on_attention;
+        std::thread::spawn(move || {
+            if let Ok(client) = applicationlauncher::tracker::TrackerClient::connect() {
+                let _ = client.set_auto_enter(enabled);
+            }
+        });
         if (self.ui_scale - settings.ui_scale).abs() > 0.001 {
             self.ui_scale = settings.ui_scale;
             ctx.set_zoom_factor(settings.ui_scale);
@@ -916,8 +1146,11 @@ impl App {
                 let mut auto_send_enter = self.auto_send_enter_on_attention;
                 if ui.checkbox(&mut auto_send_enter, "").changed() {
                     self.auto_send_enter_on_attention = auto_send_enter;
-                    self.terminal_attention_automation_enabled
-                        .store(auto_send_enter, std::sync::atomic::Ordering::Release);
+                    std::thread::spawn(move || {
+                        if let Ok(client) = applicationlauncher::tracker::TrackerClient::connect() {
+                            let _ = client.set_auto_enter(auto_send_enter);
+                        }
+                    });
                     self.save_settings();
                 }
                 ui.end_row();
@@ -1094,6 +1327,7 @@ impl App {
                 PopupEvent::CloseSettings => self.close_settings_menu(),
                 PopupEvent::CloseWindowInfo => self.process_chain_popup = None,
                 PopupEvent::CloseAppInfo => self.app_info_popup = None,
+                PopupEvent::CloseHistory => self.close_history_popup(),
             }
             restore_launcher_focus = true;
         }
@@ -1301,6 +1535,16 @@ impl App {
                         .minimized
                         .map(|value| value.to_string())
                         .unwrap_or_else(|| "Unavailable".to_string()),
+                    false,
+                ),
+                row(
+                    "Last activated",
+                    format_activation_time(window_info.last_activated_at_ms),
+                    false,
+                ),
+                row(
+                    "Activation sequence",
+                    window_info.activation_sequence.to_string(),
                     false,
                 ),
             ],
@@ -1637,6 +1881,18 @@ impl App {
                                 .unwrap_or_else(|| "Unavailable".to_string()),
                             false,
                         );
+                        info_row(
+                            ui,
+                            "Last activated",
+                            format_activation_time(window_info.last_activated_at_ms),
+                            false,
+                        );
+                        info_row(
+                            ui,
+                            "Activation sequence",
+                            window_info.activation_sequence.to_string(),
+                            false,
+                        );
                     });
 
                 ui.add_space(14.0);
@@ -1842,23 +2098,6 @@ impl App {
         }
     }
 
-    fn sync_terminal_attention_windows(&mut self) {
-        if self.terminal_attention_windows_generation == self.windows_generation {
-            return;
-        }
-
-        let snapshots = self
-            .windows
-            .iter()
-            .filter(|window| is_xfce4_terminal_class(&window.class))
-            .map(|window| (window.id.clone(), window.clone()))
-            .collect();
-        if let Ok(mut shared_windows) = self.terminal_attention_windows.lock() {
-            *shared_windows = snapshots;
-            self.terminal_attention_windows_generation = self.windows_generation;
-        }
-    }
-
     fn seed_window_icon_cache(&mut self) {
         for window in &self.windows {
             let icon_key = window_icon_cache_key(
@@ -2005,6 +2244,9 @@ impl App {
                     self.missing_window_counts.clear();
                     self.last_selected_window_id = None;
                     cache_updates.clear();
+                }
+                WindowFeedEvent::Snapshot(_) => {
+                    unreachable!("snapshot events are expanded before application");
                 }
                 WindowFeedEvent::Upsert(payload) => {
                     let window_id = payload.id.clone();
@@ -2598,9 +2840,6 @@ impl eframe::App for App {
             match event {
                 UiEvent::FocusLauncher => {
                     handled_focus_launcher = true;
-                    let _ = self
-                        .terminal_attention_sender
-                        .send(WindowFeedEvent::RearmAttentionAutomation);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
@@ -2634,6 +2873,9 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
         self.process_popup_events();
+        while let Ok(status) = self.tracker_status_receiver.try_recv() {
+            self.recovery_prompt = status.recovery_pending;
+        }
 
         match self
             .terminal_records_receiver
@@ -2674,6 +2916,13 @@ impl eframe::App for App {
                 }
                 Err(err) => {
                     eprintln!("Falling back to kdotool window polling: {err}");
+                    self.terminal_action_message = Some((
+                        format!(
+                            "Session history unavailable; using a one-time window snapshot: {err}"
+                        ),
+                        false,
+                        Instant::now(),
+                    ));
                     self.start_window_polling_thread(ctx);
                 }
             }
@@ -2868,13 +3117,12 @@ impl eframe::App for App {
             }
         }
 
-        self.sync_terminal_attention_windows();
-
         // Focus loss auto-close
         if self.close_on_blur
             && self.start_time.elapsed().as_millis() > 500
             && !ctx.input(|i| i.focused)
             && !self.show_settings_menu
+            && !self.show_history_popup
             && self.process_chain_popup.is_none()
             && self.app_info_popup.is_none()
         {
@@ -2950,7 +3198,7 @@ impl eframe::App for App {
                                 LauncherMode::Apps => "Search applications...",
                                 LauncherMode::Windows => "Search open windows...",
                             };
-                            let search_width = (ui.available_width() - 42.0).max(120.0);
+                            let search_width = (ui.available_width() - 78.0).max(120.0);
                             let text_edit = egui::TextEdit::singleline(&mut self.search_query)
                                 .hint_text(hint_text)
                                 .desired_width(search_width)
@@ -2961,6 +3209,29 @@ impl eframe::App for App {
                             search_query_changed = response.changed();
                             text_edit_response = Some(response);
                             ui.add_space(8.0);
+                            let ordering_button = egui::Button::new(
+                                egui::RichText::new("↕").size(16.0),
+                            )
+                            .selected(self.order_windows_by_last_activation);
+                            if ui
+                                .add(ordering_button)
+                                .on_hover_text(
+                                    "Order windows by last activation, oldest first",
+                                )
+                                .clicked()
+                            {
+                                self.order_windows_by_last_activation =
+                                    !self.order_windows_by_last_activation;
+                                self.selected_index = 0;
+                                self.scroll_to_first_window_on_focus = true;
+                            }
+                            if ui
+                                .button(egui::RichText::new("H").size(15.0))
+                                .on_hover_text("Window history and sessions (F9)")
+                                .clicked()
+                            {
+                                if self.show_history_popup { self.close_history_popup(); } else { self.open_history_popup(); }
+                            }
                             if ui
                                 .button(
                                     egui::RichText::new("⚙")
@@ -3183,8 +3454,11 @@ impl eframe::App for App {
 	                                            .or_default() += 1;
 	                                    }
 	                                }
-	                                Arc::make_mut(&mut filtered_windows).sort_by(|a, b| {
-	                                    let app_key_a = window_grouping_key(a);
+                                Arc::make_mut(&mut filtered_windows).sort_by(|a, b| {
+                                    if self.order_windows_by_last_activation {
+                                        return compare_windows_by_last_activation(a, b);
+                                    }
+                                    let app_key_a = window_grouping_key(a);
 	                                    let app_key_b = window_grouping_key(b);
 	                                    let count_a =
                                         app_window_counts.get(&app_key_a).copied().unwrap_or(0);
@@ -3526,8 +3800,14 @@ impl eframe::App for App {
                         }
                     }
 
+                    if ctx.input(|i| i.key_pressed(egui::Key::F9)) {
+                        if self.show_history_popup { self.close_history_popup(); } else { self.open_history_popup(); }
+                    }
+
                     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        if self.show_settings_menu {
+                        if self.show_history_popup {
+                            self.close_history_popup();
+                        } else if self.show_settings_menu {
                             self.close_settings_menu();
                         } else if self.process_chain_popup.is_some() {
                             self.process_chain_popup = None;
@@ -5352,6 +5632,9 @@ impl eframe::App for App {
                     if self.show_settings_menu {
                         self.show_settings_popup(ctx);
                     }
+                    if self.show_history_popup {
+                        self.show_history_native_viewport(ctx);
+                    }
                     if self.process_chain_popup.is_some() {
                         self.show_window_info_popup(ctx);
                     }
@@ -5373,6 +5656,34 @@ impl eframe::App for App {
                     }
                 });
             });
+
+        if self.recovery_prompt {
+            egui::Window::new("Restore previous session?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label("The previous system session ended unexpectedly. A recovery snapshot is available.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Restore missing windows").clicked() {
+                            self.recovery_prompt = false;
+                            std::thread::spawn(|| {
+                                match applicationlauncher::tracker::TrackerClient::connect().and_then(|client| client.restore_recovery()) {
+                                    Ok(report) => eprintln!("Recovery restore: {} matched, {} launched, {} failures", report.matched, report.launched, report.failures.len()),
+                                    Err(err) => eprintln!("Recovery restore failed: {err}"),
+                                }
+                            });
+                        }
+                        if ui.button("Not now").clicked() {
+                            self.recovery_prompt = false;
+                            std::thread::spawn(|| {
+                                if let Ok(client) = applicationlauncher::tracker::TrackerClient::connect() { let _ = client.dismiss_recovery(); }
+                            });
+                        }
+                    });
+                });
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -5734,6 +6045,8 @@ mod tests {
             geometry: Some((0, 0, 800, 600)),
             process_chain: Vec::new(),
             pid: Some(1234),
+            last_activated_at_ms: Some(0),
+            activation_sequence: 1,
         }
     }
 
@@ -5750,6 +6063,8 @@ mod tests {
             height: 600,
             minimized: true,
             demands_attention,
+            last_activated_at_ms: Some(0),
+            activation_sequence: 1,
         }
     }
 
@@ -5929,6 +6244,27 @@ mod tests {
     }
 
     #[test]
+    fn window_feed_coalesces_to_the_latest_full_snapshot() {
+        let mut first = test_kwin_payload("first", false);
+        first.id = "first".into();
+        let mut latest = test_kwin_payload("latest", false);
+        latest.id = "latest".into();
+
+        let events = coalesce_window_feed_events(vec![
+            WindowFeedEvent::Snapshot(vec![first]),
+            WindowFeedEvent::Snapshot(vec![latest.clone()]),
+        ]);
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events.first(), Some(WindowFeedEvent::Reset)));
+        assert!(matches!(
+            events.get(1),
+            Some(WindowFeedEvent::Upsert(payload))
+                if payload.id == latest.id && payload.title == latest.title
+        ));
+    }
+
+    #[test]
     fn terminal_attention_relaunch_rearms_an_existing_prompt() {
         let id = "test-window".to_string();
         let windows = HashMap::from([(
@@ -5994,6 +6330,8 @@ mod tests {
                 height: 600,
                 minimized: true,
                 demands_attention,
+                last_activated_at_ms: None,
+                activation_sequence: 0,
             };
 
         let feed_attention = payload(
@@ -6155,6 +6493,32 @@ mod tests {
         let matched = terminal_record_for_window_title("~ - Terminal", &records).unwrap();
         assert_eq!(matched.tab_uuid, "tab-fish");
         assert_eq!(matched.foreground_pid, 4152349);
+    }
+
+    #[test]
+    fn terminal_metadata_matches_blank_dynamic_title_spacing_variants() {
+        let mut nvtop = terminal_record("tab-nvtop", "window-nvtop", " - Terminal", "/dev/pts/31");
+        nvtop.child_pid = 2816861;
+        nvtop.foreground_pid = 2816861;
+
+        assert_eq!(
+            normalize_window_sort_title("- Terminal"),
+            normalize_window_sort_title(&nvtop.window_title)
+        );
+        let records = [nvtop];
+        let matched = terminal_record_for_window_title("- Terminal", &records).unwrap();
+        assert_eq!(matched.tab_uuid, "tab-nvtop");
+        assert_eq!(matched.foreground_pid, 2816861);
+        assert_eq!(
+            terminal_display_title(
+                "- Terminal",
+                "nvtop",
+                Some("nvtop"),
+                Some("~/Dev/applicationlauncher"),
+                None,
+            ),
+            "nvtop - ~/Dev/applicationlauncher - Terminal"
+        );
     }
 
     #[test]
@@ -6424,6 +6788,28 @@ mod tests {
 
         assert_eq!(window_sort_title_key(&old), window_sort_title_key(&new));
         assert!(window_search_metadata_equal(&old, &new));
+    }
+
+    #[test]
+    fn last_activation_order_puts_oldest_windows_first() {
+        let mut older = test_window_info("older");
+        older.last_activated_at_ms = Some(100);
+        older.activation_sequence = 2;
+        let mut newer = test_window_info("newer");
+        newer.last_activated_at_ms = Some(200);
+        newer.activation_sequence = 1;
+        let mut unknown = test_window_info("unknown");
+        unknown.last_activated_at_ms = None;
+        unknown.activation_sequence = 0;
+
+        assert_eq!(
+            compare_windows_by_last_activation(&older, &newer),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_windows_by_last_activation(&newer, &unknown),
+            std::cmp::Ordering::Less
+        );
     }
 
     #[test]

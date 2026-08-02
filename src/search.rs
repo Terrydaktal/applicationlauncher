@@ -504,8 +504,13 @@ pub(crate) fn normalize_window_sort_title(title: &str) -> String {
         .filter(|ch| !is_braille_spinner_char(*ch))
         .collect();
 
-    if without_spinners.contains(" - ") {
-        return without_spinners
+    let without_empty_leading_segment = without_spinners
+        .trim()
+        .strip_prefix("- ")
+        .unwrap_or(without_spinners.trim());
+
+    if without_empty_leading_segment.contains(" - ") {
+        return without_empty_leading_segment
             .split(" - ")
             .map(str::trim)
             .filter(|part| !part.is_empty())
@@ -514,7 +519,7 @@ pub(crate) fn normalize_window_sort_title(title: &str) -> String {
             .to_lowercase();
     }
 
-    without_spinners
+    without_empty_leading_segment
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -525,6 +530,23 @@ pub(crate) fn window_sort_title_key(win: &WindowInfo) -> String {
     normalize_window_sort_title(
         &duplicate_window_title_key(win).unwrap_or_else(|| win.title.trim().to_string()),
     )
+}
+
+pub(crate) fn compare_windows_by_last_activation(
+    left: &WindowInfo,
+    right: &WindowInfo,
+) -> std::cmp::Ordering {
+    let activation_time_order = match (left.last_activated_at_ms, right.last_activated_at_ms) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    };
+
+    activation_time_order
+        .then_with(|| left.activation_sequence.cmp(&right.activation_sequence))
+        .then_with(|| window_sort_title_key(left).cmp(&window_sort_title_key(right)))
+        .then_with(|| left.id.cmp(&right.id))
 }
 
 pub(crate) fn command_basename(exec: &str) -> Option<String> {

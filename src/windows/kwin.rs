@@ -1,11 +1,9 @@
 use eframe::egui;
-use serde_json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
-use zbus::interface;
 
 use crate::models::{
     KWinWindowPayload, SnapshotWindowDetails, TerminalDbusRecord, WindowFeedEvent, WindowInfo,
@@ -20,41 +18,6 @@ pub(crate) fn get_kdotool_path() -> PathBuf {
         }
     }
     PathBuf::from("kdotool")
-}
-
-pub(crate) struct KWinWindowFeed {
-    pub(crate) tx: std::sync::mpsc::Sender<WindowFeedEvent>,
-    pub(crate) terminal_attention_tx: std::sync::mpsc::Sender<WindowFeedEvent>,
-    pub(crate) repaint_ctx: egui::Context,
-}
-
-#[interface(name = "com.terrydaktal.ApplicationLauncher.WindowFeed", spawn = false)]
-impl KWinWindowFeed {
-    #[zbus(name = "ResetWindows")]
-    fn reset_windows(&self) {
-        let event = WindowFeedEvent::Reset;
-        let _ = self.terminal_attention_tx.send(event.clone());
-        let _ = self.tx.send(event);
-        self.repaint_ctx.request_repaint();
-    }
-
-    #[zbus(name = "UpsertWindow")]
-    fn upsert_window(&self, payload: &str) {
-        if let Ok(window) = serde_json::from_str::<KWinWindowPayload>(payload) {
-            let event = WindowFeedEvent::Upsert(window);
-            let _ = self.terminal_attention_tx.send(event.clone());
-            let _ = self.tx.send(event);
-            self.repaint_ctx.request_repaint();
-        }
-    }
-
-    #[zbus(name = "RemoveWindow")]
-    fn remove_window(&self, id: &str) {
-        let event = WindowFeedEvent::Remove(id.to_string());
-        let _ = self.terminal_attention_tx.send(event.clone());
-        let _ = self.tx.send(event);
-        self.repaint_ctx.request_repaint();
-    }
 }
 
 pub(crate) fn build_window_info(
@@ -227,172 +190,79 @@ pub(crate) fn build_window_info(
         geometry,
         process_chain,
         pid,
+        last_activated_at_ms: None,
+        activation_sequence: 0,
     })
-}
-
-pub(crate) fn kwin_window_script_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(
-        PathBuf::from(home)
-            .join(".local/share/kwin/scripts")
-            .join(KWIN_WINDOW_FEED_SCRIPT_ID),
-    )
-}
-
-pub(crate) fn install_kwin_window_feed_script() -> Result<(), String> {
-    let Some(script_dir) = kwin_window_script_dir() else {
-        return Err("HOME is not set; cannot install KWin window feed script.".to_string());
-    };
-
-    let code_dir = script_dir.join("contents/code");
-    std::fs::create_dir_all(&code_dir)
-        .map_err(|err| format!("Failed to create KWin script directory: {err}"))?;
-    std::fs::write(script_dir.join("metadata.json"), KWIN_WINDOW_FEED_METADATA)
-        .map_err(|err| format!("Failed to write KWin script metadata: {err}"))?;
-    std::fs::write(code_dir.join("main.js"), KWIN_WINDOW_FEED_MAIN_JS)
-        .map_err(|err| format!("Failed to write KWin script source: {err}"))?;
-    Ok(())
-}
-
-pub(crate) fn enable_kwin_window_feed_script() -> Result<(), String> {
-    let status = Command::new("kwriteconfig6")
-        .args([
-            "--file",
-            "kwinrc",
-            "--group",
-            "Plugins",
-            "--key",
-            &format!("{}Enabled", KWIN_WINDOW_FEED_SCRIPT_ID),
-            "true",
-        ])
-        .status()
-        .map_err(|err| format!("Failed to enable KWin window feed script: {err}"))?;
-
-    if !status.success() {
-        return Err("kwriteconfig6 failed while enabling the KWin window feed script.".to_string());
-    }
-
-    Ok(())
-}
-
-fn reload_kwin_config() -> Result<(), String> {
-    let status = Command::new("qdbus6")
-        .args([KWIN_DBUS_SERVICE, "/KWin", "reconfigure"])
-        .status()
-        .map_err(|err| format!("Failed to reload KWin configuration: {err}"))?;
-
-    if !status.success() {
-        return Err("qdbus6 returned a failure while reloading KWin.".to_string());
-    }
-
-    Ok(())
-}
-
-fn kwin_window_feed_script_is_loaded() -> Result<bool, String> {
-    let output = Command::new("qdbus6")
-        .args([
-            KWIN_DBUS_SERVICE,
-            "/Scripting",
-            "org.kde.kwin.Scripting.isScriptLoaded",
-            KWIN_WINDOW_FEED_SCRIPT_ID,
-        ])
-        .output()
-        .map_err(|err| format!("Failed to query the KWin window feed script: {err}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "KWin rejected the window feed status query: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
-}
-
-fn start_kwin_window_feed_watchdog() {
-    std::thread::spawn(|| {
-        let mut last_error: Option<String> = None;
-        loop {
-            std::thread::sleep(Duration::from_secs(KWIN_WINDOW_FEED_WATCHDOG_INTERVAL_SECS));
-
-            let result = match kwin_window_feed_script_is_loaded() {
-                Ok(true) => {
-                    last_error = None;
-                    continue;
-                }
-                Ok(false) => reload_kwin_config(),
-                Err(err) => Err(err),
-            };
-
-            match result {
-                Ok(()) => {
-                    eprintln!("Restored missing KWin window feed script");
-                    last_error = None;
-                }
-                Err(err) if last_error.as_ref() != Some(&err) => {
-                    eprintln!("KWin window feed watchdog failed: {err}");
-                    last_error = Some(err);
-                }
-                Err(_) => {}
-            }
-        }
-    });
-}
-
-pub(crate) fn start_kwin_window_feed_service(
-    tx: Sender<WindowFeedEvent>,
-    terminal_attention_tx: Sender<WindowFeedEvent>,
-    repaint_ctx: egui::Context,
-) -> Result<(), String> {
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-
-    std::thread::spawn(move || {
-        let ready_tx_success = ready_tx.clone();
-        let result = pollster::block_on(async move {
-            let connection = zbus::connection::Builder::session()
-                .map_err(|err| err.to_string())?
-                .name(KWIN_WINDOW_FEED_SERVICE)
-                .map_err(|err| err.to_string())?
-                .serve_at(
-                    KWIN_WINDOW_FEED_PATH,
-                    KWinWindowFeed {
-                        tx,
-                        terminal_attention_tx,
-                        repaint_ctx,
-                    },
-                )
-                .map_err(|err| err.to_string())?
-                .build()
-                .await
-                .map_err(|err| err.to_string())?;
-
-            let _ = ready_tx_success.send(Ok(()));
-            let _connection = connection;
-            std::future::pending::<()>().await;
-            #[allow(unreachable_code)]
-            Ok::<(), String>(())
-        });
-
-        if let Err(err) = result {
-            let _ = ready_tx.send(Err(err));
-        }
-    });
-
-    ready_rx
-        .recv()
-        .map_err(|err| format!("Failed to start KWin window feed service: {err}"))?
 }
 
 pub(crate) fn setup_kwin_window_feed(
     tx: Sender<WindowFeedEvent>,
-    terminal_attention_tx: Sender<WindowFeedEvent>,
     repaint_ctx: egui::Context,
 ) -> Result<(), String> {
-    start_kwin_window_feed_service(tx, terminal_attention_tx, repaint_ctx)?;
-    install_kwin_window_feed_script()?;
-    enable_kwin_window_feed_script()?;
-    reload_kwin_config()?;
-    start_kwin_window_feed_watchdog();
+    applicationlauncher::tracker::ensure_tracker_installed()?;
+    let mut tracker_ready = false;
+    for _ in 0..30 {
+        if applicationlauncher::tracker::TrackerClient::connect()
+            .and_then(|client| client.status())
+            .is_ok()
+        {
+            tracker_ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !tracker_ready {
+        return Err("The tracker service did not become ready within three seconds".into());
+    }
+
+    std::thread::spawn(move || {
+        let mut last_generation = u64::MAX;
+        loop {
+            let result =
+                applicationlauncher::tracker::TrackerClient::connect().and_then(|client| {
+                    let status = client.status()?;
+                    if status.generation == last_generation {
+                        return Ok(None);
+                    }
+                    client
+                        .windows()
+                        .map(|windows| Some((status.generation, windows)))
+                });
+
+            match result {
+                Ok(Some((generation, windows))) => {
+                    let payloads = windows
+                        .into_iter()
+                        .map(|window| KWinWindowPayload {
+                            id: window.id,
+                            title: window.title,
+                            class: window.class,
+                            pid: window.pid,
+                            desktop_file_name: window.desktop_file_name,
+                            x: window.x,
+                            y: window.y,
+                            width: window.width,
+                            height: window.height,
+                            minimized: window.minimized,
+                            demands_attention: window.demands_attention,
+                            last_activated_at_ms: window.last_activated_at_ms,
+                            activation_sequence: window.activation_sequence,
+                        })
+                        .collect();
+                    let _ = tx.send(WindowFeedEvent::Snapshot(payloads));
+                    last_generation = generation;
+                    repaint_ctx.request_repaint();
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(250)),
+                Err(err) => {
+                    eprintln!("Application Launcher tracker connection lost: {err}");
+                    last_generation = u64::MAX;
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            }
+        }
+    });
     Ok(())
 }
 
@@ -437,27 +307,42 @@ pub(crate) fn window_info_from_kwin_payload(
         terminal_records,
     )?;
     window.demands_attention = payload.demands_attention;
+    window.last_activated_at_ms = payload.last_activated_at_ms;
+    window.activation_sequence = payload.activation_sequence;
     Some(window)
 }
 
 pub(crate) fn coalesce_window_feed_events(events: Vec<WindowFeedEvent>) -> Vec<WindowFeedEvent> {
+    let mut expanded = Vec::new();
+    for event in events {
+        match event {
+            WindowFeedEvent::Snapshot(payloads) => {
+                expanded.push(WindowFeedEvent::Reset);
+                expanded.extend(payloads.into_iter().map(WindowFeedEvent::Upsert));
+            }
+            event => expanded.push(event),
+        }
+    }
+
     let mut latest_by_id: HashMap<String, WindowFeedEvent> = HashMap::new();
     let mut order = Vec::new();
-    let reset_at = events
+    let reset_at = expanded
         .iter()
         .rposition(|event| matches!(event, WindowFeedEvent::Reset));
     let mut coalesced = reset_at
         .map(|_| vec![WindowFeedEvent::Reset])
         .unwrap_or_default();
 
-    for event in events
+    for event in expanded
         .into_iter()
         .skip(reset_at.map_or(0, |index| index + 1))
     {
         let Some(id) = (match &event {
             WindowFeedEvent::Upsert(payload) => Some(payload.id.clone()),
             WindowFeedEvent::Remove(id) => Some(id.clone()),
-            WindowFeedEvent::Reset | WindowFeedEvent::RearmAttentionAutomation => None,
+            WindowFeedEvent::Reset
+            | WindowFeedEvent::Snapshot(_)
+            | WindowFeedEvent::RearmAttentionAutomation => None,
         }) else {
             continue;
         };
@@ -661,6 +546,12 @@ pub(crate) fn merge_reconciled_window(
     }
     // Fast snapshots cannot inspect these KWin-only state fields.
     discovered.demands_attention = existing.demands_attention;
+    if discovered.last_activated_at_ms.is_none() {
+        discovered.last_activated_at_ms = existing.last_activated_at_ms;
+    }
+    if discovered.activation_sequence == 0 {
+        discovered.activation_sequence = existing.activation_sequence;
+    }
     discovered
 }
 
