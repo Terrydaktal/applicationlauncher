@@ -79,6 +79,23 @@ impl TrackerDatabase {
         ).map(|_| ()).map_err(|err| err.to_string())
     }
 
+    pub fn current_windows(&self) -> Result<Vec<TrackedWindow>, String> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT payload_json FROM current_windows ORDER BY window_id")
+            .map_err(|err| err.to_string())?;
+        let payloads = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+
+        payloads
+            .map(|payload| {
+                let payload = payload.map_err(|err| err.to_string())?;
+                serde_json::from_str(&payload).map_err(|err| err.to_string())
+            })
+            .collect()
+    }
+
     pub fn replace_current(&mut self, windows: &[TrackedWindow]) -> Result<(), String> {
         let existing = {
             let mut statement = self
@@ -390,6 +407,7 @@ mod tests {
             ..Default::default()
         };
         db.replace_current(std::slice::from_ref(&window)).unwrap();
+        assert_eq!(db.current_windows().unwrap(), vec![window.clone()]);
         db.add_history(&window, now_ms()).unwrap();
         assert_eq!(db.history(10).unwrap().len(), 1);
 

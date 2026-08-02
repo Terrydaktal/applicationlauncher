@@ -99,7 +99,12 @@ impl Runtime {
             .as_ref()
             .map_or(timestamp, |window| window.opened_at_ms);
         incoming.updated_at_ms = timestamp;
-        if activated || (incoming.active && previous.is_none()) {
+        if activated
+            || (incoming.active
+                && previous
+                    .as_ref()
+                    .is_none_or(|window| window.last_activated_at_ms.is_none()))
+        {
             state.activation_sequence += 1;
             incoming.activation_sequence = state.activation_sequence;
             incoming.last_activated_at_ms = Some(timestamp);
@@ -337,10 +342,24 @@ fn normalized_terminal_title(title: &str) -> String {
         .chars()
         .filter(|character| !matches!(*character as u32, 0x2800..=0x28ff))
         .collect::<String>()
+        .replace("[ ! ]", "")
+        .replace("[ . ]", "")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+fn terminal_dbus_service_names(names: Vec<String>) -> Vec<String> {
+    let mut services = names
+        .into_iter()
+        .filter(|name| {
+            name == "org.xfce.Terminal5" || name.starts_with("org.xfce.Terminal5.Instance.")
+        })
+        .collect::<Vec<_>>();
+    services.sort();
+    services.dedup();
+    services
 }
 
 fn dbus_string(values: &HashMap<String, zbus::zvariant::OwnedValue>, key: &str) -> Option<String> {
@@ -355,31 +374,73 @@ fn dbus_bool(values: &HashMap<String, zbus::zvariant::OwnedValue>, key: &str) ->
 
 fn send_enter_to_terminal(window: &TrackedWindow) -> Result<(), String> {
     let connection = zbus::blocking::Connection::session().map_err(|err| err.to_string())?;
+    let dbus_proxy = zbus::blocking::Proxy::new(
+        &connection,
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+    )
+    .map_err(|err| err.to_string())?;
+    let names: Vec<String> = dbus_proxy
+        .call("ListNames", &())
+        .map_err(|err| err.to_string())?;
+    let services = terminal_dbus_service_names(names);
+    if services.is_empty() {
+        return Err("No XFCE4 Terminal D-Bus services are available".to_string());
+    }
+
+    let wanted = normalized_terminal_title(&window.title);
+    let mut matches = Vec::new();
+    for service in services {
+        let Ok(proxy) = zbus::blocking::Proxy::new(
+            &connection,
+            service.as_str(),
+            "/org/xfce/Terminal",
+            "org.xfce.Terminal5",
+        ) else {
+            continue;
+        };
+        let Ok(records) = proxy
+            .call::<_, _, Vec<HashMap<String, zbus::zvariant::OwnedValue>>>("ListTerminals", &())
+        else {
+            continue;
+        };
+        let owner_pid = dbus_proxy
+            .call::<_, _, u32>("GetConnectionUnixProcessID", &(service.as_str(),))
+            .ok();
+        let active_records = records
+            .iter()
+            .filter(|record| dbus_bool(record, "active").unwrap_or(false))
+            .collect::<Vec<_>>();
+        let process_identifies_tab =
+            owner_pid == u32::try_from(window.pid).ok() && active_records.len() == 1;
+
+        for record in active_records {
+            let title_matches = dbus_string(record, "window_title")
+                .is_some_and(|title| normalized_terminal_title(&title) == wanted);
+            if (process_identifies_tab || title_matches)
+                && let Some(tab_uuid) = dbus_string(record, "tab_uuid")
+            {
+                matches.push((service.clone(), tab_uuid));
+            }
+        }
+    }
+
+    matches.sort();
+    matches.dedup();
+    let [(service, tab_uuid)] = matches.as_slice() else {
+        if matches.is_empty() {
+            return Err("No active terminal tab matched this window".to_string());
+        }
+        return Err("Multiple terminal tabs matched this window".into());
+    };
     let proxy = zbus::blocking::Proxy::new(
         &connection,
-        "org.xfce.Terminal5",
+        service.as_str(),
         "/org/xfce/Terminal",
         "org.xfce.Terminal5",
     )
     .map_err(|err| err.to_string())?;
-    let records: Vec<HashMap<String, zbus::zvariant::OwnedValue>> = proxy
-        .call("ListTerminals", &())
-        .map_err(|err| err.to_string())?;
-    let wanted = normalized_terminal_title(&window.title);
-    let mut matches = records
-        .iter()
-        .filter(|record| {
-            dbus_bool(record, "active").unwrap_or(false)
-                && dbus_string(record, "window_title")
-                    .is_some_and(|title| normalized_terminal_title(&title) == wanted)
-        })
-        .filter_map(|record| dbus_string(record, "tab_uuid"));
-    let tab_uuid = matches
-        .next()
-        .ok_or_else(|| "No active terminal tab matched this window".to_string())?;
-    if matches.next().is_some() {
-        return Err("Multiple terminal tabs matched this window".into());
-    }
     proxy
         .call::<_, _, ()>("SendEnter", &(tab_uuid.as_str(),))
         .map_err(|err| err.to_string())
@@ -658,6 +719,20 @@ pub fn run_tracker_daemon() -> Result<(), String> {
     let previous_boot = database.meta("boot_id")?.unwrap_or_default();
     let previous_clean = database.meta("clean_shutdown")?.as_deref() == Some("true");
     let recovery_pending = !previous_boot.is_empty() && previous_boot != boot_id && !previous_clean;
+    let persisted_windows = if previous_boot == boot_id {
+        database.current_windows()?
+    } else {
+        Vec::new()
+    };
+    let activation_sequence = persisted_windows
+        .iter()
+        .map(|window| window.activation_sequence)
+        .max()
+        .unwrap_or_default();
+    let persisted_windows = persisted_windows
+        .into_iter()
+        .map(|window| (window.id.clone(), window))
+        .collect::<HashMap<_, _>>();
     database.set_meta("boot_id", &boot_id)?;
     database.set_meta("clean_shutdown", "false")?;
     database.set_meta("recovery_dismissed", "false")?;
@@ -667,11 +742,11 @@ pub fn run_tracker_daemon() -> Result<(), String> {
 
     let runtime = Runtime(Arc::new(RuntimeInner {
         state: Mutex::new(State {
-            windows: HashMap::new(),
+            windows: persisted_windows,
             snapshot_buffer: None,
             generation: 0,
             history_generation: 0,
-            activation_sequence: 0,
+            activation_sequence,
             recovery_pending,
             run_id,
             boot_id,
@@ -735,4 +810,33 @@ pub fn run_tracker_daemon() -> Result<(), String> {
         #[allow(unreachable_code)]
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalized_terminal_title, terminal_dbus_service_names};
+
+    #[test]
+    fn attention_animation_does_not_change_terminal_title_identity() {
+        assert_eq!(
+            normalized_terminal_title("[ ! ] Action Required | wordelites - Terminal"),
+            normalized_terminal_title("[ . ] Action Required | wordelites - Terminal")
+        );
+    }
+
+    #[test]
+    fn discovers_shared_and_per_process_terminal_services() {
+        assert_eq!(
+            terminal_dbus_service_names(vec![
+                ":1.2".to_string(),
+                "org.xfce.Terminal5.Instance.iabc".to_string(),
+                "org.xfce.Terminal5".to_string(),
+                "org.example.Other".to_string(),
+            ]),
+            vec![
+                "org.xfce.Terminal5".to_string(),
+                "org.xfce.Terminal5.Instance.iabc".to_string(),
+            ]
+        );
+    }
 }

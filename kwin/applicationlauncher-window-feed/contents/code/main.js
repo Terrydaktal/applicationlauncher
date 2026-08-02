@@ -209,18 +209,6 @@ callDBus(
     "ReplaceSnapshot",
     JSON.stringify(initialWindows)
 );
-if (workspace.activeWindow) {
-    var activePayload = serializeWindow(workspace.activeWindow);
-    if (activePayload) {
-        callDBus(
-            SERVICE,
-            PATH,
-            INTERFACE,
-            "WindowActivated",
-            JSON.stringify(activePayload)
-        );
-    }
-}
 
 workspace.windowAdded.connect(function (window) {
     trackWindow(window, false);

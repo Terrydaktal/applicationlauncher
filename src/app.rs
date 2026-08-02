@@ -13,6 +13,7 @@ use crate::models::*;
 use crate::*;
 
 const HISTORY_POPUP_REFRESH_INTERVAL_MS: u64 = 750;
+const WINDOW_LAST_ACTIVATION_COLUMN_WIDTH: f32 = 42.0;
 
 #[derive(Default)]
 struct HistoryPopupState {
@@ -89,6 +90,20 @@ fn format_activation_time(timestamp_ms: Option<i64>) -> String {
         "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{milliseconds:03} UTC ({})",
         history_age(timestamp_ms)
     )
+}
+
+fn format_last_activation_age(timestamp_ms: Option<i64>) -> String {
+    let Some(timestamp_ms) = timestamp_ms.filter(|timestamp| *timestamp > 0) else {
+        return "-".to_string();
+    };
+
+    let elapsed_seconds =
+        ((applicationlauncher::tracker::now_ms() - timestamp_ms).max(0) / 1000) as u64;
+    match elapsed_seconds {
+        0..=59 => format!("{elapsed_seconds}s"),
+        60..=3_599 => format!("{}m", elapsed_seconds / 60),
+        _ => format!("{}h", elapsed_seconds / 3_600),
+    }
 }
 
 fn run_history_action(
@@ -168,6 +183,7 @@ pub(crate) struct App {
     win_text_spacing: f32,
     win_line_height: f32,
     win_show_path: bool,
+    win_show_last_activation: bool,
     show_run_in_terminal: bool,
     show_cd_in_terminal: bool,
     auto_send_enter_on_attention: bool,
@@ -532,6 +548,7 @@ impl App {
             win_text_spacing: settings.win_text_spacing,
             win_line_height: settings.win_line_height,
             win_show_path: settings.win_show_path,
+            win_show_last_activation: settings.win_show_last_activation,
             show_run_in_terminal: settings.show_run_in_terminal,
             show_cd_in_terminal: settings.show_cd_in_terminal,
             auto_send_enter_on_attention: settings.auto_send_enter_on_attention,
@@ -664,6 +681,7 @@ impl App {
             win_text_spacing: self.win_text_spacing,
             win_line_height: self.win_line_height,
             win_show_path: self.win_show_path,
+            win_show_last_activation: self.win_show_last_activation,
             show_run_in_terminal: self.show_run_in_terminal,
             show_cd_in_terminal: self.show_cd_in_terminal,
             auto_send_enter_on_attention: self.auto_send_enter_on_attention,
@@ -704,6 +722,7 @@ impl App {
         self.win_text_spacing = settings.win_text_spacing;
         self.win_line_height = settings.win_line_height;
         self.win_show_path = settings.win_show_path;
+        self.win_show_last_activation = settings.win_show_last_activation;
         self.show_run_in_terminal = settings.show_run_in_terminal;
         self.show_cd_in_terminal = settings.show_cd_in_terminal;
         self.auto_send_enter_on_attention = settings.auto_send_enter_on_attention;
@@ -1113,6 +1132,17 @@ impl App {
                 let mut show_path = self.win_show_path;
                 if ui.checkbox(&mut show_path, "").changed() {
                     self.win_show_path = show_path;
+                    self.save_settings();
+                }
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Show Last Activation:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut show_last_activation = self.win_show_last_activation;
+                if ui.checkbox(&mut show_last_activation, "").changed() {
+                    self.win_show_last_activation = show_last_activation;
                     self.save_settings();
                 }
                 ui.end_row();
@@ -3102,6 +3132,13 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(audio_repaint_ms));
         }
 
+        if self.mode == LauncherMode::Windows
+            && self.win_show_last_activation
+            && !self.windows.is_empty()
+        {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+
         if !handled_focus_launcher {
             self.prune_stale_windows();
         }
@@ -3216,7 +3253,7 @@ impl eframe::App for App {
                             if ui
                                 .add(ordering_button)
                                 .on_hover_text(
-                                    "Order windows by last activation, oldest first",
+                                    "Order windows by last activation, newest first",
                                 )
                                 .clicked()
                             {
@@ -4481,6 +4518,32 @@ impl eframe::App for App {
                                         self.win_top_padding,
                                         self.win_bottom_padding,
                                     );
+                                    let last_activation_rect = if self.mode == LauncherMode::Windows
+                                        && self.win_show_last_activation
+                                    {
+                                        Some(egui::Rect::from_min_max(
+                                            egui::pos2(
+                                                content_rect.max.x
+                                                    - WINDOW_LAST_ACTIVATION_COLUMN_WIDTH,
+                                                content_rect.min.y,
+                                            ),
+                                            content_rect.max,
+                                        ))
+                                    } else {
+                                        None
+                                    };
+                                    let content_rect = if last_activation_rect.is_some() {
+                                        egui::Rect::from_min_max(
+                                            content_rect.min,
+                                            egui::pos2(
+                                                content_rect.max.x
+                                                    - WINDOW_LAST_ACTIVATION_COLUMN_WIDTH,
+                                                content_rect.max.y,
+                                            ),
+                                        )
+                                    } else {
+                                        content_rect
+                                    };
                                     let mut child_ui = ui.new_child(
                                         egui::UiBuilder::new()
                                             .max_rect(content_rect)
@@ -4878,8 +4941,26 @@ impl eframe::App for App {
 	                                                }
 	                                            }
                                                 }
-	                                        }
-	                                    }
+                                            }
+                                        }
+
+                                    if let Some(last_activation_rect) = last_activation_rect {
+                                        if terminal_action_label.is_none()
+                                            && let Some(window) = filtered_windows.get(index)
+                                        {
+                                            ui.painter().text(
+                                                last_activation_rect.right_center(),
+                                                egui::Align2::RIGHT_CENTER,
+                                                format_last_activation_age(
+                                                    window.last_activated_at_ms,
+                                                ),
+                                                egui::FontId::proportional(self.win_path_size),
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    255, 255, 255, 150,
+                                                ),
+                                            );
+                                        }
+                                    }
 
                                     let overlay_response = ui.interact(
                                         rect,
@@ -6791,7 +6872,7 @@ mod tests {
     }
 
     #[test]
-    fn last_activation_order_puts_oldest_windows_first() {
+    fn last_activation_order_puts_newest_windows_first() {
         let mut older = test_window_info("older");
         older.last_activated_at_ms = Some(100);
         older.activation_sequence = 2;
@@ -6803,7 +6884,7 @@ mod tests {
         unknown.activation_sequence = 0;
 
         assert_eq!(
-            compare_windows_by_last_activation(&older, &newer),
+            compare_windows_by_last_activation(&newer, &older),
             std::cmp::Ordering::Less
         );
         assert_eq!(

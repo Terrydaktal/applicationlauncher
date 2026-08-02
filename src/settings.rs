@@ -219,6 +219,11 @@ pub(crate) fn render_deferred_settings_panel(
                 settings_checkbox_row(ui, "Show Path:", &mut state.settings.win_show_path);
             settings_changed |= settings_checkbox_row(
                 ui,
+                "Show Last Activation:",
+                &mut state.settings.win_show_last_activation,
+            );
+            settings_changed |= settings_checkbox_row(
+                ui,
                 "Show Run in Terminal:",
                 &mut state.settings.show_run_in_terminal,
             );
@@ -380,6 +385,11 @@ pub(crate) fn load_launcher_settings() -> LauncherSettings {
                             settings.win_show_path =
                                 value.parse::<bool>().unwrap_or(settings.win_show_path);
                         }
+                        "win_show_last_activation" => {
+                            settings.win_show_last_activation = value
+                                .parse::<bool>()
+                                .unwrap_or(settings.win_show_last_activation);
+                        }
                         "show_run_in_terminal" => {
                             settings.show_run_in_terminal = value
                                 .parse::<bool>()
@@ -501,7 +511,7 @@ pub(crate) fn save_launcher_settings(settings: LauncherSettings) {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("settings.txt");
         let content = format!(
-            "show_system_settings_modules={}\napp_icon_mode={}\nwin_icon_size={:.1}\nwin_top_padding={:.1}\nwin_bottom_padding={:.1}\nwin_left_padding={:.1}\nwin_right_padding={:.1}\nwin_row_height={:.1}\nwin_text_spacing={:.1}\nwin_line_height={:.1}\nwin_show_path={}\nshow_run_in_terminal={}\nshow_cd_in_terminal={}\nauto_send_enter_on_attention={}\nwin_title_size={:.1}\nwin_path_size={:.1}\napp_icon_size={:.1}\napp_icon_tile_size={:.1}\napp_top_padding={:.1}\napp_bottom_padding={:.1}\napp_left_padding={:.1}\napp_right_padding={:.1}\napp_icon_show_name={}\napp_icon_name_size={:.1}\ndisable_ibeam={}\napp_scroll_sensitivity={:.2}\nwin_scroll_sensitivity={:.2}\nui_scale={:.2}\n",
+            "show_system_settings_modules={}\napp_icon_mode={}\nwin_icon_size={:.1}\nwin_top_padding={:.1}\nwin_bottom_padding={:.1}\nwin_left_padding={:.1}\nwin_right_padding={:.1}\nwin_row_height={:.1}\nwin_text_spacing={:.1}\nwin_line_height={:.1}\nwin_show_path={}\nwin_show_last_activation={}\nshow_run_in_terminal={}\nshow_cd_in_terminal={}\nauto_send_enter_on_attention={}\nwin_title_size={:.1}\nwin_path_size={:.1}\napp_icon_size={:.1}\napp_icon_tile_size={:.1}\napp_top_padding={:.1}\napp_bottom_padding={:.1}\napp_left_padding={:.1}\napp_right_padding={:.1}\napp_icon_show_name={}\napp_icon_name_size={:.1}\ndisable_ibeam={}\napp_scroll_sensitivity={:.2}\nwin_scroll_sensitivity={:.2}\nui_scale={:.2}\n",
             settings.show_system_settings_modules,
             settings.app_icon_mode,
             settings.win_icon_size,
@@ -513,6 +523,7 @@ pub(crate) fn save_launcher_settings(settings: LauncherSettings) {
             settings.win_text_spacing,
             settings.win_line_height,
             settings.win_show_path,
+            settings.win_show_last_activation,
             settings.show_run_in_terminal,
             settings.show_cd_in_terminal,
             settings.auto_send_enter_on_attention,

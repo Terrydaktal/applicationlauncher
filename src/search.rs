@@ -537,14 +537,14 @@ pub(crate) fn compare_windows_by_last_activation(
     right: &WindowInfo,
 ) -> std::cmp::Ordering {
     let activation_time_order = match (left.last_activated_at_ms, right.last_activated_at_ms) {
-        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(left), Some(right)) => right.cmp(&left),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => std::cmp::Ordering::Equal,
     };
 
     activation_time_order
-        .then_with(|| left.activation_sequence.cmp(&right.activation_sequence))
+        .then_with(|| right.activation_sequence.cmp(&left.activation_sequence))
         .then_with(|| window_sort_title_key(left).cmp(&window_sort_title_key(right)))
         .then_with(|| left.id.cmp(&right.id))
 }
