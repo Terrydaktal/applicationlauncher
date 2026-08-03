@@ -41,19 +41,38 @@ pub(crate) fn is_codex_process(proc_name: &str) -> bool {
     normalized == "codex" || normalized.starts_with("codexcodemode")
 }
 
-pub(crate) fn terminal_parent_program(
+pub(crate) fn terminal_parent_program<'a>(
     proc_name: &str,
-    process_chain: &[ProcessChainEntry],
-) -> Option<&'static str> {
+    process_chain: &'a [ProcessChainEntry],
+) -> Option<&'a str> {
     if is_codex_process(proc_name) {
         return None;
     }
 
-    process_chain
+    if process_chain
         .iter()
         .skip(1)
         .any(|entry| is_codex_process(&entry.name))
-        .then_some("codex")
+    {
+        return Some("codex");
+    }
+
+    if normalize_app_match_key(proc_name) == "ssh" {
+        return process_chain
+            .iter()
+            .skip(1)
+            .find(|entry| is_shell_process(&entry.name))
+            .map(|entry| terminal_process_display_name(&entry.name));
+    }
+
+    None
+}
+
+fn is_shell_process(proc_name: &str) -> bool {
+    matches!(
+        normalize_app_match_key(proc_name).as_str(),
+        "bash" | "fish" | "sh" | "zsh"
+    )
 }
 
 pub(crate) fn terminal_primary_title(proc_name: &str, command_summary: Option<&str>) -> String {
@@ -239,6 +258,12 @@ pub(crate) fn terminal_display_title(
         .strip_prefix("- ")
         .unwrap_or(raw_title.trim());
 
+    if normalize_app_match_key(proc_name) == "ssh"
+        && let Some(title) = ssh_terminal_display_title(raw_title, parent_program)
+    {
+        return title;
+    }
+
     for sep in separators {
         let parts: Vec<&str> = raw_title.split(sep).map(str::trim).collect();
         if parts.len() < 2 {
@@ -277,6 +302,44 @@ pub(crate) fn terminal_display_title(
     }
 
     terminal_title_segments(raw_title, proc_name, command_summary, cwd, parent_program).join(" - ")
+}
+
+fn ssh_terminal_display_title(raw_title: &str, parent_program: Option<&str>) -> Option<String> {
+    let dynamic_title = strip_terminal_title_marker(raw_title);
+    let closing_bracket = dynamic_title.find(']')?;
+    if !dynamic_title.starts_with('[') {
+        return None;
+    }
+
+    let remote_user = dynamic_title[..=closing_bracket].trim();
+    let remote_context = dynamic_title[closing_bracket + 1..].trim();
+    if remote_user.len() <= 2 || remote_context.is_empty() {
+        return None;
+    }
+
+    let remote_shell = parent_program
+        .filter(|program| is_shell_process(program))
+        .map(terminal_process_display_name);
+    let remote_identity = remote_shell
+        .map(|shell| format!("{remote_user} {shell}"))
+        .unwrap_or_else(|| remote_user.to_string());
+
+    Some(format!(
+        "ssh - {remote_identity} - {remote_context} - Terminal"
+    ))
+}
+
+fn strip_terminal_title_marker(raw_title: &str) -> &str {
+    for separator in [" - ", " — ", " – ", " : ", " | "] {
+        if let Some(dynamic_title) = raw_title
+            .strip_suffix("Terminal")
+            .and_then(|title| title.strip_suffix(separator))
+        {
+            return dynamic_title.trim();
+        }
+    }
+
+    raw_title.trim()
 }
 
 pub(crate) fn terminal_dbus_string(

@@ -10,6 +10,9 @@ use crate::models::{
 };
 use crate::*;
 
+const TRACKER_WINDOW_FEED_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const TRACKER_WINDOW_FEED_RECONNECT_DELAY: Duration = Duration::from_millis(500);
+
 pub(crate) fn get_kdotool_path() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
         let path = PathBuf::from(format!("{home}/.cargo/bin/kdotool"));
@@ -217,17 +220,30 @@ pub(crate) fn setup_kwin_window_feed(
 
     std::thread::spawn(move || {
         let mut last_generation = u64::MAX;
+        let mut client = None;
+        let mut previous_payloads = None;
         loop {
-            let result =
-                applicationlauncher::tracker::TrackerClient::connect().and_then(|client| {
-                    let status = client.status()?;
-                    if status.generation == last_generation {
-                        return Ok(None);
+            if client.is_none() {
+                match applicationlauncher::tracker::TrackerClient::connect() {
+                    Ok(connected) => client = Some(connected),
+                    Err(err) => {
+                        eprintln!("Application Launcher tracker connection lost: {err}");
+                        std::thread::sleep(TRACKER_WINDOW_FEED_RECONNECT_DELAY);
+                        continue;
                     }
-                    client
-                        .windows()
-                        .map(|windows| Some((status.generation, windows)))
-                });
+                }
+            }
+
+            let result = client.as_ref().unwrap().status().and_then(|status| {
+                if status.generation == last_generation {
+                    return Ok(None);
+                }
+                client
+                    .as_ref()
+                    .unwrap()
+                    .windows()
+                    .map(|windows| Some((status.generation, windows)))
+            });
 
             match result {
                 Ok(Some((generation, windows))) => {
@@ -248,22 +264,61 @@ pub(crate) fn setup_kwin_window_feed(
                             last_activated_at_ms: window.last_activated_at_ms,
                             activation_sequence: window.activation_sequence,
                         })
-                        .collect();
-                    let _ = tx.send(WindowFeedEvent::Snapshot(payloads));
+                        .collect::<Vec<_>>();
+                    let (events, current_payloads) =
+                        window_feed_events_from_snapshot(previous_payloads.as_ref(), payloads);
+                    let has_events = !events.is_empty();
+                    for event in events {
+                        let _ = tx.send(event);
+                    }
+                    previous_payloads = Some(current_payloads);
                     last_generation = generation;
-                    repaint_ctx.request_repaint();
-                    std::thread::sleep(Duration::from_millis(100));
+                    if has_events {
+                        repaint_ctx.request_repaint();
+                    }
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(250)),
+                Ok(None) => {}
                 Err(err) => {
                     eprintln!("Application Launcher tracker connection lost: {err}");
                     last_generation = u64::MAX;
-                    std::thread::sleep(Duration::from_secs(2));
+                    client = None;
+                    previous_payloads = None;
+                    std::thread::sleep(TRACKER_WINDOW_FEED_RECONNECT_DELAY);
+                    continue;
                 }
             }
+            std::thread::sleep(TRACKER_WINDOW_FEED_POLL_INTERVAL);
         }
     });
     Ok(())
+}
+
+pub(crate) fn window_feed_events_from_snapshot(
+    previous: Option<&HashMap<String, KWinWindowPayload>>,
+    payloads: Vec<KWinWindowPayload>,
+) -> (Vec<WindowFeedEvent>, HashMap<String, KWinWindowPayload>) {
+    let current = payloads
+        .iter()
+        .cloned()
+        .map(|payload| (payload.id.clone(), payload))
+        .collect::<HashMap<_, _>>();
+    let Some(previous) = previous else {
+        return (vec![WindowFeedEvent::Snapshot(payloads)], current);
+    };
+
+    let mut events = payloads
+        .into_iter()
+        .filter(|payload| previous.get(&payload.id) != Some(payload))
+        .map(WindowFeedEvent::Upsert)
+        .collect::<Vec<_>>();
+    events.extend(
+        previous
+            .keys()
+            .filter(|id| !current.contains_key(*id))
+            .cloned()
+            .map(WindowFeedEvent::Remove),
+    );
+    (events, current)
 }
 
 pub(crate) fn window_info_from_kwin_payload(
@@ -573,9 +628,13 @@ pub(crate) fn merge_reconciled_windows(
             let old_window = current[index].clone();
             let merged_window = merge_reconciled_window(&old_window, discovered_window);
             if old_window != merged_window {
-                search_changed |= !window_search_metadata_equal(&old_window, &merged_window);
+                let window_search_changed =
+                    !window_search_metadata_equal(&old_window, &merged_window);
+                search_changed |= window_search_changed;
                 current[index] = merged_window.clone();
-                cache_updates.push((old_window, merged_window));
+                if !window_search_changed {
+                    cache_updates.push((old_window, merged_window));
+                }
                 changed = true;
             }
         } else {

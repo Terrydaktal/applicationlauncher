@@ -134,7 +134,7 @@ pub enum UiEvent {
     FocusLauncher,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct KWinWindowPayload {
     pub id: String,

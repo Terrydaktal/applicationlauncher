@@ -7,70 +7,97 @@ pub(crate) fn render_info_popup_panel(ui: &mut egui::Ui, data: &InfoPopupData) {
     let searchable_label_color = egui::Color32::from_rgb(214, 184, 86);
     let searchable_value_color = egui::Color32::from_rgb(255, 236, 170);
     let neutral_label_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170);
+    let body_font = egui::TextStyle::Monospace.resolve(ui.style());
+    let heading_font = egui::TextStyle::Heading.resolve(ui.style());
+    let mut layout_job = egui::text::LayoutJob::default();
+    let format = |font_id: egui::FontId, color: egui::Color32| egui::TextFormat {
+        font_id,
+        color,
+        ..Default::default()
+    };
 
-    ui.heading(
-        egui::RichText::new(&data.heading)
-            .color(egui::Color32::WHITE)
-            .strong(),
+    layout_job.append(
+        &data.heading,
+        0.0,
+        format(heading_font, egui::Color32::WHITE),
     );
-    ui.add_space(6.0);
-    ui.label(
-        egui::RichText::new(&data.subtitle)
-            .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170)),
+    layout_job.append("\n", 0.0, format(body_font.clone(), egui::Color32::WHITE));
+    layout_job.append(
+        &data.subtitle,
+        0.0,
+        format(
+            body_font.clone(),
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170),
+        ),
     );
-    ui.add_space(10.0);
+    layout_job.append("\n\n", 0.0, format(body_font.clone(), egui::Color32::WHITE));
 
-    egui::Grid::new("deferred_info_grid")
-        .num_columns(2)
-        .spacing([14.0, 8.0])
-        .striped(true)
-        .show(ui, |ui| {
-            for row in &data.rows {
-                let label_color = if row.searched {
-                    searchable_label_color
-                } else {
-                    neutral_label_color
-                };
-                let value_color = if row.searched {
-                    searchable_value_color
-                } else {
-                    egui::Color32::WHITE
-                };
-                ui.label(egui::RichText::new(&row.label).color(label_color).strong());
-                ui.label(
-                    egui::RichText::new(&row.value)
-                        .color(value_color)
-                        .monospace(),
-                );
-                ui.end_row();
-            }
-        });
+    let label_width = data
+        .rows
+        .iter()
+        .map(|row| row.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    for row in &data.rows {
+        let label = format!("{:<label_width$}  ", row.label);
+        let label_color = if row.searched {
+            searchable_label_color
+        } else {
+            neutral_label_color
+        };
+        let value_color = if row.searched {
+            searchable_value_color
+        } else {
+            egui::Color32::WHITE
+        };
+        layout_job.append(&label, 0.0, format(body_font.clone(), label_color));
+        layout_job.append(
+            &format!("{}\n", row.value),
+            0.0,
+            format(body_font.clone(), value_color),
+        );
+    }
 
     if !data.execution_chain.is_empty() {
-        ui.add_space(14.0);
-        ui.separator();
-        ui.add_space(10.0);
-        ui.label(
-            egui::RichText::new("Execution chain")
-                .color(egui::Color32::WHITE)
-                .strong(),
+        layout_job.append(
+            "\nExecution chain\n\n",
+            0.0,
+            format(body_font.clone(), egui::Color32::WHITE),
         );
-        ui.add_space(6.0);
         for (process, executable) in &data.execution_chain {
-            ui.group(|ui| {
-                ui.label(
-                    egui::RichText::new(process)
-                        .color(egui::Color32::WHITE)
-                        .strong(),
-                );
-                ui.label(
-                    egui::RichText::new(executable)
-                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160)),
-                );
-            });
-            ui.add_space(6.0);
+            layout_job.append(
+                &format!("{process}\n"),
+                0.0,
+                format(body_font.clone(), egui::Color32::WHITE),
+            );
+            layout_job.append(
+                &format!("{executable}\n\n"),
+                0.0,
+                format(
+                    body_font.clone(),
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160),
+                ),
+            );
         }
     }
+
+    let document = layout_job.text.clone();
+    let desired_rows = document.lines().count().max(1);
+    let mut immutable_document = document.as_str();
+    let mut layouter = move |ui: &egui::Ui, _text: &dyn egui::TextBuffer, _wrap_width: f32| {
+        let mut job = layout_job.clone();
+        job.wrap.max_width = f32::INFINITY;
+        ui.fonts_mut(|fonts| fonts.layout_job(job))
+    };
+    ui.add(
+        egui::TextEdit::multiline(&mut immutable_document)
+            .id_salt("info-popup-document")
+            .frame(false)
+            .margin(egui::Margin::ZERO)
+            .desired_width(f32::INFINITY)
+            .desired_rows(desired_rows)
+            .layouter(&mut layouter),
+    );
 }
 
 pub(crate) fn show_deferred_info_popup(

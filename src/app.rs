@@ -2190,7 +2190,7 @@ impl App {
         for old_window in &old_windows {
             if let Some(new_window) = new_by_id.remove(&old_window.id) {
                 self.missing_window_counts.remove(&old_window.id);
-                merged.push(new_window);
+                merged.push(merge_reconciled_window(old_window, new_window));
                 continue;
             }
 
@@ -2226,24 +2226,18 @@ impl App {
                     .get(window.id.as_str())
                     .is_none_or(|old| !window_search_metadata_equal(old, window))
             });
-        let cache_updates = if search_changed {
-            Vec::new()
-        } else {
-            merged
-                .iter()
-                .filter_map(|window| {
-                    old_by_id
-                        .get(window.id.as_str())
-                        .map(|old| ((*old).clone(), window.clone()))
-                })
-                .collect()
-        };
+        let cache_updates = merged
+            .iter()
+            .filter_map(|window| {
+                let old = old_by_id.get(window.id.as_str())?;
+                window_search_metadata_equal(old, window).then(|| ((*old).clone(), window.clone()))
+            })
+            .collect::<Vec<_>>();
         self.windows = merged;
         self.seed_window_icon_cache();
+        self.update_cached_windows_without_rerank(&cache_updates);
         if search_changed {
             self.schedule_window_search_refresh();
-        } else {
-            self.update_cached_windows_without_rerank(&cache_updates);
         }
     }
 
@@ -2307,9 +2301,13 @@ impl App {
                             self.windows.iter_mut().find(|item| item.id == window.id)
                         {
                             let old_window = existing.clone();
-                            search_changed |= !window_search_metadata_equal(&old_window, &window);
+                            let window_search_changed =
+                                !window_search_metadata_equal(&old_window, &window);
+                            search_changed |= window_search_changed;
                             *existing = window.clone();
-                            cache_updates.push((old_window, window));
+                            if !window_search_changed {
+                                cache_updates.push((old_window, window));
+                            }
                         } else {
                             self.windows.push(window);
                             search_changed = true;
@@ -2337,10 +2335,9 @@ impl App {
         }
 
         if changed {
+            self.update_cached_windows_without_rerank(&cache_updates);
             if search_changed {
                 self.schedule_window_search_refresh();
-            } else {
-                self.update_cached_windows_without_rerank(&cache_updates);
             }
             self.refresh_window_audio_cache();
         }
@@ -2518,10 +2515,9 @@ impl App {
         }
 
         self.seed_window_icon_cache();
+        self.update_cached_windows_without_rerank(&cache_updates);
         if search_changed {
             self.schedule_window_search_refresh();
-        } else {
-            self.update_cached_windows_without_rerank(&cache_updates);
         }
         self.refresh_window_audio_cache();
     }
@@ -6346,6 +6342,36 @@ mod tests {
     }
 
     #[test]
+    fn tracker_snapshots_become_incremental_window_events() {
+        let mut spinner = test_kwin_payload("codex - ⠇ project - Terminal", false);
+        spinner.id = "spinner".into();
+        let mut removed = test_kwin_payload("removed", false);
+        removed.id = "removed".into();
+
+        let (initial_events, previous) =
+            window_feed_events_from_snapshot(None, vec![spinner.clone(), removed]);
+        assert!(matches!(
+            initial_events.as_slice(),
+            [WindowFeedEvent::Snapshot(payloads)] if payloads.len() == 2
+        ));
+
+        spinner.title = "codex - ⠧ project - Terminal".into();
+        let (events, current) =
+            window_feed_events_from_snapshot(Some(&previous), vec![spinner.clone()]);
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events.first(),
+            Some(WindowFeedEvent::Upsert(payload)) if payload == &spinner
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(WindowFeedEvent::Remove(id)) if id == "removed"
+        ));
+        assert_eq!(current.len(), 1);
+    }
+
+    #[test]
     fn terminal_attention_relaunch_rearms_an_existing_prompt() {
         let id = "test-window".to_string();
         let windows = HashMap::from([(
@@ -6761,9 +6787,13 @@ mod tests {
         existing.id = "existing".to_string();
         existing.demands_attention = true;
         existing.icon_path = Some(PathBuf::from("/tmp/existing.svg"));
+        existing.last_activated_at_ms = Some(123_456);
+        existing.activation_sequence = 42;
         let mut feed_only = test_window_info("feed only");
         feed_only.id = "feed-only".to_string();
-        let mut current = vec![existing.clone(), feed_only];
+        let mut spinner = test_window_info("codex - ⠇ applicationlauncher - Terminal");
+        spinner.id = "spinner".to_string();
+        let mut current = vec![existing.clone(), feed_only, spinner.clone()];
 
         let mut refreshed = test_window_info("new title");
         refreshed.id = "existing".to_string();
@@ -6771,16 +6801,24 @@ mod tests {
         refreshed.geometry = None;
         refreshed.minimized = None;
         refreshed.icon_path = None;
+        refreshed.last_activated_at_ms = None;
+        refreshed.activation_sequence = 0;
         let mut newly_discovered = test_window_info("new window");
         newly_discovered.id = "new".to_string();
+        let mut refreshed_spinner = spinner;
+        refreshed_spinner.title = "codex - ⠧ applicationlauncher - Terminal".to_string();
+        refreshed_spinner.raw_title = refreshed_spinner.title.clone();
 
-        let (changed, search_changed, cache_updates) =
-            merge_reconciled_windows(&mut current, vec![refreshed, newly_discovered]);
+        let (changed, search_changed, cache_updates) = merge_reconciled_windows(
+            &mut current,
+            vec![refreshed, newly_discovered, refreshed_spinner],
+        );
 
         assert!(changed);
         assert!(search_changed);
         assert_eq!(cache_updates.len(), 1);
-        assert_eq!(current.len(), 3);
+        assert_eq!(current.len(), 4);
+        assert_eq!(cache_updates[0].0.id, "spinner");
         let merged = current
             .iter()
             .find(|window| window.id == "existing")
@@ -6791,6 +6829,8 @@ mod tests {
         assert_eq!(merged.minimized, existing.minimized);
         assert_eq!(merged.icon_path, existing.icon_path);
         assert!(merged.demands_attention);
+        assert_eq!(merged.last_activated_at_ms, existing.last_activated_at_ms);
+        assert_eq!(merged.activation_sequence, existing.activation_sequence);
         assert!(current.iter().any(|window| window.id == "feed-only"));
         assert!(current.iter().any(|window| window.id == "new"));
     }
@@ -7109,6 +7149,35 @@ mod tests {
                 parent_program,
             ),
             "codex - curl - ~/Dev/applicationlauncher - Terminal"
+        );
+    }
+
+    #[test]
+    fn ssh_terminal_title_keeps_remote_shell_and_path() {
+        let process_chain = vec![
+            ProcessChainEntry {
+                pid: 20,
+                name: "ssh".to_string(),
+                exe_path: Some(PathBuf::from("/usr/bin/ssh")),
+            },
+            ProcessChainEntry {
+                pid: 19,
+                name: "fish".to_string(),
+                exe_path: Some(PathBuf::from("/usr/bin/fish")),
+            },
+        ];
+        let parent_program = terminal_parent_program("ssh", &process_chain);
+
+        assert_eq!(parent_program, Some("fish"));
+        assert_eq!(
+            terminal_display_title(
+                "[lewis] /m/l/w/Program Files - Terminal",
+                "ssh",
+                Some("ssh lewis@192.168.50.30"),
+                Some("~"),
+                parent_program,
+            ),
+            "ssh - [lewis] fish - /m/l/w/Program Files - Terminal"
         );
     }
 
