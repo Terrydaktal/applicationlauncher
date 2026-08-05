@@ -9,6 +9,12 @@ use super::{
     FEED_PATH, RestoreReport, SERVICE_NAME, TRACKER_PATH, TrackedWindow, TrackerStatus, now_ms,
 };
 
+const KWIN_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(15);
+const KWIN_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(2);
+const KWIN_SERVICE: &str = "org.kde.KWin";
+const KWIN_PATH: &str = "/KWin";
+const KWIN_INTERFACE: &str = "org.kde.KWin";
+
 struct State {
     windows: HashMap<String, TrackedWindow>,
     snapshot_buffer: Option<HashMap<String, TrackedWindow>>,
@@ -285,6 +291,40 @@ impl Runtime {
                 );
             }
         }
+    }
+
+    fn reconcile_stale_kwin_windows(&self) -> Result<usize, String> {
+        let ids = {
+            let state = self.0.state.lock().unwrap();
+            state.windows.keys().cloned().collect::<Vec<_>>()
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let connection = zbus::blocking::connection::Builder::session()
+            .map_err(|err| err.to_string())?
+            .method_timeout(KWIN_RECONCILIATION_TIMEOUT)
+            .build()
+            .map_err(|err| err.to_string())?;
+        let proxy =
+            zbus::blocking::Proxy::new(&connection, KWIN_SERVICE, KWIN_PATH, KWIN_INTERFACE)
+                .map_err(|err| err.to_string())?;
+
+        let mut stale_ids = Vec::new();
+        for id in ids {
+            let details: HashMap<String, zbus::zvariant::OwnedValue> = proxy
+                .call("getWindowInfo", &(id.as_str(),))
+                .map_err(|err| format!("KWin rejected window reconciliation for {id}: {err}"))?;
+            if details.is_empty() {
+                stale_ids.push(id);
+            }
+        }
+
+        for id in &stale_ids {
+            self.remove(id);
+        }
+        Ok(stale_ids.len())
     }
 
     fn schedule_layout_reconciliation(&self, specs: Vec<(TrackedWindow, super::RestoreSpec)>) {
@@ -767,6 +807,16 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             recovery_runtime.write_recovery_if_due(false);
             recovery_runtime.persist_current_if_due(false);
             recovery_runtime.process_attention();
+        }
+    });
+
+    let reconciliation_runtime = runtime.clone();
+    std::thread::spawn(move || {
+        loop {
+            if let Err(err) = reconciliation_runtime.reconcile_stale_kwin_windows() {
+                eprintln!("Tracker KWin window reconciliation failed: {err}");
+            }
+            std::thread::sleep(KWIN_RECONCILIATION_INTERVAL);
         }
     });
 
