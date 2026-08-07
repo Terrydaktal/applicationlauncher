@@ -3,6 +3,8 @@ use std::time::Instant;
 
 mod models;
 use models::*;
+mod config;
+use config::*;
 mod audio;
 use audio::*;
 mod windows;
@@ -19,41 +21,6 @@ mod popups;
 use popups::*;
 mod diagnostics;
 use diagnostics::*;
-
-const WINDOW_REMOVAL_CONFIRMATION_POLLS: usize = 2;
-const KWIN_DBUS_SERVICE: &str = "org.kde.KWin";
-const KWIN_DBUS_PATH: &str = "/KWin";
-const KWIN_DBUS_INTERFACE: &str = "org.kde.KWin";
-const ATSPI_LOCATION_PROBE: &str = include_str!("atspi_location_probe.py");
-const AUDIO_SINK_POLL_MS: u128 = 200;
-const AUDIO_ACTIVITY_GRACE_MS: u128 = 350;
-const PIPEWIRE_ACTIVE_US_THRESHOLD: f32 = 10.0;
-const PIPEWIRE_ACTIVE_TOTAL_US_THRESHOLD: f32 = 20.0;
-const AUDIO_ACTIVE_REPAINT_MS: u64 = 80;
-const WINDOW_SEARCH_REFRESH_INTERVAL_MS: u64 = 180;
-const WINDOW_RECONCILIATION_INTERVAL_SECS: u64 = 30;
-const WINDOW_RECONCILIATION_RETRY_SECS: u64 = 2;
-const WINDOW_FEED_EVENTS_PER_FRAME: usize = 512;
-const WINDOW_SNAPSHOTS_PER_FRAME: usize = 4;
-const SETTINGS_VIEWPORT_SIZE: [f32; 2] = [380.0, 760.0];
-const SETTINGS_VIEWPORT_MIN_SIZE: [f32; 2] = [340.0, 500.0];
-const AUDIO_UPDATES_PER_FRAME: usize = 32;
-const UI_EVENTS_PER_FRAME: usize = 8;
-const CONTROL_REQUEST_LIMIT: usize = 128;
-const DEBUG_ATTACH_TIMEOUT_SECS: u64 = 60;
-const TERMINAL_DBUS_SERVICE: &str = "org.xfce.Terminal5";
-const TERMINAL_DBUS_PATH: &str = "/org/xfce/Terminal";
-const TERMINAL_DBUS_INTERFACE: &str = "org.xfce.Terminal5";
-const TERMINAL_ACTION_MESSAGE_SECS: u64 = 4;
-const AUTO_SEND_ENTER_DELAY_SECS: u64 = 5;
-const TERMINAL_ATTENTION_RECONCILIATION_SECS: u64 = 2;
-const TERMINAL_ATTENTION_FEED_STATE_TTL_SECS: u64 = 15;
-const TERMINAL_ATTENTION_MAX_RETRIES: u8 = 3;
-const TERMINAL_ATTENTION_RETRY_BASE_MS: u64 = 750;
-const TERMINAL_ATTENTION_WORKER_MAX_WAIT_MS: u64 = 250;
-const TERMINAL_ATTENTION_DBUS_TIMEOUT_SECS: u64 = 3;
-const TERMINAL_ATTENTION_CANCELLED: &str =
-    "Automatic Enter was cancelled because the window no longer requires attention";
 
 fn print_help() {
     println!(
