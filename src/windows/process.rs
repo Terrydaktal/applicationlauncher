@@ -3,6 +3,12 @@ use std::path::Path;
 
 use crate::models::ProcessChainEntry;
 
+pub(crate) type ProcessTree = (
+    HashMap<i32, Vec<i32>>,
+    HashMap<i32, String>,
+    HashMap<i32, i32>,
+);
+
 #[derive(Clone)]
 pub(crate) struct ProcessStat {
     pub(crate) pid: i32,
@@ -62,11 +68,7 @@ pub(crate) fn is_terminal_foreground_process(
         && process.process_group == terminal.foreground_process_group
 }
 
-pub(crate) fn get_process_tree() -> (
-    HashMap<i32, Vec<i32>>,
-    HashMap<i32, String>,
-    HashMap<i32, i32>,
-) {
+pub(crate) fn get_process_tree() -> ProcessTree {
     let mut ppid_to_children = HashMap::new();
     let mut pid_to_name = HashMap::new();
     let mut pid_to_ppid = HashMap::new();

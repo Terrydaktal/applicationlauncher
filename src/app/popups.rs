@@ -28,16 +28,24 @@ impl App {
             return;
         };
 
-        let state_snapshot = shared_state.lock().ok().map(|state| {
+        let state_snapshot = shared_state.lock().ok().map(|mut state| {
+            state.flush_pending_save();
             (
                 state.settings,
                 state.revision,
                 (state.scale_anchor / state.settings.ui_scale).clamp(0.2, 5.0),
+                state.save_deadline,
             )
         });
-        let Some((settings, revision, viewport_scale_factor)) = state_snapshot else {
+        let Some((settings, revision, viewport_scale_factor, save_deadline)) = state_snapshot
+        else {
             return;
         };
+        if let Some(deadline) = save_deadline {
+            ctx.request_repaint_after(
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            );
+        }
         if revision != self.settings_popup_applied_revision {
             self.apply_launcher_settings_snapshot(settings, ctx);
             self.settings_popup_applied_revision = revision;
@@ -86,12 +94,21 @@ impl App {
                                     return;
                                 };
                                 let previous_revision = state.revision;
-                                if render_deferred_settings_panel(ui, &mut state) {
+                                let close_requested =
+                                    render_deferred_settings_panel(ui, &mut state);
+                                if close_requested {
+                                    state.flush_pending_save_now();
                                     let _ = event_sender.send(PopupEvent::CloseSettings);
                                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                 }
                                 if state.revision != previous_revision {
                                     ctx.request_repaint_of(egui::ViewportId::ROOT);
+                                }
+                                if let Some(deadline) = state.save_deadline {
+                                    ctx.request_repaint_after(
+                                        deadline
+                                            .saturating_duration_since(std::time::Instant::now()),
+                                    );
                                 }
                             });
                     });

@@ -1,6 +1,10 @@
 use super::*;
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.flush_settings_save();
+        if let Some(deadline) = self.settings_save_deadline {
+            ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
+        }
         // Track window size changes in memory
         let current_size = ctx.viewport_rect().size();
         if (current_size.x - self.width).abs() > 1.0 || (current_size.y - self.height).abs() > 1.0 {
@@ -64,7 +68,9 @@ impl eframe::App for App {
                 self.terminal_records_receiver = None;
                 match result {
                     Ok(records) => self.apply_terminal_metadata_records(records),
-                    Err(err) => eprintln!("Could not refresh XFCE4 Terminal metadata: {err}"),
+                    Err(err) => crate::diagnostics::write_stderr_line(&format!(
+                        "Could not refresh XFCE4 Terminal metadata: {err}"
+                    )),
                 }
                 if self.terminal_metadata_refresh_queued {
                     self.start_terminal_metadata_refresh();
@@ -93,7 +99,9 @@ impl eframe::App for App {
                     ctx.request_repaint();
                 }
                 Err(err) => {
-                    eprintln!("Falling back to kdotool window polling: {err}");
+                    crate::diagnostics::write_stderr_line(&format!(
+                        "Falling back to kdotool window polling: {err}"
+                    ));
                     self.terminal_action_message = Some((
                         format!(
                             "Session history unavailable; using a one-time window snapshot: {err}"
@@ -106,7 +114,7 @@ impl eframe::App for App {
             }
         }
 
-        if !handled_focus_launcher && !self.loading && self.use_kwin_window_feed {
+        if !handled_focus_launcher && self.use_kwin_window_feed {
             let mut pending_events = Vec::with_capacity(WINDOW_FEED_EVENTS_PER_FRAME);
             for _ in 0..WINDOW_FEED_EVENTS_PER_FRAME {
                 match self.window_feed_receiver.try_recv() {
@@ -133,9 +141,7 @@ impl eframe::App for App {
                 }
             }
             if let Some(new_windows) = latest_windows {
-                if !self.loading {
-                    self.apply_window_snapshot(new_windows);
-                }
+                self.apply_window_snapshot(new_windows);
             }
             if window_snapshot_count == WINDOW_SNAPSHOTS_PER_FRAME {
                 ctx.request_repaint();
@@ -207,6 +213,7 @@ impl eframe::App for App {
             Some(Ok(apps)) => {
                 self.apps = apps;
                 self.apps_generation = self.apps_generation.wrapping_add(1);
+                self.refresh_app_audio_levels();
                 self.background_apps_receiver = None;
                 ctx.request_repaint();
             }
@@ -216,36 +223,53 @@ impl eframe::App for App {
             _ => {}
         }
 
-        // Check background receiver for window query results
+        // Check background receiver for window query results without keeping a
+        // permanently repainting GUI alive when its worker has exited.
         if !handled_focus_launcher && self.loading {
-            ctx.request_repaint(); // Keep repainting until loaded to check channel promptly
-            if let Some(ref rx) = self.receiver {
-                if let Ok(result) = rx.try_recv() {
+            let result = self.receiver.as_ref().map(|rx| rx.try_recv());
+            match result {
+                Some(Ok(result)) => {
                     self.loading = false;
+                    self.receiver = None;
                     match result {
                         LoadResult::AppsSuccess(apps) => {
                             self.apps = apps;
                             self.apps_generation = self.apps_generation.wrapping_add(1);
+                            self.refresh_app_audio_levels();
                             self.selected_index = 0;
                             self.side_panel_selected_index = 0;
                             self.active_pane = ActivePane::Apps;
                         }
                         LoadResult::WindowsSuccess(windows) => {
-                            self.windows = windows;
+                            self.apply_window_snapshot(windows);
                             self.seed_window_icon_cache();
                             self.missing_window_counts.clear();
-                            self.windows_generation = self.windows_generation.wrapping_add(1);
-                            self.refresh_window_audio_cache();
                             self.selected_index = 0;
                             self.side_panel_selected_index = 0;
                             self.active_pane = ActivePane::Windows;
-                            self.start_background_window_enrichment();
+                            if !self.use_kwin_window_feed {
+                                self.start_background_window_enrichment();
+                            }
                         }
                         LoadResult::Error(err) => {
                             self.error_message = Some(err);
                             self.kdotool_path = None;
                         }
                     }
+                    ctx.request_repaint();
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                    self.loading = false;
+                    self.receiver = None;
+                    self.error_message =
+                        Some("The background window scan stopped unexpectedly.".into());
+                    ctx.request_repaint();
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {
+                    ctx.request_repaint_after(Duration::from_millis(50));
+                }
+                None => {
+                    self.loading = false;
                 }
             }
         }
@@ -267,6 +291,7 @@ impl eframe::App for App {
                 self.observed_pipewire_node_ids = update.observed_pipewire_node_ids;
                 self.active_pipewire_node_ids = update.active_pipewire_node_ids;
                 self.pipewire_activity_cache_valid = update.pipewire_activity_cache_valid;
+                self.refresh_app_audio_levels();
                 self.has_active_audio = self.has_any_active_audio();
                 let window_audio_changed = self.refresh_window_audio_cache();
                 if window_audio_changed || self.has_active_audio != previous_has_active_audio {
@@ -1330,19 +1355,14 @@ impl eframe::App for App {
 	                                let mut rendered_columns = 0usize;
 	                                let mut first_row_y = None;
 	                                ui.horizontal_wrapped(|ui| {
-		                                    for index in 0..total_items {
+												for index in 0..total_items {
 		                                        let is_selected = index == self.selected_index;
 			                                        let app = &filtered_apps[index].0;
 			                                        let tile_size = self.app_icon_tile_size;
-                                                let audio_level =
-                                                    app_audio_level(
-                                                        app,
-                                                        &self.cached_sink_inputs,
-                                                        &self.active_media_app_keys,
-                                                        &self.observed_pipewire_node_ids,
-                                                        &self.active_pipewire_node_ids,
-                                                        self.pipewire_activity_cache_valid,
-                                                    );
+                                                let audio_level = self
+                                                    .app_audio_levels
+                                                    .get(&app.desktop_file_path)
+                                                    .copied();
 
                                         let (rect, response) = ui.allocate_exact_size(
                                             egui::vec2(tile_size, tile_size),
@@ -1701,15 +1721,10 @@ impl eframe::App for App {
                                     match self.mode {
 	                                        LauncherMode::Apps => {
 	                                            let app = &filtered_apps[index].0;
-                                                let audio_level =
-                                                    app_audio_level(
-                                                        app,
-                                                        &self.cached_sink_inputs,
-                                                        &self.active_media_app_keys,
-                                                        &self.observed_pipewire_node_ids,
-                                                        &self.active_pipewire_node_ids,
-                                                        self.pipewire_activity_cache_valid,
-                                                    );
+                                                let audio_level = self
+                                                    .app_audio_levels
+                                                    .get(&app.desktop_file_path)
+                                                    .copied();
 
 		                                            // Icon render
                                                 let (icon_rect, _) = child_ui.allocate_exact_size(
@@ -2390,15 +2405,10 @@ impl eframe::App for App {
 				                                                        for (index, item) in filtered_apps.iter().enumerate() {
 			                                                            let app = &item.0;
 			                                                            let tile_size = self.app_icon_tile_size;
-                                                                    let audio_level =
-                                                                        app_audio_level(
-                                                                            app,
-                                                                            &self.cached_sink_inputs,
-                                                                            &self.active_media_app_keys,
-                                                                            &self.observed_pipewire_node_ids,
-                                                                            &self.active_pipewire_node_ids,
-                                                                            self.pipewire_activity_cache_valid,
-                                                                        );
+                                                                    let audio_level = self
+                                                                        .app_audio_levels
+                                                                        .get(&app.desktop_file_path)
+                                                                        .copied();
 		                                                            let is_selected = self.active_pane == ActivePane::Apps
 	                                                                && index == self.side_panel_selected_index;
                                                             let (rect, response) = ui.allocate_exact_size(
@@ -2582,15 +2592,10 @@ impl eframe::App for App {
 	                                                    self.rendered_side_panel_grid_columns = 1;
 			                                                    for (index, item) in filtered_apps.iter().enumerate() {
 	                                                        let app = &item.0;
-                                                            let audio_level =
-                                                                app_audio_level(
-                                                                    app,
-                                                                    &self.cached_sink_inputs,
-                                                                    &self.active_media_app_keys,
-                                                                    &self.observed_pipewire_node_ids,
-                                                                    &self.active_pipewire_node_ids,
-                                                                    self.pipewire_activity_cache_valid,
-                                                                );
+                                                            let audio_level = self
+                                                                .app_audio_levels
+                                                                .get(&app.desktop_file_path)
+                                                                .copied();
 	                                                        let (rect, response) = ui.allocate_exact_size(
                                                             egui::vec2(ui.available_width(), app_row_height),
                                                             egui::Sense::click(),
@@ -2899,8 +2904,8 @@ impl eframe::App for App {
                             self.recovery_prompt = false;
                             std::thread::spawn(|| {
                                 match applicationlauncher::tracker::TrackerClient::connect().and_then(|client| client.restore_recovery()) {
-                                    Ok(report) => eprintln!("Recovery restore: {} matched, {} launched, {} failures", report.matched, report.launched, report.failures.len()),
-                                    Err(err) => eprintln!("Recovery restore failed: {err}"),
+                                    Ok(report) => crate::diagnostics::write_stderr_line(&format!("Recovery restore: {} matched, {} launched, {} failures", report.matched, report.launched, report.failures.len())),
+                                    Err(err) => crate::diagnostics::write_stderr_line(&format!("Recovery restore failed: {err}")),
                                 }
                             });
                         }

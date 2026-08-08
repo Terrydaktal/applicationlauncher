@@ -7,6 +7,9 @@ use std::process::Command;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
 use crate::*;
 
 pub(crate) struct SingleInstanceLock {
@@ -20,15 +23,21 @@ impl Drop for SingleInstanceLock {
 }
 
 #[cfg(target_os = "linux")]
-fn set_debugger_attach_enabled(enabled: bool) -> Result<(), String> {
+fn set_debugger_attach_enabled(tracer_pid: Option<u32>) -> Result<(), String> {
     use rustix::process::{PTracer, set_ptracer};
 
-    let tracer = if enabled { PTracer::Any } else { PTracer::None };
+    let tracer = match tracer_pid {
+        Some(pid) => PTracer::ProcessID(
+            rustix::process::Pid::from_raw(pid as i32)
+                .ok_or_else(|| format!("invalid diagnostic PID {pid}"))?,
+        ),
+        None => PTracer::None,
+    };
     set_ptracer(tracer).map_err(|err| format!("failed to update ptrace permission: {err}"))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn set_debugger_attach_enabled(_enabled: bool) -> Result<(), String> {
+fn set_debugger_attach_enabled(_tracer_pid: Option<u32>) -> Result<(), String> {
     Err("on-demand debugger attachment is only supported on Linux".to_string())
 }
 
@@ -59,7 +68,8 @@ pub(crate) fn send_launcher_control_request(
 }
 
 pub(crate) fn capture_running_launcher_diagnostics(socket_path: &Path) -> Result<PathBuf, String> {
-    let response = send_launcher_control_request(socket_path, "diagnose\n", true)?;
+    let request = format!("diagnose {}\n", std::process::id());
+    let response = send_launcher_control_request(socket_path, &request, true)?;
     let pid = response
         .strip_prefix("debug-ready ")
         .ok_or_else(|| {
@@ -148,10 +158,8 @@ pub(crate) fn capture_running_launcher_diagnostics(socket_path: &Path) -> Result
             .unwrap_or_default()
             .as_secs();
         let report_path = state_dir.join(format!("hang-{timestamp}.log"));
-        std::fs::write(&report_path, report.as_bytes())
-            .map_err(|err| format!("failed to write hang report: {err}"))?;
-        std::fs::write(state_dir.join("hang-latest.log"), report.as_bytes())
-            .map_err(|err| format!("failed to write latest hang report: {err}"))?;
+        write_private_report(&report_path, report.as_bytes())?;
+        write_private_report(&state_dir.join("hang-latest.log"), report.as_bytes())?;
         Ok(report_path)
     })();
 
@@ -172,12 +180,20 @@ pub(crate) fn handle_launcher_control_connection(
         .trim();
 
     match request {
-        "diagnose" => {
-            let response = match set_debugger_attach_enabled(true) {
+        request if request.starts_with("diagnose ") => {
+            let tracer_pid = request
+                .split_whitespace()
+                .nth(1)
+                .and_then(|pid| pid.parse::<u32>().ok());
+            let response = match tracer_pid
+                .filter(|pid| *pid > 0)
+                .ok_or_else(|| "diagnose requires the requesting debugger PID".to_string())
+                .and_then(|pid| set_debugger_attach_enabled(Some(pid)))
+            {
                 Ok(()) => {
                     std::thread::spawn(|| {
                         std::thread::sleep(Duration::from_secs(DEBUG_ATTACH_TIMEOUT_SECS));
-                        let _ = set_debugger_attach_enabled(false);
+                        let _ = set_debugger_attach_enabled(None);
                     });
                     format!("debug-ready {}\n", std::process::id())
                 }
@@ -186,7 +202,7 @@ pub(crate) fn handle_launcher_control_connection(
             let _ = stream.write_all(response.as_bytes());
         }
         "diagnose-done" => {
-            let response = match set_debugger_attach_enabled(false) {
+            let response = match set_debugger_attach_enabled(None) {
                 Ok(()) => "debug-disabled\n".to_string(),
                 Err(err) => format!("debug-error {err}\n"),
             };
@@ -208,7 +224,7 @@ pub(crate) fn get_socket_path(mode: LauncherMode) -> PathBuf {
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         PathBuf::from(runtime_dir).join(filename)
     } else {
-        std::env::temp_dir().join(filename)
+        launcher_state_dir().join(filename)
     }
 }
 
@@ -216,10 +232,7 @@ pub(crate) fn focus_existing_launcher_window() {
     let kpath = get_kdotool_path();
     let mut ids = Vec::new();
 
-    for args in [
-        ["search", "--class", "applicationlauncher"].as_slice(),
-        ["search", "--title", "Open Application Windows"].as_slice(),
-    ] {
+    for args in [["search", "--title", "Open Application Windows"].as_slice()] {
         if let Ok(output) = Command::new(&kpath).args(args).output() {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -255,6 +268,20 @@ pub(crate) fn launcher_state_dir() -> PathBuf {
     std::env::temp_dir().join("applicationlauncher")
 }
 
+pub(crate) fn write_stderr_line(message: &str) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "{message}");
+}
+
+fn write_private_report(path: &Path, contents: &[u8]) -> Result<(), String> {
+    std::fs::write(path, contents)
+        .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|err| format!("failed to restrict {}: {err}", path.display()))?;
+    Ok(())
+}
+
 pub(crate) fn install_panic_hook() {
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -280,15 +307,21 @@ pub(crate) fn install_panic_hook() {
             if let Ok(mut file) = OpenOptions::new()
                 .create(true)
                 .append(true)
+                .mode(0o600)
                 .open(&panic_log)
             {
                 let _ = file.write_all(panic_entry.as_bytes());
             }
             let latest_log = state_dir.join("panic-latest.log");
             let _ = std::fs::write(latest_log, message.as_bytes());
+            #[cfg(unix)]
+            let _ = std::fs::set_permissions(
+                state_dir.join("panic-latest.log"),
+                std::fs::Permissions::from_mode(0o600),
+            );
         }
 
-        eprintln!("{message}");
+        write_stderr_line(&message);
         previous_hook(panic_info);
     }));
 }

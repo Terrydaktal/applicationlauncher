@@ -6,7 +6,8 @@ use zbus::interface;
 
 use super::database::TrackerDatabase;
 use super::{
-    FEED_PATH, RestoreReport, SERVICE_NAME, TRACKER_PATH, TrackedWindow, TrackerStatus, now_ms,
+    FEED_PATH, RestoreReport, RestoreSpec, SERVICE_NAME, TRACKER_PATH, TrackedWindow,
+    TrackerStatus, now_ms,
 };
 
 const KWIN_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(15);
@@ -14,6 +15,7 @@ const KWIN_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(2);
 const KWIN_SERVICE: &str = "org.kde.KWin";
 const KWIN_PATH: &str = "/KWin";
 const KWIN_INTERFACE: &str = "org.kde.KWin";
+const TERMINAL_DBUS_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct State {
     windows: HashMap<String, TrackedWindow>,
@@ -30,6 +32,7 @@ struct State {
     current_due: Option<Instant>,
     auto_enter_enabled: bool,
     attention: HashMap<String, AttentionState>,
+    restore_specs: HashMap<String, RestoreSpec>,
 }
 
 struct AttentionState {
@@ -74,8 +77,29 @@ impl Runtime {
     }
 
     fn persist_current(&self) {
-        let windows = self.windows();
-        if let Err(err) = self.0.database.lock().unwrap().replace_current(&windows) {
+        let entries = {
+            let state = self.0.state.lock().unwrap();
+            state
+                .windows
+                .values()
+                .cloned()
+                .map(|window| {
+                    let restore = state
+                        .restore_specs
+                        .get(&window.id)
+                        .cloned()
+                        .unwrap_or_else(|| super::infer_restore_spec(&window));
+                    (window, restore)
+                })
+                .collect::<Vec<_>>()
+        };
+        if let Err(err) = self
+            .0
+            .database
+            .lock()
+            .unwrap()
+            .replace_current_with_restore(&entries)
+        {
             eprintln!("Tracker failed to persist current windows: {err}");
         }
     }
@@ -120,6 +144,9 @@ impl Runtime {
         }
         let attention_id = incoming.id.clone();
         let requires_attention = is_attention_terminal(&incoming);
+        let restore = super::infer_restore_spec(&incoming);
+        let was_attention = state.attention.contains_key(&attention_id);
+        state.restore_specs.insert(attention_id.clone(), restore);
         if let Some(target) = state.snapshot_buffer.as_mut() {
             target.insert(incoming.id.clone(), incoming);
         } else {
@@ -129,7 +156,13 @@ impl Runtime {
             state
                 .attention
                 .entry(attention_id)
-                .or_insert(AttentionState {
+                .and_modify(|attention| {
+                    if !was_attention {
+                        attention.due = Instant::now() + Duration::from_secs(5);
+                        attention.attempts = 0;
+                    }
+                })
+                .or_insert_with(|| AttentionState {
                     due: Instant::now() + Duration::from_secs(5),
                     attempts: 0,
                 });
@@ -150,6 +183,7 @@ impl Runtime {
         }
         let removed = state.windows.remove(id);
         state.attention.remove(id);
+        let restore = state.restore_specs.remove(id);
         if removed.is_some() {
             state.history_generation = state.history_generation.wrapping_add(1);
             Self::mark_changed(&mut state);
@@ -157,12 +191,13 @@ impl Runtime {
         drop(state);
         if let Some(window) = removed {
             if is_history_worthy(&window)
-                && let Err(err) = self
-                    .0
-                    .database
-                    .lock()
-                    .unwrap()
-                    .add_history(&window, timestamp)
+                && let Err(err) = self.0.database.lock().unwrap().add_history_with_restore(
+                    &window,
+                    restore
+                        .as_ref()
+                        .unwrap_or(&super::infer_restore_spec(&window)),
+                    timestamp,
+                )
             {
                 eprintln!("Tracker failed to append window history: {err}");
             }
@@ -182,6 +217,22 @@ impl Runtime {
             }
         }
         state.windows = buffer;
+        let closed_restores = closed
+            .iter()
+            .map(|window| {
+                (
+                    window.id.clone(),
+                    state
+                        .restore_specs
+                        .get(&window.id)
+                        .cloned()
+                        .unwrap_or_else(|| super::infer_restore_spec(window)),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for window in &closed {
+            state.restore_specs.remove(&window.id);
+        }
         if !closed.is_empty() {
             state.history_generation = state.history_generation.wrapping_add(1);
         }
@@ -190,7 +241,13 @@ impl Runtime {
         let database = self.0.database.lock().unwrap();
         for window in closed {
             if is_history_worthy(&window)
-                && let Err(err) = database.add_history(&window, timestamp)
+                && let Err(err) = database.add_history_with_restore(
+                    &window,
+                    closed_restores
+                        .get(&window.id)
+                        .unwrap_or(&super::infer_restore_spec(&window)),
+                    timestamp,
+                )
             {
                 eprintln!("Tracker failed to append snapshot closure: {err}");
             }
@@ -413,7 +470,11 @@ fn dbus_bool(values: &HashMap<String, zbus::zvariant::OwnedValue>, key: &str) ->
 }
 
 fn send_enter_to_terminal(window: &TrackedWindow) -> Result<(), String> {
-    let connection = zbus::blocking::Connection::session().map_err(|err| err.to_string())?;
+    let connection = zbus::blocking::connection::Builder::session()
+        .map_err(|err| err.to_string())?
+        .method_timeout(TERMINAL_DBUS_TIMEOUT)
+        .build()
+        .map_err(|err| err.to_string())?;
     let dbus_proxy = zbus::blocking::Proxy::new(
         &connection,
         "org.freedesktop.DBus",
@@ -696,7 +757,21 @@ impl TrackerApi {
     fn set_auto_enter(&self, enabled: bool) -> String {
         let mut state = self.0.0.state.lock().unwrap();
         state.auto_enter_enabled = enabled;
-        if !enabled {
+        if enabled {
+            let due = Instant::now() + Duration::from_secs(5);
+            let attention_ids = state
+                .windows
+                .values()
+                .filter(|window| is_attention_terminal(window))
+                .map(|window| window.id.clone())
+                .collect::<Vec<_>>();
+            for id in attention_ids {
+                state
+                    .attention
+                    .entry(id)
+                    .or_insert(AttentionState { due, attempts: 0 });
+            }
+        } else {
             state.attention.clear();
         }
         drop(state);
@@ -719,9 +794,7 @@ fn reopen_history_entry(runtime: &Runtime, id: i64) -> Result<RestoreReport, Str
         .database
         .lock()
         .unwrap()
-        .history(10_000)?
-        .into_iter()
-        .find(|entry| entry.id == id)
+        .history_entry(id)?
         .ok_or_else(|| format!("History entry {id} does not exist"))?;
     if !is_history_worthy(&entry.window) {
         return Err(format!(
@@ -759,19 +832,23 @@ pub fn run_tracker_daemon() -> Result<(), String> {
     let previous_boot = database.meta("boot_id")?.unwrap_or_default();
     let previous_clean = database.meta("clean_shutdown")?.as_deref() == Some("true");
     let recovery_pending = !previous_boot.is_empty() && previous_boot != boot_id && !previous_clean;
-    let persisted_windows = if previous_boot == boot_id {
-        database.current_windows()?
+    let persisted_entries = if previous_boot == boot_id {
+        database.current_window_entries()?
     } else {
         Vec::new()
     };
-    let activation_sequence = persisted_windows
+    let activation_sequence = persisted_entries
         .iter()
-        .map(|window| window.activation_sequence)
+        .map(|(window, _)| window.activation_sequence)
         .max()
         .unwrap_or_default();
-    let persisted_windows = persisted_windows
+    let restore_specs = persisted_entries
+        .iter()
+        .map(|(window, restore)| (window.id.clone(), restore.clone()))
+        .collect::<HashMap<_, _>>();
+    let persisted_windows = persisted_entries
         .into_iter()
-        .map(|window| (window.id.clone(), window))
+        .map(|(window, _)| (window.id.clone(), window))
         .collect::<HashMap<_, _>>();
     database.set_meta("boot_id", &boot_id)?;
     database.set_meta("clean_shutdown", "false")?;
@@ -796,27 +873,69 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             current_due: None,
             auto_enter_enabled,
             attention: HashMap::new(),
+            restore_specs,
         }),
         database: Mutex::new(database),
     }));
 
+    if auto_enter_enabled {
+        let due = Instant::now() + Duration::from_secs(5);
+        let mut state = runtime.0.state.lock().unwrap();
+        let attention_ids = state
+            .windows
+            .values()
+            .filter(|window| is_attention_terminal(window))
+            .map(|window| window.id.clone())
+            .collect::<Vec<_>>();
+        for id in attention_ids {
+            state
+                .attention
+                .insert(id, AttentionState { due, attempts: 0 });
+        }
+    }
+
     let recovery_runtime = runtime.clone();
     std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(Duration::from_millis(250));
-            recovery_runtime.write_recovery_if_due(false);
-            recovery_runtime.persist_current_if_due(false);
-            recovery_runtime.process_attention();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            loop {
+                std::thread::sleep(Duration::from_millis(250));
+                recovery_runtime.write_recovery_if_due(false);
+                recovery_runtime.persist_current_if_due(false);
+            }
+        }));
+        if result.is_err() {
+            eprintln!("Tracker persistence worker panicked; restarting daemon");
+            std::process::exit(1);
+        }
+    });
+
+    let attention_runtime = runtime.clone();
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            loop {
+                std::thread::sleep(Duration::from_millis(250));
+                attention_runtime.process_attention();
+            }
+        }));
+        if result.is_err() {
+            eprintln!("Tracker attention worker panicked; restarting daemon");
+            std::process::exit(1);
         }
     });
 
     let reconciliation_runtime = runtime.clone();
     std::thread::spawn(move || {
-        loop {
-            if let Err(err) = reconciliation_runtime.reconcile_stale_kwin_windows() {
-                eprintln!("Tracker KWin window reconciliation failed: {err}");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            loop {
+                if let Err(err) = reconciliation_runtime.reconcile_stale_kwin_windows() {
+                    eprintln!("Tracker KWin window reconciliation failed: {err}");
+                }
+                std::thread::sleep(KWIN_RECONCILIATION_INTERVAL);
             }
-            std::thread::sleep(KWIN_RECONCILIATION_INTERVAL);
+        }));
+        if result.is_err() {
+            eprintln!("Tracker KWin reconciliation worker panicked; restarting daemon");
+            std::process::exit(1);
         }
     });
 

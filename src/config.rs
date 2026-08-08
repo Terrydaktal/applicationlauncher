@@ -4,6 +4,7 @@ pub(crate) const KWIN_DBUS_PATH: &str = "/KWin";
 pub(crate) const KWIN_DBUS_INTERFACE: &str = "org.kde.KWin";
 pub(crate) const ATSPI_LOCATION_PROBE: &str = include_str!("atspi_location_probe.py");
 pub(crate) const AUDIO_SINK_POLL_MS: u128 = 200;
+pub(crate) const AUDIO_IDLE_POLL_MS: u64 = 1000;
 pub(crate) const AUDIO_ACTIVITY_GRACE_MS: u128 = 350;
 pub(crate) const PIPEWIRE_ACTIVE_US_THRESHOLD: f32 = 10.0;
 pub(crate) const PIPEWIRE_ACTIVE_TOTAL_US_THRESHOLD: f32 = 20.0;

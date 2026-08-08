@@ -1,6 +1,16 @@
 use super::*;
 
 impl App {
+    fn refresh_process_tree_cache(&mut self) {
+        let refresh = self
+            .process_tree_cache_updated_at
+            .is_none_or(|updated| updated.elapsed() >= Duration::from_millis(150));
+        if refresh {
+            self.process_tree_cache = Some(get_process_tree());
+            self.process_tree_cache_updated_at = Some(Instant::now());
+        }
+    }
+
     pub(super) fn start_terminal_metadata_refresh(&mut self) {
         if self.terminal_records_receiver.is_some() {
             self.terminal_metadata_refresh_queued = true;
@@ -39,7 +49,11 @@ impl App {
             .unwrap_or("breeze-dark")
             .to_string();
         let records = self.terminal_records.clone();
-        let (ppid_to_children, pid_to_name, pid_to_ppid) = get_process_tree();
+        self.refresh_process_tree_cache();
+        let (ppid_to_children, pid_to_name, pid_to_ppid) = self
+            .process_tree_cache
+            .as_ref()
+            .expect("process tree cache initialized");
         let mut rebuilt = Vec::new();
         for old_window in terminal_windows {
             let demands_attention = old_window.demands_attention;
@@ -63,6 +77,23 @@ impl App {
             }
         }
         self.apply_window_reconciliation(rebuilt);
+    }
+
+    pub(super) fn refresh_app_audio_levels(&mut self) {
+        self.app_audio_levels.clear();
+        for app in &self.apps {
+            if let Some(level) = app_audio_level(
+                app,
+                &self.cached_sink_inputs,
+                &self.active_media_app_keys,
+                &self.observed_pipewire_node_ids,
+                &self.active_pipewire_node_ids,
+                self.pipewire_activity_cache_valid,
+            ) {
+                self.app_audio_levels
+                    .insert(app.desktop_file_path.clone(), level);
+            }
+        }
     }
     pub(super) fn update_cached_windows_without_rerank(
         &mut self,
@@ -89,6 +120,20 @@ impl App {
     }
 
     pub(super) fn seed_window_icon_cache(&mut self) {
+        let active_keys = self
+            .windows
+            .iter()
+            .map(|window| {
+                window_icon_cache_key(
+                    &window.class,
+                    window.desktop_file_name.as_deref(),
+                    window.active_process.as_deref(),
+                    window.exe_path.as_deref(),
+                )
+            })
+            .collect::<HashSet<_>>();
+        self.window_icon_cache
+            .retain(|key, _| active_keys.contains(key));
         for window in &self.windows {
             let icon_key = window_icon_cache_key(
                 &window.class,
@@ -212,7 +257,11 @@ impl App {
             .as_deref()
             .unwrap_or("breeze-dark")
             .to_string();
-        let (ppid_to_children, pid_to_name, pid_to_ppid) = get_process_tree();
+        self.refresh_process_tree_cache();
+        let (ppid_to_children, pid_to_name, pid_to_ppid) = self
+            .process_tree_cache
+            .as_ref()
+            .expect("process tree cache initialized");
         let terminal_records = self.terminal_records.clone();
         let mut changed = false;
         let mut search_changed = false;
@@ -388,6 +437,9 @@ impl App {
     }
 
     pub(super) fn refresh_windows(&mut self) {
+        if self.loading || self.receiver.is_some() {
+            return;
+        }
         if let Some(ref kpath) = self.kdotool_path {
             let kpath = kpath.clone();
             let theme = self
@@ -396,6 +448,7 @@ impl App {
                 .unwrap_or("breeze-dark")
                 .to_string();
             let (tx, rx) = std::sync::mpsc::channel();
+            let repaint_ctx = self.repaint_ctx.clone();
             self.loading = true;
             self.receiver = Some(rx);
 
@@ -404,11 +457,13 @@ impl App {
                     Ok(_) => {
                         let windows = get_open_windows_fast(&kpath, &theme).unwrap_or_default();
                         let _ = tx.send(LoadResult::WindowsSuccess(windows));
+                        repaint_ctx.request_repaint();
                     }
                     Err(_) => {
                         let _ = tx.send(LoadResult::Error(format!(
                             "kdotool utility not found.\n\nPlease install it using cargo:\n\ncargo install kdotool"
                         )));
+                        repaint_ctx.request_repaint();
                     }
                 },
             );
@@ -483,6 +538,9 @@ impl App {
     }
 
     pub(super) fn start_background_app_load(&mut self) {
+        if self.background_apps_receiver.is_some() {
+            return;
+        }
         let theme = self
             .force_theme
             .as_deref()
@@ -500,18 +558,23 @@ impl App {
     }
 
     pub(super) fn refresh_apps(&mut self) {
+        if self.loading || self.receiver.is_some() {
+            return;
+        }
         let theme = self
             .force_theme
             .as_deref()
             .unwrap_or("breeze-dark")
             .to_string();
         let (tx, rx) = std::sync::mpsc::channel();
+        let repaint_ctx = self.repaint_ctx.clone();
         self.loading = true;
         self.receiver = Some(rx);
 
         std::thread::spawn(move || {
             let apps = get_installed_apps(&theme);
             let _ = tx.send(LoadResult::AppsSuccess(apps));
+            repaint_ctx.request_repaint();
         });
     }
 

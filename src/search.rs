@@ -370,7 +370,7 @@ pub(crate) fn duplicate_window_title_key(win: &WindowInfo) -> Option<String> {
         }
     }
 
-    (!title.is_empty()).then(|| title.to_string())
+    (!title.is_empty()).then(|| normalize_window_identity_title(title))
 }
 
 pub(crate) fn duplicate_window_group_key(win: &WindowInfo) -> Option<(String, String)> {
@@ -425,9 +425,8 @@ pub(crate) fn is_braille_spinner_char(ch: char) -> bool {
 
 pub(crate) fn window_search_metadata_equal(left: &WindowInfo, right: &WindowInfo) -> bool {
     let titles_match = left.title == right.title
-        || (left.title.len() == right.title.len()
-            && normalize_window_sort_title(&left.title)
-                == normalize_window_sort_title(&right.title));
+        || normalize_window_identity_title(&left.title)
+            == normalize_window_identity_title(&right.title);
     if !titles_match {
         return false;
     }
@@ -458,7 +457,7 @@ pub(crate) fn refresh_cached_transient_title(
     old_title: &str,
     new_title: &str,
 ) {
-    if old_title == new_title || old_title.len() != new_title.len() {
+    if old_title == new_title {
         return;
     }
 
@@ -524,6 +523,20 @@ pub(crate) fn normalize_window_sort_title(title: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+fn normalize_window_identity_title(title: &str) -> String {
+    let without_attention_frames = ATTENTION_REQUIRED_FRAMES
+        .into_iter()
+        .fold(title.to_string(), |normalized, frame| {
+            normalized.replace(frame, "")
+        });
+    normalize_window_sort_title(&without_attention_frames)
+        .split(" - ")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" - ")
 }
 
 pub(crate) fn window_sort_title_key(win: &WindowInfo) -> String {

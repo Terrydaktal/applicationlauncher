@@ -11,12 +11,12 @@ pub struct ProcessChainEntry {
     pub exe_path: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct PactlVolumeChannel {
     pub value_percent: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct PactlSinkInput {
     pub index: u32,
     #[serde(default)]
@@ -171,7 +171,7 @@ pub enum WindowFeedEvent {
     RearmAttentionAutomation,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AudioCacheUpdate {
     pub sink_inputs: Vec<PactlSinkInput>,
     pub active_media_app_keys: HashSet<String>,
@@ -310,6 +310,8 @@ pub struct SettingsWindowState {
     pub pending_ui_scale: f32,
     pub scale_anchor: f32,
     pub revision: u64,
+    pub pending_save: Option<LauncherSettings>,
+    pub save_deadline: Option<std::time::Instant>,
 }
 
 #[derive(Clone)]

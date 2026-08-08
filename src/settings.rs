@@ -1,5 +1,6 @@
 use eframe::egui;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::app::App;
 use crate::models::{LauncherSettings, SettingsWindowState};
@@ -11,12 +12,34 @@ impl SettingsWindowState {
             scale_anchor: settings.ui_scale,
             settings,
             revision: 0,
+            pending_save: None,
+            save_deadline: None,
         }
     }
 
     pub(crate) fn save_changed_settings(&mut self) {
-        save_launcher_settings(self.settings);
         self.revision = self.revision.wrapping_add(1);
+        self.pending_save = Some(self.settings);
+        self.save_deadline = Some(Instant::now() + Duration::from_millis(150));
+    }
+
+    pub(crate) fn flush_pending_save(&mut self) {
+        if self
+            .save_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.save_deadline = None;
+            if let Some(settings) = self.pending_save.take() {
+                save_launcher_settings(settings);
+            }
+        }
+    }
+
+    pub(crate) fn flush_pending_save_now(&mut self) {
+        self.save_deadline = None;
+        if let Some(settings) = self.pending_save.take() {
+            save_launcher_settings(settings);
+        }
     }
 }
 pub(crate) fn render_deferred_settings_panel(

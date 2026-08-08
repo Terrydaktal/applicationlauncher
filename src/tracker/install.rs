@@ -54,33 +54,47 @@ pub fn ensure_tracker_installed() -> Result<(), String> {
         std::fs::write(&unit_path, unit).map_err(|err| err.to_string())?;
         installation_changed = true;
     }
-    let reload = Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status()
-        .map_err(|err| err.to_string())?;
-    if !reload.success() {
-        return Err("systemctl --user daemon-reload failed".into());
+    if installation_changed {
+        let reload = Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status()
+            .map_err(|err| err.to_string())?;
+        if !reload.success() {
+            return Err("systemctl --user daemon-reload failed".into());
+        }
     }
-    let enable = Command::new("systemctl")
-        .args(["--user", "enable", "applicationlauncherd.service"])
+    let enabled = Command::new("systemctl")
+        .args(["--user", "is-enabled", "applicationlauncherd.service"])
         .status()
-        .map_err(|err| err.to_string())?;
-    if !enable.success() {
-        return Err("systemctl --user enable applicationlauncherd.service failed".into());
+        .is_ok_and(|status| status.success());
+    if !enabled {
+        let enable = Command::new("systemctl")
+            .args(["--user", "enable", "applicationlauncherd.service"])
+            .status()
+            .map_err(|err| err.to_string())?;
+        if !enable.success() {
+            return Err("systemctl --user enable applicationlauncherd.service failed".into());
+        }
     }
-    let service_action = if installation_changed {
-        "restart"
-    } else {
-        "start"
-    };
-    let restart = Command::new("systemctl")
-        .args(["--user", service_action, "applicationlauncherd.service"])
+    let active = Command::new("systemctl")
+        .args(["--user", "is-active", "applicationlauncherd.service"])
         .status()
-        .map_err(|err| err.to_string())?;
-    if !restart.success() {
-        return Err(format!(
-            "systemctl --user {service_action} applicationlauncherd.service failed"
-        ));
+        .is_ok_and(|status| status.success());
+    if installation_changed || !active {
+        let service_action = if installation_changed {
+            "restart"
+        } else {
+            "start"
+        };
+        let restart = Command::new("systemctl")
+            .args(["--user", service_action, "applicationlauncherd.service"])
+            .status()
+            .map_err(|err| err.to_string())?;
+        if !restart.success() {
+            return Err(format!(
+                "systemctl --user {service_action} applicationlauncherd.service failed"
+            ));
+        }
     }
     Ok(())
 }
@@ -90,9 +104,15 @@ pub(crate) fn ensure_kwin_feed_installed() -> Result<(), String> {
     let script_dir = home.join(".local/share/kwin/scripts").join(KWIN_SCRIPT_ID);
     let code_dir = script_dir.join("contents/code");
     std::fs::create_dir_all(&code_dir).map_err(|err| err.to_string())?;
-    std::fs::write(script_dir.join("metadata.json"), KWIN_METADATA)
-        .map_err(|err| err.to_string())?;
-    std::fs::write(code_dir.join("main.js"), KWIN_MAIN_JS).map_err(|err| err.to_string())?;
+    let metadata_path = script_dir.join("metadata.json");
+    let main_path = code_dir.join("main.js");
+    let files_changed = std::fs::read_to_string(&metadata_path).ok().as_deref()
+        != Some(KWIN_METADATA)
+        || std::fs::read_to_string(&main_path).ok().as_deref() != Some(KWIN_MAIN_JS);
+    if files_changed {
+        std::fs::write(&metadata_path, KWIN_METADATA).map_err(|err| err.to_string())?;
+        std::fs::write(&main_path, KWIN_MAIN_JS).map_err(|err| err.to_string())?;
+    }
     let enabled = Command::new("kwriteconfig6")
         .args([
             "--file",
@@ -108,7 +128,26 @@ pub(crate) fn ensure_kwin_feed_installed() -> Result<(), String> {
     if !enabled.success() {
         return Err("Could not enable the KWin window feed script".into());
     }
-    reload_kwin()
+    if files_changed || !kwin_script_loaded() {
+        reload_kwin()
+    } else {
+        Ok(())
+    }
+}
+
+fn kwin_script_loaded() -> bool {
+    Command::new("qdbus6")
+        .args([
+            "org.kde.KWin",
+            "/Scripting",
+            "org.kde.kwin.Scripting.isScriptLoaded",
+            KWIN_SCRIPT_ID,
+        ])
+        .output()
+        .ok()
+        .is_some_and(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
+        })
 }
 
 fn reload_kwin() -> Result<(), String> {
@@ -172,4 +211,15 @@ pub(crate) fn start_kwin_feed_watchdog() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KWIN_MAIN_JS;
+
+    #[test]
+    fn kwin_feed_avoids_unsupported_browser_timers() {
+        assert!(!KWIN_MAIN_JS.contains("setTimeout"));
+        assert!(!KWIN_MAIN_JS.contains("clearTimeout"));
+    }
 }

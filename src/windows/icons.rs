@@ -51,14 +51,17 @@ pub(crate) fn resolve_window_icon(
         }
     };
 
-    if terminal_window {
-        push_candidate(active_process);
-    }
     push_candidate(desktop_file_name);
     if let Some(desktop_stem) = desktop_file_name.and_then(|value| value.strip_suffix(".desktop")) {
         push_candidate(Some(desktop_stem));
     }
     push_candidate(Some(class));
+    // A terminal window belongs to the terminal application even when its
+    // foreground child is Electron, Codex, htop, or another executable.
+    // Never let that child replace the terminal's own icon.
+    if !terminal_window {
+        push_candidate(active_process);
+    }
     if !tor_browser_window {
         push_candidate(
             executable
@@ -134,10 +137,19 @@ pub(crate) fn find_icon(theme: &str, class: &str) -> Option<PathBuf> {
     }
 
     // Try finding the .desktop file to see if it has a hardcoded icon path or an override name
-    let mut app_dirs = vec![PathBuf::from("/usr/share/applications")];
+    let mut app_dirs = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
         app_dirs.push(PathBuf::from(format!("{}/.local/share/applications", home)));
     }
+    let data_dirs = std::env::var_os("XDG_DATA_DIRS")
+        .map(|dirs| std::env::split_paths(&dirs).collect::<Vec<_>>())
+        .unwrap_or_else(|| {
+            vec![
+                PathBuf::from("/usr/local/share"),
+                PathBuf::from("/usr/share"),
+            ]
+        });
+    app_dirs.extend(data_dirs.into_iter().map(|dir| dir.join("applications")));
 
     let mut overrides = Vec::new();
     for dir in &app_dirs {

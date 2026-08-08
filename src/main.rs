@@ -72,8 +72,8 @@ EXAMPLES
     applicationlauncher
         Launch the application launcher.
 
-    applicationlauncher --no-close-on-blur
-        Launch the application launcher without closing on focus loss.
+    applicationlauncher --close-on-blur
+        Launch the application launcher and close it when focus is lost.
 
     applicationlauncher --diagnose
         Capture a report from a currently running, unresponsive launcher.
@@ -127,6 +127,15 @@ AUTHORS
 fn main() -> eframe::Result {
     install_panic_hook();
     let args: Vec<String> = std::env::args().collect();
+
+    if args
+        .iter()
+        .skip(1)
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    {
+        print_help();
+        return Ok(());
+    }
 
     if args.len() >= 7 && args[1] == "--draw-border" {
         let tx: f32 = args[2].parse().unwrap_or(0.0);
@@ -188,6 +197,9 @@ fn main() -> eframe::Result {
 
     // Single instance check using Unix domain socket
     let socket_path = get_socket_path(mode);
+    if let Some(parent) = socket_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     if socket_path.exists() {
         if diagnose_requested {
             match capture_running_launcher_diagnostics(&socket_path) {

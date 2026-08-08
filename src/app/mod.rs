@@ -216,6 +216,10 @@ pub(crate) struct App {
     app_info_popup: Option<AppInfo>,
     settings_popup_state: Option<Arc<std::sync::Mutex<SettingsWindowState>>>,
     settings_popup_applied_revision: u64,
+    pending_settings_save: Option<LauncherSettings>,
+    settings_save_deadline: Option<Instant>,
+    process_tree_cache: Option<crate::windows::process::ProcessTree>,
+    process_tree_cache_updated_at: Option<Instant>,
     popup_event_sender: Sender<PopupEvent>,
     popup_event_receiver: Receiver<PopupEvent>,
     window_sender: Sender<Vec<WindowInfo>>,
@@ -233,6 +237,7 @@ pub(crate) struct App {
     use_kwin_window_feed: bool,
     window_polling_started: bool,
     cached_sink_inputs: Vec<PactlSinkInput>,
+    app_audio_levels: HashMap<PathBuf, f32>,
     active_media_app_keys: HashSet<String>,
     observed_pipewire_node_ids: HashSet<u32>,
     active_pipewire_node_ids: HashSet<u32>,
@@ -479,7 +484,7 @@ impl App {
 
         let (window_tx, window_rx) = std::sync::mpsc::channel();
         let (window_feed_tx, window_feed_rx) = std::sync::mpsc::channel();
-        let (audio_cache_tx, audio_cache_rx) = std::sync::mpsc::channel();
+        let (audio_cache_tx, audio_cache_rx) = std::sync::mpsc::sync_channel(1);
         let (_terminal_action_tx, terminal_action_rx) = std::sync::mpsc::channel();
         let (popup_event_tx, popup_event_rx) = std::sync::mpsc::channel();
         let (tracker_status_tx, tracker_status_rx) = std::sync::mpsc::channel();
@@ -581,6 +586,10 @@ impl App {
             app_info_popup: None,
             settings_popup_state: None,
             settings_popup_applied_revision: 0,
+            pending_settings_save: None,
+            settings_save_deadline: None,
+            process_tree_cache: None,
+            process_tree_cache_updated_at: None,
             popup_event_sender: popup_event_tx,
             popup_event_receiver: popup_event_rx,
             window_sender: window_tx.clone(),
@@ -598,6 +607,7 @@ impl App {
             use_kwin_window_feed: false,
             window_polling_started: false,
             cached_sink_inputs: Vec::new(),
+            app_audio_levels: HashMap::new(),
             active_media_app_keys: HashSet::new(),
             observed_pipewire_node_ids: HashSet::new(),
             active_pipewire_node_ids: HashSet::new(),
@@ -614,16 +624,35 @@ impl App {
             pinned_apps_generation: 0,
         };
 
+        let audio_repaint_ctx = cc.egui_ctx.clone();
         std::thread::spawn(move || {
             let mut recent_active_pipewire_nodes: HashMap<u32, std::time::Instant> = HashMap::new();
+            let mut last_update = None;
             loop {
                 let sink_inputs = fetch_sink_inputs();
-                let active_media_app_keys = fetch_active_media_app_keys();
+                let has_active_playback = sink_inputs.iter().any(|sink| {
+                    !sink.mute
+                        && !sink.corked
+                        && sink
+                            .properties
+                            .get("media.category")
+                            .is_none_or(|category| category.eq_ignore_ascii_case("Playback"))
+                });
+                let active_media_app_keys =
+                    if has_active_playback && sink_inputs.iter().any(sink_input_is_browser_like) {
+                        fetch_active_media_app_keys()
+                    } else {
+                        HashSet::new()
+                    };
                 let (
                     observed_pipewire_node_ids,
                     active_pipewire_node_ids,
                     pipewire_activity_cache_valid,
-                ) = fetch_pipewire_activity();
+                ) = if has_active_playback {
+                    fetch_pipewire_activity()
+                } else {
+                    (HashSet::new(), HashSet::new(), false)
+                };
                 let now = std::time::Instant::now();
 
                 if pipewire_activity_cache_valid {
@@ -642,19 +671,29 @@ impl App {
                     .copied()
                     .collect::<HashSet<u32>>();
 
-                if audio_cache_tx
-                    .send(AudioCacheUpdate {
-                        sink_inputs,
-                        active_media_app_keys,
-                        observed_pipewire_node_ids,
-                        active_pipewire_node_ids: effective_active_pipewire_node_ids,
-                        pipewire_activity_cache_valid,
-                    })
-                    .is_err()
-                {
-                    break;
+                let update = AudioCacheUpdate {
+                    sink_inputs,
+                    active_media_app_keys,
+                    observed_pipewire_node_ids,
+                    active_pipewire_node_ids: effective_active_pipewire_node_ids,
+                    pipewire_activity_cache_valid,
+                };
+                if last_update.as_ref() != Some(&update) {
+                    match audio_cache_tx.try_send(update.clone()) {
+                        Ok(()) => {
+                            last_update = Some(update);
+                            audio_repaint_ctx.request_repaint();
+                        }
+                        Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
+                    }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(AUDIO_SINK_POLL_MS as u64));
+                let poll_ms = if has_active_playback {
+                    AUDIO_SINK_POLL_MS as u64
+                } else {
+                    AUDIO_IDLE_POLL_MS
+                };
+                std::thread::sleep(std::time::Duration::from_millis(poll_ms));
             }
         });
 
@@ -716,8 +755,21 @@ impl App {
         }
     }
 
-    fn save_settings(&self) {
-        save_launcher_settings(self.launcher_settings_snapshot());
+    fn save_settings(&mut self) {
+        self.pending_settings_save = Some(self.launcher_settings_snapshot());
+        self.settings_save_deadline = Some(Instant::now() + Duration::from_millis(150));
+    }
+
+    fn flush_settings_save(&mut self) {
+        if self
+            .settings_save_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.settings_save_deadline = None;
+            if let Some(settings) = self.pending_settings_save.take() {
+                save_launcher_settings(settings);
+            }
+        }
     }
 
     fn apply_launcher_settings_snapshot(

@@ -10,8 +10,19 @@
 │   ├── bin/applicationlauncherd.rs
 │   ├── tracker/
 │   ├── windows/
-│   ├── app.rs
+│   ├── app/
+│   │   ├── commands.rs
+│   │   ├── feed.rs
+│   │   ├── helpers.rs
+│   │   ├── popups.rs
+│   │   ├── settings.rs
+│   │   ├── view.rs
+│   │   └── mod.rs
+│   ├── launch/
+│   ├── diagnostics.rs
+│   ├── audio.rs
 │   ├── models.rs
+│   ├── search.rs
 │   └── main.rs
 ├── kwin/applicationlauncher-window-feed/
 ├── Cargo.toml
@@ -20,7 +31,12 @@
 ```
 
 - `src/main.rs`: GUI CLI parsing, single-instance startup, and native window creation.
-- `src/app.rs`: Launcher state and `eframe` update/render loop, including History/Sessions UI.
+- `src/app/`: Launcher state, feeds, commands, search-row rendering, settings, popups, and the `eframe` update loop.
+- `src/launch/`: Desktop-entry parsing and application/window launch actions.
+- `src/audio.rs`: Bounded audio activity sampling and waveform levels.
+- `src/diagnostics.rs`: Single-instance control socket and low-overhead live-process diagnostics.
+- `src/search.rs`: Fuzzy ranking, transient-title normalization, sorting, and highlighting.
+- `src/models.rs`: Shared window, application, feed, and audio data types.
 - `src/tracker/`: Daemon client, private SQLite persistence, restore policy, service installation, and D-Bus service.
 - `src/bin/applicationlauncherd.rs`: Persistent background tracker entry point.
 - `src/windows/`: KWin snapshot consumption, process metadata, terminal integration, and icon resolution.
@@ -54,7 +70,7 @@ The project builds a native `eframe` / `egui` GUI and a separate user-session da
   The newest recently closed window can be reopened globally with `Ctrl+Shift+T`. The KWin shortcut is ignored while Chrome, Chromium, or Firefox is active, preserving browser tab-reopen behavior. A successful reopen removes that entry from the history list.
 
 - Window loading:
-  Uses `kdotool` to query KWin-managed windows, then resolves metadata such as title, class, PID, icon, executable path, and terminal child processes.
+  Uses the KWin event feed for incremental updates, with bounded reconciliation through `kdotool`, then resolves metadata such as title, class, PID, icon, executable path, and terminal child processes.
 - Application loading:
   Scans desktop files, parses launcher metadata, resolves icon names and icon files, and classifies likely settings modules separately from normal applications.
 - Search and sorting:
@@ -77,10 +93,11 @@ The project builds a native `eframe` / `egui` GUI and a separate user-session da
 
   #### 2. Open Windows Panel
   * **When the search box is empty:**
-    1. **Application Key**: Grouped alphabetically (case-insensitive) by the window's application class/key.
-    2. **Window Title**: Alphabetically (case-insensitive) by window title.
+    1. **Application window count**: Applications with fewer open windows appear first.
+    2. **Application Key**: Terminal/application groups remain together and are ordered alphabetically.
+    3. **Window Title**: Alphabetically after transient braille and attention markers are ignored.
   * **When a search query is typed:**
-    1. **Fuzzy Match Score**: Highest fuzzy score (matching title or class name) comes first.
+    1. **Fuzzy Match Score**: Best metadata match across title, app name, class, executable, desktop entry, and path-like context.
     2. **Application Key**: Alphabetically (case-insensitive) by application class/key.
     3. **Window Title**: Alphabetically (case-insensitive) by window title.
 - UI:
@@ -96,7 +113,7 @@ The project builds a native `eframe` / `egui` GUI and a separate user-session da
 - Immediate icon tooltips in application icon mode.
 - Pinning and reordering of applications.
 - Middle-click on a window entry to launch another instance of the underlying application.
-- Right-click on a window entry to close the application or inspect its execution chain.
+- Right-click on a window entry to open, clone, show metadata, close the application, or inspect its execution chain.
 - Optional close-on-blur behavior.
 - Temporary border overlay support for highlighting a target window.
 
@@ -142,6 +159,8 @@ The launcher writes its runtime data to:
   Auto-installed tracker service with restart-on-failure behavior.
 - `$HOME/.local/bin/applicationlauncherd`
   Symbolic link to the daemon binary beside the launcher binary.
+- `$XDG_STATE_HOME/applicationlauncher/panic-latest.log` and `hang-latest.log`
+  Private crash and live-hang diagnostics. Reports are mode `0600`.
 
 ## Settings Window
 
@@ -204,6 +223,9 @@ OPTIONS
     --theme <THEME>
         Force a specific icon theme (default: automatically detected).
 
+    --diagnose
+        Capture diagnostics from the already-running launcher without restarting it.
+
 OPERATION
     When launched, the application retrieves a list of all open windows using
     kdotool and installed desktop applications from the local system. It renders
@@ -221,6 +243,10 @@ OPERATION
 EXAMPLES
     applicationlauncher
         Launch the application launcher.
+
+    applicationlauncher --diagnose
+        Attach the diagnostic helper to the running instance and write a bounded
+        process/thread report without replacing the running binary.
 
 FILES
     $HOME/.config/applicationlauncher/window_size.txt

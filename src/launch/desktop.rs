@@ -10,10 +10,14 @@ pub(crate) fn parse_desktop_file(path: &Path, theme: &str) -> Option<AppInfo> {
     let mut icon = None;
     let mut comment = None;
     let mut no_display = false;
+    let mut hidden = false;
     let mut is_application = false;
     let mut is_settings_module = false;
     let mut exec_command = None;
     let mut x_kde_alias_for = None;
+    let mut try_exec = None;
+    let mut only_show_in = Vec::new();
+    let mut not_show_in = Vec::new();
 
     if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
         let name_lower = file_name.to_lowercase();
@@ -76,6 +80,9 @@ pub(crate) fn parse_desktop_file(path: &Path, theme: &str) -> Option<AppInfo> {
             if key == "NoDisplay" && val.to_lowercase() == "true" {
                 no_display = true;
             }
+            if key == "Hidden" && val.eq_ignore_ascii_case("true") {
+                hidden = true;
+            }
             if key == "Type" && val == "Application" {
                 is_application = true;
             }
@@ -84,6 +91,23 @@ pub(crate) fn parse_desktop_file(path: &Path, theme: &str) -> Option<AppInfo> {
             }
             if key == "X-KDE-AliasFor" {
                 x_kde_alias_for = Some(val.to_string());
+            }
+            if key == "TryExec" {
+                try_exec = Some(val.to_string());
+            }
+            if key == "OnlyShowIn" {
+                only_show_in = val
+                    .split(';')
+                    .filter(|desktop| !desktop.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect();
+            }
+            if key == "NotShowIn" {
+                not_show_in = val
+                    .split(';')
+                    .filter(|desktop| !desktop.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect();
             }
         }
     }
@@ -102,7 +126,36 @@ pub(crate) fn parse_desktop_file(path: &Path, theme: &str) -> Option<AppInfo> {
         }
     }
 
-    if (no_display && !is_settings_module) || !is_application {
+    if hidden || (no_display && !is_settings_module) || !is_application {
+        return None;
+    }
+
+    let current_desktop_value = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    let current_desktops = current_desktop_value
+        .split(':')
+        .flat_map(|desktop| desktop.split(';'))
+        .filter(|desktop| !desktop.is_empty())
+        .collect::<Vec<_>>();
+    if !only_show_in.is_empty()
+        && !only_show_in.iter().any(|desktop| {
+            current_desktops
+                .iter()
+                .any(|current| current.eq_ignore_ascii_case(desktop))
+        })
+    {
+        return None;
+    }
+    if not_show_in.iter().any(|desktop| {
+        current_desktops
+            .iter()
+            .any(|current| current.eq_ignore_ascii_case(desktop))
+    }) {
+        return None;
+    }
+
+    if let Some(try_exec) = try_exec.as_deref().filter(|value| !value.trim().is_empty())
+        && !executable_is_available(try_exec)
+    {
         return None;
     }
 
@@ -138,10 +191,15 @@ pub(crate) fn parse_desktop_file(path: &Path, theme: &str) -> Option<AppInfo> {
 
 pub(crate) fn get_installed_apps(theme: &str) -> Vec<AppInfo> {
     let mut apps = Vec::new();
-    let mut app_dirs = vec![PathBuf::from("/usr/share/applications")];
+    let mut app_dirs = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
         app_dirs.push(PathBuf::from(format!("{}/.local/share/applications", home)));
     }
+    app_dirs.extend(
+        xdg_data_dirs()
+            .into_iter()
+            .map(|dir| dir.join("applications")),
+    );
     let flatpak_dir = PathBuf::from("/var/lib/flatpak/exports/share/applications");
     if flatpak_dir.exists() {
         app_dirs.push(flatpak_dir);
@@ -187,7 +245,7 @@ pub(crate) fn get_installed_apps(theme: &str) -> Vec<AppInfo> {
 }
 
 pub(crate) fn desktop_entry_search_dirs() -> Vec<PathBuf> {
-    let mut app_dirs = vec![PathBuf::from("/usr/share/applications")];
+    let mut app_dirs = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
         app_dirs.push(PathBuf::from(format!("{}/.local/share/applications", home)));
         let user_flatpak_dir = PathBuf::from(format!(
@@ -198,11 +256,36 @@ pub(crate) fn desktop_entry_search_dirs() -> Vec<PathBuf> {
             app_dirs.push(user_flatpak_dir);
         }
     }
-    let flatpak_dir = PathBuf::from("/var/lib/flatpak/exports/share/applications");
-    if flatpak_dir.exists() {
-        app_dirs.push(flatpak_dir);
-    }
+    app_dirs.extend(
+        xdg_data_dirs()
+            .into_iter()
+            .map(|dir| dir.join("applications")),
+    );
     app_dirs
+}
+
+fn xdg_data_dirs() -> Vec<PathBuf> {
+    std::env::var_os("XDG_DATA_DIRS")
+        .map(|dirs| std::env::split_paths(&dirs).collect())
+        .unwrap_or_else(|| {
+            vec![
+                PathBuf::from("/usr/local/share"),
+                PathBuf::from("/usr/share"),
+            ]
+        })
+}
+
+fn executable_is_available(value: &str) -> bool {
+    let command = value.split_whitespace().next().unwrap_or_default();
+    let path = Path::new(command);
+    if path.is_absolute() {
+        return path.is_file();
+    }
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|dir| dir.join(command))
+        .any(|candidate| candidate.is_file())
 }
 
 pub(crate) fn resolve_desktop_file_path(desktop_file_name: &str) -> Option<PathBuf> {

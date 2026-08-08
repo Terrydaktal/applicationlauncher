@@ -478,13 +478,10 @@ pub(crate) fn launch_desktop_entry(desktop_file_path: &Path) -> bool {
     };
 
     let desktop_id = desktop_id.to_string();
-    std::thread::spawn(move || {
-        let mut cmd = Command::new("gtk-launch");
-        cmd.arg(&desktop_id);
-        cmd.env_remove("PYTHONPATH");
-        cmd.env_remove("VIRTUAL_ENV");
-        cmd.env_remove("UV_ACTIVE");
-        let _ = cmd.spawn();
-    });
-    true
+    let mut cmd = Command::new("gtk-launch");
+    cmd.arg(desktop_id);
+    cmd.env_remove("PYTHONPATH");
+    cmd.env_remove("VIRTUAL_ENV");
+    cmd.env_remove("UV_ACTIVE");
+    cmd.spawn().is_ok()
 }

@@ -812,6 +812,25 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_group_ignores_spinner_and_attention_variants() {
+        let plain = test_window_info("codex - ~/Dev/iris - Terminal");
+        let mut spinner = test_window_info("codex - ⠴ ~/Dev/iris - Terminal");
+        spinner.id = "spinner".to_string();
+        let mut attention =
+            test_window_info("codex - [ ! ] Action Required - ~/Dev/iris - Terminal");
+        attention.id = "attention".to_string();
+
+        assert_eq!(
+            duplicate_window_group_key(&plain),
+            duplicate_window_group_key(&spinner)
+        );
+        assert_eq!(
+            duplicate_window_group_key(&plain),
+            duplicate_window_group_key(&attention)
+        );
+    }
+
+    #[test]
     fn last_activation_order_puts_newest_windows_first() {
         let mut older = test_window_info("older");
         older.last_activated_at_ms = Some(100);
@@ -842,6 +861,17 @@ mod tests {
         refresh_cached_transient_title(&mut display_title, old, new);
 
         assert_eq!(display_title, format!("{new} | codex | ~/Dev/sites/dictai"));
+    }
+
+    #[test]
+    fn cached_spinner_transition_updates_without_reranking() {
+        let old = "codex - ~/Dev/iris - Terminal";
+        let new = "codex - ⠴ ~/Dev/iris - Terminal";
+        let mut display_title = format!("{old} | codex | ~/Dev/iris");
+
+        refresh_cached_transient_title(&mut display_title, old, new);
+
+        assert_eq!(display_title, format!("{new} | codex | ~/Dev/iris"));
     }
 
     #[test]
