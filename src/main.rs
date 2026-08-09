@@ -200,39 +200,60 @@ fn main() -> eframe::Result {
     if let Some(parent) = socket_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if socket_path.exists() {
-        if diagnose_requested {
-            match capture_running_launcher_diagnostics(&socket_path) {
-                Ok(path) => {
-                    println!("Hang report written to {}", path.display());
-                    return Ok(());
+    let listener = match std::os::unix::net::UnixListener::bind(&socket_path) {
+        Ok(listener) => {
+            if diagnose_requested {
+                eprintln!("Diagnostic capture failed: no running launcher was found");
+                return Ok(());
+            }
+            listener
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+            if diagnose_requested {
+                match capture_running_launcher_diagnostics(&socket_path) {
+                    Ok(path) => {
+                        println!("Hang report written to {}", path.display());
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        eprintln!("Diagnostic capture failed: {err}");
+                        std::process::exit(1);
+                    }
                 }
+            }
+            if send_launcher_control_request(&socket_path, "focus\n", false).is_ok() {
+                focus_existing_launcher_window();
+                return Ok(());
+            }
+            // No listener answered, so this is a stale socket. Only remove it
+            // after bind established that it is blocking this instance.
+            if let Err(remove_err) = std::fs::remove_file(&socket_path) {
+                eprintln!("Could not remove stale launcher socket: {remove_err}");
+                return Ok(());
+            }
+            match std::os::unix::net::UnixListener::bind(&socket_path) {
+                Ok(listener) => listener,
                 Err(err) => {
-                    eprintln!("Diagnostic capture failed: {err}");
-                    std::process::exit(1);
+                    eprintln!("Could not reclaim stale launcher socket: {err}");
+                    return Ok(());
                 }
             }
         }
-        if send_launcher_control_request(&socket_path, "focus\n", false).is_ok() {
-            focus_existing_launcher_window();
+        Err(err) => {
+            eprintln!("Could not bind launcher control socket: {err}");
             return Ok(());
         }
-        let _ = std::fs::remove_file(&socket_path);
-    }
-
-    if diagnose_requested {
-        eprintln!("Diagnostic capture failed: no running launcher was found");
-        std::process::exit(1);
-    }
-
-    let listener = match std::os::unix::net::UnixListener::bind(&socket_path) {
-        Ok(l) => l,
-        Err(_) => return Ok(()),
     };
 
     let (ui_event_tx, ui_event_rx) = std::sync::mpsc::channel();
 
-    let _lock = SingleInstanceLock { path: socket_path };
+    let _lock = match SingleInstanceLock::new(socket_path) {
+        Ok(lock) => lock,
+        Err(err) => {
+            eprintln!("Could not own launcher control socket: {err}");
+            return Ok(());
+        }
+    };
 
     let mut close_on_blur = false;
     let mut force_theme = None;

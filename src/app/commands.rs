@@ -210,9 +210,14 @@ impl App {
                 let geom = get_window_geometry(&kpath, &id_clone);
 
                 // Activate the window and raise it to make sure it comes to the top
-                let _ = Command::new(&kpath)
-                    .args(["windowactivate", &id_clone, "windowraise", &id_clone])
-                    .status();
+                let _ = applicationlauncher::process::status_with_timeout(
+                    {
+                        let mut command = Command::new(&kpath);
+                        command.args(["windowactivate", &id_clone, "windowraise", &id_clone]);
+                        command
+                    },
+                    Duration::from_secs(3),
+                );
 
                 // If we got geometry, spawn the border overlay process
                 if let Some((x, y, w, h)) = geom {
@@ -240,7 +245,14 @@ impl App {
         if let Some(ref kpath) = self.kdotool_path {
             let kpath = kpath.clone();
             std::thread::spawn(move || {
-                let _ = Command::new(&kpath).args(["windowclose", &id]).status();
+                let _ = applicationlauncher::process::status_with_timeout(
+                    {
+                        let mut command = Command::new(&kpath);
+                        command.args(["windowclose", &id]);
+                        command
+                    },
+                    Duration::from_secs(3),
+                );
             });
         }
         ctx.request_repaint();

@@ -1,7 +1,4 @@
 pub(crate) const WINDOW_REMOVAL_CONFIRMATION_POLLS: usize = 2;
-pub(crate) const KWIN_DBUS_SERVICE: &str = "org.kde.KWin";
-pub(crate) const KWIN_DBUS_PATH: &str = "/KWin";
-pub(crate) const KWIN_DBUS_INTERFACE: &str = "org.kde.KWin";
 pub(crate) const ATSPI_LOCATION_PROBE: &str = include_str!("atspi_location_probe.py");
 pub(crate) const AUDIO_SINK_POLL_MS: u128 = 200;
 pub(crate) const AUDIO_IDLE_POLL_MS: u64 = 1000;
@@ -24,12 +21,3 @@ pub(crate) const TERMINAL_DBUS_SERVICE: &str = "org.xfce.Terminal5";
 pub(crate) const TERMINAL_DBUS_PATH: &str = "/org/xfce/Terminal";
 pub(crate) const TERMINAL_DBUS_INTERFACE: &str = "org.xfce.Terminal5";
 pub(crate) const TERMINAL_ACTION_MESSAGE_SECS: u64 = 4;
-pub(crate) const AUTO_SEND_ENTER_DELAY_SECS: u64 = 5;
-pub(crate) const TERMINAL_ATTENTION_RECONCILIATION_SECS: u64 = 2;
-pub(crate) const TERMINAL_ATTENTION_FEED_STATE_TTL_SECS: u64 = 15;
-pub(crate) const TERMINAL_ATTENTION_MAX_RETRIES: u8 = 3;
-pub(crate) const TERMINAL_ATTENTION_RETRY_BASE_MS: u64 = 750;
-pub(crate) const TERMINAL_ATTENTION_WORKER_MAX_WAIT_MS: u64 = 250;
-pub(crate) const TERMINAL_ATTENTION_DBUS_TIMEOUT_SECS: u64 = 3;
-pub(crate) const TERMINAL_ATTENTION_CANCELLED: &str =
-    "Automatic Enter was cancelled because the window no longer requires attention";

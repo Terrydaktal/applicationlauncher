@@ -4,10 +4,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub(crate) fn launch_app(exec: &str) {
-    let cmd_str = clean_exec_cmd(exec);
+    let Some(mut argv) = desktop_exec_argv(exec) else {
+        eprintln!("Could not parse desktop Exec value");
+        return;
+    };
+    let executable = argv.remove(0);
     std::thread::spawn(move || {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(&cmd_str);
+        let mut cmd = Command::new(executable);
+        cmd.args(argv);
 
         // Clean Python environment variables to prevent version mismatch crashes in launched apps
         cmd.env_remove("PYTHONPATH");
@@ -327,7 +331,11 @@ pub(crate) fn accessible_location_for_window(win: &WindowInfo) -> Option<String>
     command.arg("--title").arg(&win.title);
     command.arg("--class").arg(&win.class);
     scrub_command_env(&mut command);
-    let output = command.output().ok()?;
+    let output = applicationlauncher::process::output_with_timeout(
+        command,
+        std::time::Duration::from_secs(3),
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }

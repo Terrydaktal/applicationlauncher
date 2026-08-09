@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use super::{HistoryEntry, RestoreReport, RestoreSpec, SnapshotDetail, TrackedWindow, app_key};
 
@@ -65,9 +66,9 @@ pub(crate) fn apply_matching_layouts(
     }
     if replay_activation_order {
         for id in &matched {
-            if !Command::new("kdotool")
-                .args(["windowactivate", id])
-                .status()
+            let mut command = Command::new("kdotool");
+            command.args(["windowactivate", id]);
+            if !crate::process::status_with_timeout(command, Duration::from_secs(2))
                 .is_ok_and(|status| status.success())
             {
                 failures.push(format!("Could not replay activation order for {id}"));
@@ -108,23 +109,34 @@ fn find_matching_window<'a>(
         });
     }
 
-    current
+    let app_matches = current.iter().filter(same_app).collect::<Vec<_>>();
+    app_matches
         .iter()
-        .filter(same_app)
         .find(|window| wanted.title == window.title)
-        .or_else(|| current.iter().filter(same_app).next())
+        .copied()
+        .or_else(|| (app_matches.len() == 1).then(|| app_matches[0]))
 }
 
 fn apply_layout(current: &TrackedWindow, wanted: &TrackedWindow, failures: &mut Vec<String>) {
     let id = current.id.as_str();
     let run = |args: &[String]| {
-        Command::new("kdotool")
-            .args(args)
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+        crate::process::status_with_timeout(
+            {
+                let mut command = Command::new("kdotool");
+                command.args(args);
+                command
+            },
+            Duration::from_secs(2),
+        )
+        .map(|status| status.success())
+        .unwrap_or(false)
     };
-    if wanted.desktop > 0 {
+    if wanted.on_all_desktops {
+        let args = vec!["set_desktop_for_window".into(), id.into(), "all".into()];
+        if !run(&args) {
+            failures.push(format!("Could not move {} to all desktops", wanted.title));
+        }
+    } else if wanted.desktop > 0 {
         let args = vec![
             "set_desktop_for_window".into(),
             id.into(),
@@ -154,29 +166,44 @@ fn apply_layout(current: &TrackedWindow, wanted: &TrackedWindow, failures: &mut 
             failures.push(format!("Could not restore geometry for {}", wanted.title));
         }
     }
-    let property = if wanted.fullscreen {
-        Some("fullscreen")
-    } else if wanted.maximized {
-        Some("maximized")
-    } else if wanted.minimized {
-        Some("minimized")
-    } else {
-        None
-    };
-    if let Some(property) = property {
-        let args = vec![
-            "windowstate".into(),
-            "--add".into(),
-            property.into(),
-            id.into(),
-        ];
-        if !run(&args) {
-            failures.push(format!(
-                "Could not restore {property} state for {}",
-                wanted.title
-            ));
-        }
+    let mut state_args = vec!["windowstate".into()];
+    for property in [
+        "fullscreen",
+        "maximized",
+        "maximized_horz",
+        "maximized_vert",
+        "minimized",
+    ] {
+        state_args.extend(["--remove".into(), property.into()]);
     }
+    if !run(&state_args_with_window(state_args, id)) {
+        failures.push(format!("Could not clear window state for {}", wanted.title));
+    }
+
+    let mut state_args = vec!["windowstate".into()];
+    if wanted.fullscreen {
+        state_args.extend(["--add".into(), "fullscreen".into()]);
+    } else if wanted.maximized {
+        state_args.extend([
+            "--add".into(),
+            "maximized_horz".into(),
+            "--add".into(),
+            "maximized_vert".into(),
+        ]);
+    } else if wanted.minimized {
+        state_args.extend(["--add".into(), "minimized".into()]);
+    }
+    if state_args.len() > 1 && !run(&state_args_with_window(state_args, id)) {
+        failures.push(format!(
+            "Could not restore window state for {}",
+            wanted.title
+        ));
+    }
+}
+
+fn state_args_with_window(mut args: Vec<String>, id: &str) -> Vec<String> {
+    args.push(id.to_string());
+    args
 }
 
 fn launch(restore: &RestoreSpec) -> Result<(), String> {
@@ -201,11 +228,15 @@ fn launch(restore: &RestoreSpec) -> Result<(), String> {
         return command.spawn().map(|_| ()).map_err(|err| err.to_string());
     }
     let desktop = resolve_desktop_file(restore)?;
-    let status = Command::new("gio")
-        .arg("launch")
-        .arg(&desktop)
-        .status()
-        .map_err(|err| format!("Could not run gio for {}: {err}", desktop.display()))?;
+    let status = crate::process::status_with_timeout(
+        {
+            let mut command = Command::new("gio");
+            command.arg("launch").arg(&desktop);
+            command
+        },
+        Duration::from_secs(5),
+    )
+    .map_err(|err| format!("Could not run gio for {}: {err}", desktop.display()))?;
     if status.success() {
         Ok(())
     } else {

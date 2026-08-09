@@ -127,21 +127,13 @@ pub fn infer_restore_spec(window: &TrackedWindow) -> RestoreSpec {
             .as_ref()
             .map(|details| details.0.as_str())
             .unwrap_or("");
-        if title.contains("codex") {
+        if title.contains("codex") || process_name == "codex" {
             "codex"
-        } else if process_name == "codex" {
-            "codex"
-        } else if title.contains("agy") {
+        } else if title.contains("agy") || process_name == "agy" {
             "agy"
-        } else if process_name == "agy" {
-            "agy"
-        } else if title.contains("htop") {
+        } else if title.contains("htop") || process_name == "htop" {
             "htop"
-        } else if process_name == "htop" {
-            "htop"
-        } else if title.contains("nvtop") {
-            "nvtop"
-        } else if process_name == "nvtop" {
+        } else if title.contains("nvtop") || process_name == "nvtop" {
             "nvtop"
         } else {
             "shell"
@@ -164,7 +156,7 @@ pub fn infer_restore_spec(window: &TrackedWindow) -> RestoreSpec {
 
 fn terminal_process_details(root_pid: i32) -> (String, Option<String>, Option<String>) {
     let mut stack = vec![root_pid];
-    let mut best = root_pid;
+    let mut leaves = Vec::new();
     while let Some(pid) = stack.pop() {
         let children =
             std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
@@ -173,11 +165,18 @@ fn terminal_process_details(root_pid: i32) -> (String, Option<String>, Option<St
             .filter_map(|value| value.parse::<i32>().ok())
             .collect::<Vec<_>>();
         if child_pids.is_empty() {
-            best = pid;
+            leaves.push(pid);
         } else {
             stack.extend(child_pids);
         }
     }
+    // A terminal server can own multiple tabs. Do not select an arbitrary tab's
+    // process when the process tree has more than one leaf.
+    let best = if leaves.len() == 1 {
+        leaves[0]
+    } else {
+        root_pid
+    };
     let name = std::fs::read_to_string(format!("/proc/{best}/comm"))
         .unwrap_or_default()
         .trim()

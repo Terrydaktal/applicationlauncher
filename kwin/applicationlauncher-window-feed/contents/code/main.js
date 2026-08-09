@@ -126,7 +126,7 @@ function sendRemove(windowOrId) {
 registerShortcut(
     "applicationlauncher-reopen-latest",
     "Reopen recently closed window",
-    "Ctrl+Shift+T",
+    "Meta+Ctrl+Shift+T",
     reopenLatestClosedWindow
 );
 
@@ -158,6 +158,15 @@ function trackWindow(window, deferInitialUpsert) {
     }
     if (window.frameGeometryChanged) {
         window.frameGeometryChanged.connect(function () {
+            // Interactive resize/move can emit this signal at pointer rate.
+            // Publish the final geometry from interactiveMoveResizeFinished.
+            if (!window.move && !window.resize) {
+                sendUpsert(window);
+            }
+        });
+    }
+    if (window.interactiveMoveResizeFinished) {
+        window.interactiveMoveResizeFinished.connect(function () {
             sendUpsert(window);
         });
     }

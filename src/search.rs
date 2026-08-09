@@ -4,9 +4,8 @@ use fuzzy_rank::metadata::{
 use fuzzy_rank::ranking::SearchRank;
 
 use eframe::egui;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use crate::models::{AppInfo, WindowInfo};
 use crate::*;
@@ -129,18 +128,13 @@ pub(crate) fn pinned_app_position(pinned_apps: &[PathBuf], app: &AppInfo) -> usi
 }
 
 pub(crate) fn clean_exec_cmd(exec: &str) -> String {
-    let mut cleaned = exec.to_string();
-    for placeholder in &[
-        "%f", "%F", "%u", "%U", "%d", "%D", "%n", "%N", "%i", "%c", "%k", "%v",
-    ] {
-        cleaned = cleaned.replace(placeholder, "");
-    }
-    cleaned.trim().to_string()
+    desktop_exec_argv(exec)
+        .map(|argv| argv.join(" "))
+        .unwrap_or_default()
 }
 
 pub(crate) fn executable_path_from_exec(exec: &str) -> Option<PathBuf> {
-    let command = clean_exec_cmd(exec);
-    let executable = command.split_whitespace().next()?.trim_matches('"');
+    let executable = desktop_exec_argv(exec)?.into_iter().next()?;
     if executable.is_empty() {
         None
     } else if executable.contains('/') {
@@ -148,10 +142,61 @@ pub(crate) fn executable_path_from_exec(exec: &str) -> Option<PathBuf> {
     } else {
         let path_value = std::env::var_os("PATH")?;
         std::env::split_paths(&path_value)
-            .map(|directory| directory.join(executable))
+            .map(|directory| directory.join(&executable))
             .find(|path| path.is_file())
-            .or_else(|| Some(PathBuf::from(executable)))
+            .or_else(|| Some(PathBuf::from(&executable)))
     }
+}
+
+pub(crate) fn desktop_exec_argv(exec: &str) -> Option<Vec<String>> {
+    let mut argv = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+
+    for character in exec.chars() {
+        if escaped {
+            token.push(character);
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(current_quote) if character == current_quote => quote = None,
+            Some(_) => token.push(character),
+            None if character == '\\' => escaped = true,
+            None if character == '"' || character == '\'' => quote = Some(character),
+            None if character.is_whitespace() => {
+                if !token.is_empty() {
+                    argv.push(std::mem::take(&mut token));
+                }
+            }
+            None => token.push(character),
+        }
+    }
+
+    if escaped || quote.is_some() {
+        return None;
+    }
+    if !token.is_empty() {
+        argv.push(token);
+    }
+
+    let field_codes = [
+        "%f", "%F", "%u", "%U", "%d", "%D", "%n", "%N", "%i", "%c", "%k", "%v",
+    ];
+    let mut cleaned = Vec::new();
+    for mut argument in argv {
+        if field_codes.contains(&argument.as_str()) {
+            continue;
+        }
+        for field_code in field_codes {
+            argument = argument.replace(field_code, "");
+        }
+        if !argument.is_empty() {
+            cleaned.push(argument);
+        }
+    }
+    (!cleaned.is_empty()).then_some(cleaned)
 }
 
 pub(crate) fn is_dolphin_app(app: &AppInfo) -> bool {
@@ -381,42 +426,6 @@ pub(crate) fn duplicate_window_group_key(win: &WindowInfo) -> Option<(String, St
 
 pub(crate) fn window_requires_attention(win: &WindowInfo) -> bool {
     win.demands_attention || win.title.to_lowercase().contains("action required")
-}
-
-pub(crate) fn update_terminal_attention_schedule(
-    enabled: bool,
-    eligible_ids: &HashSet<String>,
-    deadlines: &mut HashMap<String, Instant>,
-    handled: &mut HashSet<String>,
-    now: Instant,
-) -> (Vec<String>, Option<Instant>) {
-    if !enabled {
-        deadlines.clear();
-        handled.clear();
-        return (Vec::new(), None);
-    }
-
-    deadlines.retain(|id, _| eligible_ids.contains(id) && !handled.contains(id));
-    handled.retain(|id| eligible_ids.contains(id));
-
-    for id in eligible_ids {
-        if !handled.contains(id) {
-            deadlines
-                .entry(id.clone())
-                .or_insert(now + Duration::from_secs(AUTO_SEND_ENTER_DELAY_SECS));
-        }
-    }
-
-    let mut due_ids = Vec::new();
-    for id in eligible_ids {
-        if deadlines.get(id).is_some_and(|deadline| now >= *deadline) {
-            deadlines.remove(id);
-            due_ids.push(id.clone());
-        }
-    }
-
-    let next_deadline = deadlines.values().copied().min();
-    (due_ids, next_deadline)
 }
 
 pub(crate) fn is_braille_spinner_char(ch: char) -> bool {

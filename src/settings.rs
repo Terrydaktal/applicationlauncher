@@ -565,7 +565,9 @@ pub(crate) fn save_launcher_settings(settings: LauncherSettings) {
             settings.win_scroll_sensitivity,
             settings.ui_scale
         );
-        let _ = std::fs::write(path, content);
+        if let Err(err) = applicationlauncher::process::atomic_write(&path, content.as_bytes()) {
+            eprintln!("Could not save launcher settings: {err}");
+        }
     }
 }
 

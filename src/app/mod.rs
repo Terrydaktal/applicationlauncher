@@ -310,6 +310,11 @@ impl App {
     }
 
     fn close_settings_menu(&mut self) {
+        if let Some(state) = self.settings_popup_state.as_ref()
+            && let Ok(mut state) = state.lock()
+        {
+            state.flush_pending_save_now();
+        }
         self.repaint_ctx.send_viewport_cmd_to(
             egui::ViewportId::from_hash_of("launcher_settings_popup"),
             egui::ViewportCommand::Close,
@@ -717,7 +722,10 @@ impl App {
             let base_width = (self.width * self.ui_scale).clamp(300.0, 1920.0);
             let base_height = (self.height * self.ui_scale).clamp(200.0, 1080.0);
             let content = format!("{}\n{}", base_width, base_height);
-            let _ = std::fs::write(path, content);
+            if let Err(err) = applicationlauncher::process::atomic_write(&path, content.as_bytes())
+            {
+                eprintln!("Could not save launcher window size: {err}");
+            }
         }
     }
 
@@ -828,7 +836,10 @@ impl App {
                 content.push_str(&p.to_string_lossy());
                 content.push('\n');
             }
-            let _ = std::fs::write(path, content);
+            if let Err(err) = applicationlauncher::process::atomic_write(&path, content.as_bytes())
+            {
+                eprintln!("Could not save pinned applications: {err}");
+            }
         }
         self.pinned_apps_generation = self.pinned_apps_generation.wrapping_add(1);
     }
@@ -933,7 +944,14 @@ pub(crate) struct MonitorInfo {
 
 pub(crate) fn get_monitors() -> Vec<MonitorInfo> {
     let mut monitors = Vec::new();
-    let output = match Command::new("kscreen-doctor").arg("-j").output() {
+    let output = match applicationlauncher::process::output_with_timeout(
+        {
+            let mut command = Command::new("kscreen-doctor");
+            command.arg("-j");
+            command
+        },
+        Duration::from_secs(3),
+    ) {
         Ok(o) => o,
         Err(_) => return monitors,
     };

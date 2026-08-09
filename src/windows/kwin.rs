@@ -220,6 +220,7 @@ pub(crate) fn setup_kwin_window_feed(
 
     std::thread::spawn(move || {
         let mut last_generation = u64::MAX;
+        let mut last_run_id = None;
         let mut client = None;
         let mut previous_payloads = None;
         loop {
@@ -235,6 +236,12 @@ pub(crate) fn setup_kwin_window_feed(
             }
 
             let result = client.as_ref().unwrap().status().and_then(|status| {
+                let tracker_restarted = last_run_id.as_deref() != Some(status.run_id.as_str());
+                if tracker_restarted {
+                    last_run_id = Some(status.run_id.clone());
+                    last_generation = u64::MAX;
+                    previous_payloads = None;
+                }
                 if status.generation == last_generation {
                     return Ok(None);
                 }
@@ -281,6 +288,7 @@ pub(crate) fn setup_kwin_window_feed(
                 Err(err) => {
                     eprintln!("Application Launcher tracker connection lost: {err}");
                     last_generation = u64::MAX;
+                    last_run_id = None;
                     client = None;
                     previous_payloads = None;
                     std::thread::sleep(TRACKER_WINDOW_FEED_RECONNECT_DELAY);
@@ -395,9 +403,7 @@ pub(crate) fn coalesce_window_feed_events(events: Vec<WindowFeedEvent>) -> Vec<W
         let Some(id) = (match &event {
             WindowFeedEvent::Upsert(payload) => Some(payload.id.clone()),
             WindowFeedEvent::Remove(id) => Some(id.clone()),
-            WindowFeedEvent::Reset
-            | WindowFeedEvent::Snapshot(_)
-            | WindowFeedEvent::RearmAttentionAutomation => None,
+            WindowFeedEvent::Reset | WindowFeedEvent::Snapshot(_) => None,
         }) else {
             continue;
         };
@@ -417,12 +423,12 @@ pub(crate) fn get_open_windows_with_snapshot_mode(
     include_snapshot_details: bool,
 ) -> Option<Vec<WindowInfo>> {
     // 1. Fetch all window IDs using kdotool search
-    let output = match Command::new(kdotool_path)
-        .arg("search")
-        .arg("--title")
-        .arg("")
-        .output()
-    {
+    let mut search_command = Command::new(kdotool_path);
+    search_command.args(["search", "--title", ""]);
+    let output = match applicationlauncher::process::output_with_timeout(
+        search_command,
+        Duration::from_secs(3),
+    ) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("Failed to execute kdotool search: {:?}", e);
@@ -449,7 +455,7 @@ pub(crate) fn get_open_windows_with_snapshot_mode(
     }
 
     if ids.is_empty() {
-        return None;
+        return Some(Vec::new());
     }
 
     // 2. Query all window metadata in a single chained kdotool invocation!
@@ -466,16 +472,17 @@ pub(crate) fn get_open_windows_with_snapshot_mode(
             .arg(id);
     }
 
-    let meta_output = match cmd.output() {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!(
-                "Failed to execute chained kdotool metadata command: {:?}",
-                e
-            );
-            return None;
-        }
-    };
+    let meta_output =
+        match applicationlauncher::process::output_with_timeout(cmd, Duration::from_secs(5)) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!(
+                    "Failed to execute chained kdotool metadata command: {:?}",
+                    e
+                );
+                return None;
+            }
+        };
 
     if !meta_output.status.success() {
         eprintln!(
@@ -673,10 +680,15 @@ pub(crate) fn load_pinned_apps() -> Vec<PathBuf> {
 }
 
 pub(crate) fn get_window_geometry(kpath: &Path, id: &str) -> Option<(f32, f32, f32, f32)> {
-    let output = Command::new(kpath)
-        .args(["getwindowgeometry", id])
-        .output()
-        .ok()?;
+    let output = applicationlauncher::process::output_with_timeout(
+        {
+            let mut command = Command::new(kpath);
+            command.args(["getwindowgeometry", id]);
+            command
+        },
+        Duration::from_secs(2),
+    )
+    .ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     let mut x = None;
@@ -707,9 +719,14 @@ pub(crate) fn get_window_geometry(kpath: &Path, id: &str) -> Option<(f32, f32, f
 }
 
 pub(crate) fn get_snapshot_window_details(id: &str) -> SnapshotWindowDetails {
-    let output = Command::new("qdbus6")
-        .args(["org.kde.KWin", "/KWin", "org.kde.KWin.getWindowInfo", id])
-        .output();
+    let output = applicationlauncher::process::output_with_timeout(
+        {
+            let mut command = Command::new("qdbus6");
+            command.args(["org.kde.KWin", "/KWin", "org.kde.KWin.getWindowInfo", id]);
+            command
+        },
+        Duration::from_secs(2),
+    );
 
     let Ok(output) = output else {
         return SnapshotWindowDetails {

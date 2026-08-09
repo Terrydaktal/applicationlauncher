@@ -1,6 +1,7 @@
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
+use std::time::Duration;
 
 use super::{
     PIPEWIRE_ACTIVE_TOTAL_US_THRESHOLD, PIPEWIRE_ACTIVE_US_THRESHOLD, command_basename,
@@ -197,9 +198,14 @@ pub(crate) fn sink_match_signature(cache: &WindowAudioCache) -> HashMap<String, 
 }
 
 pub(crate) fn fetch_sink_inputs() -> Vec<PactlSinkInput> {
-    let output = Command::new("pactl")
-        .args(["--format=json", "list", "sink-inputs"])
-        .output();
+    let output = applicationlauncher::process::output_with_timeout(
+        {
+            let mut command = Command::new("pactl");
+            command.args(["--format=json", "list", "sink-inputs"]);
+            command
+        },
+        Duration::from_secs(2),
+    );
     match output {
         Ok(out) if out.status.success() => {
             serde_json::from_slice::<Vec<PactlSinkInput>>(&out.stdout).unwrap_or_default()
@@ -244,9 +250,14 @@ pub(crate) fn sink_input_is_browser_like(sink: &PactlSinkInput) -> bool {
 }
 
 pub(crate) fn mpris_service_names() -> Vec<String> {
-    let output = Command::new("busctl")
-        .args(["--user", "list", "--no-legend"])
-        .output();
+    let output = applicationlauncher::process::output_with_timeout(
+        {
+            let mut command = Command::new("busctl");
+            command.args(["--user", "list", "--no-legend"]);
+            command
+        },
+        Duration::from_secs(2),
+    );
     match output {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
             .lines()
@@ -263,17 +274,22 @@ pub(crate) fn busctl_string_property(
     interface: &str,
     property: &str,
 ) -> Option<String> {
-    let output = Command::new("busctl")
-        .args([
-            "--user",
-            "get-property",
-            service,
-            "/org/mpris/MediaPlayer2",
-            interface,
-            property,
-        ])
-        .output()
-        .ok()?;
+    let output = applicationlauncher::process::output_with_timeout(
+        {
+            let mut command = Command::new("busctl");
+            command.args([
+                "--user",
+                "get-property",
+                service,
+                "/org/mpris/MediaPlayer2",
+                interface,
+                property,
+            ]);
+            command
+        },
+        Duration::from_secs(2),
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -312,7 +328,14 @@ pub(crate) fn fetch_active_media_app_keys() -> HashSet<String> {
 }
 
 pub(crate) fn fetch_pipewire_activity() -> (HashSet<u32>, HashSet<u32>, bool) {
-    let output = Command::new("pw-top").args(["-b", "-n", "1"]).output();
+    let output = applicationlauncher::process::output_with_timeout(
+        {
+            let mut command = Command::new("pw-top");
+            command.args(["-b", "-n", "1"]);
+            command
+        },
+        Duration::from_secs(2),
+    );
     match output {
         Ok(out) if out.status.success() => {
             let mut observed_ids = HashSet::new();
@@ -405,23 +428,27 @@ pub(crate) fn paint_audio_activity_ring(
     }
 }
 pub(crate) fn set_sink_input_volume(index: u32, volume_percent: u32) {
-    let _ = Command::new("pactl")
-        .args(&[
+    std::thread::spawn(move || {
+        let mut command = Command::new("pactl");
+        command.args([
             "set-sink-input-volume",
             &index.to_string(),
             &format!("{}%", volume_percent),
-        ])
-        .status();
+        ]);
+        let _ = applicationlauncher::process::status_with_timeout(command, Duration::from_secs(2));
+    });
 }
 
 pub(crate) fn set_sink_input_mute(index: u32, mute: bool) {
-    let _ = Command::new("pactl")
-        .args(&[
+    std::thread::spawn(move || {
+        let mut command = Command::new("pactl");
+        command.args([
             "set-sink-input-mute",
             &index.to_string(),
             if mute { "1" } else { "0" },
-        ])
-        .status();
+        ]);
+        let _ = applicationlauncher::process::status_with_timeout(command, Duration::from_secs(2));
+    });
 }
 
 pub(crate) fn sink_display_volume_percent(sink: &PactlSinkInput) -> u32 {

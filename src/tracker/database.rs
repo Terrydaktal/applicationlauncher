@@ -2,12 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{HistoryEntry, RestoreSpec, SnapshotDetail, SnapshotSummary, TrackedWindow};
 
 const MAX_HISTORY_ENTRIES: i64 = 10_000;
+const SCHEMA_VERSION: &str = "1";
 
 pub struct TrackerDatabase {
     connection: Connection,
@@ -27,6 +29,9 @@ impl TrackerDatabase {
             .open(path)
             .map_err(|err| err.to_string())?;
         let connection = Connection::open(path).map_err(|err| err.to_string())?;
+        connection
+            .busy_timeout(Duration::from_secs(2))
+            .map_err(|err| err.to_string())?;
         connection
             .execute_batch(
                 "PRAGMA journal_mode=WAL;
@@ -52,6 +57,29 @@ impl TrackerDatabase {
                     ordinal INTEGER NOT NULL, payload_json TEXT NOT NULL,
                     restore_json TEXT NOT NULL, PRIMARY KEY(snapshot_id, ordinal)
                  );",
+            )
+            .map_err(|err| err.to_string())?;
+        let schema_version = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| err.to_string())?;
+        if schema_version
+            .as_deref()
+            .is_some_and(|version| version != SCHEMA_VERSION)
+        {
+            return Err(format!(
+                "unsupported applicationlauncher database schema {:?}; expected {}",
+                schema_version, SCHEMA_VERSION
+            ));
+        }
+        connection
+            .execute(
+                "INSERT INTO meta(key,value) VALUES('schema_version',?1) ON CONFLICT(key) DO NOTHING",
+                [SCHEMA_VERSION],
             )
             .map_err(|err| err.to_string())?;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
@@ -81,69 +109,63 @@ impl TrackerDatabase {
         ).map(|_| ()).map_err(|err| err.to_string())
     }
 
-    pub fn current_windows(&self) -> Result<Vec<TrackedWindow>, String> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT payload_json FROM current_windows ORDER BY window_id")
-            .map_err(|err| err.to_string())?;
-        let payloads = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|err| err.to_string())?;
-
-        payloads
-            .map(|payload| {
-                let payload = payload.map_err(|err| err.to_string())?;
-                serde_json::from_str(&payload).map_err(|err| err.to_string())
-            })
-            .collect()
-    }
-
     pub fn current_window_entries(&self) -> Result<Vec<(TrackedWindow, RestoreSpec)>, String> {
         let mut statement = self
             .connection
-            .prepare("SELECT payload_json,restore_json FROM current_windows ORDER BY window_id")
+            .prepare("SELECT window_id,payload_json,restore_json FROM current_windows ORDER BY window_id")
             .map_err(|err| err.to_string())?;
         let rows = statement
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .map_err(|err| err.to_string())?;
-        rows.map(|row| {
-            let (payload, restore) = row.map_err(|err| err.to_string())?;
-            Ok((
-                serde_json::from_str(&payload).map_err(|err| err.to_string())?,
-                serde_json::from_str(&restore).map_err(|err| err.to_string())?,
-            ))
-        })
-        .collect()
-    }
-
-    pub fn replace_current(&mut self, windows: &[TrackedWindow]) -> Result<(), String> {
-        let entries = windows
-            .iter()
-            .cloned()
-            .map(|window| {
-                let restore = super::infer_restore_spec(&window);
-                (window, restore)
-            })
-            .collect::<Vec<_>>();
-        self.replace_current_with_restore(&entries)
+        let rows = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())?;
+        drop(statement);
+        let mut entries = Vec::new();
+        for (id, payload, restore) in rows {
+            match (
+                serde_json::from_str::<TrackedWindow>(&payload),
+                serde_json::from_str::<RestoreSpec>(&restore),
+            ) {
+                (Ok(window), Ok(restore)) => entries.push((window, restore)),
+                (window_result, restore_result) => {
+                    eprintln!(
+                        "Removing corrupt current window {id}: {window_result:?}, {restore_result:?}"
+                    );
+                    self.connection
+                        .execute("DELETE FROM current_windows WHERE window_id=?1", [&id])
+                        .map_err(|err| err.to_string())?;
+                }
+            }
+        }
+        Ok(entries)
     }
 
     pub fn replace_current_with_restore(
         &mut self,
         entries: &[(TrackedWindow, RestoreSpec)],
     ) -> Result<(), String> {
-        let existing = {
+        let existing: HashMap<String, (String, String)> = {
             let mut statement = self
                 .connection
-                .prepare("SELECT window_id,payload_json FROM current_windows")
+                .prepare("SELECT window_id,payload_json,restore_json FROM current_windows")
                 .map_err(|err| err.to_string())?;
             statement
                 .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 })
                 .map_err(|err| err.to_string())?
+                .map(|row| row.map(|(id, payload, restore)| (id, (payload, restore))))
                 .collect::<Result<HashMap<_, _>, _>>()
                 .map_err(|err| err.to_string())?
         };
@@ -166,12 +188,12 @@ impl TrackerDatabase {
             let payload = serde_json::to_string(window).unwrap();
             let restore = serde_json::to_string(restore).unwrap();
             match existing.get(&window.id) {
-                Some(previous) => {
-                    let previous_window = serde_json::from_str::<TrackedWindow>(previous).ok();
-                    if previous_window
-                        .as_ref()
-                        .is_some_and(|previous| persistence_equivalent(previous, window))
-                    {
+                Some((previous_payload, previous_restore)) => {
+                    let previous_window =
+                        serde_json::from_str::<TrackedWindow>(previous_payload).ok();
+                    if previous_window.as_ref().is_some_and(|previous| {
+                        persistence_equivalent(previous, window) && previous_restore == &restore
+                    }) {
                         continue;
                     }
                     tx.execute(
@@ -189,21 +211,6 @@ impl TrackerDatabase {
             }
         }
         tx.commit().map_err(|err| err.to_string())
-    }
-
-    pub fn add_history(&self, window: &TrackedWindow, closed_at_ms: i64) -> Result<(), String> {
-        let restore = self
-            .connection
-            .query_row(
-                "SELECT restore_json FROM current_windows WHERE window_id=?1",
-                [&window.id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|err| err.to_string())?
-            .and_then(|restore| serde_json::from_str(&restore).ok())
-            .unwrap_or_else(|| super::infer_restore_spec(window));
-        self.add_history_with_restore(window, &restore, closed_at_ms)
     }
 
     pub fn add_history_with_restore(
@@ -241,21 +248,31 @@ impl TrackerDatabase {
             )
             .optional()
             .map_err(|err| err.to_string())?;
-        row.map(|(payload, restore, closed_at_ms)| {
+        let Some((payload, restore, closed_at_ms)) = row else {
+            return Ok(None);
+        };
+        let parsed = (|| {
             let restore =
                 serde_json::from_str::<RestoreSpec>(&restore).map_err(|err| err.to_string())?;
             let window = history_window_with_restore_title(
                 serde_json::from_str(&payload).map_err(|err| err.to_string())?,
                 &restore,
             );
-            Ok(HistoryEntry {
+            Ok::<HistoryEntry, String>(HistoryEntry {
                 id,
                 window,
                 closed_at_ms,
                 restore,
             })
-        })
-        .transpose()
+        })();
+        match parsed {
+            Ok(entry) => Ok(Some(entry)),
+            Err(err) => {
+                eprintln!("Removing corrupt history entry {id}: {err}");
+                self.remove_history(id)?;
+                Ok(None)
+            }
+        }
     }
 
     pub fn history(&self, limit: usize) -> Result<Vec<HistoryEntry>, String> {
@@ -269,22 +286,35 @@ impl TrackerDatabase {
                 Ok((row.get(0)?, payload, restore, row.get(3)?))
             })
             .map_err(|err| err.to_string())?;
-        rows.map(|row| {
-            let (id, payload, restore, closed_at_ms) = row.map_err(|err| err.to_string())?;
-            let restore = serde_json::from_str::<super::RestoreSpec>(&restore)
-                .map_err(|err| err.to_string())?;
-            let window = history_window_with_restore_title(
-                serde_json::from_str(&payload).map_err(|err| err.to_string())?,
-                &restore,
-            );
-            Ok(HistoryEntry {
-                id,
-                window,
-                closed_at_ms,
-                restore,
-            })
-        })
-        .collect()
+        let rows = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())?;
+        drop(statement);
+        let mut history = Vec::new();
+        for (id, payload, restore, closed_at_ms) in rows {
+            let parsed = (|| {
+                let restore = serde_json::from_str::<super::RestoreSpec>(&restore)
+                    .map_err(|err| err.to_string())?;
+                let window = history_window_with_restore_title(
+                    serde_json::from_str(&payload).map_err(|err| err.to_string())?,
+                    &restore,
+                );
+                Ok::<HistoryEntry, String>(HistoryEntry {
+                    id,
+                    window,
+                    closed_at_ms,
+                    restore,
+                })
+            })();
+            match parsed {
+                Ok(entry) => history.push(entry),
+                Err(err) => {
+                    eprintln!("Removing corrupt history entry {id}: {err}");
+                    self.remove_history(id)?;
+                }
+            }
+        }
+        Ok(history)
     }
 
     pub fn clear_history(&self) -> Result<(), String> {
@@ -379,21 +409,40 @@ impl TrackerDatabase {
         let Some(summary) = summary else {
             return Ok(None);
         };
-        let mut statement = self.connection.prepare("SELECT payload_json,restore_json FROM snapshot_windows WHERE snapshot_id=?1 ORDER BY ordinal").map_err(|err| err.to_string())?;
+        let mut statement = self.connection.prepare("SELECT ordinal,payload_json,restore_json FROM snapshot_windows WHERE snapshot_id=?1 ORDER BY ordinal").map_err(|err| err.to_string())?;
         let rows = statement
             .query_map([id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|err| err.to_string())?;
-        let windows = rows
-            .map(|row| {
-                let (window, restore) = row.map_err(|err| err.to_string())?;
                 Ok((
-                    serde_json::from_str(&window).map_err(|err| err.to_string())?,
-                    serde_json::from_str(&restore).map_err(|err| err.to_string())?,
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
                 ))
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .map_err(|err| err.to_string())?;
+        let rows = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())?;
+        drop(statement);
+        let mut windows = Vec::new();
+        for (ordinal, payload, restore) in rows {
+            match (
+                serde_json::from_str::<TrackedWindow>(&payload),
+                serde_json::from_str::<RestoreSpec>(&restore),
+            ) {
+                (Ok(window), Ok(restore)) => windows.push((window, restore)),
+                (window_result, restore_result) => {
+                    eprintln!(
+                        "Removing corrupt snapshot row {id}/{ordinal}: {window_result:?}, {restore_result:?}"
+                    );
+                    self.connection
+                        .execute(
+                            "DELETE FROM snapshot_windows WHERE snapshot_id=?1 AND ordinal=?2",
+                            params![id, ordinal],
+                        )
+                        .map_err(|err| err.to_string())?;
+                }
+            }
+        }
         Ok(Some(SnapshotDetail { summary, windows }))
     }
 
@@ -477,9 +526,15 @@ mod tests {
             updated_at_ms: now_ms(),
             ..Default::default()
         };
-        db.replace_current(std::slice::from_ref(&window)).unwrap();
-        assert_eq!(db.current_windows().unwrap(), vec![window.clone()]);
-        db.add_history(&window, now_ms()).unwrap();
+        let restore = crate::tracker::infer_restore_spec(&window);
+        db.replace_current_with_restore(&[(window.clone(), restore.clone())])
+            .unwrap();
+        assert_eq!(
+            db.current_window_entries().unwrap(),
+            vec![(window.clone(), restore.clone())]
+        );
+        db.add_history_with_restore(&window, &restore, now_ms())
+            .unwrap();
         assert_eq!(db.history(10).unwrap().len(), 1);
 
         let plasma = TrackedWindow {
@@ -489,7 +544,9 @@ mod tests {
             updated_at_ms: now_ms(),
             ..Default::default()
         };
-        db.add_history(&plasma, now_ms()).unwrap();
+        let plasma_restore = crate::tracker::infer_restore_spec(&plasma);
+        db.add_history_with_restore(&plasma, &plasma_restore, now_ms())
+            .unwrap();
         assert_eq!(db.prune_shell_surface_history().unwrap(), 1);
         assert_eq!(db.history(10).unwrap().len(), 1);
         let id = db

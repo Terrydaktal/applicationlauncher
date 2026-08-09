@@ -168,7 +168,6 @@ pub enum WindowFeedEvent {
     Snapshot(Vec<KWinWindowPayload>),
     Upsert(KWinWindowPayload),
     Remove(String),
-    RearmAttentionAutomation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -4,22 +4,59 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use crate::*;
 
 pub(crate) struct SingleInstanceLock {
     pub(crate) path: PathBuf,
+    inode: u64,
+}
+
+impl SingleInstanceLock {
+    pub(crate) fn new(path: PathBuf) -> Result<Self, String> {
+        let inode = std::fs::symlink_metadata(&path)
+            .map_err(|err| format!("could not inspect the bound launcher socket: {err}"))?
+            .ino();
+        Ok(Self { path, inode })
+    }
 }
 
 impl Drop for SingleInstanceLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if std::fs::symlink_metadata(&self.path)
+            .ok()
+            .is_some_and(|metadata| metadata.ino() == self.inode)
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
+}
+
+static DEBUG_ATTACH_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+fn pid_belongs_to_current_user(pid: u32) -> bool {
+    let uid = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find(|line| line.starts_with("Uid:"))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|uid| uid.parse::<u32>().ok())
+        });
+    uid == Some(rustix::process::getuid().as_raw())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_belongs_to_current_user(_pid: u32) -> bool {
+    true
 }
 
 #[cfg(target_os = "linux")]
@@ -70,8 +107,11 @@ pub(crate) fn send_launcher_control_request(
 pub(crate) fn capture_running_launcher_diagnostics(socket_path: &Path) -> Result<PathBuf, String> {
     let request = format!("diagnose {}\n", std::process::id());
     let response = send_launcher_control_request(socket_path, &request, true)?;
-    let pid = response
-        .strip_prefix("debug-ready ")
+    let mut response_fields = response.split_whitespace();
+    let pid = response_fields
+        .next()
+        .filter(|prefix| *prefix == "debug-ready")
+        .and_then(|_| response_fields.next())
         .ok_or_else(|| {
             if response.is_empty() {
                 "the running launcher did not support diagnostic attachment".to_string()
@@ -81,6 +121,9 @@ pub(crate) fn capture_running_launcher_diagnostics(socket_path: &Path) -> Result
         })?
         .parse::<u32>()
         .map_err(|err| format!("invalid launcher PID in diagnostic response: {err}"))?;
+    let token = response_fields
+        .next()
+        .ok_or_else(|| "diagnostic response did not include an authorization token".to_string())?;
 
     let result = (|| {
         let state_dir = launcher_state_dir();
@@ -89,42 +132,56 @@ pub(crate) fn capture_running_launcher_diagnostics(socket_path: &Path) -> Result
 
         let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
             .unwrap_or_else(|err| format!("unable to read process status: {err}\n"));
-        let thread_snapshot = Command::new("ps")
-            .args([
-                "-L",
-                "-p",
-                &pid.to_string(),
-                "-o",
-                "pid=,tid=,psr=,stat=,pcpu=,time=,wchan:32=,comm=",
-            ])
-            .output();
-        let stack_output = Command::new("timeout")
-            .args(["5s", "eu-stack", "-p", &pid.to_string(), "-n", "48", "-s"])
-            .output();
-        let stack_output = match stack_output {
-            Ok(output) if output.status.success() || !output.stdout.is_empty() => Ok(output),
-            _ => Command::new("timeout")
-                .env("DEBUGINFOD_URLS", "")
-                .args([
-                    "10s",
-                    "gdb",
-                    "-q",
-                    "-batch",
-                    "-iex",
-                    "set pagination off",
-                    "-iex",
-                    "set debuginfod enabled off",
-                    "-ex",
-                    "set print thread-events off",
-                    "-ex",
-                    "info threads",
-                    "-ex",
-                    "thread apply all bt 40",
-                    &format!("/proc/{pid}/exe"),
+        let thread_snapshot = applicationlauncher::process::output_with_timeout(
+            {
+                let mut command = Command::new("ps");
+                command.args([
+                    "-L",
                     "-p",
                     &pid.to_string(),
-                ])
-                .output(),
+                    "-o",
+                    "pid=,tid=,psr=,stat=,pcpu=,time=,wchan:32=,comm=",
+                ]);
+                command
+            },
+            Duration::from_secs(5),
+        );
+        let stack_output = applicationlauncher::process::output_with_timeout(
+            {
+                let mut command = Command::new("timeout");
+                command.args(["5s", "eu-stack", "-p", &pid.to_string(), "-n", "48", "-s"]);
+                command
+            },
+            Duration::from_secs(8),
+        );
+        let stack_output = match stack_output {
+            Ok(output) if output.status.success() || !output.stdout.is_empty() => Ok(output),
+            _ => applicationlauncher::process::output_with_timeout(
+                {
+                    let mut command = Command::new("timeout");
+                    command.env("DEBUGINFOD_URLS", "").args([
+                        "10s",
+                        "gdb",
+                        "-q",
+                        "-batch",
+                        "-iex",
+                        "set pagination off",
+                        "-iex",
+                        "set debuginfod enabled off",
+                        "-ex",
+                        "set print thread-events off",
+                        "-ex",
+                        "info threads",
+                        "-ex",
+                        "thread apply all bt 40",
+                        &format!("/proc/{pid}/exe"),
+                        "-p",
+                        &pid.to_string(),
+                    ]);
+                    command
+                },
+                Duration::from_secs(13),
+            ),
         };
 
         let mut report = String::new();
@@ -163,7 +220,7 @@ pub(crate) fn capture_running_launcher_diagnostics(socket_path: &Path) -> Result
         Ok(report_path)
     })();
 
-    let _ = send_launcher_control_request(socket_path, "diagnose-done\n", true);
+    let _ = send_launcher_control_request(socket_path, &format!("diagnose-done {token}\n"), true);
     result
 }
 
@@ -187,24 +244,39 @@ pub(crate) fn handle_launcher_control_connection(
                 .and_then(|pid| pid.parse::<u32>().ok());
             let response = match tracer_pid
                 .filter(|pid| *pid > 0)
+                .filter(|pid| pid_belongs_to_current_user(*pid))
                 .ok_or_else(|| "diagnose requires the requesting debugger PID".to_string())
                 .and_then(|pid| set_debugger_attach_enabled(Some(pid)))
             {
                 Ok(()) => {
-                    std::thread::spawn(|| {
+                    let token = DEBUG_ATTACH_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+                    std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_secs(DEBUG_ATTACH_TIMEOUT_SECS));
-                        let _ = set_debugger_attach_enabled(None);
+                        if DEBUG_ATTACH_GENERATION.load(Ordering::Acquire) == token {
+                            let _ = set_debugger_attach_enabled(None);
+                        }
                     });
-                    format!("debug-ready {}\n", std::process::id())
+                    format!("debug-ready {} {token}\n", std::process::id())
                 }
                 Err(err) => format!("debug-error {err}\n"),
             };
             let _ = stream.write_all(response.as_bytes());
         }
-        "diagnose-done" => {
-            let response = match set_debugger_attach_enabled(None) {
-                Ok(()) => "debug-disabled\n".to_string(),
-                Err(err) => format!("debug-error {err}\n"),
+        request if request.starts_with("diagnose-done") => {
+            let token = request
+                .split_whitespace()
+                .nth(1)
+                .and_then(|token| token.parse::<u64>().ok());
+            let response = if token
+                .is_some_and(|token| DEBUG_ATTACH_GENERATION.load(Ordering::Acquire) == token)
+            {
+                DEBUG_ATTACH_GENERATION.fetch_add(1, Ordering::AcqRel);
+                match set_debugger_attach_enabled(None) {
+                    Ok(()) => "debug-disabled\n".to_string(),
+                    Err(err) => format!("debug-error {err}\n"),
+                }
+            } else {
+                "debug-disabled\n".to_string()
             };
             let _ = stream.write_all(response.as_bytes());
         }
@@ -233,7 +305,14 @@ pub(crate) fn focus_existing_launcher_window() {
     let mut ids = Vec::new();
 
     for args in [["search", "--title", "Open Application Windows"].as_slice()] {
-        if let Ok(output) = Command::new(&kpath).args(args).output() {
+        if let Ok(output) = applicationlauncher::process::output_with_timeout(
+            {
+                let mut command = Command::new(&kpath);
+                command.args(args);
+                command
+            },
+            Duration::from_secs(3),
+        ) {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for id in stdout.lines().map(str::trim).filter(|id| !id.is_empty()) {
@@ -246,12 +325,31 @@ pub(crate) fn focus_existing_launcher_window() {
     }
 
     for id in ids {
-        let _ = Command::new(&kpath)
-            .args(["windowstate", "--remove", "MINIMIZED", &id])
-            .status();
+        let _ = applicationlauncher::process::status_with_timeout(
+            {
+                let mut command = Command::new(&kpath);
+                command.args(["windowstate", "--remove", "MINIMIZED", &id]);
+                command
+            },
+            Duration::from_secs(3),
+        );
         std::thread::sleep(std::time::Duration::from_millis(60));
-        let _ = Command::new(&kpath).args(["windowactivate", &id]).status();
-        let _ = Command::new(&kpath).args(["windowraise", &id]).status();
+        let _ = applicationlauncher::process::status_with_timeout(
+            {
+                let mut command = Command::new(&kpath);
+                command.args(["windowactivate", &id]);
+                command
+            },
+            Duration::from_secs(3),
+        );
+        let _ = applicationlauncher::process::status_with_timeout(
+            {
+                let mut command = Command::new(&kpath);
+                command.args(["windowraise", &id]);
+                command
+            },
+            Duration::from_secs(3),
+        );
     }
 }
 
@@ -274,7 +372,7 @@ pub(crate) fn write_stderr_line(message: &str) {
 }
 
 fn write_private_report(path: &Path, contents: &[u8]) -> Result<(), String> {
-    std::fs::write(path, contents)
+    applicationlauncher::process::atomic_write(path, contents)
         .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
     #[cfg(unix)]
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
@@ -313,7 +411,7 @@ pub(crate) fn install_panic_hook() {
                 let _ = file.write_all(panic_entry.as_bytes());
             }
             let latest_log = state_dir.join("panic-latest.log");
-            let _ = std::fs::write(latest_log, message.as_bytes());
+            let _ = applicationlauncher::process::atomic_write(&latest_log, message.as_bytes());
             #[cfg(unix)]
             let _ = std::fs::set_permissions(
                 state_dir.join("panic-latest.log"),

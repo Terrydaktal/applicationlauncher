@@ -1,3 +1,4 @@
+use std::time::Duration;
 use zbus::blocking::{Connection, Proxy};
 
 use super::{
@@ -11,7 +12,10 @@ pub struct TrackerClient {
 
 impl TrackerClient {
     pub fn connect() -> Result<Self, String> {
-        Connection::session()
+        zbus::blocking::connection::Builder::session()
+            .map_err(|err| err.to_string())?
+            .method_timeout(Duration::from_secs(3))
+            .build()
             .map(|connection| Self { connection })
             .map_err(|err| err.to_string())
     }

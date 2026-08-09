@@ -339,7 +339,6 @@ impl App {
                     changed |= removed;
                     search_changed |= removed;
                 }
-                WindowFeedEvent::RearmAttentionAutomation => {}
             }
         }
 
@@ -452,8 +451,15 @@ impl App {
             self.loading = true;
             self.receiver = Some(rx);
 
-            std::thread::spawn(
-                move || match Command::new(&kpath).arg("--version").output() {
+            std::thread::spawn(move || {
+                match applicationlauncher::process::output_with_timeout(
+                    {
+                        let mut command = Command::new(&kpath);
+                        command.arg("--version");
+                        command
+                    },
+                    Duration::from_secs(2),
+                ) {
                     Ok(_) => {
                         let windows = get_open_windows_fast(&kpath, &theme).unwrap_or_default();
                         let _ = tx.send(LoadResult::WindowsSuccess(windows));
@@ -465,8 +471,8 @@ impl App {
                         )));
                         repaint_ctx.request_repaint();
                     }
-                },
-            );
+                }
+            });
         }
     }
 
@@ -512,8 +518,7 @@ impl App {
         self.next_window_reconciliation_at = None;
 
         std::thread::spawn(move || {
-            let windows =
-                get_open_windows_fast(&kpath, &theme).filter(|windows| !windows.is_empty());
+            let windows = get_open_windows_fast(&kpath, &theme);
             let _ = tx.send(windows);
             repaint_ctx.request_repaint();
         });
