@@ -1,13 +1,57 @@
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const KWIN_SCRIPT_ID: &str = "applicationlauncher-window-feed";
+const KWIN_FEED_WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const KWIN_FEED_MISSING_GRACE: Duration = Duration::from_secs(2);
+const KWIN_FEED_RETRY_DELAY: Duration = Duration::from_secs(5);
 const KWIN_METADATA: &str =
     include_str!("../../kwin/applicationlauncher-window-feed/metadata.json");
 const KWIN_MAIN_JS: &str =
     include_str!("../../kwin/applicationlauncher-window-feed/contents/code/main.js");
+static KWIN_SCRIPTING_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[derive(Default)]
+struct KwinFeedWatchdogState {
+    missing_since: Option<Instant>,
+    retry_not_before: Option<Instant>,
+}
+
+impl KwinFeedWatchdogState {
+    fn should_recover(&mut self, now: Instant, loaded: bool, kdotool_running: bool) -> bool {
+        if loaded {
+            self.missing_since = None;
+            self.retry_not_before = None;
+            return false;
+        }
+
+        // kdotool also uses KWin's scripting service. Wait for a full quiet
+        // period after it exits rather than racing its temporary action script.
+        if kdotool_running {
+            self.missing_since = Some(now);
+            return false;
+        }
+
+        if self
+            .retry_not_before
+            .is_some_and(|retry_not_before| now < retry_not_before)
+        {
+            return false;
+        }
+
+        let missing_since = *self.missing_since.get_or_insert(now);
+        if now.duration_since(missing_since) < KWIN_FEED_MISSING_GRACE {
+            return false;
+        }
+
+        self.missing_since = Some(now);
+        self.retry_not_before = Some(now + KWIN_FEED_RETRY_DELAY);
+        true
+    }
+}
 
 pub fn tracker_binary_path() -> Result<PathBuf, String> {
     let current = std::env::current_exe().map_err(|err| err.to_string())?;
@@ -199,12 +243,28 @@ fn kwin_script_loaded() -> bool {
     })
 }
 
+fn kwin_scripting_lock() -> std::sync::MutexGuard<'static, ()> {
+    KWIN_SCRIPTING_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn reload_kwin() -> Result<(), String> {
-    let home = PathBuf::from(std::env::var("HOME").map_err(|_| "HOME is not set")?);
-    let script = home
-        .join(".local/share/kwin/scripts")
-        .join(KWIN_SCRIPT_ID)
-        .join("contents/code/main.js");
+    let _guard = kwin_scripting_lock();
+    unload_kwin();
+    load_kwin_unlocked()
+}
+
+fn recover_kwin_feed() -> Result<(), String> {
+    let _guard = kwin_scripting_lock();
+    if kwin_script_loaded() {
+        return Ok(());
+    }
+    load_kwin_unlocked()
+}
+
+fn unload_kwin() {
     let _ = crate::process::status_with_timeout(
         {
             let mut command = Command::new("qdbus6");
@@ -218,7 +278,15 @@ fn reload_kwin() -> Result<(), String> {
         },
         Duration::from_secs(5),
     );
-    let loaded = crate::process::status_with_timeout(
+}
+
+fn load_kwin_unlocked() -> Result<(), String> {
+    let home = PathBuf::from(std::env::var("HOME").map_err(|_| "HOME is not set")?);
+    let script = home
+        .join(".local/share/kwin/scripts")
+        .join(KWIN_SCRIPT_ID)
+        .join("contents/code/main.js");
+    let loaded = crate::process::output_with_timeout(
         {
             let mut command = Command::new("qdbus6");
             command.args([
@@ -233,7 +301,11 @@ fn reload_kwin() -> Result<(), String> {
         Duration::from_secs(5),
     )
     .map_err(|err| err.to_string())?;
-    if !loaded.success() {
+    let script_number = String::from_utf8_lossy(&loaded.stdout)
+        .trim()
+        .parse::<i32>()
+        .unwrap_or(-1);
+    if !loaded.status.success() || script_number < 0 {
         return Err("KWin rejected the window feed script load".into());
     }
     let started = crate::process::status_with_timeout(
@@ -251,12 +323,34 @@ fn reload_kwin() -> Result<(), String> {
         .ok_or_else(|| "KWin rejected the window feed script start".into())
 }
 
+fn kdotool_running() -> bool {
+    let Ok(processes) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+
+    processes.filter_map(Result::ok).any(|entry| {
+        let file_name = entry.file_name();
+        let Some(pid) = file_name.to_str() else {
+            return false;
+        };
+        if !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+
+        std::fs::read_to_string(entry.path().join("comm"))
+            .is_ok_and(|comm| comm.trim() == "kdotool")
+    })
+}
+
 pub(crate) fn start_kwin_feed_watchdog() {
     std::thread::spawn(|| {
+        let mut state = KwinFeedWatchdogState::default();
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(5));
-            if !kwin_script_loaded()
-                && let Err(err) = reload_kwin()
+            std::thread::sleep(KWIN_FEED_WATCHDOG_POLL_INTERVAL);
+            let loaded = kwin_script_loaded();
+            let scripting_busy = !loaded && kdotool_running();
+            if state.should_recover(Instant::now(), loaded, scripting_busy)
+                && let Err(err) = recover_kwin_feed()
             {
                 eprintln!("Tracker KWin feed watchdog failed: {err}");
             }
@@ -266,11 +360,52 @@ pub(crate) fn start_kwin_feed_watchdog() {
 
 #[cfg(test)]
 mod tests {
-    use super::KWIN_MAIN_JS;
+    use std::time::{Duration, Instant};
+
+    use super::{KWIN_FEED_MISSING_GRACE, KWIN_MAIN_JS, KwinFeedWatchdogState};
 
     #[test]
     fn kwin_feed_avoids_unsupported_browser_timers() {
         assert!(!KWIN_MAIN_JS.contains("setTimeout"));
         assert!(!KWIN_MAIN_JS.contains("clearTimeout"));
+    }
+
+    #[test]
+    fn watchdog_debounces_a_transient_missing_feed() {
+        let started = Instant::now();
+        let mut state = KwinFeedWatchdogState::default();
+
+        assert!(!state.should_recover(started, false, false));
+        assert!(!state.should_recover(
+            started + KWIN_FEED_MISSING_GRACE - Duration::from_millis(1),
+            false,
+            false,
+        ));
+        assert!(state.should_recover(started + KWIN_FEED_MISSING_GRACE, false, false,));
+    }
+
+    #[test]
+    fn watchdog_requires_a_quiet_period_after_kdotool() {
+        let started = Instant::now();
+        let mut state = KwinFeedWatchdogState::default();
+
+        assert!(!state.should_recover(started, false, false));
+        assert!(!state.should_recover(started + KWIN_FEED_MISSING_GRACE, false, true,));
+        assert!(!state.should_recover(
+            started + KWIN_FEED_MISSING_GRACE + Duration::from_millis(1),
+            false,
+            false,
+        ));
+        assert!(state.should_recover(started + KWIN_FEED_MISSING_GRACE * 2, false, false,));
+    }
+
+    #[test]
+    fn watchdog_resets_after_the_feed_returns() {
+        let started = Instant::now();
+        let mut state = KwinFeedWatchdogState::default();
+
+        assert!(!state.should_recover(started, false, false));
+        assert!(!state.should_recover(started + Duration::from_secs(1), true, false));
+        assert!(!state.should_recover(started + KWIN_FEED_MISSING_GRACE, false, false,));
     }
 }

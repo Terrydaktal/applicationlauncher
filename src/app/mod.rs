@@ -171,8 +171,6 @@ pub(crate) struct App {
     receiver: Option<std::sync::mpsc::Receiver<LoadResult>>,
     background_apps_receiver: Option<Receiver<Vec<AppInfo>>>,
     background_window_enrichment_receiver: Option<Receiver<Vec<WindowInfo>>>,
-    background_window_reconciliation_receiver: Option<Receiver<Option<Vec<WindowInfo>>>>,
-    next_window_reconciliation_at: Option<Instant>,
     ui_event_rx: std::sync::mpsc::Receiver<UiEvent>,
     kwin_window_feed_setup_rx: Option<Receiver<Result<(), String>>>,
     repaint_ctx: egui::Context,
@@ -231,6 +229,7 @@ pub(crate) struct App {
     terminal_records: Vec<TerminalDbusRecord>,
     terminal_records_receiver: Option<Receiver<Result<Vec<TerminalDbusRecord>, String>>>,
     terminal_metadata_refresh_queued: bool,
+    terminal_metadata_retry_not_before: Option<Instant>,
     rapid_polling: std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_selected_window_id: Option<String>,
     missing_window_counts: HashMap<String, usize>,
@@ -546,8 +545,6 @@ impl App {
             receiver: None,
             background_apps_receiver: None,
             background_window_enrichment_receiver: None,
-            background_window_reconciliation_receiver: None,
-            next_window_reconciliation_at: None,
             ui_event_rx,
             kwin_window_feed_setup_rx: Some(kwin_window_feed_setup_rx),
             repaint_ctx: cc.egui_ctx.clone(),
@@ -606,6 +603,7 @@ impl App {
             terminal_records: Vec::new(),
             terminal_records_receiver: None,
             terminal_metadata_refresh_queued: false,
+            terminal_metadata_retry_not_before: None,
             rapid_polling: std::sync::Arc::clone(&rapid_polling),
             last_selected_window_id: None,
             missing_window_counts: HashMap::new(),
@@ -705,7 +703,6 @@ impl App {
         match app.mode {
             LauncherMode::Apps => app.refresh_apps(),
             LauncherMode::Windows => {
-                app.refresh_windows();
                 app.start_background_app_load();
             }
         }

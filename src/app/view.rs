@@ -45,9 +45,6 @@ impl eframe::App for App {
                     };
                     self.start_background_app_load();
                     self.start_terminal_metadata_refresh();
-                    if self.use_kwin_window_feed {
-                        self.schedule_window_reconciliation(Duration::ZERO);
-                    }
                 }
             }
         }
@@ -67,10 +64,19 @@ impl eframe::App for App {
             Some(Ok(result)) => {
                 self.terminal_records_receiver = None;
                 match result {
-                    Ok(records) => self.apply_terminal_metadata_records(records),
-                    Err(err) => crate::diagnostics::write_stderr_line(&format!(
-                        "Could not refresh XFCE4 Terminal metadata: {err}"
-                    )),
+                    Ok(records) => {
+                        self.terminal_metadata_retry_not_before = None;
+                        self.apply_terminal_metadata_records(records);
+                    }
+                    Err(err) => {
+                        self.terminal_metadata_refresh_queued = true;
+                        self.terminal_metadata_retry_not_before = Some(
+                            Instant::now() + Duration::from_secs(TERMINAL_METADATA_RETRY_SECS),
+                        );
+                        crate::diagnostics::write_stderr_line(&format!(
+                            "Could not refresh XFCE4 Terminal metadata: {err}"
+                        ));
+                    }
                 }
                 if self.terminal_metadata_refresh_queued {
                     self.start_terminal_metadata_refresh();
@@ -79,11 +85,20 @@ impl eframe::App for App {
             }
             Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
                 self.terminal_records_receiver = None;
-                if self.terminal_metadata_refresh_queued {
-                    self.start_terminal_metadata_refresh();
-                }
+                self.terminal_metadata_refresh_queued = true;
+                self.terminal_metadata_retry_not_before =
+                    Some(Instant::now() + Duration::from_secs(TERMINAL_METADATA_RETRY_SECS));
+                self.start_terminal_metadata_refresh();
             }
             _ => {}
+        }
+        if super::feed::terminal_metadata_refresh_due(
+            self.terminal_records_receiver.is_some(),
+            self.terminal_metadata_refresh_queued,
+            self.terminal_metadata_retry_not_before,
+            Instant::now(),
+        ) {
+            self.start_terminal_metadata_refresh();
         }
 
         if let Some(result) = self
@@ -95,7 +110,6 @@ impl eframe::App for App {
             match result {
                 Ok(()) => {
                     self.use_kwin_window_feed = true;
-                    self.schedule_window_reconciliation(Duration::from_secs(1));
                     ctx.request_repaint();
                 }
                 Err(err) => {
@@ -109,6 +123,7 @@ impl eframe::App for App {
                         false,
                         Instant::now(),
                     ));
+                    self.refresh_windows();
                     self.start_window_polling_thread(ctx);
                 }
             }
@@ -163,42 +178,6 @@ impl eframe::App for App {
                     self.background_window_enrichment_receiver = None;
                 }
                 _ => {}
-            }
-        }
-
-        match self
-            .background_window_reconciliation_receiver
-            .as_ref()
-            .map(|rx| rx.try_recv())
-        {
-            Some(Ok(Some(windows))) => {
-                self.background_window_reconciliation_receiver = None;
-                self.apply_window_reconciliation(windows);
-                self.schedule_window_reconciliation(Duration::from_secs(
-                    WINDOW_RECONCILIATION_INTERVAL_SECS,
-                ));
-                ctx.request_repaint();
-            }
-            Some(Ok(None)) | Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
-                self.background_window_reconciliation_receiver = None;
-                self.schedule_window_reconciliation(Duration::from_secs(
-                    WINDOW_RECONCILIATION_RETRY_SECS,
-                ));
-            }
-            _ => {}
-        }
-
-        if self.use_kwin_window_feed
-            && !self.loading
-            && self.background_window_reconciliation_receiver.is_none()
-        {
-            if let Some(deadline) = self.next_window_reconciliation_at {
-                let now = Instant::now();
-                if now >= deadline {
-                    self.start_window_reconciliation();
-                } else {
-                    ctx.request_repaint_after(deadline.saturating_duration_since(now));
-                }
             }
         }
 

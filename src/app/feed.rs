@@ -1,5 +1,14 @@
 use super::*;
 
+pub(super) fn terminal_metadata_refresh_due(
+    receiver_active: bool,
+    refresh_queued: bool,
+    retry_not_before: Option<Instant>,
+    now: Instant,
+) -> bool {
+    !receiver_active && refresh_queued && retry_not_before.is_some_and(|deadline| now >= deadline)
+}
+
 impl App {
     fn refresh_process_tree_cache(&mut self) {
         let refresh = self
@@ -15,6 +24,16 @@ impl App {
         if self.terminal_records_receiver.is_some() {
             self.terminal_metadata_refresh_queued = true;
             return;
+        }
+        if let Some(deadline) = self.terminal_metadata_retry_not_before {
+            let now = Instant::now();
+            if now < deadline {
+                self.terminal_metadata_refresh_queued = true;
+                self.repaint_ctx
+                    .request_repaint_after(deadline.saturating_duration_since(now));
+                return;
+            }
+            self.terminal_metadata_retry_not_before = None;
         }
 
         let repaint_ctx = self.repaint_ctx.clone();
@@ -492,35 +511,6 @@ impl App {
         std::thread::spawn(move || {
             let windows = get_open_windows(&kpath, &theme).unwrap_or_default();
             let _ = tx.send(windows);
-        });
-    }
-
-    pub(super) fn schedule_window_reconciliation(&mut self, delay: Duration) {
-        self.next_window_reconciliation_at = Some(Instant::now() + delay);
-    }
-
-    pub(super) fn start_window_reconciliation(&mut self) {
-        if self.background_window_reconciliation_receiver.is_some() {
-            return;
-        }
-        let Some(kpath) = self.kdotool_path.clone() else {
-            self.next_window_reconciliation_at = None;
-            return;
-        };
-        let theme = self
-            .force_theme
-            .as_deref()
-            .unwrap_or("breeze-dark")
-            .to_string();
-        let repaint_ctx = self.repaint_ctx.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.background_window_reconciliation_receiver = Some(rx);
-        self.next_window_reconciliation_at = None;
-
-        std::thread::spawn(move || {
-            let windows = get_open_windows_fast(&kpath, &theme);
-            let _ = tx.send(windows);
-            repaint_ctx.request_repaint();
         });
     }
 

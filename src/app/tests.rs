@@ -421,6 +421,31 @@ mod tests {
     }
 
     #[test]
+    fn failed_terminal_metadata_refresh_waits_for_its_retry_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(5);
+
+        assert!(!super::super::feed::terminal_metadata_refresh_due(
+            false,
+            true,
+            Some(deadline),
+            now,
+        ));
+        assert!(!super::super::feed::terminal_metadata_refresh_due(
+            true,
+            true,
+            Some(deadline),
+            deadline,
+        ));
+        assert!(super::super::feed::terminal_metadata_refresh_due(
+            false,
+            true,
+            Some(deadline),
+            deadline,
+        ));
+    }
+
+    #[test]
     fn icon_cache_separates_terminal_children_from_standalone_apps() {
         let terminal_child = window_icon_cache_key(
             "xfce4-terminal",
