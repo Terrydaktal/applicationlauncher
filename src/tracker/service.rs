@@ -50,7 +50,6 @@ struct AttentionState {
     due: Instant,
     consecutive_failures: u8,
     signature: String,
-    sent_signature: Option<String>,
 }
 
 fn attention_retry_delay(consecutive_failures: u8) -> Duration {
@@ -62,15 +61,9 @@ fn attention_retry_delay(consecutive_failures: u8) -> Duration {
     Duration::from_millis(ATTENTION_RETRY_BASE_MS.saturating_mul(1_u64 << exponent))
 }
 
-fn record_attention_attempt(
-    attention: &mut AttentionState,
-    now: Instant,
-    signature: &str,
-    succeeded: bool,
-) {
+fn record_attention_attempt(attention: &mut AttentionState, now: Instant, succeeded: bool) {
     if succeeded {
         attention.consecutive_failures = 0;
-        attention.sent_signature = Some(signature.to_string());
         attention.due = now + ATTENTION_RECHECK_DELAY;
     } else {
         attention.consecutive_failures = attention.consecutive_failures.saturating_add(1);
@@ -93,7 +86,6 @@ fn reconcile_attention_states(
                         due: now + ATTENTION_RECHECK_DELAY,
                         consecutive_failures: 0,
                         signature,
-                        sent_signature: None,
                     });
                 }
                 std::collections::hash_map::Entry::Occupied(mut entry)
@@ -102,7 +94,6 @@ fn reconcile_attention_states(
                     entry.get_mut().due = now + ATTENTION_RECHECK_DELAY;
                     entry.get_mut().consecutive_failures = 0;
                     entry.get_mut().signature = signature;
-                    entry.get_mut().sent_signature = None;
                 }
                 std::collections::hash_map::Entry::Occupied(_) => {}
             }
@@ -255,7 +246,6 @@ impl Runtime {
                         due: now + ATTENTION_RECHECK_DELAY,
                         consecutive_failures: 0,
                         signature,
-                        sent_signature: None,
                     });
                 }
                 std::collections::hash_map::Entry::Occupied(mut entry)
@@ -264,7 +254,6 @@ impl Runtime {
                     entry.get_mut().due = now + ATTENTION_RECHECK_DELAY;
                     entry.get_mut().consecutive_failures = 0;
                     entry.get_mut().signature = signature;
-                    entry.get_mut().sent_signature = None;
                 }
                 std::collections::hash_map::Entry::Occupied(_) => {}
             }
@@ -455,10 +444,7 @@ impl Runtime {
                 .iter()
                 .filter_map(|(id, attention)| {
                     let window = windows.get(id)?;
-                    (attention.due <= now
-                        && attention.sent_signature.as_deref()
-                            != Some(attention_signature(window).as_str()))
-                    .then_some(window.clone())
+                    (attention.due <= now).then_some(window.clone())
                 })
                 .collect::<Vec<_>>()
         };
@@ -476,7 +462,7 @@ impl Runtime {
             if let Some(attention) = state.attention.get_mut(&window.id) {
                 let signature = attention_signature(&window);
                 if attention.signature == signature {
-                    record_attention_attempt(attention, Instant::now(), &signature, result.is_ok());
+                    record_attention_attempt(attention, Instant::now(), result.is_ok());
                 }
             }
             if let Err(err) = result {
@@ -992,7 +978,6 @@ impl TrackerApi {
                     due,
                     consecutive_failures: 0,
                     signature,
-                    sent_signature: None,
                 });
             }
         } else {
@@ -1138,7 +1123,6 @@ pub fn run_tracker_daemon() -> Result<(), String> {
                     due,
                     consecutive_failures: 0,
                     signature,
-                    sent_signature: None,
                 },
             );
         }
@@ -1250,23 +1234,18 @@ mod tests {
     use crate::tracker::TrackedWindow;
 
     #[test]
-    fn successful_attention_send_is_recorded_for_the_same_prompt() {
+    fn successful_attention_send_rearms_identical_back_to_back_prompts() {
         let now = Instant::now();
         let mut attention = AttentionState {
             due: now,
             consecutive_failures: u8::MAX,
             signature: "action required | tree".to_string(),
-            sent_signature: None,
         };
 
-        record_attention_attempt(&mut attention, now, "action required | tree", true);
+        record_attention_attempt(&mut attention, now, true);
 
         assert_eq!(attention.consecutive_failures, 0);
         assert_eq!(attention.due, now + ATTENTION_RECHECK_DELAY);
-        assert_eq!(
-            attention.sent_signature.as_deref(),
-            Some("action required | tree")
-        );
     }
 
     #[test]
@@ -1276,15 +1255,14 @@ mod tests {
             due: now,
             consecutive_failures: 6,
             signature: "action required | tree".to_string(),
-            sent_signature: None,
         };
 
-        record_attention_attempt(&mut attention, now, "action required | tree", false);
+        record_attention_attempt(&mut attention, now, false);
         assert_eq!(attention.consecutive_failures, 7);
         assert_eq!(attention.due, now + Duration::from_secs(48));
 
         let later = now + Duration::from_secs(100);
-        record_attention_attempt(&mut attention, later, "action required | tree", false);
+        record_attention_attempt(&mut attention, later, false);
         assert_eq!(attention.consecutive_failures, 8);
         assert_eq!(attention.due, later + attention_retry_delay(8));
         assert_eq!(attention_retry_delay(8), Duration::from_secs(48));

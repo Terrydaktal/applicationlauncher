@@ -60,6 +60,7 @@ pub struct WindowIconCacheKey {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TerminalDbusRecord {
+    pub terminal_pid: u32,
     pub window_uuid: String,
     pub tab_uuid: String,
     pub active: bool,

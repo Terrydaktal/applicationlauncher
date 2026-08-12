@@ -228,23 +228,10 @@ fn launch(restore: &RestoreSpec) -> Result<(), String> {
         return crate::process::spawn_and_reap(command).map_err(|err| err.to_string());
     }
     let desktop = resolve_desktop_file(restore)?;
-    let status = crate::process::status_with_timeout(
-        {
-            let mut command = Command::new("gio");
-            command.arg("launch").arg(&desktop);
-            command
-        },
-        Duration::from_secs(5),
-    )
-    .map_err(|err| format!("Could not run gio for {}: {err}", desktop.display()))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "gio could not launch {} (exit status {status})",
-            desktop.display()
-        ))
-    }
+    let mut command = Command::new("gio");
+    command.arg("launch").arg(&desktop);
+    crate::process::spawn_and_reap(command)
+        .map_err(|err| format!("Could not run gio for {}: {err}", desktop.display()))
 }
 
 fn resolve_desktop_file(restore: &RestoreSpec) -> Result<PathBuf, String> {

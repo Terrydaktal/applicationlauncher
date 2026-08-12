@@ -104,7 +104,7 @@ pub fn ensure_tracker_installed() -> Result<(), String> {
         .unwrap_or_default();
     let build_fingerprint = format!("{}-{}-{content_hash:x}", binary_metadata.len(), modified);
     let unit = format!(
-        "[Unit]\nDescription=Application Launcher window and session tracker\nAfter=graphical-session.target\nPartOf=graphical-session.target\n\n[Service]\nType=simple\nEnvironment=APPLICATIONLAUNCHER_DAEMON_BUILD={build_fingerprint}\nExecStart={}\nRestart=on-failure\nRestartSec=1\n\n[Install]\nWantedBy=graphical-session.target\n",
+        "[Unit]\nDescription=Application Launcher window and session tracker\nAfter=graphical-session.target\nPartOf=graphical-session.target\n\n[Service]\nType=simple\nEnvironment=APPLICATIONLAUNCHER_DAEMON_BUILD={build_fingerprint}\nExecStart={}\nRestart=on-failure\nRestartSec=1\nKillMode=process\n\n[Install]\nWantedBy=graphical-session.target\n",
         link.display()
     );
     let unit_path = unit_dir.join("applicationlauncherd.service");

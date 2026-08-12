@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_CAPTURE_BYTES: u64 = 4 * 1024 * 1024;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static SPAWN_SCOPE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const SPAWN_SCOPE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn output_with_timeout(mut command: Command, timeout: Duration) -> io::Result<Output> {
     isolate_process_group(&mut command);
@@ -47,12 +49,95 @@ pub fn status_with_timeout(command: Command, timeout: Duration) -> io::Result<Ex
     output_with_timeout(command, timeout).map(|output| output.status)
 }
 
-pub fn spawn_and_reap(mut command: Command) -> io::Result<()> {
-    let mut child = command.spawn()?;
+pub fn spawn_and_reap(command: Command) -> io::Result<()> {
+    let mut child = spawn_in_independent_scope(command)?;
     thread::spawn(move || {
         let _ = child.wait();
     });
     Ok(())
+}
+
+fn spawn_in_independent_scope(command: Command) -> io::Result<Child> {
+    let (mut scoped, expected_cgroup) = independent_scope_command(command);
+    let mut child = scoped.spawn()?;
+    let deadline = Instant::now() + SPAWN_SCOPE_TIMEOUT;
+    loop {
+        let cgroup =
+            std::fs::read_to_string(format!("/proc/{}/cgroup", child.id())).unwrap_or_default();
+        if cgroup.lines().any(|line| line.contains(&expected_cgroup)) {
+            break;
+        }
+        if let Some(status) = child.try_wait()? {
+            if status.success() {
+                return Err(io::Error::other(
+                    "the isolated application exited before its scope could be verified",
+                ));
+            } else {
+                return Err(io::Error::other(format!(
+                    "systemd-run could not start the isolated application scope ({status})"
+                )));
+            }
+        }
+        if Instant::now() >= deadline {
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "could not verify the application's independent systemd scope",
+            ));
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    Ok(child)
+}
+
+fn independent_scope_command(command: Command) -> (Command, String) {
+    let program = command.get_program().to_os_string();
+    let arguments = command
+        .get_args()
+        .map(std::ffi::OsStr::to_os_string)
+        .collect::<Vec<_>>();
+    let current_dir = command.get_current_dir().map(std::path::Path::to_path_buf);
+    let environment = command
+        .get_envs()
+        .map(|(key, value)| (key.to_os_string(), value.map(std::ffi::OsStr::to_os_string)))
+        .collect::<Vec<_>>();
+    let sequence = SPAWN_SCOPE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let launch_nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let scope_name = format!(
+        "applicationlauncher-spawn-{}-{launch_nonce}-{sequence}",
+        std::process::id(),
+    );
+    let expected_cgroup = format!("{scope_name}.scope");
+
+    let mut scoped = Command::new("systemd-run");
+    scoped.args([
+        "--user",
+        "--scope",
+        "--collect",
+        "--quiet",
+        "--unit",
+        &scope_name,
+        "--",
+    ]);
+    scoped.arg(program).args(arguments);
+    if let Some(current_dir) = current_dir {
+        scoped.current_dir(current_dir);
+    }
+    for (key, value) in environment {
+        if let Some(value) = value {
+            scoped.env(key, value);
+        } else {
+            scoped.env_remove(key);
+        }
+    }
+
+    (scoped, expected_cgroup)
 }
 
 pub fn atomic_write(path: &std::path::Path, contents: &[u8]) -> io::Result<()> {
@@ -149,5 +234,47 @@ mod tests {
 
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    #[ignore = "requires the live user systemd manager"]
+    fn launched_applications_enter_an_independent_systemd_scope() {
+        let mut command = Command::new("sleep");
+        command.arg("1");
+        let mut child = spawn_in_independent_scope(command).unwrap();
+        let cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", child.id())).unwrap();
+
+        assert!(cgroup.contains("applicationlauncher-spawn-"));
+        assert!(cgroup.contains(".scope"));
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn application_launches_are_wrapped_in_collectable_user_scopes() {
+        let mut command = Command::new("example-program");
+        command.arg("--example");
+        let (scoped, expected_cgroup) = independent_scope_command(command);
+        let arguments = scoped
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(scoped.get_program(), "systemd-run");
+        assert!(arguments.starts_with(&[
+            "--user".into(),
+            "--scope".into(),
+            "--collect".into(),
+            "--quiet".into(),
+            "--unit".into(),
+        ]));
+        assert!(arguments.iter().any(|argument| argument == "--"));
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "example-program")
+        );
+        assert!(arguments.iter().any(|argument| argument == "--example"));
+        assert!(expected_cgroup.starts_with("applicationlauncher-spawn-"));
+        assert!(expected_cgroup.ends_with(".scope"));
     }
 }

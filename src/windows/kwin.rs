@@ -72,17 +72,29 @@ pub(crate) fn build_window_info(
     if let Some(pid) = pid {
         let mut target_pid = pid;
         if is_terminal_class(&class_lower) {
-            if let Some(record) = terminal_record_for_window_title(&raw_title, terminal_records) {
+            if let Some(record) = terminal_record_for_window(pid, &raw_title, terminal_records) {
                 let record_target = [record.foreground_pid, record.child_pid]
                     .into_iter()
                     .filter_map(|candidate| i32::try_from(candidate).ok())
                     .find(|candidate| *candidate > 0 && process_exists(*candidate));
                 if let Some(record_target) = record_target {
-                    target_pid = record_target;
-                    active_process = pid_to_name
+                    let record_process_name = pid_to_name
                         .get(&record_target)
                         .cloned()
                         .or_else(|| read_process_stat(record_target).map(|stat| stat.name));
+                    let resolved_process = record_process_name.as_deref().and_then(|name| {
+                        is_shell(name)
+                            .then(|| {
+                                find_terminal_leaf(record_target, ppid_to_children, pid_to_name)
+                            })
+                            .flatten()
+                    });
+                    if let Some((process_pid, process_name)) = resolved_process
+                        .or_else(|| record_process_name.map(|name| (record_target, name)))
+                    {
+                        target_pid = process_pid;
+                        active_process = Some(process_name);
+                    }
                 }
                 if !record.working_directory.is_empty() {
                     cwd_path = Some(PathBuf::from(&record.working_directory));

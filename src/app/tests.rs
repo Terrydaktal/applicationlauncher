@@ -155,6 +155,7 @@ mod tests {
         pty: &str,
     ) -> TerminalDbusRecord {
         TerminalDbusRecord {
+            terminal_pid: 0,
             window_uuid: window_uuid.to_string(),
             tab_uuid: tab_uuid.to_string(),
             active: true,
@@ -280,6 +281,24 @@ mod tests {
         second.child_pid = 200;
 
         assert!(terminal_record_for_window_title("~ - Terminal", &[first, second]).is_none());
+    }
+
+    #[test]
+    fn terminal_metadata_uses_server_pid_for_duplicate_generic_titles() {
+        let mut htop = terminal_record("tab-htop", "window-htop", "Terminal", "/dev/pts/19");
+        htop.terminal_pid = 10;
+        htop.child_pid = 100;
+        let mut nvtop = terminal_record("tab-nvtop", "window-nvtop", "Terminal", "/dev/pts/20");
+        nvtop.terminal_pid = 20;
+        nvtop.child_pid = 200;
+        let records = [htop, nvtop];
+
+        assert!(terminal_record_for_window_title("Terminal", &records).is_none());
+        assert_eq!(
+            terminal_record_for_window(20, "Terminal", &records)
+                .map(|record| record.tab_uuid.as_str()),
+            Some("tab-nvtop")
+        );
     }
 
     #[test]
@@ -742,6 +761,12 @@ mod tests {
 
         assert_eq!(
             find_terminal_leaf_with_stat_reader(1, &ppid_to_children, &pid_to_name, |pid| stats
+                .get(&pid)
+                .cloned(),),
+            Some((4, "codex".to_string()))
+        );
+        assert_eq!(
+            find_terminal_leaf_with_stat_reader(2, &ppid_to_children, &pid_to_name, |pid| stats
                 .get(&pid)
                 .cloned(),),
             Some((4, "codex".to_string()))

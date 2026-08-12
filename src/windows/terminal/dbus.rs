@@ -36,6 +36,7 @@ pub(crate) fn parse_terminal_dbus_records(
             }
 
             Some(TerminalDbusRecord {
+                terminal_pid: 0,
                 window_uuid: terminal_dbus_string(&values, "window_uuid").unwrap_or_default(),
                 tab_uuid,
                 active: terminal_dbus_bool(&values, "active").unwrap_or(false),
@@ -73,6 +74,9 @@ pub(crate) fn fetch_terminal_dbus_records() -> Result<Vec<TerminalDbusRecord>, S
     services.sort();
     services.dedup();
     for service in services {
+        let terminal_pid = dbus_proxy
+            .call::<_, _, u32>("GetConnectionUnixProcessID", &(service.as_str(),))
+            .unwrap_or(0);
         let Ok(proxy) = zbus::blocking::Proxy::new(
             &connection,
             service.as_str(),
@@ -86,13 +90,50 @@ pub(crate) fn fetch_terminal_dbus_records() -> Result<Vec<TerminalDbusRecord>, S
         else {
             continue;
         };
-        records.extend(parse_terminal_dbus_records(raw_records));
+        let mut service_records = parse_terminal_dbus_records(raw_records);
+        for record in &mut service_records {
+            record.terminal_pid = terminal_pid;
+        }
+        records.extend(service_records);
     }
     records.sort_by(|left, right| left.tab_uuid.cmp(&right.tab_uuid));
     records.dedup_by(|left, right| left.tab_uuid == right.tab_uuid);
     (!records.is_empty())
         .then_some(records)
         .ok_or_else(|| "XFCE4 Terminal's metadata API is unavailable".to_string())
+}
+
+pub(crate) fn terminal_record_for_window<'a>(
+    terminal_pid: i32,
+    raw_title: &str,
+    records: &'a [TerminalDbusRecord],
+) -> Option<&'a TerminalDbusRecord> {
+    if let Ok(terminal_pid) = u32::try_from(terminal_pid) {
+        let process_records = records
+            .iter()
+            .filter(|record| {
+                record.active
+                    && record.terminal_pid == terminal_pid
+                    && (record.child_pid > 0 || record.foreground_pid > 0)
+            })
+            .collect::<Vec<_>>();
+        if process_records.len() == 1 {
+            return process_records.into_iter().next();
+        }
+
+        let normalized_title = normalize_window_sort_title(raw_title);
+        let mut title_matches = process_records.into_iter().filter(|record| {
+            !normalized_title.is_empty()
+                && normalize_window_sort_title(&record.window_title) == normalized_title
+        });
+        if let Some(matched) = title_matches.next()
+            && title_matches.next().is_none()
+        {
+            return Some(matched);
+        }
+    }
+
+    terminal_record_for_window_title(raw_title, records)
 }
 
 pub(crate) fn terminal_dbus_service_names(names: Vec<String>) -> Vec<String> {
@@ -127,23 +168,25 @@ pub(crate) fn terminal_server_has_dbus_records(
     records: &[TerminalDbusRecord],
     pid_to_ppid: &HashMap<i32, i32>,
 ) -> bool {
+    let terminal_pid_u32 = u32::try_from(terminal_pid).ok();
     records.iter().any(|record| {
-        [record.child_pid, record.foreground_pid]
-            .into_iter()
-            .filter_map(|pid| i32::try_from(pid).ok())
-            .any(|mut pid| {
-                let mut visited = HashSet::new();
-                while pid > 0 && visited.insert(pid) {
-                    if pid == terminal_pid {
-                        return true;
+        terminal_pid_u32 == Some(record.terminal_pid)
+            || [record.child_pid, record.foreground_pid]
+                .into_iter()
+                .filter_map(|pid| i32::try_from(pid).ok())
+                .any(|mut pid| {
+                    let mut visited = HashSet::new();
+                    while pid > 0 && visited.insert(pid) {
+                        if pid == terminal_pid {
+                            return true;
+                        }
+                        let Some(parent) = pid_to_ppid.get(&pid).copied() else {
+                            break;
+                        };
+                        pid = parent;
                     }
-                    let Some(parent) = pid_to_ppid.get(&pid).copied() else {
-                        break;
-                    };
-                    pid = parent;
-                }
-                false
-            })
+                    false
+                })
     })
 }
 
