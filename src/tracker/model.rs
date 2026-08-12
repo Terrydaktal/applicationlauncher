@@ -29,6 +29,10 @@ pub struct TrackedWindow {
     #[serde(default)]
     pub active: bool,
     #[serde(default)]
+    pub skip_taskbar: bool,
+    #[serde(default)]
+    pub skip_switcher: bool,
+    #[serde(default)]
     pub desktop: i32,
     #[serde(default)]
     pub on_all_desktops: bool,
@@ -42,6 +46,70 @@ pub struct TrackedWindow {
     pub last_activated_at_ms: Option<i64>,
     #[serde(default)]
     pub activation_sequence: i64,
+}
+
+pub fn is_compact_chromium_helper_surface(
+    class: &str,
+    desktop_file_name: Option<&str>,
+    width: i32,
+) -> bool {
+    let identity = desktop_file_name
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(class);
+    (1..=200).contains(&width)
+        && has_chromium_isolated_app_id(identity)
+        && !desktop_entry_exists(identity)
+}
+
+fn has_chromium_isolated_app_id(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    ["google-chrome-", "chrome-", "chromium-", "brave-browser-"]
+        .into_iter()
+        .filter_map(|prefix| value.strip_prefix(prefix))
+        .filter_map(|suffix| suffix.split('-').next())
+        .any(|id| id.len() == 32 && id.bytes().all(|byte| (b'a'..=b'p').contains(&byte)))
+}
+
+fn desktop_entry_exists(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let path = std::path::Path::new(value);
+    if path.is_absolute() {
+        return path.is_file();
+    }
+    let file_name = if value.ends_with(".desktop") {
+        value.to_string()
+    } else {
+        format!("{value}.desktop")
+    };
+    let mut directories = Vec::new();
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+        directories.push(std::path::PathBuf::from(data_home).join("applications"));
+    } else if let Some(home) = std::env::var_os("HOME") {
+        let home = std::path::PathBuf::from(home);
+        directories.push(home.join(".local/share/applications"));
+        directories.push(home.join(".local/share/flatpak/exports/share/applications"));
+    }
+    directories.extend(
+        std::env::var_os("XDG_DATA_DIRS")
+            .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+            .unwrap_or_else(|| {
+                vec![
+                    std::path::PathBuf::from("/usr/local/share"),
+                    std::path::PathBuf::from("/usr/share"),
+                ]
+            })
+            .into_iter()
+            .map(|path| path.join("applications")),
+    );
+    directories.push(std::path::PathBuf::from(
+        "/var/lib/flatpak/exports/share/applications",
+    ));
+    directories
+        .into_iter()
+        .any(|directory| directory.join(&file_name).is_file())
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -157,7 +225,11 @@ pub fn infer_restore_spec(window: &TrackedWindow) -> RestoreSpec {
 fn terminal_process_details(root_pid: i32) -> (String, Option<String>, Option<String>) {
     let mut stack = vec![root_pid];
     let mut leaves = Vec::new();
+    let mut visited = std::collections::HashSet::new();
     while let Some(pid) = stack.pop() {
+        if visited.len() >= 4096 || !visited.insert(pid) {
+            continue;
+        }
         let children =
             std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
         let child_pids = children
@@ -167,7 +239,11 @@ fn terminal_process_details(root_pid: i32) -> (String, Option<String>, Option<St
         if child_pids.is_empty() {
             leaves.push(pid);
         } else {
-            stack.extend(child_pids);
+            stack.extend(
+                child_pids
+                    .into_iter()
+                    .take(4096usize.saturating_sub(visited.len())),
+            );
         }
     }
     // A terminal server can own multiple tabs. Do not select an arbitrary tab's

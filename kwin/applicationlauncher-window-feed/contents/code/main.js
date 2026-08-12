@@ -90,6 +90,8 @@ function serializeWindow(window) {
         fullscreen: !!window.fullScreen,
         demandsAttention: !!window.demandsAttention,
         active: !!window.active,
+        skipTaskbar: !!window.skipTaskbar,
+        skipSwitcher: !!window.skipSwitcher,
         desktop: desktop,
         onAllDesktops: !!window.onAllDesktops,
         output: outputName

@@ -7,7 +7,6 @@ mod settings;
 mod tests;
 mod view;
 use eframe::egui;
-use fuzzy_rank::metadata::{MetadataCandidate, MetadataQuery};
 pub(crate) use helpers::{
     effective_list_row_height, filtered_search_cache_key, grid_move_down, grid_move_up, inset_rect,
     load_window_size, nearest_center_index, paint_centered_title_job, paint_icon_in_rect,
@@ -19,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
     Arc,
-    mpsc::{Receiver, Sender},
+    mpsc::{Receiver, Sender, SyncSender},
 };
 use std::time::{Duration, Instant};
 
@@ -148,8 +147,10 @@ fn run_history_action(
 pub(crate) struct App {
     mode: LauncherMode,
     windows: Vec<WindowInfo>,
+    window_search_documents: Vec<PreparedSearchDocument>,
     window_icon_cache: HashMap<WindowIconCacheKey, Option<PathBuf>>,
     apps: Vec<AppInfo>,
+    app_search_documents: Vec<PreparedSearchDocument>,
     pinned_apps: Vec<PathBuf>,
     search_query: String,
     selected_index: usize,
@@ -170,6 +171,7 @@ pub(crate) struct App {
     loading: bool,
     receiver: Option<std::sync::mpsc::Receiver<LoadResult>>,
     background_apps_receiver: Option<Receiver<Vec<AppInfo>>>,
+    background_apps_refresh_queued: bool,
     background_window_enrichment_receiver: Option<Receiver<Vec<WindowInfo>>>,
     ui_event_rx: std::sync::mpsc::Receiver<UiEvent>,
     kwin_window_feed_setup_rx: Option<Receiver<Result<(), String>>>,
@@ -220,12 +222,13 @@ pub(crate) struct App {
     process_tree_cache_updated_at: Option<Instant>,
     popup_event_sender: Sender<PopupEvent>,
     popup_event_receiver: Receiver<PopupEvent>,
-    window_sender: Sender<Vec<WindowInfo>>,
+    window_sender: SyncSender<Vec<WindowInfo>>,
     window_receiver: Receiver<Vec<WindowInfo>>,
-    window_feed_receiver: Receiver<WindowFeedEvent>,
+    window_feed_inbox: Arc<std::sync::Mutex<Option<Vec<WindowFeedEvent>>>>,
     audio_cache_receiver: Receiver<AudioCacheUpdate>,
     terminal_action_receiver: Receiver<Result<String, String>>,
     terminal_action_message: Option<(String, bool, Instant)>,
+    auto_enter_update_sender: SyncSender<bool>,
     terminal_records: Vec<TerminalDbusRecord>,
     terminal_records_receiver: Option<Receiver<Result<Vec<TerminalDbusRecord>, String>>>,
     terminal_metadata_refresh_queued: bool,
@@ -245,7 +248,6 @@ pub(crate) struct App {
     has_active_audio: bool,
     app_scroll_sensitivity: f32,
     win_scroll_sensitivity: f32,
-    last_stale_prune: Option<Instant>,
     filtered_search_cache: Option<FilteredSearchCache>,
     pending_window_search_refresh_at: Option<Instant>,
     apps_generation: u64,
@@ -486,27 +488,53 @@ impl App {
         let settings = load_launcher_settings();
         cc.egui_ctx.set_zoom_factor(settings.ui_scale);
 
-        let (window_tx, window_rx) = std::sync::mpsc::channel();
-        let (window_feed_tx, window_feed_rx) = std::sync::mpsc::channel();
+        let (window_tx, window_rx) = std::sync::mpsc::sync_channel(1);
+        let window_feed_inbox = Arc::new(std::sync::Mutex::new(None));
         let (audio_cache_tx, audio_cache_rx) = std::sync::mpsc::sync_channel(1);
         let (_terminal_action_tx, terminal_action_rx) = std::sync::mpsc::channel();
+        let (auto_enter_update_sender, auto_enter_update_receiver) =
+            std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            'worker: while let Ok(mut enabled) = auto_enter_update_receiver.recv() {
+                loop {
+                    while let Ok(latest) = auto_enter_update_receiver.try_recv() {
+                        enabled = latest;
+                    }
+                    match applicationlauncher::tracker::TrackerClient::connect()
+                        .and_then(|client| client.set_auto_enter(enabled))
+                    {
+                        Ok(()) => break,
+                        Err(_) => {
+                            std::thread::sleep(Duration::from_millis(250));
+                            match auto_enter_update_receiver.try_recv() {
+                                Ok(latest) => enabled = latest,
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    break 'worker;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                            }
+                        }
+                    }
+                }
+            }
+        });
         let (popup_event_tx, popup_event_rx) = std::sync::mpsc::channel();
         let (tracker_status_tx, tracker_status_rx) = std::sync::mpsc::channel();
         let (kwin_window_feed_setup_tx, kwin_window_feed_setup_rx) = std::sync::mpsc::channel();
         let rapid_polling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let kwin_window_feed_repaint_ctx = cc.egui_ctx.clone();
+        let kwin_window_feed_inbox = Arc::clone(&window_feed_inbox);
         std::thread::spawn(move || {
-            let result = setup_kwin_window_feed(window_feed_tx, kwin_window_feed_repaint_ctx);
+            let result =
+                setup_kwin_window_feed(kwin_window_feed_inbox, kwin_window_feed_repaint_ctx);
             let _ = kwin_window_feed_setup_tx.send(result);
         });
 
-        let configured_auto_enter = settings.auto_send_enter_on_attention;
         std::thread::spawn(move || {
             for _ in 0..30 {
                 if let Ok(client) = applicationlauncher::tracker::TrackerClient::connect()
                     && let Ok(status) = client.status()
                 {
-                    let _ = client.set_auto_enter(configured_auto_enter);
                     let _ = tracker_status_tx.send(status);
                     break;
                 }
@@ -518,8 +546,10 @@ impl App {
         let mut app = Self {
             mode,
             windows: Vec::new(),
+            window_search_documents: Vec::new(),
             window_icon_cache: HashMap::new(),
             apps: Vec::new(),
+            app_search_documents: Vec::new(),
             pinned_apps,
             search_query: String::new(),
             selected_index: 0,
@@ -544,6 +574,7 @@ impl App {
             loading: false,
             receiver: None,
             background_apps_receiver: None,
+            background_apps_refresh_queued: false,
             background_window_enrichment_receiver: None,
             ui_event_rx,
             kwin_window_feed_setup_rx: Some(kwin_window_feed_setup_rx),
@@ -596,10 +627,11 @@ impl App {
             popup_event_receiver: popup_event_rx,
             window_sender: window_tx.clone(),
             window_receiver: window_rx,
-            window_feed_receiver: window_feed_rx,
+            window_feed_inbox,
             audio_cache_receiver: audio_cache_rx,
             terminal_action_receiver: terminal_action_rx,
             terminal_action_message: None,
+            auto_enter_update_sender,
             terminal_records: Vec::new(),
             terminal_records_receiver: None,
             terminal_metadata_refresh_queued: false,
@@ -619,7 +651,6 @@ impl App {
             has_active_audio: false,
             app_scroll_sensitivity: settings.app_scroll_sensitivity,
             win_scroll_sensitivity: settings.win_scroll_sensitivity,
-            last_stale_prune: None,
             filtered_search_cache: None,
             pending_window_search_refresh_at: None,
             apps_generation: 0,
@@ -707,6 +738,9 @@ impl App {
             }
         }
         app.start_terminal_metadata_refresh();
+        let _ = app
+            .auto_enter_update_sender
+            .try_send(settings.auto_send_enter_on_attention);
 
         app
     }
@@ -782,6 +816,9 @@ impl App {
         settings: LauncherSettings,
         ctx: &egui::Context,
     ) {
+        let settings = settings.sanitized();
+        let auto_enter_changed =
+            self.auto_send_enter_on_attention != settings.auto_send_enter_on_attention;
         self.show_system_settings_modules = settings.show_system_settings_modules;
         self.icon_only = settings.app_icon_mode;
         self.win_icon_size = settings.win_icon_size;
@@ -810,12 +847,11 @@ impl App {
         self.disable_ibeam = settings.disable_ibeam;
         self.app_scroll_sensitivity = settings.app_scroll_sensitivity;
         self.win_scroll_sensitivity = settings.win_scroll_sensitivity;
-        let enabled = settings.auto_send_enter_on_attention;
-        std::thread::spawn(move || {
-            if let Ok(client) = applicationlauncher::tracker::TrackerClient::connect() {
-                let _ = client.set_auto_enter(enabled);
-            }
-        });
+        if auto_enter_changed {
+            let _ = self
+                .auto_enter_update_sender
+                .try_send(settings.auto_send_enter_on_attention);
+        }
         if (self.ui_scale - settings.ui_scale).abs() > 0.001 {
             self.ui_scale = settings.ui_scale;
             ctx.set_zoom_factor(settings.ui_scale);

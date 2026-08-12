@@ -20,7 +20,6 @@ impl TrackerDatabase {
     pub fn open(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
         OpenOptions::new()
             .create(true)
@@ -82,7 +81,8 @@ impl TrackerDatabase {
                 [SCHEMA_VERSION],
             )
             .map_err(|err| err.to_string())?;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|err| format!("could not secure tracker database: {err}"))?;
         Ok(Self {
             connection,
             path: path.to_path_buf(),
@@ -136,11 +136,8 @@ impl TrackerDatabase {
                 (Ok(window), Ok(restore)) => entries.push((window, restore)),
                 (window_result, restore_result) => {
                     eprintln!(
-                        "Removing corrupt current window {id}: {window_result:?}, {restore_result:?}"
+                        "Ignoring corrupt current window {id}; it remains available for recovery: {window_result:?}, {restore_result:?}"
                     );
-                    self.connection
-                        .execute("DELETE FROM current_windows WHERE window_id=?1", [&id])
-                        .map_err(|err| err.to_string())?;
                 }
             }
         }
@@ -268,8 +265,9 @@ impl TrackerDatabase {
         match parsed {
             Ok(entry) => Ok(Some(entry)),
             Err(err) => {
-                eprintln!("Removing corrupt history entry {id}: {err}");
-                self.remove_history(id)?;
+                eprintln!(
+                    "Ignoring corrupt history entry {id}; it remains available for recovery: {err}"
+                );
                 Ok(None)
             }
         }
@@ -277,7 +275,7 @@ impl TrackerDatabase {
 
     pub fn history(&self, limit: usize) -> Result<Vec<HistoryEntry>, String> {
         let mut statement = self.connection.prepare(
-            "SELECT id,payload_json,restore_json,closed_at_ms FROM history ORDER BY closed_at_ms DESC LIMIT ?1"
+            "SELECT id,payload_json,restore_json,closed_at_ms FROM history ORDER BY closed_at_ms DESC, id DESC LIMIT ?1"
         ).map_err(|err| err.to_string())?;
         let rows = statement
             .query_map([limit as i64], |row| {
@@ -309,8 +307,9 @@ impl TrackerDatabase {
             match parsed {
                 Ok(entry) => history.push(entry),
                 Err(err) => {
-                    eprintln!("Removing corrupt history entry {id}: {err}");
-                    self.remove_history(id)?;
+                    eprintln!(
+                        "Ignoring corrupt history entry {id}; it remains available for recovery: {err}"
+                    );
                 }
             }
         }
@@ -432,14 +431,8 @@ impl TrackerDatabase {
                 (Ok(window), Ok(restore)) => windows.push((window, restore)),
                 (window_result, restore_result) => {
                     eprintln!(
-                        "Removing corrupt snapshot row {id}/{ordinal}: {window_result:?}, {restore_result:?}"
+                        "Ignoring corrupt snapshot row {id}/{ordinal}; it remains available for recovery: {window_result:?}, {restore_result:?}"
                     );
-                    self.connection
-                        .execute(
-                            "DELETE FROM snapshot_windows WHERE snapshot_id=?1 AND ordinal=?2",
-                            params![id, ordinal],
-                        )
-                        .map_err(|err| err.to_string())?;
                 }
             }
         }

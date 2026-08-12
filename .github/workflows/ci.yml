@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out applicationlauncher
+        uses: actions/checkout@v4
+        with:
+          path: applicationlauncher
+
+      - name: Check out fuzzy-rank dependency
+        uses: actions/checkout@v4
+        with:
+          repository: Terrydaktal/fuzzy-rank
+          path: fuzzy-rank
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        working-directory: applicationlauncher
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        working-directory: applicationlauncher
+        run: cargo test --all-targets --locked
+
+      - name: Build release binary
+        working-directory: applicationlauncher
+        run: cargo build --release --locked
+
+      - name: Audit dependencies
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

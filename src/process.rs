@@ -5,6 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_CAPTURE_BYTES: u64 = 4 * 1024 * 1024;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn output_with_timeout(mut command: Command, timeout: Duration) -> io::Result<Output> {
@@ -31,6 +32,10 @@ pub fn output_with_timeout(mut command: Command, timeout: Duration) -> io::Resul
         thread::sleep(POLL_INTERVAL);
     };
 
+    // A command can exit while a descendant still owns one of its pipes.
+    // Reap the leader and terminate the private group before joining readers.
+    terminate_process_group(child.id());
+
     Ok(Output {
         status,
         stdout: join_pipe(stdout),
@@ -40,6 +45,14 @@ pub fn output_with_timeout(mut command: Command, timeout: Duration) -> io::Resul
 
 pub fn status_with_timeout(command: Command, timeout: Duration) -> io::Result<ExitStatus> {
     output_with_timeout(command, timeout).map(|output| output.status)
+}
+
+pub fn spawn_and_reap(mut command: Command) -> io::Result<()> {
+    let mut child = command.spawn()?;
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 pub fn atomic_write(path: &std::path::Path, contents: &[u8]) -> io::Result<()> {
@@ -78,10 +91,14 @@ pub fn atomic_write(path: &std::path::Path, contents: &[u8]) -> io::Result<()> {
     result
 }
 
-fn read_pipe(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+fn read_pipe(pipe: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
     thread::spawn(move || {
         let mut output = Vec::new();
-        let _ = pipe.read_to_end(&mut output);
+        let mut limited = pipe.take(MAX_CAPTURE_BYTES.saturating_add(1));
+        let _ = limited.read_to_end(&mut output);
+        if output.len() > MAX_CAPTURE_BYTES as usize {
+            output.truncate(MAX_CAPTURE_BYTES as usize);
+        }
         output
     })
 }
@@ -92,14 +109,18 @@ fn join_pipe(pipe: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
 }
 
 fn terminate_child(child: &mut Child) {
+    terminate_process_group(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn terminate_process_group(child_id: u32) {
     #[cfg(unix)]
     {
-        if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+        if let Some(pid) = rustix::process::Pid::from_raw(child_id as i32) {
             let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 #[cfg(unix)]

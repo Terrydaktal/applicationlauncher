@@ -2,7 +2,7 @@ use eframe::egui;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::models::{
@@ -41,6 +41,14 @@ pub(crate) fn build_window_info(
     let class_lower = class.to_lowercase();
     let my_pid = std::process::id() as i32;
 
+    if applicationlauncher::tracker::is_compact_chromium_helper_surface(
+        &class,
+        desktop_file_name.as_deref(),
+        geometry.map_or(0, |(_, _, width, _)| width),
+    ) {
+        return None;
+    }
+
     if class_lower.contains("plasmashell")
         || class_lower == "kwin_wayland"
         || class_lower.is_empty()
@@ -50,12 +58,6 @@ pub(crate) fn build_window_info(
         || pid == Some(my_pid)
     {
         return None;
-    }
-
-    if let Some(pid) = pid {
-        if !process_exists(pid) {
-            return None;
-        }
     }
 
     let raw_title = title.clone();
@@ -199,7 +201,7 @@ pub(crate) fn build_window_info(
 }
 
 pub(crate) fn setup_kwin_window_feed(
-    tx: Sender<WindowFeedEvent>,
+    inbox: Arc<Mutex<Option<Vec<WindowFeedEvent>>>>,
     repaint_ctx: egui::Context,
 ) -> Result<(), String> {
     applicationlauncher::tracker::ensure_tracker_installed()?;
@@ -268,6 +270,8 @@ pub(crate) fn setup_kwin_window_feed(
                             height: window.height,
                             minimized: window.minimized,
                             demands_attention: window.demands_attention,
+                            skip_taskbar: window.skip_taskbar,
+                            skip_switcher: window.skip_switcher,
                             last_activated_at_ms: window.last_activated_at_ms,
                             activation_sequence: window.activation_sequence,
                         })
@@ -275,12 +279,18 @@ pub(crate) fn setup_kwin_window_feed(
                     let (events, current_payloads) =
                         window_feed_events_from_snapshot(previous_payloads.as_ref(), payloads);
                     let has_events = !events.is_empty();
-                    for event in events {
-                        let _ = tx.send(event);
-                    }
+                    let should_repaint = if has_events {
+                        let mut pending = match inbox.lock() {
+                            Ok(pending) => pending,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        queue_window_feed_update(&mut pending, events, &current_payloads)
+                    } else {
+                        false
+                    };
                     previous_payloads = Some(current_payloads);
                     last_generation = generation;
-                    if has_events {
+                    if should_repaint {
                         repaint_ctx.request_repaint();
                     }
                 }
@@ -299,6 +309,24 @@ pub(crate) fn setup_kwin_window_feed(
         }
     });
     Ok(())
+}
+
+pub(crate) fn queue_window_feed_update(
+    pending: &mut Option<Vec<WindowFeedEvent>>,
+    events: Vec<WindowFeedEvent>,
+    current_payloads: &HashMap<String, KWinWindowPayload>,
+) -> bool {
+    let should_repaint = pending.is_none();
+    // Once a repaint is pending, replace all intermediate events with one
+    // authoritative state. This preserves removals while avoiding replay.
+    *pending = Some(if should_repaint {
+        events
+    } else {
+        vec![WindowFeedEvent::Snapshot(
+            current_payloads.values().cloned().collect(),
+        )]
+    });
+    should_repaint
 }
 
 pub(crate) fn window_feed_events_from_snapshot(
@@ -338,6 +366,9 @@ pub(crate) fn window_info_from_kwin_payload(
     pid_to_ppid: &HashMap<i32, i32>,
     terminal_records: &[TerminalDbusRecord],
 ) -> Option<WindowInfo> {
+    if payload.skip_taskbar || payload.skip_switcher {
+        return None;
+    }
     let desktop_file_name_value = payload.desktop_file_name.trim().to_string();
     let class = if payload.class.trim().is_empty() {
         desktop_file_name_value.clone()

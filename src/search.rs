@@ -1,13 +1,14 @@
-use fuzzy_rank::metadata::{
-    MatchedFieldHighlight, MetadataCandidate, MetadataQuery, SearchField, dedup_push_search_field,
+use fuzzy_rank::fields::fuzzy::{
+    MatchedFieldHighlight, MetadataCandidate, MetadataQuery, PreparedMetadataCandidate,
+    PreparedMetadataField, SearchField, dedup_push_search_field,
 };
 use fuzzy_rank::ranking::SearchRank;
 
 use eframe::egui;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::models::{AppInfo, WindowInfo};
+use crate::models::{AppInfo, RankedAppMatch, RankedWindowMatch, WindowInfo};
 use crate::*;
 
 pub(crate) fn dedup_search_values(values: Vec<(u8, String)>) -> Vec<(u8, String)> {
@@ -60,12 +61,232 @@ pub(crate) fn metadata_fields_for_values<'a>(values: &'a [(u8, String)]) -> Vec<
     fields
 }
 
+fn projected_search_values(values: &[(u8, String)]) -> Vec<(u8, String)> {
+    values
+        .iter()
+        .map(|(priority, value)| (*priority, search_projection(value)))
+        .collect()
+}
+
+/// Keep one ASCII character per source character so fuzzy-rank byte ranges
+/// can be mapped back without Unicode case-folding changing offsets.
+pub(crate) fn search_projection(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '—' | '–' | '−' => '-',
+            '•' | '·' | '●' | '▪' | '◦' | '‣' => ' ',
+            character if character.is_ascii() => character.to_ascii_lowercase(),
+            character if character.is_whitespace() => ' ',
+            _ => ' ',
+        })
+        .collect()
+}
+
+pub(crate) fn search_queries(query: &str) -> Option<(MetadataQuery, MetadataQuery)> {
+    let projected_query = search_projection(query);
+    let base_query = MetadataQuery::new(&projected_query)?;
+    let typo_query = MetadataQuery::new(&projected_query)?.with_typo_fallback(true);
+    Some((base_query, typo_query))
+}
+
+fn search_projection_with_map(value: &str) -> (String, Vec<usize>) {
+    let mut projection = String::with_capacity(value.len());
+    let mut projection_to_original = Vec::with_capacity(value.chars().count() + 1);
+    projection_to_original.push(0);
+    for (start, character) in value.char_indices() {
+        let end = start + character.len_utf8();
+        projection.push(match character {
+            '—' | '–' | '−' => '-',
+            '•' | '·' | '●' | '▪' | '◦' | '‣' => ' ',
+            character if character.is_ascii() => character.to_ascii_lowercase(),
+            character if character.is_whitespace() => ' ',
+            _ => ' ',
+        });
+        projection_to_original.push(end);
+    }
+    (projection, projection_to_original)
+}
+
+fn map_projected_range(mapping: &[usize], start: usize, end: usize) -> Option<(usize, usize)> {
+    let mapped_start = *mapping.get(start)?;
+    let mapped_end = *mapping.get(end)?;
+    (mapped_start < mapped_end).then_some((mapped_start, mapped_end))
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedSearchDocument {
+    pub(crate) key: String,
+    pub(crate) values: Vec<(u8, String)>,
+    fields: Vec<PreparedMetadataField>,
+}
+
+impl PreparedSearchDocument {
+    pub(crate) fn new(key: String, values: Vec<(u8, String)>) -> Self {
+        let projected_values = values
+            .iter()
+            .map(|(priority, value)| (*priority, search_projection(value)))
+            .collect::<Vec<_>>();
+        let fields = projected_values
+            .iter()
+            .filter_map(|(priority, value)| PreparedMetadataField::new(*priority, value))
+            .collect();
+        Self {
+            key,
+            values,
+            fields,
+        }
+    }
+
+    pub(crate) fn candidate(&self, score: f64) -> PreparedMetadataCandidate<'_> {
+        PreparedMetadataCandidate {
+            key: &self.key,
+            fields: &self.fields,
+            score,
+        }
+    }
+}
+
+pub(crate) fn app_search_document(app: &AppInfo) -> PreparedSearchDocument {
+    PreparedSearchDocument::new(
+        format!(
+            "{}\u{0}{}",
+            app.name.to_lowercase(),
+            app.desktop_file_path.to_string_lossy()
+        ),
+        app_search_values(app),
+    )
+}
+
+pub(crate) fn window_search_document(window: &WindowInfo) -> PreparedSearchDocument {
+    PreparedSearchDocument::new(
+        format!(
+            "{}\u{0}{}\u{0}{}",
+            window_grouping_key(window),
+            window_sort_title_key(window),
+            window.id
+        ),
+        window_search_values(window),
+    )
+}
+
+pub(crate) fn rank_prepared_documents(
+    documents: &[PreparedSearchDocument],
+    scores: &[f64],
+    base_query: &MetadataQuery,
+    typo_query: &MetadataQuery,
+) -> Vec<(usize, SearchRank)> {
+    let mut matches = Vec::new();
+    for (index, document) in documents.iter().enumerate() {
+        let score = scores.get(index).copied().unwrap_or(0.0);
+        let candidate = document.candidate(score);
+        let Some(rank) = base_query
+            .search_rank_prepared(candidate)
+            .or_else(|| typo_query.search_rank_prepared(candidate))
+        else {
+            continue;
+        };
+        matches.push((candidate, rank, index));
+    }
+
+    typo_query.sort_matches_prepared_with(&mut matches);
+    matches
+        .into_iter()
+        .map(|(_, rank, index)| (index, rank))
+        .collect()
+}
+
+pub(crate) fn ranked_app_matches(
+    apps: &[AppInfo],
+    documents: &[PreparedSearchDocument],
+    pinned_apps: &[PathBuf],
+    show_system_settings_modules: bool,
+    base_query: &MetadataQuery,
+    typo_query: &MetadataQuery,
+) -> Vec<RankedAppMatch> {
+    let pinned_positions = pinned_apps
+        .iter()
+        .enumerate()
+        .map(|(position, path)| (path.as_path(), position))
+        .collect::<HashMap<_, _>>();
+    let scores = apps
+        .iter()
+        .map(|app| {
+            if let Some(&position) = pinned_positions.get(app.desktop_file_path.as_path()) {
+                2_000_000.0 - position as f64
+            } else if !app.is_settings_module {
+                1_000_000.0
+            } else {
+                0.0
+            }
+        })
+        .collect::<Vec<_>>();
+
+    rank_prepared_documents(documents, &scores, base_query, typo_query)
+        .into_iter()
+        .filter_map(|(index, rank)| {
+            let app = apps.get(index)?;
+            if !show_system_settings_modules && app.is_settings_module {
+                return None;
+            }
+            let document = documents.get(index)?;
+            let (_, display_title, highlight_segments, title_is_typo) =
+                compute_display_title_and_highlights_for_rank(
+                    &full_search_visible_app_title(app),
+                    &document.values,
+                    typo_query,
+                    rank.clone(),
+                    70,
+                );
+            let is_pinned = pinned_positions.contains_key(app.desktop_file_path.as_path());
+            Some(RankedAppMatch {
+                app: app.clone(),
+                title_is_typo,
+                is_pinned,
+                display_title,
+                highlight_segments,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn ranked_window_matches(
+    windows: &[WindowInfo],
+    documents: &[PreparedSearchDocument],
+    base_query: &MetadataQuery,
+    typo_query: &MetadataQuery,
+) -> Vec<RankedWindowMatch> {
+    let scores = vec![0.0; documents.len()];
+    rank_prepared_documents(documents, &scores, base_query, typo_query)
+        .into_iter()
+        .filter_map(|(index, rank)| {
+            let window = windows.get(index)?;
+            let document = documents.get(index)?;
+            let (_, display_title, highlight_segments, title_is_typo) =
+                compute_display_title_and_highlights_for_rank(
+                    &full_search_visible_window_title(window),
+                    &document.values,
+                    typo_query,
+                    rank.clone(),
+                    70,
+                );
+            Some(RankedWindowMatch {
+                window: window.clone(),
+                title_is_typo,
+                display_title,
+                highlight_segments,
+            })
+        })
+        .collect()
+}
+
 #[allow(dead_code)]
 pub(crate) fn search_rank_for_values(
     query: &MetadataQuery,
     values: &[(u8, String)],
 ) -> Option<SearchRank> {
-    let fields = metadata_fields_for_values(values);
+    let projected_values = projected_search_values(values);
+    let fields = metadata_fields_for_values(&projected_values);
     query.search_rank(MetadataCandidate {
         key: "",
         fields: &fields,
@@ -106,20 +327,6 @@ pub(crate) fn window_search_values(win: &WindowInfo) -> Vec<(u8, String)> {
 
     dedup_search_values(owned_values)
 }
-pub(crate) fn sort_ranked_matches_with_visible<T, FVisible, FCompare>(
-    items: &mut [T],
-    visible_priority_fn: FVisible,
-    compare_fn: FCompare,
-) where
-    FVisible: Fn(&T) -> u8,
-    FCompare: Fn(&T, &T) -> std::cmp::Ordering,
-{
-    items.sort_unstable_by(|left, right| {
-        compare_fn(left, right)
-            .then_with(|| visible_priority_fn(left).cmp(&visible_priority_fn(right)))
-    });
-}
-
 pub(crate) fn pinned_app_position(pinned_apps: &[PathBuf], app: &AppInfo) -> usize {
     pinned_apps
         .iter()
@@ -763,6 +970,7 @@ pub(crate) fn map_field_highlights_to_full_text(
     fields: &[SearchField<'_>],
     highlights: &[MatchedFieldHighlight],
 ) -> (Vec<(usize, usize, bool)>, Option<(usize, usize)>) {
+    let (full_text_projection, projection_to_original) = search_projection_with_map(full_text);
     let mut full_ranges = Vec::new();
     let mut strongest_focus: Option<(usize, usize, bool, usize)> = None;
 
@@ -770,22 +978,25 @@ pub(crate) fn map_field_highlights_to_full_text(
         let Some(field) = fields.get(hl.field_index) else {
             continue;
         };
-        let field_val_lower = field.value.to_lowercase();
-        let full_text_lower = full_text.to_lowercase();
+        let field_val = field.value;
 
-        for (match_start, _) in full_text_lower.match_indices(&field_val_lower) {
+        for (match_start, _) in full_text_projection.match_indices(field_val) {
             for &(r_start, r_end, is_exact) in &hl.ranges {
-                let mapped_start = match_start + r_start;
-                let mapped_end = match_start + r_end;
-                if mapped_end <= full_text.len() {
+                if let Some((mapped_start, mapped_end)) = map_projected_range(
+                    &projection_to_original,
+                    match_start + r_start,
+                    match_start + r_end,
+                ) {
                     full_ranges.push((mapped_start, mapped_end, is_exact));
                 }
             }
 
             if let Some((f_start, f_end)) = hl.focus_range {
-                let mapped_f_start = match_start + f_start;
-                let mapped_f_end = match_start + f_end;
-                if mapped_f_end <= full_text.len() {
+                if let Some((mapped_f_start, mapped_f_end)) = map_projected_range(
+                    &projection_to_original,
+                    match_start + f_start,
+                    match_start + f_end,
+                ) {
                     let is_exact = hl
                         .ranges
                         .iter()
@@ -969,35 +1180,55 @@ pub(crate) fn compute_display_title_and_highlights(
     typo_query: &MetadataQuery,
     max_chars: usize,
 ) -> Option<(SearchRank, String, Vec<(usize, usize, bool)>, bool)> {
-    let fields = metadata_fields_for_values(search_values);
+    let projected_values = projected_search_values(search_values);
+    let fields = metadata_fields_for_values(&projected_values);
     let candidate = MetadataCandidate {
         key: "",
         fields: &fields,
         score: 0.0,
     };
-    let base_res = base_query.search_rank_with_highlights(candidate);
-    let typo_res = typo_query.search_rank_with_highlights(candidate);
+    let (rank, highlights) = base_query
+        .search_rank_with_highlights(candidate)
+        .or_else(|| typo_query.search_rank_with_highlights(candidate))?;
 
-    let (rank, highlights) = match (base_res, typo_res) {
-        (Some((base_rank, base_high)), Some((typo_rank, typo_high))) => {
-            if pick_better_rank(base_rank.clone(), typo_rank.clone()) == base_rank {
-                (base_rank, base_high)
-            } else {
-                (typo_rank, typo_high)
-            }
-        }
-        (Some((base_rank, base_high)), None) => (base_rank, base_high),
-        (None, Some((typo_rank, typo_high))) => (typo_rank, typo_high),
-        (None, None) => return None,
+    Some(render_display_title_and_highlights(
+        full_text, &fields, rank, highlights, max_chars,
+    ))
+}
+
+pub(crate) fn compute_display_title_and_highlights_for_rank(
+    full_text: &str,
+    search_values: &[(u8, String)],
+    query: &MetadataQuery,
+    rank: SearchRank,
+    max_chars: usize,
+) -> (SearchRank, String, Vec<(usize, usize, bool)>, bool) {
+    let projected_values = projected_search_values(search_values);
+    let fields = metadata_fields_for_values(&projected_values);
+    let candidate = MetadataCandidate {
+        key: "",
+        fields: &fields,
+        score: 0.0,
     };
+    let highlights = query.highlights_for_rank(candidate, &rank);
 
+    render_display_title_and_highlights(full_text, &fields, rank, highlights, max_chars)
+}
+
+fn render_display_title_and_highlights(
+    full_text: &str,
+    fields: &[SearchField<'_>],
+    rank: SearchRank,
+    highlights: Vec<MatchedFieldHighlight>,
+    max_chars: usize,
+) -> (SearchRank, String, Vec<(usize, usize, bool)>, bool) {
     let (full_ranges, focus) = map_field_highlights_to_full_text(full_text, &fields, &highlights);
     let (display_title, highlight_segments) =
         focus_text_around_byte_range(full_text, focus, &full_ranges, max_chars);
 
     let title_is_typo = highlight_segments.iter().any(|(_, _, is_red)| !*is_red);
 
-    Some((rank, display_title, highlight_segments, title_is_typo))
+    (rank, display_title, highlight_segments, title_is_typo)
 }
 pub(crate) fn best_app_match_score(
     window_keys: &[String],
@@ -1226,12 +1457,16 @@ pub(crate) fn expand_range_to_token_boundaries(
 }
 
 pub(crate) fn fuzzy_rank_visible_match_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
-    let Some(query) = MetadataQuery::new(query).map(|query| query.with_typo_fallback(true)) else {
+    let (projected_text, projection_to_original) = search_projection_with_map(text);
+    let projected_query = search_projection(query);
+    let Some(query) =
+        MetadataQuery::new(&projected_query).map(|query| query.with_typo_fallback(true))
+    else {
         return Vec::new();
     };
     let field = SearchField {
         priority: 0,
-        value: text,
+        value: &projected_text,
     };
     let fields = [field];
     let candidate = MetadataCandidate {
@@ -1245,20 +1480,29 @@ pub(crate) fn fuzzy_rank_visible_match_ranges(text: &str, query: &str) -> Vec<(u
     let provenance = rank.provenance();
 
     match provenance.variant_scope {
-        Some(1) => alnum_tokens_with_ranges(text)
+        Some(1) => alnum_tokens_with_ranges(&projected_text)
             .into_iter()
             .nth(provenance.token_index)
-            .map(|(token_start, token_end, _)| vec![(token_start, token_end)])
-            .unwrap_or_default(),
-        Some(2) => alnum_tokens_with_ranges(text)
-            .into_iter()
-            .nth(provenance.token_index)
-            .map(|(start, end, _)| vec![(start, end)])
-            .unwrap_or_default(),
-        _ => char_span_to_byte_range(text, provenance.start_idx, provenance.matched_char_len)
-            .and_then(|(start, end)| expand_range_to_token_boundaries(text, start, end))
+            .and_then(|(token_start, token_end, _)| {
+                map_projected_range(&projection_to_original, token_start, token_end)
+            })
             .map(|range| vec![range])
             .unwrap_or_default(),
+        Some(2) => alnum_tokens_with_ranges(&projected_text)
+            .into_iter()
+            .nth(provenance.token_index)
+            .and_then(|(start, end, _)| map_projected_range(&projection_to_original, start, end))
+            .map(|range| vec![range])
+            .unwrap_or_default(),
+        _ => char_span_to_byte_range(
+            &projected_text,
+            provenance.start_idx,
+            provenance.matched_char_len,
+        )
+        .and_then(|(start, end)| expand_range_to_token_boundaries(&projected_text, start, end))
+        .and_then(|(start, end)| map_projected_range(&projection_to_original, start, end))
+        .map(|range| vec![range])
+        .unwrap_or_default(),
     }
 }
 
@@ -1532,24 +1776,10 @@ pub(crate) fn highlighted_title_job_from_segments(
     job
 }
 
-pub(crate) fn pick_better_rank(left: SearchRank, right: SearchRank) -> SearchRank {
-    if left <= right { left } else { right }
-}
-
 #[allow(dead_code)]
 pub(crate) fn visible_title_has_typo_match(title: &str, query: &str) -> bool {
     if query.trim().is_empty() || !title_match_ranges(title, query).is_empty() {
         return false;
     }
     !typo_title_match_ranges(title, query).is_empty()
-}
-
-pub(crate) fn visible_match_priority(title: &str, query: &str) -> u8 {
-    if query.trim().is_empty() {
-        0
-    } else if !title_match_ranges(title, query).is_empty() {
-        0
-    } else {
-        1
-    }
 }

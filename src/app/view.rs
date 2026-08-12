@@ -130,17 +130,10 @@ impl eframe::App for App {
         }
 
         if !handled_focus_launcher && self.use_kwin_window_feed {
-            let mut pending_events = Vec::with_capacity(WINDOW_FEED_EVENTS_PER_FRAME);
-            for _ in 0..WINDOW_FEED_EVENTS_PER_FRAME {
-                match self.window_feed_receiver.try_recv() {
-                    Ok(event) => pending_events.push(event),
-                    Err(_) => break,
-                }
-            }
-            let hit_window_feed_budget = pending_events.len() == WINDOW_FEED_EVENTS_PER_FRAME;
-            if hit_window_feed_budget {
-                ctx.request_repaint();
-            }
+            let pending_events = match self.window_feed_inbox.lock() {
+                Ok(mut inbox) => inbox.take().unwrap_or_default(),
+                Err(poisoned) => poisoned.into_inner().take().unwrap_or_default(),
+            };
             self.apply_window_feed_events(pending_events);
         } else if !self.use_kwin_window_feed {
             // Check background receiver for periodic window updates
@@ -191,13 +184,20 @@ impl eframe::App for App {
         {
             Some(Ok(apps)) => {
                 self.apps = apps;
+                self.app_search_documents = self.apps.iter().map(app_search_document).collect();
                 self.apps_generation = self.apps_generation.wrapping_add(1);
                 self.refresh_app_audio_levels();
                 self.background_apps_receiver = None;
                 ctx.request_repaint();
+                if self.background_apps_refresh_queued {
+                    self.start_background_app_load();
+                }
             }
             Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
                 self.background_apps_receiver = None;
+                if self.background_apps_refresh_queued {
+                    self.start_background_app_load();
+                }
             }
             _ => {}
         }
@@ -213,6 +213,8 @@ impl eframe::App for App {
                     match result {
                         LoadResult::AppsSuccess(apps) => {
                             self.apps = apps;
+                            self.app_search_documents =
+                                self.apps.iter().map(app_search_document).collect();
                             self.apps_generation = self.apps_generation.wrapping_add(1);
                             self.refresh_app_audio_levels();
                             self.selected_index = 0;
@@ -289,10 +291,6 @@ impl eframe::App for App {
             && !self.windows.is_empty()
         {
             ctx.request_repaint_after(Duration::from_secs(1));
-        }
-
-        if !handled_focus_launcher {
-            self.prune_stale_windows();
         }
 
         if let Some(deadline) = self.pending_window_search_refresh_at {
@@ -530,78 +528,17 @@ impl eframe::App for App {
                                             (false, false) => a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()),
                                         })
 				                                });
-			                            } else if let (Some(base_query), Some(typo_query)) = (
-                                    MetadataQuery::new(&search_query),
-                                    MetadataQuery::new(&search_query).map(|q| q.with_typo_fallback(true)),
-                                ) {
-		                                let mut ranked_apps: Vec<RankedAppMatch> = self.apps
-		                                    .iter()
-                                    .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
-                                    .filter_map(|app| {
-                                        let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
-	                                        let search_values = app_search_values(app);
-                                        let (rank, display_title, highlight_segments, title_is_typo) =
-                                            compute_display_title_and_highlights(
-                                                &full_search_visible_app_title(app),
-                                                &search_values,
-                                                &base_query,
-                                                &typo_query,
-                                                70,
-                                            )?;
-                                        let visible_match_priority = visible_match_priority(
-                                            &full_search_visible_app_title(app),
-                                            &search_query,
-                                        );
-                                        let pin_position = pinned_app_position(&self.pinned_apps, app);
-                                        let candidate_score = if is_pinned {
-                                            2_000_000.0 - pin_position as f64
-                                        } else if !app.is_settings_module {
-                                            1_000_000.0
-                                        } else {
-                                            0.0
-                                        };
-	                                        Some(RankedAppMatch {
-	                                            app: app.clone(),
-	                                            rank,
-	                                            title_is_typo,
-	                                            visible_match_priority,
-	                                            is_pinned,
-                                                display_title,
-                                                highlight_segments,
-	                                            search_values,
-	                                            candidate_key: format!(
-	                                                "{}\u{0}{}",
-	                                                app.name.to_lowercase(),
-                                                app.desktop_file_path.to_string_lossy()
-                                            ),
-                                            candidate_score,
-	                                        })
-		                                    })
-		                                    .collect();
-			                                sort_ranked_matches_with_visible(
-	                                    &mut ranked_apps,
-	                                            |item| item.visible_match_priority,
-		                                    |left, right| {
-		                                        let left_fields =
-		                                            metadata_fields_for_values(&left.search_values);
-		                                        let right_fields =
-		                                            metadata_fields_for_values(&right.search_values);
-		                                        typo_query.compare_candidates(
-		                                            MetadataCandidate {
-		                                                key: &left.candidate_key,
-		                                                fields: &left_fields,
-		                                                score: left.candidate_score,
-		                                            },
-		                                            &left.rank,
-		                                            MetadataCandidate {
-		                                                key: &right.candidate_key,
-		                                                fields: &right_fields,
-		                                                score: right.candidate_score,
-		                                            },
-		                                            &right.rank,
-		                                        )
-		                                    },
-		                                );
+                            } else if let Some((base_query, typo_query)) =
+                                search_queries(&search_query)
+                            {
+                                let ranked_apps = ranked_app_matches(
+                                    &self.apps,
+                                    &self.app_search_documents,
+                                    &self.pinned_apps,
+                                    self.show_system_settings_modules,
+                                    &base_query,
+                                    &typo_query,
+                                );
                                         filtered_app_title_is_typos = Arc::new(ranked_apps
                                             .iter()
                                             .map(|item| item.title_is_typo)
@@ -689,65 +626,15 @@ impl eframe::App for App {
 	                                        })
 	                                        .then_with(|| a.id.cmp(&b.id))
 					                                });
-				                            } else if let (Some(base_query), Some(typo_query)) = (
-                                    MetadataQuery::new(&search_query),
-                                    MetadataQuery::new(&search_query).map(|q| q.with_typo_fallback(true)),
-                                ) {
-		                                let mut ranked_windows: Vec<RankedWindowMatch> = self.windows
-                                    .iter()
-                                    .filter_map(|win| {
-                                        let search_values = window_search_values(win);
-                                        let (rank, display_title, highlight_segments, title_is_typo) =
-                                            compute_display_title_and_highlights(
-                                                &full_search_visible_window_title(win),
-                                                &search_values,
-                                                &base_query,
-                                                &typo_query,
-                                                70,
-                                            )?;
-                                        let visible_match_priority = 0;
-                                        Some(RankedWindowMatch {
-                                            window: win.clone(),
-                                            rank,
-                                            title_is_typo,
-                                            visible_match_priority,
-                                            display_title,
-                                            highlight_segments,
-                                            search_values,
-                                            candidate_key: format!(
-                                                "{}\u{0}{}\u{0}{}",
-                                                window_grouping_key(win),
-                                                window_sort_title_key(win),
-                                                win.id
-                                            ),
-                                            candidate_score: 0.0,
-                                        })
-                                    })
-                                    .collect();
-			                                sort_ranked_matches_with_visible(
-	                                    &mut ranked_windows,
-	                                            |item| item.visible_match_priority,
-		                                    |left, right| {
-		                                        let left_fields =
-		                                            metadata_fields_for_values(&left.search_values);
-		                                        let right_fields =
-		                                            metadata_fields_for_values(&right.search_values);
-		                                        typo_query.compare_candidates(
-		                                            MetadataCandidate {
-		                                                key: &left.candidate_key,
-		                                                fields: &left_fields,
-		                                                score: left.candidate_score,
-		                                            },
-		                                            &left.rank,
-		                                            MetadataCandidate {
-		                                                key: &right.candidate_key,
-		                                                fields: &right_fields,
-		                                                score: right.candidate_score,
-		                                            },
-		                                            &right.rank,
-		                                        )
-		                                    },
-		                                );
+                                    } else if let Some((base_query, typo_query)) =
+                                        search_queries(&search_query)
+                                    {
+                                let ranked_windows = ranked_window_matches(
+                                    &self.windows,
+                                    &self.window_search_documents,
+                                    &base_query,
+                                    &typo_query,
+                                );
                                         filtered_window_title_is_typos = Arc::new(ranked_windows
                                             .iter()
                                             .map(|item| item.title_is_typo)
@@ -792,78 +679,17 @@ impl eframe::App for App {
 		                                        (false, false) => a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()),
 		                                    })
 				                            });
-				                        } else if let (Some(base_query), Some(typo_query)) = (
-                                MetadataQuery::new(&search_query),
-                                MetadataQuery::new(&search_query).map(|q| q.with_typo_fallback(true)),
-                            ) {
-		                            let mut ranked_apps: Vec<RankedAppMatch> = self.apps
-		                                .iter()
-		                                .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
-		                                .filter_map(|app| {
-		                                    let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
-			                                    let search_values = app_search_values(app);
-                                            let (rank, display_title, highlight_segments, title_is_typo) =
-                                                compute_display_title_and_highlights(
-                                                    &full_search_visible_app_title(app),
-                                                    &search_values,
-                                                    &base_query,
-                                                    &typo_query,
-                                                    70,
-                                                )?;
-		                                    let visible_match_priority = visible_match_priority(
-		                                        &full_search_visible_app_title(app),
-		                                        &search_query,
-		                                    );
-		                                    let pin_position = pinned_app_position(&self.pinned_apps, app);
-		                                    let candidate_score = if is_pinned {
-		                                        2_000_000.0 - pin_position as f64
-	                                    } else if !app.is_settings_module {
-	                                        1_000_000.0
-	                                    } else {
-	                                        0.0
-	                                    };
-			                                    Some(RankedAppMatch {
-			                                        app: app.clone(),
-			                                        rank,
-			                                        title_is_typo,
-			                                        visible_match_priority,
-			                                        is_pinned,
-                                                    display_title,
-                                                    highlight_segments,
-			                                        search_values,
-			                                        candidate_key: format!(
-		                                            "{}\u{0}{}",
-	                                            app.name.to_lowercase(),
-	                                            app.desktop_file_path.to_string_lossy()
-	                                        ),
-	                                        candidate_score,
-	                                    })
-		                                })
-		                                .collect();
-				                            sort_ranked_matches_with_visible(
-				                                &mut ranked_apps,
-	                                            |item| item.visible_match_priority,
-			                                |left, right| {
-			                                    let left_fields =
-			                                        metadata_fields_for_values(&left.search_values);
-			                                    let right_fields =
-			                                        metadata_fields_for_values(&right.search_values);
-			                                    typo_query.compare_candidates(
-			                                        MetadataCandidate {
-			                                            key: &left.candidate_key,
-			                                            fields: &left_fields,
-			                                            score: left.candidate_score,
-			                                        },
-			                                        &left.rank,
-			                                        MetadataCandidate {
-			                                            key: &right.candidate_key,
-			                                            fields: &right_fields,
-			                                            score: right.candidate_score,
-			                                        },
-			                                        &right.rank,
-			                                    )
-			                                },
-			                            );
+                        } else if let Some((base_query, typo_query)) =
+                            search_queries(&search_query)
+                        {
+                            let ranked_apps = ranked_app_matches(
+                                &self.apps,
+                                &self.app_search_documents,
+                                &self.pinned_apps,
+                                self.show_system_settings_modules,
+                                &base_query,
+                                &typo_query,
+                            );
 	                                    filtered_app_title_is_typos = Arc::new(ranked_apps
                                         .iter()
                                         .map(|item| item.title_is_typo)

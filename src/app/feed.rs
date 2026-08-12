@@ -10,6 +10,10 @@ pub(super) fn terminal_metadata_refresh_due(
 }
 
 impl App {
+    fn rebuild_window_search_documents(&mut self) {
+        self.window_search_documents = self.windows.iter().map(window_search_document).collect();
+    }
+
     fn refresh_process_tree_cache(&mut self) {
         let refresh = self
             .process_tree_cache_updated_at
@@ -167,6 +171,7 @@ impl App {
     }
 
     pub(super) fn schedule_window_search_refresh(&mut self) {
+        self.rebuild_window_search_documents();
         if self.search_query.trim().is_empty() {
             self.pending_window_search_refresh_at = None;
             self.windows_generation = self.windows_generation.wrapping_add(1);
@@ -191,6 +196,7 @@ impl App {
     pub(super) fn apply_window_snapshot(&mut self, new_windows: Vec<WindowInfo>) {
         if self.windows.is_empty() {
             self.windows = new_windows;
+            self.rebuild_window_search_documents();
             self.seed_window_icon_cache();
             self.missing_window_counts.clear();
             self.windows_generation = self.windows_generation.wrapping_add(1);
@@ -342,12 +348,12 @@ impl App {
                         }
                         changed = true;
                     } else {
-                        self.missing_window_counts.remove(&window_id);
-                        let previous_len = self.windows.len();
-                        self.windows.retain(|window| window.id != window_id);
-                        let removed = self.windows.len() != previous_len;
-                        changed |= removed;
-                        search_changed |= removed;
+                        // KWin owns window lifetime. A missing PID or a transient
+                        // enrichment failure is not evidence that the surface closed.
+                        if self.windows.iter().any(|window| window.id == window_id) {
+                            let count = self.missing_window_counts.entry(window_id).or_default();
+                            *count = count.saturating_add(1);
+                        }
                     }
                 }
                 WindowFeedEvent::Remove(id) => {
@@ -370,43 +376,6 @@ impl App {
         }
         if needs_terminal_metadata_refresh {
             self.start_terminal_metadata_refresh();
-        }
-    }
-
-    pub(super) fn prune_stale_windows(&mut self) {
-        let now = Instant::now();
-        if self
-            .last_stale_prune
-            .is_some_and(|last| now.duration_since(last) < std::time::Duration::from_secs(1))
-        {
-            return;
-        }
-        self.last_stale_prune = Some(now);
-
-        let stale_ids: HashSet<String> = self
-            .windows
-            .iter()
-            .filter(|window| window.pid.is_some_and(|pid| !process_exists(pid)))
-            .map(|window| window.id.clone())
-            .collect();
-
-        if stale_ids.is_empty() {
-            return;
-        }
-
-        self.windows
-            .retain(|window| !stale_ids.contains(&window.id));
-        self.missing_window_counts
-            .retain(|window_id, _| !stale_ids.contains(window_id));
-        self.schedule_window_search_refresh();
-        self.refresh_window_audio_cache();
-
-        if self
-            .last_selected_window_id
-            .as_ref()
-            .is_some_and(|window_id| stale_ids.contains(window_id))
-        {
-            self.last_selected_window_id = None;
         }
     }
 
@@ -534,8 +503,10 @@ impl App {
 
     pub(super) fn start_background_app_load(&mut self) {
         if self.background_apps_receiver.is_some() {
+            self.background_apps_refresh_queued = true;
             return;
         }
+        self.background_apps_refresh_queued = false;
         let theme = self
             .force_theme
             .as_deref()

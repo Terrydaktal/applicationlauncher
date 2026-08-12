@@ -7,6 +7,7 @@ use crate::models::{LauncherSettings, SettingsWindowState};
 
 impl SettingsWindowState {
     pub(crate) fn new(settings: LauncherSettings) -> Self {
+        let settings = settings.sanitized();
         Self {
             pending_ui_scale: settings.ui_scale,
             scale_anchor: settings.ui_scale,
@@ -525,7 +526,7 @@ pub(crate) fn load_launcher_settings() -> LauncherSettings {
         }
     }
 
-    settings
+    settings.sanitized()
 }
 
 pub(crate) fn save_launcher_settings(settings: LauncherSettings) {

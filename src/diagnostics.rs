@@ -4,10 +4,12 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
@@ -39,6 +41,32 @@ impl Drop for SingleInstanceLock {
 }
 
 static DEBUG_ATTACH_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+fn control_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    (result == 0 && length >= std::mem::size_of::<libc::ucred>() as libc::socklen_t)
+        .then_some(credentials.pid)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn control_peer_pid(_stream: &std::os::unix::net::UnixStream) -> Option<i32> {
+    None
+}
 
 #[cfg(target_os = "linux")]
 fn pid_belongs_to_current_user(pid: u32) -> bool {
@@ -104,6 +132,15 @@ pub(crate) fn send_launcher_control_request(
     Ok(response.trim().to_string())
 }
 
+fn ensure_private_state_dir(path: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(path)
+        .map_err(|err| format!("failed to create launcher state directory: {err}"))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|err| format!("failed to restrict launcher state directory: {err}"))?;
+    Ok(())
+}
+
 pub(crate) fn capture_running_launcher_diagnostics(socket_path: &Path) -> Result<PathBuf, String> {
     let request = format!("diagnose {}\n", std::process::id());
     let response = send_launcher_control_request(socket_path, &request, true)?;
@@ -127,8 +164,7 @@ pub(crate) fn capture_running_launcher_diagnostics(socket_path: &Path) -> Result
 
     let result = (|| {
         let state_dir = launcher_state_dir();
-        std::fs::create_dir_all(&state_dir)
-            .map_err(|err| format!("failed to create launcher state directory: {err}"))?;
+        ensure_private_state_dir(&state_dir)?;
 
         let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
             .unwrap_or_else(|err| format!("unable to read process status: {err}\n"));
@@ -235,6 +271,7 @@ pub(crate) fn handle_launcher_control_connection(
     let request = std::str::from_utf8(&request[..request_len])
         .unwrap_or_default()
         .trim();
+    let peer_pid = control_peer_pid(&stream);
 
     match request {
         request if request.starts_with("diagnose ") => {
@@ -245,6 +282,7 @@ pub(crate) fn handle_launcher_control_connection(
             let response = match tracer_pid
                 .filter(|pid| *pid > 0)
                 .filter(|pid| pid_belongs_to_current_user(*pid))
+                .filter(|pid| cfg!(not(target_os = "linux")) || peer_pid == Some(*pid as i32))
                 .ok_or_else(|| "diagnose requires the requesting debugger PID".to_string())
                 .and_then(|pid| set_debugger_attach_enabled(Some(pid)))
             {
@@ -354,7 +392,14 @@ pub(crate) fn focus_existing_launcher_window() {
 }
 
 pub(crate) fn request_launcher_foreground() {
-    std::thread::spawn(focus_existing_launcher_window);
+    static FOCUS_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    if FOCUS_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    std::thread::spawn(|| {
+        focus_existing_launcher_window();
+        FOCUS_IN_FLIGHT.store(false, Ordering::Release);
+    });
 }
 pub(crate) fn launcher_state_dir() -> PathBuf {
     if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
@@ -363,7 +408,13 @@ pub(crate) fn launcher_state_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
         return PathBuf::from(home).join(".local/state/applicationlauncher");
     }
-    std::env::temp_dir().join("applicationlauncher")
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime_dir).join("applicationlauncher");
+    }
+    PathBuf::from(format!(
+        "/tmp/applicationlauncher-{}",
+        rustix::process::getuid().as_raw()
+    ))
 }
 
 pub(crate) fn write_stderr_line(message: &str) {
@@ -396,19 +447,30 @@ pub(crate) fn install_panic_hook() {
         message.push_str(&format!("backtrace:\n{}\n", Backtrace::force_capture()));
 
         let state_dir = launcher_state_dir();
-        if std::fs::create_dir_all(&state_dir).is_ok() {
+        if ensure_private_state_dir(&state_dir).is_ok() {
             let panic_log = state_dir.join("panic.log");
             let mut panic_entry = String::new();
             panic_entry.push_str("\n==== applicationlauncher panic ====\n");
             panic_entry.push_str(&format!("{:?}\n", std::time::SystemTime::now()));
             panic_entry.push_str(&message);
-            if let Ok(mut file) = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
-                .open(&panic_log)
-            {
-                let _ = file.write_all(panic_entry.as_bytes());
+            const MAX_PANIC_LOG_BYTES: u64 = 4 * 1024 * 1024;
+            let current_size = std::fs::metadata(&panic_log)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            if current_size < MAX_PANIC_LOG_BYTES {
+                if let Ok(mut file) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .mode(0o600)
+                    .open(&panic_log)
+                {
+                    let remaining = (MAX_PANIC_LOG_BYTES - current_size) as usize;
+                    let entry = panic_entry.as_bytes();
+                    let _ = file.write_all(&entry[..entry.len().min(remaining)]);
+                }
+            } else {
+                let _ =
+                    applicationlauncher::process::atomic_write(&panic_log, panic_entry.as_bytes());
             }
             let latest_log = state_dir.join("panic-latest.log");
             let _ = applicationlauncher::process::atomic_write(&latest_log, message.as_bytes());

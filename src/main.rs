@@ -1,6 +1,9 @@
 use eframe::egui;
 use std::time::Instant;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 mod models;
 use models::*;
 mod config;
@@ -199,6 +202,10 @@ fn main() -> eframe::Result {
     let socket_path = get_socket_path(mode);
     if let Some(parent) = socket_path.parent() {
         let _ = std::fs::create_dir_all(parent);
+        if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+            #[cfg(unix)]
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
     }
     let listener = match std::os::unix::net::UnixListener::bind(&socket_path) {
         Ok(listener) => {
@@ -222,7 +229,6 @@ fn main() -> eframe::Result {
                 }
             }
             if send_launcher_control_request(&socket_path, "focus\n", false).is_ok() {
-                focus_existing_launcher_window();
                 return Ok(());
             }
             // No listener answered, so this is a stale socket. Only remove it
