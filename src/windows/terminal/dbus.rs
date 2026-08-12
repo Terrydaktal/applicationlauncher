@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 pub(crate) fn terminal_dbus_string(
     values: &HashMap<String, zbus::zvariant::OwnedValue>,
     key: &str,
@@ -50,19 +52,56 @@ pub(crate) fn parse_terminal_dbus_records(
 }
 
 pub(crate) fn fetch_terminal_dbus_records() -> Result<Vec<TerminalDbusRecord>, String> {
-    let connection = zbus::blocking::Connection::session()
+    let connection = zbus::blocking::connection::Builder::session()
+        .map_err(|err| format!("Could not connect to the session D-Bus: {err}"))?
+        .method_timeout(Duration::from_secs(3))
+        .build()
         .map_err(|err| format!("Could not connect to the session D-Bus: {err}"))?;
-    let proxy = zbus::blocking::Proxy::new(
+    let dbus_proxy = zbus::blocking::Proxy::new(
         &connection,
-        TERMINAL_DBUS_SERVICE,
-        TERMINAL_DBUS_PATH,
-        TERMINAL_DBUS_INTERFACE,
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
     )
-    .map_err(|err| format!("Could not create the XFCE4 Terminal D-Bus client: {err}"))?;
-    let raw_records: Vec<HashMap<String, zbus::zvariant::OwnedValue>> = proxy
-        .call("ListTerminals", &())
-        .map_err(|err| format!("XFCE4 Terminal's metadata API is unavailable: {err}"))?;
-    Ok(parse_terminal_dbus_records(raw_records))
+    .map_err(|err| format!("Could not create the session D-Bus client: {err}"))?;
+    let names: Vec<String> = dbus_proxy
+        .call("ListNames", &())
+        .map_err(|err| format!("Could not enumerate session D-Bus names: {err}"))?;
+
+    let mut records = Vec::new();
+    let mut services = terminal_dbus_service_names(names);
+    services.sort();
+    services.dedup();
+    for service in services {
+        let Ok(proxy) = zbus::blocking::Proxy::new(
+            &connection,
+            service.as_str(),
+            TERMINAL_DBUS_PATH,
+            TERMINAL_DBUS_INTERFACE,
+        ) else {
+            continue;
+        };
+        let Ok(raw_records) = proxy
+            .call::<_, _, Vec<HashMap<String, zbus::zvariant::OwnedValue>>>("ListTerminals", &())
+        else {
+            continue;
+        };
+        records.extend(parse_terminal_dbus_records(raw_records));
+    }
+    records.sort_by(|left, right| left.tab_uuid.cmp(&right.tab_uuid));
+    records.dedup_by(|left, right| left.tab_uuid == right.tab_uuid);
+    (!records.is_empty())
+        .then_some(records)
+        .ok_or_else(|| "XFCE4 Terminal's metadata API is unavailable".to_string())
+}
+
+pub(crate) fn terminal_dbus_service_names(names: Vec<String>) -> Vec<String> {
+    names
+        .into_iter()
+        .filter(|name| {
+            name == TERMINAL_DBUS_SERVICE || name.starts_with("org.xfce.Terminal5.Instance.")
+        })
+        .collect()
 }
 
 pub(crate) fn terminal_record_for_window_title<'a>(

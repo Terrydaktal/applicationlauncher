@@ -30,7 +30,7 @@ pub(crate) fn launch_app(exec: &str) {
             }
         }
 
-        let _ = cmd.spawn();
+        let _ = applicationlauncher::process::spawn_and_reap(cmd);
     });
 }
 
@@ -56,7 +56,7 @@ pub(crate) fn launch_terminal_command(command: &str) {
             .arg(r#"fish -ic 'eval "$APPLICATIONLAUNCHER_TERMINAL_COMMAND"; exec fish'"#)
             .env("APPLICATIONLAUNCHER_TERMINAL_COMMAND", command);
         scrub_command_env(&mut cmd);
-        let _ = cmd.spawn();
+        let _ = applicationlauncher::process::spawn_and_reap(cmd);
     });
 }
 
@@ -104,7 +104,7 @@ pub(crate) fn launch_fish_terminal(
         cmd.env_remove("VIRTUAL_ENV");
         cmd.env_remove("UV_ACTIVE");
 
-        let _ = cmd.spawn();
+        let _ = applicationlauncher::process::spawn_and_reap(cmd);
     });
 }
 
@@ -115,7 +115,7 @@ pub(crate) fn launch_terminal_window() {
         cmd.env_remove("PYTHONHOME");
         cmd.env_remove("VIRTUAL_ENV");
         cmd.env_remove("UV_ACTIVE");
-        let _ = cmd.spawn();
+        let _ = applicationlauncher::process::spawn_and_reap(cmd);
     });
 }
 
@@ -268,7 +268,7 @@ pub(crate) fn clone_chrome_window(win: &WindowInfo) -> bool {
     command.env_remove("PYTHONHOME");
     command.env_remove("VIRTUAL_ENV");
     command.env_remove("UV_ACTIVE");
-    command.spawn().is_ok()
+    applicationlauncher::process::spawn_and_reap(command).is_ok()
 }
 
 pub(crate) fn expand_display_path_candidate(value: &str) -> Option<PathBuf> {
@@ -402,7 +402,7 @@ pub(crate) fn clone_pcmanfm_with_fish_cd(target_hint: String) {
             .env("APPLICATIONLAUNCHER_PCMANFM_TARGET", target_hint)
             .env("APPLICATIONLAUNCHER_PCMANFM_FALLBACK", fallback_target);
         scrub_command_env(&mut cmd);
-        let _ = cmd.spawn();
+        let _ = applicationlauncher::process::spawn_and_reap(cmd);
     });
 }
 
@@ -414,7 +414,7 @@ pub(crate) fn launch_pcmanfm_target(exe_path: Option<PathBuf>, target: &str) -> 
     };
     command.arg("--new-win").arg(target);
     scrub_command_env(&mut command);
-    command.spawn().is_ok()
+    applicationlauncher::process::spawn_and_reap(command).is_ok()
 }
 
 pub(crate) fn clone_pcmanfm_window(win: &WindowInfo) -> bool {
@@ -452,7 +452,7 @@ pub(crate) fn launch_dolphin_target(exe_path: Option<PathBuf>, target: Option<&s
         command.arg(target);
     }
     scrub_command_env(&mut command);
-    command.spawn().is_ok()
+    applicationlauncher::process::spawn_and_reap(command).is_ok()
 }
 
 pub(crate) fn launch_dolphin_app() -> bool {
@@ -491,5 +491,5 @@ pub(crate) fn launch_desktop_entry(desktop_file_path: &Path) -> bool {
     cmd.env_remove("PYTHONPATH");
     cmd.env_remove("VIRTUAL_ENV");
     cmd.env_remove("UV_ACTIVE");
-    cmd.spawn().is_ok()
+    applicationlauncher::process::spawn_and_reap(cmd).is_ok()
 }

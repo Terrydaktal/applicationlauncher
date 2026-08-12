@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::models::ProcessChainEntry;
@@ -150,8 +150,12 @@ pub(crate) fn find_terminal_leaf_with_stat_reader(
         .flatten()
         .map(|pid| (*pid, 1_usize))
         .collect::<Vec<_>>();
+    let mut visited = HashSet::new();
 
     while let Some((pid, depth)) = pending.pop() {
+        if depth > 64 || !visited.insert(pid) {
+            continue;
+        }
         let Some(process_stat) = stat_for_pid(pid) else {
             continue;
         };
@@ -174,7 +178,12 @@ pub(crate) fn find_terminal_leaf_with_stat_reader(
         }
 
         if let Some(children) = ppid_to_children.get(&pid) {
-            pending.extend(children.iter().map(|child| (*child, depth + 1)));
+            pending.extend(
+                children
+                    .iter()
+                    .take(4096usize.saturating_sub(visited.len()))
+                    .map(|child| (*child, depth + 1)),
+            );
         }
     }
 
@@ -190,8 +199,12 @@ pub(crate) fn build_process_chain(
 ) -> Vec<ProcessChainEntry> {
     let mut chain = Vec::new();
     let mut current_pid = Some(start_pid);
+    let mut visited = HashSet::new();
 
     while let Some(pid) = current_pid {
+        if chain.len() >= 128 || !visited.insert(pid) {
+            break;
+        }
         let name = pid_to_name
             .get(&pid)
             .cloned()

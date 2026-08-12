@@ -24,6 +24,12 @@ pub fn state_dir() -> std::path::PathBuf {
                 .map(std::path::PathBuf::from)
                 .map(|home| home.join(".local/state"))
         })
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from))
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(format!(
+                "/tmp/applicationlauncher-{}",
+                rustix::process::getuid().as_raw()
+            ))
+        })
         .join("applicationlauncher")
 }

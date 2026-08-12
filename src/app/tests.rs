@@ -2,7 +2,7 @@ use super::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuzzy_rank::metadata::SearchField;
+    use fuzzy_rank::fields::fuzzy::{MetadataCandidate, MetadataQuery, SearchField};
 
     fn test_window_info(title: &str) -> WindowInfo {
         WindowInfo {
@@ -40,6 +40,8 @@ mod tests {
             height: 600,
             minimized: true,
             demands_attention,
+            skip_taskbar: false,
+            skip_switcher: false,
             last_activated_at_ms: Some(0),
             activation_sequence: 1,
         }
@@ -88,6 +90,31 @@ mod tests {
             events.get(1),
             Some(WindowFeedEvent::Upsert(payload))
                 if payload.id == latest.id && payload.title == latest.title
+        ));
+    }
+
+    #[test]
+    fn occupied_window_feed_inbox_is_replaced_by_one_snapshot_without_another_wakeup() {
+        let first = test_kwin_payload("first", false);
+        let mut latest = test_kwin_payload("latest", false);
+        latest.id = "latest".into();
+        let current = HashMap::from([(latest.id.clone(), latest.clone())]);
+        let mut pending = None;
+
+        assert!(queue_window_feed_update(
+            &mut pending,
+            vec![WindowFeedEvent::Upsert(first)],
+            &current,
+        ));
+        assert!(!queue_window_feed_update(
+            &mut pending,
+            vec![WindowFeedEvent::Upsert(latest.clone())],
+            &current,
+        ));
+        assert!(matches!(
+            pending.as_deref(),
+            Some([WindowFeedEvent::Snapshot(payloads)])
+                if payloads.len() == 1 && payloads[0] == latest
         ));
     }
 
@@ -926,6 +953,28 @@ mod tests {
     }
 
     #[test]
+    fn compact_unregistered_chromium_extension_surfaces_are_not_listed() {
+        let mut icon_cache = HashMap::new();
+        let window = build_window_info(
+            "extension-popup".to_string(),
+            "transparency".to_string(),
+            "chrome-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-Default".to_string(),
+            Some("chrome-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-Default".to_string()),
+            Some(1234),
+            Some((0, 0, 150, 478)),
+            Some(false),
+            "breeze-dark",
+            &mut icon_cache,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        );
+
+        assert!(window.is_none());
+    }
+
+    #[test]
     fn test_compute_display_title_and_highlights_typo() {
         let base_query = MetadataQuery::new("fiom").unwrap();
         let typo_query = MetadataQuery::new("fiom").unwrap().with_typo_fallback(true);
@@ -945,5 +994,31 @@ mod tests {
         assert_eq!(display_title, "fish");
         assert_eq!(highlights, vec![(0, 4, false)]);
         assert!(title_is_typo);
+    }
+
+    #[test]
+    fn settings_sanitize_nonfinite_and_out_of_range_values() {
+        let settings = LauncherSettings {
+            ui_scale: f32::NAN,
+            win_row_height: 1_000.0,
+            app_scroll_sensitivity: f32::NEG_INFINITY,
+            ..LauncherSettings::default()
+        }
+        .sanitized();
+
+        assert_eq!(settings.ui_scale, LauncherSettings::default().ui_scale);
+        assert_eq!(settings.win_row_height, 100.0);
+        assert_eq!(
+            settings.app_scroll_sensitivity,
+            LauncherSettings::default().app_scroll_sensitivity
+        );
+    }
+
+    #[test]
+    fn search_projection_keeps_unicode_ranges_safe() {
+        let projected = search_projection("GIMP — İmage");
+        assert_eq!(projected.len(), "GIMP — İmage".chars().count());
+        assert_eq!(projected, "gimp -  mage");
+        assert!(search_queries("mpv").is_some());
     }
 }

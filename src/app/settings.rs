@@ -410,11 +410,7 @@ impl App {
                 let mut auto_send_enter = self.auto_send_enter_on_attention;
                 if ui.checkbox(&mut auto_send_enter, "").changed() {
                     self.auto_send_enter_on_attention = auto_send_enter;
-                    std::thread::spawn(move || {
-                        if let Ok(client) = applicationlauncher::tracker::TrackerClient::connect() {
-                            let _ = client.set_auto_enter(auto_send_enter);
-                        }
-                    });
+                    let _ = self.auto_enter_update_sender.try_send(auto_send_enter);
                     self.save_settings();
                 }
                 ui.end_row();

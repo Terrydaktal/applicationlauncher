@@ -14,7 +14,10 @@ impl TrackerClient {
     pub fn connect() -> Result<Self, String> {
         zbus::blocking::connection::Builder::session()
             .map_err(|err| err.to_string())?
-            .method_timeout(Duration::from_secs(3))
+            // Restore can legitimately launch several applications and wait for
+            // their desktop helpers. The daemon also claims operations so a
+            // retry cannot duplicate an in-flight restore.
+            .method_timeout(Duration::from_secs(30))
             .build()
             .map(|connection| Self { connection })
             .map_err(|err| err.to_string())

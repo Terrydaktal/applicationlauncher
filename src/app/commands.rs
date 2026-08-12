@@ -147,7 +147,7 @@ impl App {
                 cmd.env_remove("PYTHONHOME");
                 cmd.env_remove("VIRTUAL_ENV");
                 cmd.env_remove("UV_ACTIVE");
-                let _ = cmd.spawn();
+                let _ = applicationlauncher::process::spawn_and_reap(cmd);
             });
             ctx.request_repaint();
             return;
@@ -222,16 +222,16 @@ impl App {
                 // If we got geometry, spawn the border overlay process
                 if let Some((x, y, w, h)) = geom {
                     if let Ok(current_exe) = std::env::current_exe() {
-                        let _ = Command::new(current_exe)
-                            .args([
-                                "--draw-border",
-                                &x.to_string(),
-                                &y.to_string(),
-                                &w.to_string(),
-                                &h.to_string(),
-                                &id_clone,
-                            ])
-                            .spawn();
+                        let mut overlay = Command::new(current_exe);
+                        overlay.args([
+                            "--draw-border",
+                            &x.to_string(),
+                            &y.to_string(),
+                            &w.to_string(),
+                            &h.to_string(),
+                            &id_clone,
+                        ]);
+                        let _ = applicationlauncher::process::spawn_and_reap(overlay);
                     }
                 }
             });

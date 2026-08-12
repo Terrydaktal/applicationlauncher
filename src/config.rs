@@ -1,13 +1,12 @@
 pub(crate) const WINDOW_REMOVAL_CONFIRMATION_POLLS: usize = 2;
 pub(crate) const ATSPI_LOCATION_PROBE: &str = include_str!("atspi_location_probe.py");
-pub(crate) const AUDIO_SINK_POLL_MS: u128 = 200;
+pub(crate) const AUDIO_SINK_POLL_MS: u128 = 500;
 pub(crate) const AUDIO_IDLE_POLL_MS: u64 = 1000;
 pub(crate) const AUDIO_ACTIVITY_GRACE_MS: u128 = 350;
 pub(crate) const PIPEWIRE_ACTIVE_US_THRESHOLD: f32 = 10.0;
 pub(crate) const PIPEWIRE_ACTIVE_TOTAL_US_THRESHOLD: f32 = 20.0;
 pub(crate) const AUDIO_ACTIVE_REPAINT_MS: u64 = 80;
 pub(crate) const WINDOW_SEARCH_REFRESH_INTERVAL_MS: u64 = 180;
-pub(crate) const WINDOW_FEED_EVENTS_PER_FRAME: usize = 512;
 pub(crate) const WINDOW_SNAPSHOTS_PER_FRAME: usize = 4;
 pub(crate) const SETTINGS_VIEWPORT_SIZE: [f32; 2] = [380.0, 760.0];
 pub(crate) const SETTINGS_VIEWPORT_MIN_SIZE: [f32; 2] = [340.0, 500.0];

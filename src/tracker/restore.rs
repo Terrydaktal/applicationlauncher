@@ -217,7 +217,7 @@ fn launch(restore: &RestoreSpec) -> Result<(), String> {
         if let Some(cwd) = restore.cwd.as_deref() {
             command.arg(expand_home(cwd));
         }
-        return command.spawn().map(|_| ()).map_err(|err| err.to_string());
+        return crate::process::spawn_and_reap(command).map_err(|err| err.to_string());
     }
     if key.contains("pcmanfm") {
         let mut command = Command::new("pcmanfm");
@@ -225,7 +225,7 @@ fn launch(restore: &RestoreSpec) -> Result<(), String> {
         if let Some(cwd) = restore.cwd.as_deref() {
             command.arg(expand_home(cwd));
         }
-        return command.spawn().map(|_| ()).map_err(|err| err.to_string());
+        return crate::process::spawn_and_reap(command).map_err(|err| err.to_string());
     }
     let desktop = resolve_desktop_file(restore)?;
     let status = crate::process::status_with_timeout(
@@ -308,21 +308,20 @@ fn launch_terminal(kind: &str, cwd: Option<&str>) -> Result<(), String> {
     let cwd = cwd
         .map(expand_home)
         .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into())));
-    let command = match kind {
+    let shell_command = match kind {
         "codex" => "codex resume --last; exec fish",
         "agy" => "agy -c; exec fish",
         "htop" => "htop; exec fish",
         "nvtop" => "nvtop; exec fish",
         _ => "exec fish",
     };
-    Command::new("xfce4-terminal")
+    let mut command = Command::new("xfce4-terminal");
+    command
         .arg("--working-directory")
         .arg(cwd)
         .arg("--command")
-        .arg(format!("fish -lc '{command}'"))
-        .spawn()
-        .map(|_| ())
-        .map_err(|err| err.to_string())
+        .arg(format!("fish -lc '{shell_command}'"));
+    crate::process::spawn_and_reap(command).map_err(|err| err.to_string())
 }
 
 fn expand_home(path: &str) -> PathBuf {

@@ -2,12 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use zbus::interface;
 
 use super::database::TrackerDatabase;
 use super::{
     FEED_PATH, RestoreReport, RestoreSpec, SERVICE_NAME, TRACKER_PATH, TrackedWindow,
-    TrackerStatus, now_ms,
+    TrackerStatus, is_compact_chromium_helper_surface, now_ms,
 };
 
 const KWIN_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(15);
@@ -19,10 +22,12 @@ const TERMINAL_DBUS_TIMEOUT: Duration = Duration::from_secs(3);
 const ATTENTION_RECHECK_DELAY: Duration = Duration::from_secs(5);
 const ATTENTION_RETRY_BASE_MS: u64 = 750;
 const ATTENTION_RETRY_MAX_EXPONENT: u8 = 6;
+const SNAPSHOT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct State {
     windows: HashMap<String, TrackedWindow>,
     snapshot_buffer: Option<HashMap<String, TrackedWindow>>,
+    snapshot_deadline: Option<Instant>,
     generation: u64,
     history_generation: u64,
     activation_sequence: i64,
@@ -38,11 +43,14 @@ struct State {
     auto_enter_enabled: bool,
     attention: HashMap<String, AttentionState>,
     restore_specs: HashMap<String, RestoreSpec>,
+    restore_claims: HashSet<String>,
 }
 
 struct AttentionState {
     due: Instant,
     consecutive_failures: u8,
+    signature: String,
+    sent_signature: Option<String>,
 }
 
 fn attention_retry_delay(consecutive_failures: u8) -> Duration {
@@ -54,9 +62,15 @@ fn attention_retry_delay(consecutive_failures: u8) -> Duration {
     Duration::from_millis(ATTENTION_RETRY_BASE_MS.saturating_mul(1_u64 << exponent))
 }
 
-fn record_attention_attempt(attention: &mut AttentionState, now: Instant, succeeded: bool) {
+fn record_attention_attempt(
+    attention: &mut AttentionState,
+    now: Instant,
+    signature: &str,
+    succeeded: bool,
+) {
     if succeeded {
         attention.consecutive_failures = 0;
+        attention.sent_signature = Some(signature.to_string());
         attention.due = now + ATTENTION_RECHECK_DELAY;
     } else {
         attention.consecutive_failures = attention.consecutive_failures.saturating_add(1);
@@ -72,10 +86,26 @@ fn reconcile_attention_states(
     attention.retain(|id, _| windows.get(id).is_some_and(is_attention_terminal));
     for (id, window) in windows {
         if is_attention_terminal(window) {
-            attention.entry(id.clone()).or_insert(AttentionState {
-                due: now + ATTENTION_RECHECK_DELAY,
-                consecutive_failures: 0,
-            });
+            let signature = attention_signature(window);
+            match attention.entry(id.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(AttentionState {
+                        due: now + ATTENTION_RECHECK_DELAY,
+                        consecutive_failures: 0,
+                        signature,
+                        sent_signature: None,
+                    });
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry)
+                    if entry.get().signature != signature =>
+                {
+                    entry.get_mut().due = now + ATTENTION_RECHECK_DELAY;
+                    entry.get_mut().consecutive_failures = 0;
+                    entry.get_mut().signature = signature;
+                    entry.get_mut().sent_signature = None;
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
+            }
         }
     }
 }
@@ -89,6 +119,18 @@ struct RuntimeInner {
 struct Runtime(Arc<RuntimeInner>);
 
 impl Runtime {
+    fn claim_restore(&self, key: String) -> Result<(), String> {
+        let mut state = self.0.state.lock().unwrap();
+        if !state.restore_claims.insert(key.clone()) {
+            return Err(format!("restore operation {key} is already in progress"));
+        }
+        Ok(())
+    }
+
+    fn release_restore(&self, key: &str) {
+        self.0.state.lock().unwrap().restore_claims.remove(key);
+    }
+
     fn status(&self) -> TrackerStatus {
         let database_path = self.0.database.lock().unwrap().path().display().to_string();
         let state = self.0.state.lock().unwrap();
@@ -152,9 +194,24 @@ impl Runtime {
             .get_or_insert_with(|| Instant::now() + Duration::from_millis(500));
     }
 
+    fn expire_snapshot_if_needed(state: &mut State) {
+        if state
+            .snapshot_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            state.snapshot_buffer = None;
+            state.snapshot_deadline = None;
+        }
+    }
+
     fn upsert(&self, mut incoming: TrackedWindow, activated: bool) {
+        if !is_history_worthy(&incoming) {
+            return;
+        }
         let timestamp = now_ms();
+        let restore = super::infer_restore_spec(&incoming);
         let mut state = self.0.state.lock().unwrap();
+        Self::expire_snapshot_if_needed(&mut state);
         let previous = state
             .snapshot_buffer
             .as_ref()
@@ -180,7 +237,10 @@ impl Runtime {
         }
         let attention_id = incoming.id.clone();
         let requires_attention = is_attention_terminal(&incoming);
-        let restore = super::infer_restore_spec(&incoming);
+        let signature = attention_signature(&incoming);
+        let changed = previous
+            .as_ref()
+            .is_none_or(|previous| tracked_window_state_changed(previous, &incoming));
         state.restore_specs.insert(attention_id.clone(), restore);
         if let Some(target) = state.snapshot_buffer.as_mut() {
             target.insert(incoming.id.clone(), incoming);
@@ -188,17 +248,30 @@ impl Runtime {
             state.windows.insert(incoming.id.clone(), incoming);
         }
         if state.auto_enter_enabled && requires_attention {
-            state
-                .attention
-                .entry(attention_id)
-                .or_insert_with(|| AttentionState {
-                    due: Instant::now() + ATTENTION_RECHECK_DELAY,
-                    consecutive_failures: 0,
-                });
+            let now = Instant::now();
+            match state.attention.entry(attention_id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(AttentionState {
+                        due: now + ATTENTION_RECHECK_DELAY,
+                        consecutive_failures: 0,
+                        signature,
+                        sent_signature: None,
+                    });
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry)
+                    if entry.get().signature != signature =>
+                {
+                    entry.get_mut().due = now + ATTENTION_RECHECK_DELAY;
+                    entry.get_mut().consecutive_failures = 0;
+                    entry.get_mut().signature = signature;
+                    entry.get_mut().sent_signature = None;
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
+            }
         } else if !requires_attention {
             state.attention.remove(&attention_id);
         }
-        if state.snapshot_buffer.is_none() {
+        if state.snapshot_buffer.is_none() && changed {
             Self::mark_changed(&mut state);
         }
     }
@@ -206,6 +279,7 @@ impl Runtime {
     fn remove(&self, id: &str) {
         let timestamp = now_ms();
         let mut state = self.0.state.lock().unwrap();
+        Self::expire_snapshot_if_needed(&mut state);
         if let Some(buffer) = state.snapshot_buffer.as_mut() {
             buffer.remove(id);
             return;
@@ -236,9 +310,11 @@ impl Runtime {
         let timestamp = now_ms();
         let mut closed = Vec::new();
         let mut state = self.0.state.lock().unwrap();
+        Self::expire_snapshot_if_needed(&mut state);
         let Some(buffer) = state.snapshot_buffer.take() else {
             return;
         };
+        state.snapshot_deadline = None;
         for (id, window) in &state.windows {
             if !buffer.contains_key(id) {
                 closed.push(window.clone());
@@ -378,9 +454,11 @@ impl Runtime {
             attention
                 .iter()
                 .filter_map(|(id, attention)| {
-                    (attention.due <= now)
-                        .then(|| windows.get(id).cloned())
-                        .flatten()
+                    let window = windows.get(id)?;
+                    (attention.due <= now
+                        && attention.sent_signature.as_deref()
+                            != Some(attention_signature(window).as_str()))
+                    .then_some(window.clone())
                 })
                 .collect::<Vec<_>>()
         };
@@ -396,7 +474,10 @@ impl Runtime {
                 continue;
             }
             if let Some(attention) = state.attention.get_mut(&window.id) {
-                record_attention_attempt(attention, Instant::now(), result.is_ok());
+                let signature = attention_signature(&window);
+                if attention.signature == signature {
+                    record_attention_attempt(attention, Instant::now(), &signature, result.is_ok());
+                }
             }
             if let Err(err) = result {
                 eprintln!(
@@ -446,6 +527,7 @@ impl Runtime {
         specs: Vec<(TrackedWindow, super::RestoreSpec)>,
         history_id: Option<i64>,
         baseline_ids: HashSet<String>,
+        claim: Option<String>,
     ) {
         let runtime = self.clone();
         std::thread::spawn(move || {
@@ -489,6 +571,9 @@ impl Runtime {
                             ),
                         }
                     }
+                    if let Some(claim) = claim.as_deref() {
+                        runtime.release_restore(claim);
+                    }
                     break;
                 }
                 if final_attempt {
@@ -496,6 +581,9 @@ impl Runtime {
                         "Session layout restore timed out with {matched}/{} windows matched",
                         specs.len()
                     );
+                    if let Some(claim) = claim.as_deref() {
+                        runtime.release_restore(claim);
+                    }
                     break;
                 }
             }
@@ -509,17 +597,46 @@ fn is_attention_terminal(window: &TrackedWindow) -> bool {
         .to_lowercase()
         .replace(['-', '_'], "")
         .contains("xfce4terminal")
-        && (window.demands_attention || window.title.to_lowercase().contains("action required"))
+        && window.title.to_lowercase().contains("action required")
+}
+
+fn attention_signature(window: &TrackedWindow) -> String {
+    let title = window.title.to_lowercase();
+    let Some(action_start) = title.find("action required") else {
+        return String::new();
+    };
+
+    title[action_start..]
+        .chars()
+        .filter(|character| !('\u{2800}'..='\u{28ff}').contains(character))
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn is_history_worthy(window: &TrackedWindow) -> bool {
     let class = window.class.to_lowercase();
     !window.title.trim().is_empty()
         && !window.class.trim().is_empty()
+        && !window.skip_taskbar
+        && !window.skip_switcher
+        && !is_compact_chromium_helper_surface(
+            &window.class,
+            Some(&window.desktop_file_name),
+            window.width,
+        )
         && !matches!(
             class.as_str(),
             "plasmashell" | "org.kde.plasmashell" | "kwin_wayland" | "applicationlauncher"
         )
+}
+
+fn tracked_window_state_changed(previous: &TrackedWindow, incoming: &TrackedWindow) -> bool {
+    let mut comparable = previous.clone();
+    comparable.updated_at_ms = incoming.updated_at_ms;
+    comparable.opened_at_ms = incoming.opened_at_ms;
+    comparable != *incoming
 }
 
 fn normalized_terminal_title(title: &str) -> String {
@@ -642,7 +759,9 @@ struct WindowFeed(Runtime);
 impl WindowFeed {
     #[zbus(name = "BeginSnapshot")]
     fn begin_snapshot(&self) {
-        self.0.0.state.lock().unwrap().snapshot_buffer = Some(HashMap::new());
+        let mut state = self.0.0.state.lock().unwrap();
+        state.snapshot_buffer = Some(HashMap::new());
+        state.snapshot_deadline = Some(Instant::now() + SNAPSHOT_TRANSACTION_TIMEOUT);
     }
 
     #[zbus(name = "ResetWindows")]
@@ -667,7 +786,7 @@ impl WindowFeed {
                 return;
             }
         };
-        self.0.0.state.lock().unwrap().snapshot_buffer = Some(HashMap::new());
+        self.begin_snapshot();
         for window in windows {
             self.0.upsert(window, false);
         }
@@ -752,19 +871,21 @@ impl TrackerApi {
     fn restore_snapshot(&self, id: i64) -> String {
         let snapshot = self.0.0.database.lock().unwrap().snapshot(id);
         let result = snapshot.and_then(|snapshot| {
-            snapshot
-                .map(|snapshot| {
-                    let report = super::restore_snapshot(&snapshot, &self.0.windows());
-                    if report.launched > 0 {
-                        self.0.schedule_layout_reconciliation(
-                            snapshot.windows,
-                            None,
-                            HashSet::new(),
-                        );
-                    }
-                    report
-                })
-                .ok_or_else(|| format!("Snapshot {id} does not exist"))
+            let snapshot = snapshot.ok_or_else(|| format!("Snapshot {id} does not exist"))?;
+            let claim = format!("snapshot:{id}");
+            self.0.claim_restore(claim.clone())?;
+            let report = super::restore_snapshot(&snapshot, &self.0.windows());
+            if report.launched > 0 {
+                self.0.schedule_layout_reconciliation(
+                    snapshot.windows,
+                    None,
+                    HashSet::new(),
+                    Some(claim),
+                );
+            } else {
+                self.0.release_restore(&claim);
+            }
+            Ok(report)
         });
         serde_json::to_string(&result).unwrap()
     }
@@ -784,13 +905,21 @@ impl TrackerApi {
                     .ok_or_else(|| "Recovery snapshot disappeared".to_string())
             })
         };
-        let result = snapshot.map(|snapshot| {
+        let result = snapshot.and_then(|snapshot| {
+            let claim = "recovery".to_string();
+            self.0.claim_restore(claim.clone())?;
             let report = super::restore_snapshot(&snapshot, &self.0.windows());
             if report.launched > 0 {
-                self.0
-                    .schedule_layout_reconciliation(snapshot.windows, None, HashSet::new());
+                self.0.schedule_layout_reconciliation(
+                    snapshot.windows,
+                    None,
+                    HashSet::new(),
+                    Some(claim),
+                );
+            } else {
+                self.0.release_restore(&claim);
             }
-            report
+            Ok(report)
         });
         if result.is_ok() {
             self.0.0.state.lock().unwrap().recovery_pending = false;
@@ -856,12 +985,14 @@ impl TrackerApi {
                 .windows
                 .values()
                 .filter(|window| is_attention_terminal(window))
-                .map(|window| window.id.clone())
+                .map(|window| (window.id.clone(), attention_signature(window)))
                 .collect::<Vec<_>>();
-            for id in attention_ids {
+            for (id, signature) in attention_ids {
                 state.attention.entry(id).or_insert(AttentionState {
                     due,
                     consecutive_failures: 0,
+                    signature,
+                    sent_signature: None,
                 });
             }
         } else {
@@ -901,13 +1032,18 @@ fn reopen_history_entry(runtime: &Runtime, id: i64) -> Result<RestoreReport, Str
         .into_iter()
         .map(|window| window.id)
         .collect::<HashSet<_>>();
+    let claim = format!("history:{id}");
+    runtime.claim_restore(claim.clone())?;
     let report = super::restore::reopen_entry(&entry);
     if report.launched > 0 {
         runtime.schedule_layout_reconciliation(
             vec![(entry.window, entry.restore)],
             Some(id),
             baseline_ids,
+            Some(claim),
         );
+    } else {
+        runtime.release_restore(&claim);
     }
     Ok(report)
 }
@@ -924,7 +1060,12 @@ fn run_id() -> String {
 }
 
 pub fn run_tracker_daemon() -> Result<(), String> {
-    let database_path = super::state_dir().join("history.sqlite3");
+    let state_dir = super::state_dir();
+    std::fs::create_dir_all(&state_dir)
+        .map_err(|err| format!("could not create tracker state directory: {err}"))?;
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|err| format!("could not secure tracker state directory: {err}"))?;
+    let database_path = state_dir.join("history.sqlite3");
     let database = TrackerDatabase::open(&database_path)?;
     database.prune_shell_surface_history()?;
     let boot_id = read_boot_id();
@@ -960,6 +1101,7 @@ pub fn run_tracker_daemon() -> Result<(), String> {
         state: Mutex::new(State {
             windows: persisted_windows,
             snapshot_buffer: None,
+            snapshot_deadline: None,
             generation: 0,
             history_generation: 0,
             activation_sequence,
@@ -975,6 +1117,7 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             auto_enter_enabled,
             attention: HashMap::new(),
             restore_specs,
+            restore_claims: HashSet::new(),
         }),
         database: Mutex::new(database),
     }));
@@ -986,14 +1129,16 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             .windows
             .values()
             .filter(|window| is_attention_terminal(window))
-            .map(|window| window.id.clone())
+            .map(|window| (window.id.clone(), attention_signature(window)))
             .collect::<Vec<_>>();
-        for id in attention_ids {
+        for (id, signature) in attention_ids {
             state.attention.insert(
                 id,
                 AttentionState {
                     due,
                     consecutive_failures: 0,
+                    signature,
+                    sent_signature: None,
                 },
             );
         }
@@ -1098,23 +1243,30 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ATTENTION_RECHECK_DELAY, AttentionState, attention_retry_delay, normalized_terminal_title,
-        reconcile_attention_states, record_attention_attempt, terminal_dbus_service_names,
+        ATTENTION_RECHECK_DELAY, AttentionState, attention_retry_delay, is_history_worthy,
+        normalized_terminal_title, reconcile_attention_states, record_attention_attempt,
+        terminal_dbus_service_names, tracked_window_state_changed,
     };
     use crate::tracker::TrackedWindow;
 
     #[test]
-    fn successful_attention_send_rearms_back_to_back_prompt_detection() {
+    fn successful_attention_send_is_recorded_for_the_same_prompt() {
         let now = Instant::now();
         let mut attention = AttentionState {
             due: now,
             consecutive_failures: u8::MAX,
+            signature: "action required | tree".to_string(),
+            sent_signature: None,
         };
 
-        record_attention_attempt(&mut attention, now, true);
+        record_attention_attempt(&mut attention, now, "action required | tree", true);
 
         assert_eq!(attention.consecutive_failures, 0);
         assert_eq!(attention.due, now + ATTENTION_RECHECK_DELAY);
+        assert_eq!(
+            attention.sent_signature.as_deref(),
+            Some("action required | tree")
+        );
     }
 
     #[test]
@@ -1123,14 +1275,16 @@ mod tests {
         let mut attention = AttentionState {
             due: now,
             consecutive_failures: 6,
+            signature: "action required | tree".to_string(),
+            sent_signature: None,
         };
 
-        record_attention_attempt(&mut attention, now, false);
+        record_attention_attempt(&mut attention, now, "action required | tree", false);
         assert_eq!(attention.consecutive_failures, 7);
         assert_eq!(attention.due, now + Duration::from_secs(48));
 
         let later = now + Duration::from_secs(100);
-        record_attention_attempt(&mut attention, later, false);
+        record_attention_attempt(&mut attention, later, "action required | tree", false);
         assert_eq!(attention.consecutive_failures, 8);
         assert_eq!(attention.due, later + attention_retry_delay(8));
         assert_eq!(attention_retry_delay(8), Duration::from_secs(48));
@@ -1184,5 +1338,38 @@ mod tests {
                 "org.xfce.Terminal5.Instance.iabc".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn tracker_generation_ignores_storage_timestamps_but_detects_window_changes() {
+        let previous = TrackedWindow {
+            id: "window".into(),
+            title: "first".into(),
+            class: "example".into(),
+            opened_at_ms: 10,
+            updated_at_ms: 20,
+            ..TrackedWindow::default()
+        };
+        let mut incoming = previous.clone();
+        incoming.updated_at_ms = 30;
+
+        assert!(!tracked_window_state_changed(&previous, &incoming));
+        incoming.title = "second".into();
+        assert!(tracked_window_state_changed(&previous, &incoming));
+    }
+
+    #[test]
+    fn compact_chromium_extension_helpers_are_not_session_windows() {
+        let window = TrackedWindow {
+            id: "extension-popup".into(),
+            title: "transparency".into(),
+            class: "chrome-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-Default".into(),
+            desktop_file_name: "chrome-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-Default".into(),
+            width: 150,
+            height: 478,
+            ..TrackedWindow::default()
+        };
+
+        assert!(!is_history_worthy(&window));
     }
 }

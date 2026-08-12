@@ -514,6 +514,13 @@ pub(crate) fn find_sink_inputs_for_window(
     if matches.is_empty() {
         let class_lower = window.class.to_lowercase();
         let active_lower = window.active_process.as_ref().map(|s| s.to_lowercase());
+        if class_lower.trim().is_empty()
+            && active_lower
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            return matches;
+        }
         for sink in sink_inputs {
             let app_name = sink
                 .properties
@@ -524,19 +531,17 @@ pub(crate) fn find_sink_inputs_for_window(
                 .get("application.process.binary")
                 .map(|s| s.to_lowercase());
 
-            let name_match = app_name.as_ref().map_or(false, |n| {
-                n.contains(&class_lower)
-                    || class_lower.contains(n)
+            let name_match = app_name.as_ref().is_some_and(|n| {
+                (!class_lower.is_empty() && (n.contains(&class_lower) || class_lower.contains(n)))
                     || active_lower
                         .as_ref()
-                        .map_or(false, |act| n.contains(act) || act.contains(n))
+                        .is_some_and(|act| !act.is_empty() && (n.contains(act) || act.contains(n)))
             });
-            let binary_match = app_binary.as_ref().map_or(false, |b| {
-                b.contains(&class_lower)
-                    || class_lower.contains(b)
+            let binary_match = app_binary.as_ref().is_some_and(|b| {
+                (!class_lower.is_empty() && (b.contains(&class_lower) || class_lower.contains(b)))
                     || active_lower
                         .as_ref()
-                        .map_or(false, |act| b.contains(act) || act.contains(b))
+                        .is_some_and(|act| !act.is_empty() && (b.contains(act) || act.contains(b)))
             });
 
             if name_match || binary_match {

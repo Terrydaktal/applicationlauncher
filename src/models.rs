@@ -1,4 +1,3 @@
-use fuzzy_rank::ranking::SearchRank;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -94,28 +93,18 @@ pub struct AppInfo {
 #[derive(Clone, Debug)]
 pub struct RankedAppMatch {
     pub app: AppInfo,
-    pub rank: SearchRank,
     pub title_is_typo: bool,
-    pub visible_match_priority: u8,
     pub is_pinned: bool,
     pub display_title: String,
     pub highlight_segments: Vec<(usize, usize, bool)>,
-    pub search_values: Vec<(u8, String)>,
-    pub candidate_key: String,
-    pub candidate_score: f64,
 }
 
 #[derive(Clone, Debug)]
 pub struct RankedWindowMatch {
     pub window: WindowInfo,
-    pub rank: SearchRank,
     pub title_is_typo: bool,
-    pub visible_match_priority: u8,
     pub display_title: String,
     pub highlight_segments: Vec<(usize, usize, bool)>,
-    pub search_values: Vec<(u8, String)>,
-    pub candidate_key: String,
-    pub candidate_score: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +145,10 @@ pub struct KWinWindowPayload {
     pub minimized: bool,
     #[serde(default)]
     pub demands_attention: bool,
+    #[serde(default)]
+    pub skip_taskbar: bool,
+    #[serde(default)]
+    pub skip_switcher: bool,
     #[serde(default)]
     pub last_activated_at_ms: Option<i64>,
     #[serde(default)]
@@ -292,6 +285,43 @@ impl Default for LauncherSettings {
             win_scroll_sensitivity: 1.0,
             ui_scale: 1.0,
         }
+    }
+}
+
+impl LauncherSettings {
+    pub fn sanitized(mut self) -> Self {
+        let defaults = Self::default();
+        macro_rules! finite_clamped {
+            ($field:ident, $min:expr, $max:expr) => {
+                self.$field = if self.$field.is_finite() {
+                    self.$field.clamp($min, $max)
+                } else {
+                    defaults.$field
+                };
+            };
+        }
+
+        finite_clamped!(win_icon_size, 16.0, 64.0);
+        finite_clamped!(win_top_padding, 0.0, 24.0);
+        finite_clamped!(win_bottom_padding, 0.0, 24.0);
+        finite_clamped!(win_left_padding, 0.0, 32.0);
+        finite_clamped!(win_right_padding, 0.0, 32.0);
+        finite_clamped!(win_row_height, 12.0, 100.0);
+        finite_clamped!(win_text_spacing, 0.0, 12.0);
+        finite_clamped!(win_line_height, 6.0, 30.0);
+        finite_clamped!(win_title_size, 6.0, 24.0);
+        finite_clamped!(win_path_size, 6.0, 20.0);
+        finite_clamped!(app_icon_size, 16.0, 64.0);
+        finite_clamped!(app_icon_tile_size, 48.0, 128.0);
+        finite_clamped!(app_top_padding, 0.0, 24.0);
+        finite_clamped!(app_bottom_padding, 0.0, 24.0);
+        finite_clamped!(app_left_padding, 0.0, 32.0);
+        finite_clamped!(app_right_padding, 0.0, 32.0);
+        finite_clamped!(app_icon_name_size, 8.0, 20.0);
+        finite_clamped!(app_scroll_sensitivity, 0.1, 10.0);
+        finite_clamped!(win_scroll_sensitivity, 0.1, 10.0);
+        finite_clamped!(ui_scale, 0.5, 2.5);
+        self
     }
 }
 
