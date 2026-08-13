@@ -25,6 +25,7 @@
 │   ├── search.rs
 │   └── main.rs
 ├── kwin/applicationlauncher-window-feed/
+├── scripts/applicationlauncher
 ├── Cargo.toml
 ├── Cargo.lock
 └── README.md
@@ -41,6 +42,7 @@
 - `src/bin/applicationlauncherd.rs`: Persistent background tracker entry point.
 - `src/windows/`: KWin snapshot consumption, process metadata, terminal integration, and icon resolution.
 - `kwin/applicationlauncher-window-feed/`: Transactional KWin script that sends compositor window events to the daemon.
+- `scripts/applicationlauncher`: Fast launch wrapper that rebuilds a stale release binary once under a lock, then runs it.
 - `Cargo.toml`: Package metadata and Rust dependencies.
 - `Cargo.lock`: Locked dependency graph for reproducible builds.
 - `README.md`: Project documentation for the current GUI application.
@@ -134,10 +136,18 @@ cargo build --release
 ## Run
 
 ```bash
-cargo run --release
+./scripts/applicationlauncher
 ```
 
-Or run the compiled binary directly:
+The wrapper normally adds only a source timestamp check. When application sources, embedded KWin files, Cargo metadata, or the local `../fuzzy-rank` dependency are newer than the release binary, it runs one serialized release build before launching. If that build fails, it reports the private log at `$XDG_STATE_HOME/applicationlauncher/launcher-build.log` and uses the previous release binary when one exists.
+
+Install the command as a symbolic link so the wrapper remains updated with the repository:
+
+```bash
+ln -sfn /home/lewis/Dev/applicationlauncher/scripts/applicationlauncher "$HOME/.local/bin/applicationlauncher"
+```
+
+The compiled binary can still be run directly when an automatic freshness check is not wanted:
 
 ```bash
 ./target/release/applicationlauncher

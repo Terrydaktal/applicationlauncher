@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+umask 077
+
+script_path="$(readlink -f -- "${BASH_SOURCE[0]}")"
+repo_dir="$(cd -- "$(dirname -- "$script_path")/.." && pwd -P)"
+binary="$repo_dir/target/release/applicationlauncher"
+build_stamp="$repo_dir/target/release/.applicationlauncher-build-stamp"
+fuzzy_rank_dir="$(cd -- "$repo_dir/../fuzzy-rank" 2>/dev/null && pwd -P || true)"
+state_root="${XDG_STATE_HOME:-${HOME}/.local/state}"
+state_dir="$state_root/applicationlauncher"
+build_log="$state_dir/launcher-build.log"
+runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+build_lock="$runtime_dir/applicationlauncher-build-v2.lock"
+
+inputs_are_newer() {
+	local input
+
+	[[ -x "$binary" && -f "$build_stamp" ]] || return 0
+
+	for input in \
+		"$repo_dir/Cargo.toml" \
+		"$repo_dir/Cargo.lock" \
+		"$repo_dir/build.rs" \
+		"$repo_dir/rust-toolchain" \
+		"$repo_dir/rust-toolchain.toml"; do
+		if [[ -f "$input" && "$input" -nt "$build_stamp" ]]; then
+			return 0
+		fi
+	done
+
+	for input in \
+		"$repo_dir/src" \
+		"$repo_dir/.cargo" \
+		"$repo_dir/kwin/applicationlauncher-window-feed"; do
+		if [[ -d "$input" ]] && find "$input" -type f -newer "$build_stamp" -print -quit | grep -q .; then
+			return 0
+		fi
+	done
+
+	if [[ -n "$fuzzy_rank_dir" ]]; then
+		for input in \
+			"$fuzzy_rank_dir/Cargo.toml" \
+			"$fuzzy_rank_dir/Cargo.lock" \
+			"$fuzzy_rank_dir/build.rs" \
+			"$fuzzy_rank_dir/rust-toolchain" \
+			"$fuzzy_rank_dir/rust-toolchain.toml"; do
+			if [[ -f "$input" && "$input" -nt "$build_stamp" ]]; then
+				return 0
+			fi
+		done
+
+		for input in "$fuzzy_rank_dir/src" "$fuzzy_rank_dir/.cargo"; do
+			if [[ -d "$input" ]] && find "$input" -type f -newer "$build_stamp" -print -quit | grep -q .; then
+				return 0
+			fi
+		done
+	fi
+
+	return 1
+}
+
+report_build_failure() {
+	printf 'Application Launcher release build failed; see %s\n' "$build_log" >&2
+	if command -v notify-send >/dev/null 2>&1; then
+		notify-send \
+			--app-name='Application Launcher' \
+			--urgency=critical \
+			'Application Launcher build failed' \
+			"Using the previous release binary. Build log: $build_log" || true
+	fi
+}
+
+if inputs_are_newer; then
+	mkdir -p -- "$state_dir" "$runtime_dir"
+	(
+		exec 9>"$build_lock"
+		flock 9
+
+		# Another shortcut invocation may have completed the build while this one waited.
+		if inputs_are_newer; then
+			if ! cargo build \
+				--manifest-path "$repo_dir/Cargo.toml" \
+				--release \
+				--bins \
+				>"$build_log" 2>&1; then
+				report_build_failure
+				if [[ ! -x "$binary" ]]; then
+					exit 1
+				fi
+			else
+				touch -- "$build_stamp"
+			fi
+		fi
+	)
+fi
+
+exec "$binary" "$@"
