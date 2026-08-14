@@ -1,4 +1,5 @@
 use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -9,6 +10,71 @@ const MAX_CAPTURE_BYTES: u64 = 4 * 1024 * 1024;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static SPAWN_SCOPE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const SPAWN_SCOPE_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub fn kdotool_path() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    kdotool_path_for_home(home.as_deref())
+}
+
+pub fn executable_path(program: impl AsRef<Path>) -> Option<PathBuf> {
+    let program = program.as_ref();
+    if program.components().count() > 1 {
+        return is_executable_file(program).then(|| program.to_path_buf());
+    }
+
+    executable_path_in(program, &executable_search_directories())
+}
+
+fn executable_search_directories() -> Vec<PathBuf> {
+    let mut directories = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        directories.push(home.join(".local/bin"));
+        directories.push(home.join(".cargo/bin"));
+    }
+    directories.extend([PathBuf::from("/usr/local/bin"), PathBuf::from("/usr/bin")]);
+    let mut unique = Vec::with_capacity(directories.len());
+    for directory in directories {
+        if !unique.contains(&directory) {
+            unique.push(directory);
+        }
+    }
+    unique
+}
+
+fn executable_path_in(program: &Path, directories: &[PathBuf]) -> Option<PathBuf> {
+    directories
+        .iter()
+        .map(|directory| directory.join(program))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn kdotool_path_for_home(home: Option<&std::path::Path>) -> std::path::PathBuf {
+    if let Some(home) = home {
+        for relative in [".local/bin/kdotool", ".cargo/bin/kdotool"] {
+            let candidate = home.join(relative);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    std::path::PathBuf::from("kdotool")
+}
 
 pub fn output_with_timeout(mut command: Command, timeout: Duration) -> io::Result<Output> {
     isolate_process_group(&mut command);
@@ -224,6 +290,49 @@ fn isolate_process_group(_command: &mut Command) {}
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kdotool_resolves_cargo_install_outside_path() {
+        let root = std::env::temp_dir().join(format!(
+            "applicationlauncher-kdotool-path-{}",
+            std::process::id()
+        ));
+        let cargo_bin = root.join(".cargo/bin");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        let installed = cargo_bin.join("kdotool");
+        std::fs::write(&installed, b"test").unwrap();
+
+        assert_eq!(kdotool_path_for_home(Some(&root)), installed);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn executable_resolution_preserves_search_order_and_requires_execute_permission() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "applicationlauncher-executable-path-{}",
+            std::process::id()
+        ));
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let first_program = first.join("example-program");
+        let second_program = second.join("example-program");
+        std::fs::write(&first_program, b"first").unwrap();
+        std::fs::write(&second_program, b"second").unwrap();
+        std::fs::set_permissions(&first_program, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&second_program, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            executable_path_in(Path::new("example-program"), &[first, second.clone()]),
+            Some(second_program)
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn timeout_terminates_a_command_with_descendants() {

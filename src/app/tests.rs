@@ -94,27 +94,54 @@ mod tests {
     }
 
     #[test]
-    fn occupied_window_feed_inbox_is_replaced_by_one_snapshot_without_another_wakeup() {
+    fn occupied_window_feed_inbox_keeps_only_latest_delta_without_another_wakeup() {
         let first = test_kwin_payload("first", false);
-        let mut latest = test_kwin_payload("latest", false);
-        latest.id = "latest".into();
-        let current = HashMap::from([(latest.id.clone(), latest.clone())]);
+        let mut first_latest = first.clone();
+        first_latest.title = "first latest".into();
+        let mut second = test_kwin_payload("second", false);
+        second.id = "second".into();
         let mut pending = None;
 
         assert!(queue_window_feed_update(
             &mut pending,
             vec![WindowFeedEvent::Upsert(first)],
-            &current,
         ));
         assert!(!queue_window_feed_update(
             &mut pending,
-            vec![WindowFeedEvent::Upsert(latest.clone())],
-            &current,
+            vec![WindowFeedEvent::Upsert(first_latest.clone())],
+        ));
+        assert!(!queue_window_feed_update(
+            &mut pending,
+            vec![WindowFeedEvent::Upsert(second.clone())],
         ));
         assert!(matches!(
             pending.as_deref(),
-            Some([WindowFeedEvent::Snapshot(payloads)])
-                if payloads.len() == 1 && payloads[0] == latest
+            Some([
+                WindowFeedEvent::Upsert(first_payload),
+                WindowFeedEvent::Upsert(second_payload),
+            ]) if first_payload == &first_latest && second_payload == &second
+        ));
+    }
+
+    #[test]
+    fn process_tree_refresh_is_non_reentrant_and_respects_cache_age() {
+        let now = Instant::now();
+
+        assert!(super::super::feed::process_tree_cache_refresh_due(
+            None, false, now,
+        ));
+        assert!(!super::super::feed::process_tree_cache_refresh_due(
+            None, true, now,
+        ));
+        assert!(!super::super::feed::process_tree_cache_refresh_due(
+            Some(now),
+            false,
+            now + Duration::from_millis(499),
+        ));
+        assert!(super::super::feed::process_tree_cache_refresh_due(
+            Some(now),
+            false,
+            now + Duration::from_millis(500),
         ));
     }
 

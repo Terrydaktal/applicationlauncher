@@ -6,6 +6,7 @@ umask 077
 script_path="$(readlink -f -- "${BASH_SOURCE[0]}")"
 repo_dir="$(cd -- "$(dirname -- "$script_path")/.." && pwd -P)"
 binary="$repo_dir/target/release/applicationlauncher"
+daemon_binary="$repo_dir/target/release/applicationlauncherd"
 build_stamp="$repo_dir/target/release/.applicationlauncher-build-stamp"
 fuzzy_rank_dir="$(cd -- "$repo_dir/../fuzzy-rank" 2>/dev/null && pwd -P || true)"
 state_root="${XDG_STATE_HOME:-${HOME}/.local/state}"
@@ -13,6 +14,16 @@ state_dir="$state_root/applicationlauncher"
 build_log="$state_dir/launcher-build.log"
 runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 build_lock="$runtime_dir/applicationlauncher-build-v2.lock"
+cargo_binary="$(command -v cargo 2>/dev/null || true)"
+
+if [[ -z "$cargo_binary" ]]; then
+	for candidate in "$HOME/.local/bin/cargo" "$HOME/.cargo/bin/cargo"; do
+		if [[ -x "$candidate" ]]; then
+			cargo_binary="$candidate"
+			break
+		fi
+	done
+fi
 
 inputs_are_newer() {
 	local input
@@ -61,14 +72,15 @@ inputs_are_newer() {
 	return 1
 }
 
-report_build_failure() {
-	printf 'Application Launcher release build failed; see %s\n' "$build_log" >&2
+report_deployment_failure() {
+	local summary="$1"
+	printf '%s; see %s\n' "$summary" "$build_log" >&2
 	if command -v notify-send >/dev/null 2>&1; then
 		notify-send \
 			--app-name='Application Launcher' \
 			--urgency=critical \
-			'Application Launcher build failed' \
-			"Using the previous release binary. Build log: $build_log" || true
+			'Application Launcher update failed' \
+			"$summary. Using the previous installed state. Log: $build_log" || true
 	fi
 }
 
@@ -80,12 +92,23 @@ if inputs_are_newer; then
 
 		# Another shortcut invocation may have completed the build while this one waited.
 		if inputs_are_newer; then
-			if ! cargo build \
+			if [[ -z "$cargo_binary" ]]; then
+				printf 'cargo was not found in PATH, ~/.local/bin, or ~/.cargo/bin\n' >"$build_log"
+				report_deployment_failure 'Application Launcher release build failed'
+				if [[ ! -x "$binary" ]]; then
+					exit 1
+				fi
+			elif ! "$cargo_binary" build \
 				--manifest-path "$repo_dir/Cargo.toml" \
 				--release \
 				--bins \
 				>"$build_log" 2>&1; then
-				report_build_failure
+				report_deployment_failure 'Application Launcher release build failed'
+				if [[ ! -x "$binary" ]]; then
+					exit 1
+				fi
+			elif ! "$daemon_binary" --install >>"$build_log" 2>&1; then
+				report_deployment_failure 'Application Launcher daemon update failed'
 				if [[ ! -x "$binary" ]]; then
 					exit 1
 				fi

@@ -57,6 +57,31 @@ impl eframe::App for App {
         }
 
         match self
+            .process_tree_cache_receiver
+            .as_ref()
+            .map(|rx| rx.try_recv())
+        {
+            Some(Ok(process_tree)) => {
+                self.process_tree_cache = Some(process_tree);
+                self.process_tree_cache_updated_at = Some(Instant::now());
+                self.process_tree_cache_receiver = None;
+
+                if self.terminal_metadata_apply_queued {
+                    self.apply_terminal_metadata_records(self.terminal_records.clone());
+                }
+                if !self.deferred_window_feed_events.is_empty() {
+                    let events = std::mem::take(&mut self.deferred_window_feed_events);
+                    self.apply_window_feed_events(events);
+                }
+                ctx.request_repaint();
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.process_tree_cache_receiver = None;
+            }
+            _ => {}
+        }
+
+        match self
             .terminal_records_receiver
             .as_ref()
             .map(|rx| rx.try_recv())

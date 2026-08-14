@@ -220,6 +220,9 @@ pub(crate) struct App {
     settings_save_deadline: Option<Instant>,
     process_tree_cache: Option<crate::windows::process::ProcessTree>,
     process_tree_cache_updated_at: Option<Instant>,
+    process_tree_cache_receiver: Option<Receiver<crate::windows::process::ProcessTree>>,
+    deferred_window_feed_events: Vec<WindowFeedEvent>,
+    terminal_metadata_apply_queued: bool,
     popup_event_sender: Sender<PopupEvent>,
     popup_event_receiver: Receiver<PopupEvent>,
     window_sender: SyncSender<Vec<WindowInfo>>,
@@ -623,6 +626,9 @@ impl App {
             settings_save_deadline: None,
             process_tree_cache: None,
             process_tree_cache_updated_at: None,
+            process_tree_cache_receiver: None,
+            deferred_window_feed_events: Vec::new(),
+            terminal_metadata_apply_queued: false,
             popup_event_sender: popup_event_tx,
             popup_event_receiver: popup_event_rx,
             window_sender: window_tx.clone(),
@@ -657,6 +663,8 @@ impl App {
             windows_generation: 0,
             pinned_apps_generation: 0,
         };
+
+        app.start_process_tree_cache_refresh();
 
         let audio_repaint_ctx = cc.egui_ctx.clone();
         std::thread::spawn(move || {

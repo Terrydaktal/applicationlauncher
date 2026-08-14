@@ -104,7 +104,8 @@ pub fn ensure_tracker_installed() -> Result<(), String> {
         .unwrap_or_default();
     let build_fingerprint = format!("{}-{}-{content_hash:x}", binary_metadata.len(), modified);
     let unit = format!(
-        "[Unit]\nDescription=Application Launcher window and session tracker\nAfter=graphical-session.target\nPartOf=graphical-session.target\n\n[Service]\nType=simple\nEnvironment=APPLICATIONLAUNCHER_DAEMON_BUILD={build_fingerprint}\nExecStart={}\nRestart=on-failure\nRestartSec=1\nKillMode=process\n\n[Install]\nWantedBy=graphical-session.target\n",
+        "[Unit]\nDescription=Application Launcher window and session tracker\nAfter=graphical-session.target\nPartOf=graphical-session.target\n\n[Service]\nType=simple\nEnvironment=APPLICATIONLAUNCHER_BUILD_ID={}\nEnvironment=APPLICATIONLAUNCHER_DAEMON_BUILD={build_fingerprint}\nExecStart={}\nRestart=on-failure\nRestartSec=1\nKillMode=process\n\n[Install]\nWantedBy=graphical-session.target\n",
+        crate::BUILD_ID,
         link.display()
     );
     let unit_path = unit_dir.join("applicationlauncherd.service");
@@ -180,6 +181,23 @@ pub fn ensure_tracker_installed() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+pub fn restart_tracker_service() -> Result<(), String> {
+    let status = crate::process::status_with_timeout(
+        {
+            let mut command = Command::new("systemctl");
+            command.args(["--user", "restart", "applicationlauncherd.service"]);
+            command
+        },
+        Duration::from_secs(5),
+    )
+    .map_err(|err| err.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("systemctl --user restart applicationlauncherd.service failed".into())
+    }
 }
 
 pub(crate) fn ensure_kwin_feed_installed() -> Result<(), String> {
@@ -368,6 +386,12 @@ mod tests {
     fn kwin_feed_avoids_unsupported_browser_timers() {
         assert!(!KWIN_MAIN_JS.contains("setTimeout"));
         assert!(!KWIN_MAIN_JS.contains("clearTimeout"));
+    }
+
+    #[test]
+    fn kwin_feed_registers_the_documented_reopen_shortcut() {
+        assert!(KWIN_MAIN_JS.contains("\"Ctrl+Shift+T\""));
+        assert!(!KWIN_MAIN_JS.contains("\"Meta+Ctrl+Shift+T\""));
     }
 
     #[test]

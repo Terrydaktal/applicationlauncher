@@ -128,7 +128,7 @@ function sendRemove(windowOrId) {
 registerShortcut(
     "applicationlauncher-reopen-latest",
     "Reopen recently closed window",
-    "Meta+Ctrl+Shift+T",
+    "Ctrl+Shift+T",
     reopenLatestClosedWindow
 );
 

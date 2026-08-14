@@ -153,6 +153,7 @@ pub struct TrackerStatus {
     pub recovery_pending: bool,
     pub database_path: String,
     pub run_id: String,
+    pub build_id: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]

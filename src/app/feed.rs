@@ -1,5 +1,7 @@
 use super::*;
 
+const PROCESS_TREE_CACHE_MAX_AGE: Duration = Duration::from_millis(500);
+
 pub(super) fn terminal_metadata_refresh_due(
     receiver_active: bool,
     refresh_queued: bool,
@@ -9,19 +11,38 @@ pub(super) fn terminal_metadata_refresh_due(
     !receiver_active && refresh_queued && retry_not_before.is_some_and(|deadline| now >= deadline)
 }
 
+pub(super) fn process_tree_cache_refresh_due(
+    cache_updated_at: Option<Instant>,
+    refresh_active: bool,
+    now: Instant,
+) -> bool {
+    !refresh_active
+        && cache_updated_at.is_none_or(|updated_at| {
+            now.saturating_duration_since(updated_at) >= PROCESS_TREE_CACHE_MAX_AGE
+        })
+}
+
 impl App {
     fn rebuild_window_search_documents(&mut self) {
         self.window_search_documents = self.windows.iter().map(window_search_document).collect();
     }
 
-    fn refresh_process_tree_cache(&mut self) {
-        let refresh = self
-            .process_tree_cache_updated_at
-            .is_none_or(|updated| updated.elapsed() >= Duration::from_millis(150));
-        if refresh {
-            self.process_tree_cache = Some(get_process_tree());
-            self.process_tree_cache_updated_at = Some(Instant::now());
+    pub(super) fn start_process_tree_cache_refresh(&mut self) {
+        if !process_tree_cache_refresh_due(
+            self.process_tree_cache_updated_at,
+            self.process_tree_cache_receiver.is_some(),
+            Instant::now(),
+        ) {
+            return;
         }
+
+        let repaint_ctx = self.repaint_ctx.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.process_tree_cache_receiver = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(get_process_tree());
+            repaint_ctx.request_repaint();
+        });
     }
 
     pub(super) fn start_terminal_metadata_refresh(&mut self) {
@@ -52,6 +73,7 @@ impl App {
 
     pub(super) fn apply_terminal_metadata_records(&mut self, records: Vec<TerminalDbusRecord>) {
         self.terminal_records = records;
+        self.terminal_metadata_apply_queued = false;
         if self.terminal_records.is_empty() {
             return;
         }
@@ -72,11 +94,12 @@ impl App {
             .unwrap_or("breeze-dark")
             .to_string();
         let records = self.terminal_records.clone();
-        self.refresh_process_tree_cache();
-        let (ppid_to_children, pid_to_name, pid_to_ppid) = self
-            .process_tree_cache
-            .as_ref()
-            .expect("process tree cache initialized");
+        self.start_process_tree_cache_refresh();
+        let Some((ppid_to_children, pid_to_name, pid_to_ppid)) = self.process_tree_cache.as_ref()
+        else {
+            self.terminal_metadata_apply_queued = true;
+            return;
+        };
         let mut rebuilt = Vec::new();
         for old_window in terminal_windows {
             let demands_attention = old_window.demands_attention;
@@ -276,13 +299,26 @@ impl App {
             return;
         }
 
+        self.start_process_tree_cache_refresh();
+        if self.process_tree_cache.is_none() {
+            self.deferred_window_feed_events.extend(events);
+            self.deferred_window_feed_events =
+                coalesce_window_feed_events(std::mem::take(&mut self.deferred_window_feed_events));
+            return;
+        }
+
+        let mut events = events;
+        if !self.deferred_window_feed_events.is_empty() {
+            let mut deferred = std::mem::take(&mut self.deferred_window_feed_events);
+            deferred.extend(events);
+            events = deferred;
+        }
         let events = coalesce_window_feed_events(events);
         let theme = self
             .force_theme
             .as_deref()
             .unwrap_or("breeze-dark")
             .to_string();
-        self.refresh_process_tree_cache();
         let (ppid_to_children, pid_to_name, pid_to_ppid) = self
             .process_tree_cache
             .as_ref()

@@ -6,7 +6,7 @@ mod restore;
 mod service;
 
 pub use client::TrackerClient;
-pub use install::{ensure_tracker_installed, tracker_binary_path};
+pub use install::{ensure_tracker_installed, restart_tracker_service, tracker_binary_path};
 pub use model::*;
 pub use restore::{restore_entries, restore_snapshot};
 pub use service::run_tracker_daemon;

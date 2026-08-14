@@ -12,15 +12,10 @@ use crate::*;
 
 const TRACKER_WINDOW_FEED_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TRACKER_WINDOW_FEED_RECONNECT_DELAY: Duration = Duration::from_millis(500);
+const TRACKER_BUILD_RESTART_LIMIT: usize = 2;
 
 pub(crate) fn get_kdotool_path() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        let path = PathBuf::from(format!("{home}/.cargo/bin/kdotool"));
-        if path.exists() {
-            return path;
-        }
-    }
-    PathBuf::from("kdotool")
+    applicationlauncher::process::kdotool_path()
 }
 
 pub(crate) fn build_window_info(
@@ -216,22 +211,7 @@ pub(crate) fn setup_kwin_window_feed(
     inbox: Arc<Mutex<Option<Vec<WindowFeedEvent>>>>,
     repaint_ctx: egui::Context,
 ) -> Result<(), String> {
-    applicationlauncher::tracker::ensure_tracker_installed()?;
-    let mut tracker_ready = false;
-    for _ in 0..30 {
-        if applicationlauncher::tracker::TrackerClient::connect()
-            .and_then(|client| client.status())
-            .is_ok()
-        {
-            tracker_ready = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    if !tracker_ready {
-        return Err("The tracker service did not become ready within three seconds".into());
-    }
-
+    ensure_tracker_ready()?;
     std::thread::spawn(move || {
         let mut last_generation = u64::MAX;
         let mut last_run_id = None;
@@ -256,6 +236,7 @@ pub(crate) fn setup_kwin_window_feed(
                     last_generation = u64::MAX;
                     previous_payloads = None;
                 }
+
                 if status.generation == last_generation {
                     return Ok(None);
                 }
@@ -296,7 +277,7 @@ pub(crate) fn setup_kwin_window_feed(
                             Ok(pending) => pending,
                             Err(poisoned) => poisoned.into_inner(),
                         };
-                        queue_window_feed_update(&mut pending, events, &current_payloads)
+                        queue_window_feed_update(&mut pending, events)
                     } else {
                         false
                     };
@@ -323,21 +304,52 @@ pub(crate) fn setup_kwin_window_feed(
     Ok(())
 }
 
+fn ensure_tracker_ready() -> Result<(), String> {
+    applicationlauncher::tracker::ensure_tracker_installed()?;
+    let mut restart_attempts = 0;
+    let mut last_error = "tracker did not report a status".to_string();
+    for _ in 0..30 {
+        match applicationlauncher::tracker::TrackerClient::connect()
+            .and_then(|client| client.status())
+        {
+            Ok(status) if tracker_status_matches_build(&status) => return Ok(()),
+            Ok(status) => {
+                last_error = format!(
+                    "tracker build mismatch: launcher={} daemon={}",
+                    applicationlauncher::BUILD_ID,
+                    status.build_id
+                );
+            }
+            Err(err) => last_error = format!("tracker status unavailable: {err}"),
+        }
+        if restart_attempts < TRACKER_BUILD_RESTART_LIMIT {
+            restart_attempts += 1;
+            eprintln!(
+                "Application Launcher tracker compatibility check failed; restarting daemon (attempt {restart_attempts}/{TRACKER_BUILD_RESTART_LIMIT}): {last_error}"
+            );
+            if let Err(err) = applicationlauncher::tracker::restart_tracker_service() {
+                last_error = format!("{last_error}; restart failed: {err}");
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!(
+        "The tracker daemon is not compatible with this launcher build after {TRACKER_BUILD_RESTART_LIMIT} restart attempts: {last_error}"
+    ))
+}
+
+fn tracker_status_matches_build(status: &applicationlauncher::tracker::TrackerStatus) -> bool {
+    status.build_id == applicationlauncher::BUILD_ID
+}
+
 pub(crate) fn queue_window_feed_update(
     pending: &mut Option<Vec<WindowFeedEvent>>,
     events: Vec<WindowFeedEvent>,
-    current_payloads: &HashMap<String, KWinWindowPayload>,
 ) -> bool {
     let should_repaint = pending.is_none();
-    // Once a repaint is pending, replace all intermediate events with one
-    // authoritative state. This preserves removals while avoiding replay.
-    *pending = Some(if should_repaint {
-        events
-    } else {
-        vec![WindowFeedEvent::Snapshot(
-            current_payloads.values().cloned().collect(),
-        )]
-    });
+    let mut combined = pending.take().unwrap_or_default();
+    combined.extend(events);
+    *pending = Some(coalesce_window_feed_events(combined));
     should_repaint
 }
 
@@ -820,5 +832,20 @@ pub(crate) fn get_snapshot_window_details(id: &str) -> SnapshotWindowDetails {
             _ => None,
         },
         minimized,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tracker_status_matches_build;
+
+    #[test]
+    fn tracker_status_requires_the_current_launcher_build() {
+        let mut status = applicationlauncher::tracker::TrackerStatus::default();
+        status.build_id = applicationlauncher::BUILD_ID.to_string();
+        assert!(tracker_status_matches_build(&status));
+
+        status.build_id.push_str("-stale");
+        assert!(!tracker_status_matches_build(&status));
     }
 }

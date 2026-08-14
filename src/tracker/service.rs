@@ -9,12 +9,15 @@ use zbus::interface;
 
 use super::database::TrackerDatabase;
 use super::{
-    FEED_PATH, RestoreReport, RestoreSpec, SERVICE_NAME, TRACKER_PATH, TrackedWindow,
+    FEED_PATH, HistoryEntry, RestoreReport, RestoreSpec, SERVICE_NAME, TRACKER_PATH, TrackedWindow,
     TrackerStatus, is_compact_chromium_helper_surface, now_ms,
 };
 
 const KWIN_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(15);
 const KWIN_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(2);
+const LAYOUT_RECONCILIATION_FAST_POLL: Duration = Duration::from_millis(40);
+const LAYOUT_RECONCILIATION_SLOW_POLL: Duration = Duration::from_millis(250);
+const LAYOUT_RECONCILIATION_FAST_PERIOD: Duration = Duration::from_secs(2);
 const KWIN_SERVICE: &str = "org.kde.KWin";
 const KWIN_PATH: &str = "/KWin";
 const KWIN_INTERFACE: &str = "org.kde.KWin";
@@ -23,6 +26,9 @@ const ATTENTION_RECHECK_DELAY: Duration = Duration::from_secs(5);
 const ATTENTION_RETRY_BASE_MS: u64 = 750;
 const ATTENTION_RETRY_MAX_EXPONENT: u8 = 6;
 const SNAPSHOT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(5);
+const REOPEN_HISTORY_SCAN_LIMIT: usize = 10_000;
+const REOPEN_LAUNCH_ATTEMPT_LIMIT: usize = 4;
+const HISTORY_RESTORE_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 struct State {
     windows: HashMap<String, TrackedWindow>,
@@ -44,6 +50,7 @@ struct State {
     attention: HashMap<String, AttentionState>,
     restore_specs: HashMap<String, RestoreSpec>,
     restore_claims: HashSet<String>,
+    history_restore_retry_after: HashMap<i64, Instant>,
 }
 
 struct AttentionState {
@@ -122,6 +129,49 @@ impl Runtime {
         self.0.state.lock().unwrap().restore_claims.remove(key);
     }
 
+    fn excluded_history_restores(&self) -> HashSet<i64> {
+        let now = Instant::now();
+        let mut state = self.0.state.lock().unwrap();
+        state
+            .history_restore_retry_after
+            .retain(|_, retry_after| *retry_after > now);
+        let mut excluded = state
+            .history_restore_retry_after
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        excluded.extend(
+            state
+                .restore_claims
+                .iter()
+                .filter_map(|claim| claim.strip_prefix("history:"))
+                .filter_map(|id| id.parse::<i64>().ok()),
+        );
+        excluded
+    }
+
+    fn defer_history_restore(&self, id: i64, reason: &'static str) {
+        self.0
+            .state
+            .lock()
+            .unwrap()
+            .history_restore_retry_after
+            .insert(id, Instant::now() + HISTORY_RESTORE_RETRY_DELAY);
+        eprintln!(
+            "tracker_restore event=history_deferred history_id={id} reason={reason} retry_ms={}",
+            HISTORY_RESTORE_RETRY_DELAY.as_millis()
+        );
+    }
+
+    fn clear_history_restore_deferment(&self, id: i64) {
+        self.0
+            .state
+            .lock()
+            .unwrap()
+            .history_restore_retry_after
+            .remove(&id);
+    }
+
     fn status(&self) -> TrackerStatus {
         let database_path = self.0.database.lock().unwrap().path().display().to_string();
         let state = self.0.state.lock().unwrap();
@@ -132,6 +182,7 @@ impl Runtime {
             recovery_pending: state.recovery_pending,
             database_path,
             run_id: state.run_id.clone(),
+            build_id: crate::BUILD_ID.to_string(),
         }
     }
 
@@ -517,9 +568,9 @@ impl Runtime {
     ) {
         let runtime = self.clone();
         std::thread::spawn(move || {
+            let started = Instant::now();
             let deadline = Instant::now() + Duration::from_secs(20);
             loop {
-                std::thread::sleep(Duration::from_millis(500));
                 let current = runtime.windows();
                 let final_attempt = Instant::now() >= deadline;
                 let candidates = if history_id.is_some() {
@@ -551,6 +602,7 @@ impl Runtime {
                             Ok(()) => {
                                 let mut state = runtime.0.state.lock().unwrap();
                                 state.history_generation = state.history_generation.wrapping_add(1);
+                                state.history_restore_retry_after.remove(&history_id);
                             }
                             Err(err) => eprintln!(
                                 "Session restore matched, but history entry {history_id} could not be removed: {err}"
@@ -567,13 +619,25 @@ impl Runtime {
                         "Session layout restore timed out with {matched}/{} windows matched",
                         specs.len()
                     );
+                    if let Some(history_id) = history_id {
+                        runtime.defer_history_restore(history_id, "window_match_timeout");
+                    }
                     if let Some(claim) = claim.as_deref() {
                         runtime.release_restore(claim);
                     }
                     break;
                 }
+                std::thread::sleep(layout_reconciliation_poll_interval(started.elapsed()));
             }
         });
+    }
+}
+
+fn layout_reconciliation_poll_interval(elapsed: Duration) -> Duration {
+    if elapsed < LAYOUT_RECONCILIATION_FAST_PERIOD {
+        LAYOUT_RECONCILIATION_FAST_POLL
+    } else {
+        LAYOUT_RECONCILIATION_SLOW_POLL
     }
 }
 
@@ -921,21 +985,14 @@ impl TrackerApi {
 
     #[zbus(name = "ReopenLatestHistory")]
     fn reopen_latest_history(&self) -> String {
-        let latest_id = self
+        let history = self
             .0
             .0
             .database
             .lock()
             .unwrap()
-            .history(1)
-            .and_then(|history| {
-                history
-                    .into_iter()
-                    .next()
-                    .map(|entry| entry.id)
-                    .ok_or_else(|| "No recently closed windows are available".into())
-            });
-        let result = latest_id.and_then(|id| reopen_history_entry(&self.0, id));
+            .history(REOPEN_HISTORY_SCAN_LIMIT);
+        let result = history.and_then(|history| reopen_latest_history_entry(&self.0, &history));
         serde_json::to_string(&result).unwrap()
     }
 
@@ -957,6 +1014,7 @@ impl TrackerApi {
         if result.is_ok() {
             let mut state = self.0.0.state.lock().unwrap();
             state.history_generation = state.history_generation.wrapping_add(1);
+            state.history_restore_retry_after.clear();
         }
         serde_json::to_string(&result).unwrap()
     }
@@ -1021,6 +1079,7 @@ fn reopen_history_entry(runtime: &Runtime, id: i64) -> Result<RestoreReport, Str
     runtime.claim_restore(claim.clone())?;
     let report = super::restore::reopen_entry(&entry);
     if report.launched > 0 {
+        runtime.clear_history_restore_deferment(id);
         runtime.schedule_layout_reconciliation(
             vec![(entry.window, entry.restore)],
             Some(id),
@@ -1029,8 +1088,124 @@ fn reopen_history_entry(runtime: &Runtime, id: i64) -> Result<RestoreReport, Str
         );
     } else {
         runtime.release_restore(&claim);
+        runtime.defer_history_restore(id, "launch_failed");
     }
     Ok(report)
+}
+
+fn reopen_latest_history_entry(
+    runtime: &Runtime,
+    history: &[HistoryEntry],
+) -> Result<RestoreReport, String> {
+    let excluded = runtime.excluded_history_restores();
+    let (candidate_ids, stats) = reopenable_history_ids(history, &excluded);
+    let (selected, launch_failures) =
+        first_launched_history_report(candidate_ids, |id| reopen_history_entry(runtime, id));
+    if let Some((id, report)) = selected {
+        eprintln!(
+            "tracker_restore event=reopen_latest_selected history_id={id} scanned={} excluded={} non_window={} unsupported_terminal={} missing_executable={} missing_desktop={} non_launchable_desktop={} prior_launch_failures={launch_failures}",
+            stats.scanned,
+            stats.excluded,
+            stats.non_window,
+            stats.unsupported_terminal,
+            stats.missing_executable,
+            stats.missing_desktop,
+            stats.non_launchable_desktop,
+        );
+        return Ok(report);
+    }
+
+    eprintln!(
+        "tracker_restore event=reopen_latest_unavailable scanned={} excluded={} non_window={} unsupported_terminal={} missing_executable={} missing_desktop={} non_launchable_desktop={} launch_failures={launch_failures}",
+        stats.scanned,
+        stats.excluded,
+        stats.non_window,
+        stats.unsupported_terminal,
+        stats.missing_executable,
+        stats.missing_desktop,
+        stats.non_launchable_desktop,
+    );
+    Err("No reopenable recently closed windows are currently available".into())
+}
+
+fn first_launched_history_report(
+    candidate_ids: impl IntoIterator<Item = i64>,
+    mut reopen: impl FnMut(i64) -> Result<RestoreReport, String>,
+) -> (Option<(i64, RestoreReport)>, usize) {
+    let mut failures = 0;
+    for id in candidate_ids {
+        match reopen(id) {
+            Ok(report) if report.launched > 0 => return (Some((id, report)), failures),
+            Ok(_) | Err(_) => failures += 1,
+        }
+    }
+    (None, failures)
+}
+
+#[derive(Default)]
+struct ReopenSelectionStats {
+    scanned: usize,
+    excluded: usize,
+    non_window: usize,
+    unsupported_terminal: usize,
+    missing_executable: usize,
+    missing_desktop: usize,
+    non_launchable_desktop: usize,
+}
+
+fn reopenable_history_ids(
+    history: &[HistoryEntry],
+    excluded: &HashSet<i64>,
+) -> (Vec<i64>, ReopenSelectionStats) {
+    reopenable_history_ids_with(
+        history,
+        excluded,
+        REOPEN_LAUNCH_ATTEMPT_LIMIT,
+        super::restore::unavailable_reason,
+    )
+}
+
+fn reopenable_history_ids_with(
+    history: &[HistoryEntry],
+    excluded: &HashSet<i64>,
+    limit: usize,
+    unavailable_reason: impl Fn(&RestoreSpec) -> Option<super::restore::LaunchUnavailableCode>,
+) -> (Vec<i64>, ReopenSelectionStats) {
+    let mut stats = ReopenSelectionStats::default();
+    let candidates = history
+        .iter()
+        .filter_map(|entry| {
+            stats.scanned += 1;
+            if excluded.contains(&entry.id) {
+                stats.excluded += 1;
+                return None;
+            }
+            if !is_history_worthy(&entry.window) {
+                stats.non_window += 1;
+                return None;
+            }
+            if let Some(reason) = unavailable_reason(&entry.restore) {
+                match reason {
+                    super::restore::LaunchUnavailableCode::UnsupportedTerminalKind => {
+                        stats.unsupported_terminal += 1;
+                    }
+                    super::restore::LaunchUnavailableCode::MissingExecutable => {
+                        stats.missing_executable += 1;
+                    }
+                    super::restore::LaunchUnavailableCode::MissingDesktopEntry => {
+                        stats.missing_desktop += 1;
+                    }
+                    super::restore::LaunchUnavailableCode::NonLaunchableDesktopEntry => {
+                        stats.non_launchable_desktop += 1;
+                    }
+                }
+                return None;
+            }
+            Some(entry.id)
+        })
+        .take(limit)
+        .collect();
+    (candidates, stats)
 }
 
 fn read_boot_id() -> String {
@@ -1103,6 +1278,7 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             attention: HashMap::new(),
             restore_specs,
             restore_claims: HashSet::new(),
+            history_restore_retry_after: HashMap::new(),
         }),
         database: Mutex::new(database),
     }));
@@ -1223,15 +1399,117 @@ pub fn run_tracker_daemon() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
 
     use super::{
-        ATTENTION_RECHECK_DELAY, AttentionState, attention_retry_delay, is_history_worthy,
+        ATTENTION_RECHECK_DELAY, AttentionState, attention_retry_delay,
+        first_launched_history_report, is_history_worthy, layout_reconciliation_poll_interval,
         normalized_terminal_title, reconcile_attention_states, record_attention_attempt,
-        terminal_dbus_service_names, tracked_window_state_changed,
+        reopenable_history_ids_with, terminal_dbus_service_names, tracked_window_state_changed,
     };
-    use crate::tracker::TrackedWindow;
+    use crate::tracker::restore::LaunchUnavailableCode;
+    use crate::tracker::{HistoryEntry, RestoreReport, RestoreSpec, TrackedWindow};
+
+    #[test]
+    fn reopened_windows_use_fast_initial_reconciliation() {
+        assert_eq!(
+            layout_reconciliation_poll_interval(Duration::ZERO),
+            Duration::from_millis(40)
+        );
+        assert_eq!(
+            layout_reconciliation_poll_interval(Duration::from_secs(2)),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn global_reopen_skips_unlaunchable_history_entries() {
+        let unlaunchable = HistoryEntry {
+            id: 2,
+            window: TrackedWindow {
+                title: "chatgpt".into(),
+                class: "electron".into(),
+                ..TrackedWindow::default()
+            },
+            closed_at_ms: 2,
+            restore: RestoreSpec {
+                app_key: "missing-electron-desktop-entry".into(),
+                desktop_file: Some("missing-electron-desktop-entry".into()),
+                ..RestoreSpec::default()
+            },
+        };
+        let terminal = HistoryEntry {
+            id: 1,
+            window: TrackedWindow {
+                title: "~ - Terminal".into(),
+                class: "xfce4-terminal".into(),
+                ..TrackedWindow::default()
+            },
+            closed_at_ms: 1,
+            restore: RestoreSpec {
+                app_key: "xfce4-terminal".into(),
+                terminal_kind: Some("shell".into()),
+                ..RestoreSpec::default()
+            },
+        };
+
+        let history = [unlaunchable, terminal];
+        let (candidates, stats) =
+            reopenable_history_ids_with(&history, &HashSet::new(), 4, |restore| {
+                (restore.app_key == "missing-electron-desktop-entry")
+                    .then_some(LaunchUnavailableCode::MissingDesktopEntry)
+            });
+
+        assert_eq!(candidates, [1]);
+        assert_eq!(stats.scanned, 2);
+        assert_eq!(stats.missing_desktop, 1);
+        assert_eq!(stats.excluded, 0);
+    }
+
+    #[test]
+    fn global_reopen_skips_in_flight_entries_and_bounds_candidates() {
+        let history = (1..=8)
+            .rev()
+            .map(|id| HistoryEntry {
+                id,
+                window: TrackedWindow {
+                    title: format!("Window {id}"),
+                    class: "test-app".into(),
+                    ..TrackedWindow::default()
+                },
+                closed_at_ms: id,
+                restore: RestoreSpec {
+                    app_key: "test-app".into(),
+                    ..RestoreSpec::default()
+                },
+            })
+            .collect::<Vec<_>>();
+        let excluded = HashSet::from([8, 7]);
+
+        let (candidates, stats) = reopenable_history_ids_with(&history, &excluded, 3, |_| None);
+
+        assert_eq!(candidates, [6, 5, 4]);
+        assert_eq!(stats.scanned, 5);
+        assert_eq!(stats.excluded, 2);
+    }
+
+    #[test]
+    fn global_reopen_continues_after_immediate_launch_failures() {
+        let mut attempts = Vec::new();
+
+        let (selected, failures) = first_launched_history_report([3, 2, 1], |id| {
+            attempts.push(id);
+            Ok(RestoreReport {
+                launched: usize::from(id == 1),
+                ..RestoreReport::default()
+            })
+        });
+
+        assert_eq!(attempts, [3, 2, 1]);
+        assert_eq!(selected.map(|(id, _)| id), Some(1));
+        assert_eq!(failures, 2);
+    }
 
     #[test]
     fn successful_attention_send_rearms_identical_back_to_back_prompts() {
