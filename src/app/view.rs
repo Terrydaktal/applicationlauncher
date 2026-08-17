@@ -13,6 +13,9 @@ impl eframe::App for App {
         }
 
         let mut handled_focus_launcher = false;
+        let mut focus_requested = false;
+        let mut source_changes_pending = None;
+        let mut shutdown_requested = false;
         let mut ui_event_count = 0;
         for _ in 0..UI_EVENTS_PER_FRAME {
             let Ok(event) = self.ui_event_rx.try_recv() else {
@@ -20,34 +23,52 @@ impl eframe::App for App {
             };
             ui_event_count += 1;
             match event {
-                UiEvent::FocusLauncher => {
-                    handled_focus_launcher = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                        egui::WindowLevel::AlwaysOnTop,
-                    ));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
-                        egui::UserAttentionType::Informational,
-                    ));
-                    request_launcher_foreground();
-                    self.search_focus_until = Some(Instant::now() + Duration::from_millis(1200));
-                    self.search_query.clear();
-                    self.selected_index = 0;
-                    self.side_panel_selected_index = 0;
-                    self.last_selected_window_id = None;
-                    self.scroll_to_first_window_on_focus = self.mode == LauncherMode::Windows;
-                    self.active_pane = if self.mode == LauncherMode::Windows {
-                        ActivePane::Windows
-                    } else {
-                        ActivePane::Apps
-                    };
-                    self.start_background_app_load();
-                    self.start_terminal_metadata_refresh();
+                UiEvent::FocusLauncher {
+                    source_changes_pending: pending,
+                } => {
+                    focus_requested = true;
+                    source_changes_pending = Some(pending);
+                }
+                UiEvent::ShutdownLauncher => {
+                    shutdown_requested = true;
                 }
             }
         }
+        if shutdown_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        if focus_requested {
+            handled_focus_launcher = true;
+            if let Some(pending) = source_changes_pending {
+                self.source_changes_pending = pending;
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                egui::WindowLevel::AlwaysOnTop,
+            ));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Informational,
+            ));
+            request_launcher_foreground();
+            self.search_focus_until = Some(Instant::now() + Duration::from_millis(1200));
+            self.search_query.clear();
+            self.selected_index = 0;
+            self.side_panel_selected_index = 0;
+            self.last_selected_window_id = None;
+            self.scroll_to_first_window_on_focus = self.mode == LauncherMode::Windows;
+            self.active_pane = if self.mode == LauncherMode::Windows {
+                ActivePane::Windows
+            } else {
+                ActivePane::Apps
+            };
+            self.start_background_app_load();
+            self.start_terminal_metadata_refresh();
+        }
+
         if ui_event_count == UI_EVENTS_PER_FRAME || handled_focus_launcher {
             ctx.request_repaint();
         }
@@ -209,6 +230,10 @@ impl eframe::App for App {
         {
             Some(Ok(apps)) => {
                 self.apps = apps;
+                applicationlauncher::observability::set_gauge(
+                    applicationlauncher::observability::Gauge::InstalledApps,
+                    self.apps.len(),
+                );
                 self.app_search_documents = self.apps.iter().map(app_search_document).collect();
                 self.apps_generation = self.apps_generation.wrapping_add(1);
                 self.refresh_app_audio_levels();
@@ -238,6 +263,10 @@ impl eframe::App for App {
                     match result {
                         LoadResult::AppsSuccess(apps) => {
                             self.apps = apps;
+                            applicationlauncher::observability::set_gauge(
+                                applicationlauncher::observability::Gauge::InstalledApps,
+                                self.apps.len(),
+                            );
                             self.app_search_documents =
                                 self.apps.iter().map(app_search_document).collect();
                             self.apps_generation = self.apps_generation.wrapping_add(1);
@@ -2705,6 +2734,7 @@ impl eframe::App for App {
                     if self.app_info_popup.is_some() {
                         self.show_app_info_popup(ctx);
                     }
+                    self.show_source_changes_warning(ctx);
                     self.show_terminal_action_message(ctx);
 
                     if let Some(ref resp) = text_edit_response {

@@ -13,7 +13,6 @@ pub(crate) const SETTINGS_VIEWPORT_MIN_SIZE: [f32; 2] = [340.0, 500.0];
 pub(crate) const AUDIO_UPDATES_PER_FRAME: usize = 32;
 pub(crate) const UI_EVENTS_PER_FRAME: usize = 8;
 pub(crate) const CONTROL_REQUEST_LIMIT: usize = 128;
-pub(crate) const DEBUG_ATTACH_TIMEOUT_SECS: u64 = 60;
 pub(crate) const TERMINAL_DBUS_SERVICE: &str = "org.xfce.Terminal5";
 pub(crate) const TERMINAL_DBUS_PATH: &str = "/org/xfce/Terminal";
 pub(crate) const TERMINAL_DBUS_INTERFACE: &str = "org.xfce.Terminal5";

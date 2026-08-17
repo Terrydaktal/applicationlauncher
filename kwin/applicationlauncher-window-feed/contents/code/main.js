@@ -5,6 +5,7 @@ var TRACKER_PATH = "/Tracker";
 var TRACKER_INTERFACE = "com.terrydaktal.ApplicationLauncher.Tracker1";
 
 var trackedWindows = {};
+var reopenShortcutActive = true;
 
 function activeWindowIsBrowser() {
     var window = workspace.activeWindow;
@@ -16,6 +17,27 @@ function activeWindowIsBrowser() {
     return identity.indexOf("chrome") !== -1 ||
         identity.indexOf("chromium") !== -1 ||
         identity.indexOf("firefox") !== -1;
+}
+
+function setReopenShortcutActive(active) {
+    if (reopenShortcutActive === active) {
+        return;
+    }
+
+    reopenShortcutActive = active;
+    callDBus(
+        SERVICE,
+        TRACKER_PATH,
+        TRACKER_INTERFACE,
+        "SetReopenShortcutActive",
+        active
+    );
+}
+
+function updateReopenShortcutState() {
+    // A registered global shortcut is consumed before its callback runs. Release
+    // this action while a browser is active so the physical key reaches the app.
+    setReopenShortcutActive(!activeWindowIsBrowser());
 }
 
 function reopenLatestClosedWindow() {
@@ -131,6 +153,7 @@ registerShortcut(
     "Ctrl+Shift+T",
     reopenLatestClosedWindow
 );
+updateReopenShortcutState();
 
 function trackWindow(window, deferInitialUpsert) {
     if (!window || !window.internalId) {
@@ -234,6 +257,7 @@ workspace.windowRemoved.connect(function (window) {
 });
 
 workspace.windowActivated.connect(function (window) {
+    updateReopenShortcutState();
     if (window) {
         var payload = serializeWindow(window);
         if (payload) {

@@ -35,6 +35,13 @@ pub(crate) fn resolve_window_icon(
 ) -> Option<PathBuf> {
     let terminal_window = is_terminal_class(&class.to_lowercase());
     let tor_browser_window = is_tor_browser_identity(class);
+    if terminal_window
+        && let Some(child_icon) = active_process
+            .and_then(|process| find_terminal_child_icon(theme, process, &application_dirs()))
+    {
+        return Some(child_icon);
+    }
+
     let mut candidates = Vec::new();
     let mut push_candidate = |candidate: Option<&str>| {
         let Some(candidate) = candidate.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -56,9 +63,9 @@ pub(crate) fn resolve_window_icon(
         push_candidate(Some(desktop_stem));
     }
     push_candidate(Some(class));
-    // A terminal window belongs to the terminal application even when its
-    // foreground child is Electron, Codex, htop, or another executable.
-    // Never let that child replace the terminal's own icon.
+    // Terminal children are handled above only when a matching desktop entry
+    // explicitly declares Terminal=true. Unknown and detached helper processes
+    // retain the terminal application's icon.
     if !terminal_window {
         push_candidate(active_process);
     }
@@ -74,16 +81,101 @@ pub(crate) fn resolve_window_icon(
         .into_iter()
         .find_map(|candidate| find_icon(theme, &candidate))
 }
-fn parse_icon_from_desktop(path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.starts_with("Icon=") {
-            let val = line.strip_prefix("Icon=")?;
-            return Some(val.trim().to_string());
+
+#[derive(Default)]
+struct DesktopEntryMetadata {
+    icon: Option<String>,
+    runs_in_terminal: bool,
+}
+
+fn application_dirs() -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+        directories.push(PathBuf::from(data_home).join("applications"));
+    } else if let Some(home) = std::env::var_os("HOME") {
+        directories.push(PathBuf::from(home).join(".local/share/applications"));
+    }
+    let data_dirs = std::env::var_os("XDG_DATA_DIRS")
+        .map(|dirs| std::env::split_paths(&dirs).collect::<Vec<_>>())
+        .unwrap_or_else(|| {
+            vec![
+                PathBuf::from("/usr/local/share"),
+                PathBuf::from("/usr/share"),
+            ]
+        });
+    for directory in data_dirs {
+        let directory = directory.join("applications");
+        if !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    directories
+}
+
+fn find_terminal_child_icon(
+    theme: &str,
+    active_process: &str,
+    application_dirs: &[PathBuf],
+) -> Option<PathBuf> {
+    let process_name = Path::new(active_process.trim())
+        .file_name()
+        .and_then(|name| name.to_str())?
+        .trim_end_matches(".desktop");
+    let mut desktop_stems = vec![process_name.to_string()];
+    let lowercase = process_name.to_lowercase();
+    if lowercase != process_name {
+        desktop_stems.push(lowercase);
+    }
+
+    for stem in &desktop_stems {
+        for directory in application_dirs {
+            let Some(metadata) = parse_desktop_entry(&directory.join(format!("{stem}.desktop")))
+            else {
+                continue;
+            };
+            if !metadata.runs_in_terminal {
+                return None;
+            }
+            let Some(icon) = metadata.icon else {
+                return None;
+            };
+            let icon_path = PathBuf::from(&icon);
+            if icon_path.is_absolute() {
+                return icon_path.is_file().then_some(icon_path);
+            }
+            return lookup_theme_icon_exact(theme, &icon);
         }
     }
     None
+}
+
+fn parse_desktop_entry(path: &Path) -> Option<DesktopEntryMetadata> {
+    let content = std::fs::read_to_string(path).ok()?;
+    Some(parse_desktop_entry_content(&content))
+}
+
+fn parse_desktop_entry_content(content: &str) -> DesktopEntryMetadata {
+    let mut metadata = DesktopEntryMetadata::default();
+    let mut in_desktop_entry = false;
+    for line in content.lines().map(str::trim) {
+        if line.starts_with('[') && line.ends_with(']') {
+            in_desktop_entry = line.eq_ignore_ascii_case("[Desktop Entry]");
+            continue;
+        }
+        if !in_desktop_entry || line.starts_with('#') {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("Icon=") {
+            metadata.icon = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("Terminal=") {
+            metadata.runs_in_terminal = value.trim().eq_ignore_ascii_case("true");
+        }
+    }
+    metadata
+}
+
+fn parse_icon_from_desktop(path: &Path) -> Option<String> {
+    parse_desktop_entry(path)?.icon
 }
 
 pub(crate) fn lookup_theme_icon_exact(theme: &str, name: &str) -> Option<PathBuf> {
@@ -137,19 +229,7 @@ pub(crate) fn find_icon(theme: &str, class: &str) -> Option<PathBuf> {
     }
 
     // Try finding the .desktop file to see if it has a hardcoded icon path or an override name
-    let mut app_dirs = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
-        app_dirs.push(PathBuf::from(format!("{}/.local/share/applications", home)));
-    }
-    let data_dirs = std::env::var_os("XDG_DATA_DIRS")
-        .map(|dirs| std::env::split_paths(&dirs).collect::<Vec<_>>())
-        .unwrap_or_else(|| {
-            vec![
-                PathBuf::from("/usr/local/share"),
-                PathBuf::from("/usr/share"),
-            ]
-        });
-    app_dirs.extend(data_dirs.into_iter().map(|dir| dir.join("applications")));
+    let app_dirs = application_dirs();
 
     let mut overrides = Vec::new();
     for dir in &app_dirs {
@@ -230,4 +310,85 @@ pub(crate) fn find_icon(theme: &str, class: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_entry_parser_uses_only_the_main_section() {
+        let metadata = parse_desktop_entry_content(
+            "[Desktop Entry]\nIcon=htop\nTerminal=true\n\n[Desktop Action Unsafe]\nTerminal=false\nIcon=electron\n",
+        );
+        assert_eq!(metadata.icon.as_deref(), Some("htop"));
+        assert!(metadata.runs_in_terminal);
+    }
+
+    #[test]
+    fn terminal_child_icon_requires_a_terminal_desktop_entry() {
+        let root = std::env::temp_dir().join(format!(
+            "applicationlauncher-terminal-icons-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let htop_icon = root.join("htop.svg");
+        let electron_icon = root.join("electron.svg");
+        std::fs::write(&htop_icon, "<svg/>").unwrap();
+        std::fs::write(&electron_icon, "<svg/>").unwrap();
+        std::fs::write(
+            root.join("htop.desktop"),
+            format!(
+                "[Desktop Entry]\nType=Application\nTerminal=true\nIcon={}\n",
+                htop_icon.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("electron.desktop"),
+            format!(
+                "[Desktop Entry]\nType=Application\nTerminal=false\nIcon={}\n",
+                electron_icon.display()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            find_terminal_child_icon("breeze", "htop", std::slice::from_ref(&root)),
+            Some(htop_icon)
+        );
+        assert_eq!(
+            find_terminal_child_icon("breeze", "electron", std::slice::from_ref(&root)),
+            None
+        );
+        let override_root = root.join("overrides");
+        std::fs::create_dir(&override_root).unwrap();
+        std::fs::write(
+            override_root.join("htop.desktop"),
+            "[Desktop Entry]\nType=Application\nTerminal=false\nIcon=htop\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_terminal_child_icon("breeze", "htop", &[override_root, root.clone()]),
+            None
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn installed_terminal_monitor_icons_resolve_when_available() {
+        let directories = application_dirs();
+        for process in ["htop", "nvtop"] {
+            let desktop_installed = directories
+                .iter()
+                .any(|directory| directory.join(format!("{process}.desktop")).is_file());
+            if desktop_installed {
+                assert!(
+                    find_terminal_child_icon("breeze-dark", process, &directories).is_some(),
+                    "installed {process} desktop entry did not resolve an icon"
+                );
+            }
+        }
+    }
 }

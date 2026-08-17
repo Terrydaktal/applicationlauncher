@@ -26,6 +26,15 @@ jobs:
         with:
           components: rustfmt
 
+      - name: Install diagnostic build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils elfutils gdb jq shellcheck
+
+      - name: Validate shell scripts
+        working-directory: applicationlauncher
+        run: shellcheck scripts/applicationlauncher scripts/build-debuggable-release
+
       - name: Check formatting
         working-directory: applicationlauncher
         run: cargo fmt --all -- --check
@@ -37,6 +46,22 @@ jobs:
       - name: Build release binary
         working-directory: applicationlauncher
         run: cargo build --release --locked
+
+      - name: Archive exact release and split symbols
+        working-directory: applicationlauncher
+        env:
+          APPLICATIONLAUNCHER_BUILD_ARCHIVE: ${{ runner.temp }}/applicationlauncher-builds
+        run: scripts/build-debuggable-release --no-build
+
+      - name: Verify production diagnostics
+        working-directory: applicationlauncher
+        env:
+          APPLICATIONLAUNCHER_BUILD_ARCHIVE: ${{ runner.temp }}/applicationlauncher-builds
+          XDG_RUNTIME_DIR: ${{ runner.temp }}/applicationlauncher-runtime
+          XDG_STATE_HOME: ${{ runner.temp }}/applicationlauncher-state
+        run: |
+          mkdir -p "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME"
+          target/release/applicationlauncher debug-doctor
 
       - name: Audit dependencies
         uses: rustsec/audit-check@v2

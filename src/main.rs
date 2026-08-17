@@ -1,6 +1,9 @@
 use eframe::egui;
 use std::time::Instant;
 
+use applicationlauncher::diagnostic_capture::{CaptureOptions, capture_auto, run_debug_doctor};
+use applicationlauncher::observability::{self, Component};
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -50,9 +53,17 @@ OPTIONS
         Force a specific icon theme (default: automatically detected).
 
     --diagnose
-        Ask the running launcher to permit a temporary debugger attachment,
-        capture all thread stacks, and write a hang report. This option does
-        not start another launcher instance.
+        Alias for --diagnose auto.
+
+    --diagnose auto [--perf] [--core]
+        Independently capture the running GUI and daemon: repeated all-thread
+        stacks, bounded /proc state, semantic snapshots, loaded modules,
+        relevant journal records, and checksums. --perf adds a short profile.
+        --core explicitly adds full live cores, which may contain secrets.
+
+    debug-doctor
+        Verify build IDs, symbolization data, diagnostic attachment, output
+        permissions, required tools, and flight-recorder budgets.
 
 OPERATION
     When launched, the application retrieves a list of all open windows using
@@ -78,8 +89,11 @@ EXAMPLES
     applicationlauncher --close-on-blur
         Launch the application launcher and close it when focus is lost.
 
-    applicationlauncher --diagnose
-        Capture a report from a currently running, unresponsive launcher.
+    applicationlauncher --diagnose auto
+        Capture bounded evidence from the running GUI and daemon.
+
+    applicationlauncher --diagnose auto --perf
+        Add a short call-graph profile for each running component.
 
 FILES
     $HOME/.config/applicationlauncher/config.toml
@@ -91,11 +105,11 @@ FILES
     $HOME/.config/applicationlauncher/pinned_apps.txt
         Stores absolute paths of pinned desktop applications.
 
-    $XDG_STATE_HOME/applicationlauncher/hang-latest.log
-        Contains the most recently captured hang report.
+    $XDG_STATE_HOME/applicationlauncher/diagnostics/
+        Contains bounded, checksummed GUI and daemon diagnostic bundles.
 
-    $XDG_STATE_HOME/applicationlauncher/panic-latest.log
-        Contains the most recently captured Rust panic and backtrace.
+    $XDG_STATE_HOME/applicationlauncher/panic-gui-latest.log
+        Contains the most recently captured GUI Rust panic and backtrace.
 
     $XDG_STATE_HOME/applicationlauncher/history.sqlite3
         Private window history, crash recovery, and saved-session database.
@@ -128,8 +142,84 @@ AUTHORS
 }
 
 fn main() -> eframe::Result {
-    install_panic_hook();
     let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|argument| argument == "--build-id") {
+        println!("{}", applicationlauncher::BUILD_ID);
+        return Ok(());
+    }
+
+    if let Some(position) = args
+        .iter()
+        .position(|argument| argument == "--diagnostic-probe")
+    {
+        observability::initialize(Component::Gui);
+        install_panic_hook();
+        let probe = args.get(position + 1).map(String::as_str).ok_or_else(|| {
+            eframe::Error::AppCreation("--diagnostic-probe requires a kind".into())
+        })?;
+        if let Err(err) = applicationlauncher::diagnostic_capture::run_internal_probe(probe) {
+            eprintln!("Diagnostic probe failed: {err}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    if args.iter().any(|argument| argument == "debug-doctor") {
+        observability::initialize(Component::Test);
+        observability::install_panic_hook(Component::Test);
+        match run_debug_doctor() {
+            Ok((path, report)) => {
+                println!("Debug doctor report written to {}", path.display());
+                for check in &report.checks {
+                    println!(
+                        "{} {}: {}",
+                        if check.passed { "PASS" } else { "FAIL" },
+                        check.name,
+                        check.detail
+                    );
+                }
+                if !report.passed() {
+                    std::process::exit(1);
+                }
+            }
+            Err(err) => {
+                eprintln!("Debug doctor failed: {err}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(position) = args.iter().position(|argument| argument == "--diagnose") {
+        observability::initialize(Component::Test);
+        observability::install_panic_hook(Component::Test);
+        if let Some(mode) = args.get(position + 1)
+            && !mode.starts_with('-')
+            && mode != "auto"
+        {
+            eprintln!("Unsupported diagnostic mode {mode}; expected auto");
+            std::process::exit(1);
+        }
+        let options = CaptureOptions {
+            include_perf: args.iter().any(|argument| argument == "--perf"),
+            include_core: args.iter().any(|argument| argument == "--core"),
+            ..CaptureOptions::default()
+        };
+        if options.include_core {
+            eprintln!(
+                "Full cores were explicitly requested; core files can contain unredacted secrets"
+            );
+        }
+        match capture_auto(options) {
+            Ok(path) => println!("Diagnostic bundle written to {}", path.display()),
+            Err(err) => {
+                eprintln!("Diagnostic capture failed: {err}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
 
     if args
         .iter()
@@ -139,6 +229,9 @@ fn main() -> eframe::Result {
         print_help();
         return Ok(());
     }
+
+    observability::initialize(Component::Gui);
+    install_panic_hook();
 
     if args.len() >= 7 && args[1] == "--draw-border" {
         let tx: f32 = args[2].parse().unwrap_or(0.0);
@@ -196,7 +289,15 @@ fn main() -> eframe::Result {
     }
 
     let mode = LauncherMode::Windows;
-    let diagnose_requested = args.iter().any(|arg| arg == "--diagnose");
+    let source_changes_pending = std::env::var_os("APPLICATIONLAUNCHER_SOURCE_CHANGES_PENDING")
+        .is_some_and(|value| value == "1");
+    if args.iter().any(|arg| arg == "--shutdown") {
+        let socket_path = get_socket_path(mode);
+        if let Err(err) = send_launcher_control_request(&socket_path, "shutdown\n", true) {
+            eprintln!("Could not shut down the running launcher: {err}");
+        }
+        return Ok(());
+    }
 
     // Single instance check using Unix domain socket
     let socket_path = get_socket_path(mode);
@@ -208,27 +309,14 @@ fn main() -> eframe::Result {
         }
     }
     let listener = match std::os::unix::net::UnixListener::bind(&socket_path) {
-        Ok(listener) => {
-            if diagnose_requested {
-                eprintln!("Diagnostic capture failed: no running launcher was found");
-                return Ok(());
-            }
-            listener
-        }
+        Ok(listener) => listener,
         Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
-            if diagnose_requested {
-                match capture_running_launcher_diagnostics(&socket_path) {
-                    Ok(path) => {
-                        println!("Hang report written to {}", path.display());
-                        return Ok(());
-                    }
-                    Err(err) => {
-                        eprintln!("Diagnostic capture failed: {err}");
-                        std::process::exit(1);
-                    }
-                }
-            }
-            if send_launcher_control_request(&socket_path, "focus\n", false).is_ok() {
+            let focus_request = if source_changes_pending {
+                "focus-source-changes-pending\n"
+            } else {
+                "focus\n"
+            };
+            if send_launcher_control_request(&socket_path, focus_request, false).is_ok() {
                 focus_existing_launcher_window();
                 return Ok(());
             }
@@ -261,6 +349,14 @@ fn main() -> eframe::Result {
             return Ok(());
         }
     };
+    let _diagnostic_server = match observability::start_diagnostic_server(Component::Gui) {
+        Ok(server) => Some(server),
+        Err(err) => {
+            eprintln!("Could not start the independent GUI diagnostic endpoint: {err}");
+            None
+        }
+    };
+    let _gui_worker = observability::register_worker("gui-main");
 
     let mut close_on_blur = false;
     let mut force_theme = None;
@@ -314,7 +410,8 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let repaint_ctx = cc.egui_ctx.clone();
-            std::thread::spawn(move || {
+            observability::spawn_named("gui-control", move |worker| {
+                worker.set_state("accepting");
                 for stream in listener.incoming() {
                     match stream {
                         Ok(stream) => {
@@ -331,6 +428,7 @@ fn main() -> eframe::Result {
                 force_theme,
                 mode,
                 icon_only,
+                source_changes_pending,
                 ui_event_rx,
             )))
         }),

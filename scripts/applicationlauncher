@@ -7,28 +7,18 @@ script_path="$(readlink -f -- "${BASH_SOURCE[0]}")"
 repo_dir="$(cd -- "$(dirname -- "$script_path")/.." && pwd -P)"
 binary="$repo_dir/target/release/applicationlauncher"
 daemon_binary="$repo_dir/target/release/applicationlauncherd"
-build_stamp="$repo_dir/target/release/.applicationlauncher-build-stamp"
 fuzzy_rank_dir="$(cd -- "$repo_dir/../fuzzy-rank" 2>/dev/null && pwd -P || true)"
 state_root="${XDG_STATE_HOME:-${HOME}/.local/state}"
 state_dir="$state_root/applicationlauncher"
 build_log="$state_dir/launcher-build.log"
 runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 build_lock="$runtime_dir/applicationlauncher-build-v2.lock"
-cargo_binary="$(command -v cargo 2>/dev/null || true)"
+socket_path="$runtime_dir/applicationlauncher-windows.sock"
 
-if [[ -z "$cargo_binary" ]]; then
-	for candidate in "$HOME/.local/bin/cargo" "$HOME/.cargo/bin/cargo"; do
-		if [[ -x "$candidate" ]]; then
-			cargo_binary="$candidate"
-			break
-		fi
-	done
-fi
-
-inputs_are_newer() {
+source_inputs_are_newer() {
 	local input
 
-	[[ -x "$binary" && -f "$build_stamp" ]] || return 0
+	[[ -x "$binary" && -x "$daemon_binary" ]] || return 1
 
 	for input in \
 		"$repo_dir/Cargo.toml" \
@@ -36,7 +26,7 @@ inputs_are_newer() {
 		"$repo_dir/build.rs" \
 		"$repo_dir/rust-toolchain" \
 		"$repo_dir/rust-toolchain.toml"; do
-		if [[ -f "$input" && "$input" -nt "$build_stamp" ]]; then
+		if [[ -f "$input" && ("$input" -nt "$binary" || "$input" -nt "$daemon_binary") ]]; then
 			return 0
 		fi
 	done
@@ -45,7 +35,10 @@ inputs_are_newer() {
 		"$repo_dir/src" \
 		"$repo_dir/.cargo" \
 		"$repo_dir/kwin/applicationlauncher-window-feed"; do
-		if [[ -d "$input" ]] && find "$input" -type f -newer "$build_stamp" -print -quit | grep -q .; then
+		if [[ -d "$input" ]] && {
+			find "$input" -type f -newer "$binary" -print -quit | grep -q . ||
+				find "$input" -type f -newer "$daemon_binary" -print -quit | grep -q .
+		}; then
 			return 0
 		fi
 	done
@@ -57,19 +50,145 @@ inputs_are_newer() {
 			"$fuzzy_rank_dir/build.rs" \
 			"$fuzzy_rank_dir/rust-toolchain" \
 			"$fuzzy_rank_dir/rust-toolchain.toml"; do
-			if [[ -f "$input" && "$input" -nt "$build_stamp" ]]; then
+			if [[ -f "$input" && ("$input" -nt "$binary" || "$input" -nt "$daemon_binary") ]]; then
 				return 0
 			fi
 		done
 
 		for input in "$fuzzy_rank_dir/src" "$fuzzy_rank_dir/.cargo"; do
-			if [[ -d "$input" ]] && find "$input" -type f -newer "$build_stamp" -print -quit | grep -q .; then
+			if [[ -d "$input" ]] && {
+				find "$input" -type f -newer "$binary" -print -quit | grep -q . ||
+					find "$input" -type f -newer "$daemon_binary" -print -quit | grep -q .
+			}; then
 				return 0
 			fi
 		done
 	fi
 
 	return 1
+}
+
+process_ids_for_executable() {
+	local expected_name="$1"
+	local expected_comm="${expected_name:0:15}"
+	local process_dir pid process_comm executable executable_name
+
+	for process_dir in /proc/[0-9]*; do
+		pid="${process_dir##*/}"
+		# Linux truncates comm to 15 bytes. Use it only as a cheap shell-builtin
+		# prefilter, then retain the exact /proc/PID/exe basename check below.
+		IFS= read -r process_comm 2>/dev/null <"$process_dir/comm" || continue
+		[[ "$process_comm" == "$expected_comm" ]] || continue
+		executable="$(readlink -- "/proc/$pid/exe" 2>/dev/null || true)"
+		[[ -n "$executable" ]] || continue
+		executable="${executable% (deleted)}"
+		executable_name="${executable##*/}"
+		[[ "$executable_name" == "$expected_name" ]] && printf '%s\n' "$pid"
+	done
+}
+
+process_uses_release_binary() {
+	local pid="$1"
+	local release_binary="$2"
+	local process_identity release_identity
+
+	process_identity="$(stat -Lc '%d:%i' "/proc/$pid/exe" 2>/dev/null || true)"
+	release_identity="$(stat -Lc '%d:%i' "$release_binary" 2>/dev/null || true)"
+	[[ -n "$process_identity" && "$process_identity" == "$release_identity" ]]
+}
+
+launcher_processes_are_current() {
+	local pid
+	while read -r pid; do
+		[[ -n "$pid" ]] || continue
+		process_uses_release_binary "$pid" "$binary" || return 1
+	done < <(process_ids_for_executable applicationlauncher)
+}
+
+daemon_deployment_is_current() {
+	local daemon_link daemon_pid
+	[[ -x "$daemon_binary" ]] || return 1
+	daemon_link="$(readlink -f -- "$HOME/.local/bin/applicationlauncherd" 2>/dev/null || true)"
+	[[ "$daemon_link" == "$daemon_binary" ]] || return 1
+
+	# An inactive service is a liveness issue, not an out-of-date deployment.
+	# It is started below without closing the GUI or rebuilding unchanged code.
+	if ! systemctl --user is-active --quiet applicationlauncherd.service 2>/dev/null; then
+		[[ -z "$(process_ids_for_executable applicationlauncherd)" ]]
+		return
+	fi
+
+	daemon_pid="$(systemctl --user show applicationlauncherd.service --property=MainPID --value 2>/dev/null || true)"
+	[[ "$daemon_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+	process_uses_release_binary "$daemon_pid" "$daemon_binary"
+}
+
+deployment_needs_restart() {
+	launcher_processes_are_current || return 0
+	daemon_deployment_is_current || return 0
+	return 1
+}
+
+stop_named_processes() {
+	local pid
+	while read -r pid; do
+		[[ -n "$pid" ]] && kill -TERM "$pid" 2>/dev/null || true
+	done < <(process_ids_for_executable "$1")
+}
+
+force_stop_named_processes() {
+	local pid
+	while read -r pid; do
+		[[ -n "$pid" ]] && kill -KILL "$pid" 2>/dev/null || true
+	done < <(process_ids_for_executable "$1")
+}
+
+wait_for_named_processes_to_exit() {
+	local name="$1"
+	local pids
+	for _ in {1..50}; do
+		pids="$(process_ids_for_executable "$name")"
+		if [[ -z "$pids" ]]; then
+			return 0
+		fi
+		sleep 0.1
+	done
+	return 1
+}
+
+ensure_daemon_running() {
+	if systemctl --user is-active --quiet applicationlauncherd.service 2>/dev/null; then
+		return 0
+	fi
+
+	systemctl --user reset-failed applicationlauncherd.service >/dev/null 2>&1 || true
+	if [[ -x "$daemon_binary" ]] && "$daemon_binary" --install >>"$build_log" 2>&1; then
+		return 0
+	fi
+
+	report_deployment_failure 'Application Launcher daemon failed to start'
+}
+
+close_deployment_processes() {
+	# Ask newer launchers to close through their control socket first. The exact
+	# process fallback also handles older binaries and an unresponsive GUI.
+	if [[ -S "$socket_path" && -x "$binary" ]]; then
+		"$binary" --shutdown >/dev/null 2>&1 || true
+	fi
+	stop_named_processes applicationlauncher
+	wait_for_named_processes_to_exit applicationlauncher || {
+		force_stop_named_processes applicationlauncher
+		wait_for_named_processes_to_exit applicationlauncher || true
+	}
+
+	if systemctl --user is-active --quiet applicationlauncherd.service 2>/dev/null; then
+		systemctl --user stop applicationlauncherd.service >/dev/null 2>&1 || true
+	fi
+	stop_named_processes applicationlauncherd
+	wait_for_named_processes_to_exit applicationlauncherd || {
+		force_stop_named_processes applicationlauncherd
+		wait_for_named_processes_to_exit applicationlauncherd || true
+	}
 }
 
 report_deployment_failure() {
@@ -84,39 +203,46 @@ report_deployment_failure() {
 	fi
 }
 
-if inputs_are_newer; then
-	mkdir -p -- "$state_dir" "$runtime_dir"
-	(
-		exec 9>"$build_lock"
-		flock 9
+mkdir -p -- "$state_dir" "$runtime_dir"
 
-		# Another shortcut invocation may have completed the build while this one waited.
-		if inputs_are_newer; then
-			if [[ -z "$cargo_binary" ]]; then
-				printf 'cargo was not found in PATH, ~/.local/bin, or ~/.cargo/bin\n' >"$build_log"
-				report_deployment_failure 'Application Launcher release build failed'
-				if [[ ! -x "$binary" ]]; then
-					exit 1
-				fi
-			elif ! "$cargo_binary" build \
-				--manifest-path "$repo_dir/Cargo.toml" \
-				--release \
-				--bins \
-				>"$build_log" 2>&1; then
-				report_deployment_failure 'Application Launcher release build failed'
-				if [[ ! -x "$binary" ]]; then
-					exit 1
-				fi
-			elif ! "$daemon_binary" --install >>"$build_log" 2>&1; then
-				report_deployment_failure 'Application Launcher daemon update failed'
-				if [[ ! -x "$binary" ]]; then
-					exit 1
-				fi
-			else
-				touch -- "$build_stamp"
-			fi
+if [[ ! -x "$binary" || ! -x "$daemon_binary" ]]; then
+	report_deployment_failure 'Application Launcher release binaries are missing; run cargo build --release --bins'
+	exit 1
+fi
+
+source_changes_pending=false
+if source_inputs_are_newer; then
+	source_changes_pending=true
+fi
+
+# Restart only when an already-built release binary differs from the running
+# process. Source changes are reported by the GUI and never compile here.
+if deployment_needs_restart; then
+	exec 9>"$build_lock"
+	if ! flock -n 9; then
+		exit 0
+	fi
+
+	# Another invocation may have activated the release binaries before this
+	# process acquired the lock.
+	if deployment_needs_restart; then
+		close_deployment_processes
+		systemctl --user reset-failed applicationlauncherd.service >/dev/null 2>&1 || true
+		if ! "$daemon_binary" --install >>"$build_log" 2>&1; then
+			report_deployment_failure 'Application Launcher daemon update failed'
 		fi
-	)
+	fi
+
+	flock -u 9
+	exec 9>&-
+fi
+
+ensure_daemon_running
+
+if [[ "$source_changes_pending" == true ]]; then
+	export APPLICATIONLAUNCHER_SOURCE_CHANGES_PENDING=1
+else
+	unset APPLICATIONLAUNCHER_SOURCE_CHANGES_PENDING
 fi
 
 exec "$binary" "$@"

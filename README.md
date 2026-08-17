@@ -20,12 +20,17 @@
 │   │   └── mod.rs
 │   ├── launch/
 │   ├── diagnostics.rs
+│   ├── diagnostic_capture.rs
+│   ├── observability.rs
 │   ├── audio.rs
 │   ├── models.rs
 │   ├── search.rs
 │   └── main.rs
 ├── kwin/applicationlauncher-window-feed/
-├── scripts/applicationlauncher
+├── scripts/
+│   ├── applicationlauncher
+│   └── build-debuggable-release
+├── docs/DEBUGGABILITY.md
 ├── Cargo.toml
 ├── Cargo.lock
 └── README.md
@@ -35,14 +40,18 @@
 - `src/app/`: Launcher state, feeds, commands, search-row rendering, settings, popups, and the `eframe` update loop.
 - `src/launch/`: Desktop-entry parsing and application/window launch actions.
 - `src/audio.rs`: Bounded audio activity sampling and waveform levels.
-- `src/diagnostics.rs`: Single-instance control socket and low-overhead live-process diagnostics.
+- `src/diagnostics.rs`: GUI single-instance control and foreground activation.
+- `src/observability.rs`: Shared bounded events, counters, workers, panic handling, and independent diagnostic endpoints.
+- `src/diagnostic_capture.rs`: Activated GUI/daemon evidence collector, checksums, privacy filtering, and debug doctor.
 - `src/search.rs`: Fuzzy ranking, transient-title normalization, sorting, and highlighting.
 - `src/models.rs`: Shared window, application, feed, and audio data types.
 - `src/tracker/`: Daemon client, private SQLite persistence, restore policy, service installation, and D-Bus service.
 - `src/bin/applicationlauncherd.rs`: Persistent background tracker entry point.
 - `src/windows/`: KWin snapshot consumption, process metadata, terminal integration, and icon resolution.
 - `kwin/applicationlauncher-window-feed/`: Transactional KWin script that sends compositor window events to the daemon.
-- `scripts/applicationlauncher`: Fast launch wrapper that rebuilds a stale release binary once under a lock, then runs it.
+- `scripts/applicationlauncher`: Fast launch wrapper that activates current release binaries and reports newer source without compiling it.
+- `scripts/build-debuggable-release`: Produces build-ID-indexed exact binaries, split symbols, hashes, and `build-info.json`.
+- `docs/DEBUGGABILITY.md`: Runtime modes, budgets, capture guarantees, privacy rules, and progress invariants.
 - `Cargo.toml`: Package metadata and Rust dependencies.
 - `Cargo.lock`: Locked dependency graph for reproducible builds.
 - `README.md`: Project documentation for the current GUI application.
@@ -133,13 +142,24 @@ Install Rust dependencies and build with Cargo. `kdotool` is the main external r
 cargo build --release
 ```
 
+To retain exact production artifacts and separate symbols indexed by ELF build
+ID, use:
+
+```bash
+scripts/build-debuggable-release
+```
+
+This post-link step has no runtime CPU cost. See
+[`docs/DEBUGGABILITY.md`](docs/DEBUGGABILITY.md) for the stateful production
+debuggability contract and explicit CPU, latency, RSS, and size budgets.
+
 ## Run
 
 ```bash
 ./scripts/applicationlauncher
 ```
 
-The wrapper normally adds only a source timestamp check. When application sources, embedded KWin files, Cargo metadata, or the local `../fuzzy-rank` dependency are newer than the release binary, it runs one serialized release build before launching. If that build fails, it reports the private log at `$XDG_STATE_HOME/applicationlauncher/launcher-build.log` and uses the previous release binary when one exists.
+The wrapper never invokes Cargo during launcher activation. It compares any running launcher and daemon processes with the already-built `target/release` executables and restarts both components only when those executable files have been replaced. Source, Cargo metadata, embedded KWin files, and the local `../fuzzy-rank` dependency are checked separately; newer source produces a warning in the launcher while the existing release continues running. Run `cargo build --release --bins` explicitly to build those changes.
 
 Install the command as a symbolic link so the wrapper remains updated with the repository:
 
@@ -169,8 +189,14 @@ The launcher writes its runtime data to:
   Auto-installed tracker service with restart-on-failure behavior.
 - `$HOME/.local/bin/applicationlauncherd`
   Symbolic link to the daemon binary beside the launcher binary.
-- `$XDG_STATE_HOME/applicationlauncher/panic-latest.log` and `hang-latest.log`
-  Private crash and live-hang diagnostics. Reports are mode `0600`.
+- `$XDG_STATE_HOME/applicationlauncher/panic-gui-latest.log` and `panic-daemon-latest.log`
+  Private Rust panic reports with release backtraces. Reports are mode `0600`.
+- `$XDG_STATE_HOME/applicationlauncher/diagnostics/`
+  Checksummed, bounded `--diagnose auto` bundles covering both GUI and daemon.
+- `$XDG_STATE_HOME/applicationlauncher/builds/by-build-id/`
+  Exact release binaries, stripped copies, separate symbols, and build metadata.
+  The archive keeps the newest three builds per component plus any build ID
+  still used by a running launcher or daemon.
 
 ## Settings Window
 
@@ -233,8 +259,14 @@ OPTIONS
     --theme <THEME>
         Force a specific icon theme (default: automatically detected).
 
-    --diagnose
-        Capture diagnostics from the already-running launcher without restarting it.
+    --diagnose auto [--perf] [--core]
+        Capture repeated stacks, /proc state, semantic state, journals, loaded
+        modules, and checksums from the running GUI and daemon. Perf and full
+        cores are explicit activated-only additions.
+
+    debug-doctor
+        Verify symbolization, diagnostic attachment, tools, private output, and
+        bounded recorder behavior.
 
 OPERATION
     When launched, the application retrieves a list of all open windows using
@@ -254,9 +286,8 @@ EXAMPLES
     applicationlauncher
         Launch the application launcher.
 
-    applicationlauncher --diagnose
-        Attach the diagnostic helper to the running instance and write a bounded
-        process/thread report without replacing the running binary.
+    applicationlauncher --diagnose auto
+        Capture both running components without replacing or restarting them.
 
 FILES
     $HOME/.config/applicationlauncher/window_size.txt

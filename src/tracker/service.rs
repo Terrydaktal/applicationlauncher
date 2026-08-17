@@ -21,6 +21,9 @@ const LAYOUT_RECONCILIATION_FAST_PERIOD: Duration = Duration::from_secs(2);
 const KWIN_SERVICE: &str = "org.kde.KWin";
 const KWIN_PATH: &str = "/KWin";
 const KWIN_INTERFACE: &str = "org.kde.KWin";
+const KGLOBALACCEL_SERVICE: &str = "org.kde.kglobalaccel";
+const KGLOBALACCEL_PATH: &str = "/kglobalaccel";
+const KGLOBALACCEL_INTERFACE: &str = "org.kde.KGlobalAccel";
 const TERMINAL_DBUS_TIMEOUT: Duration = Duration::from_secs(3);
 const ATTENTION_RECHECK_DELAY: Duration = Duration::from_secs(5);
 const ATTENTION_RETRY_BASE_MS: u64 = 750;
@@ -29,6 +32,30 @@ const SNAPSHOT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(5);
 const REOPEN_HISTORY_SCAN_LIMIT: usize = 10_000;
 const REOPEN_LAUNCH_ATTEMPT_LIMIT: usize = 4;
 const HISTORY_RESTORE_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+fn reopen_shortcut_action_id() -> Vec<&'static str> {
+    vec![
+        "kwin",
+        "applicationlauncher-reopen-latest",
+        "KWin",
+        "Reopen recently closed window",
+    ]
+}
+
+fn set_reopen_shortcut_active(active: bool) -> Result<(), String> {
+    let connection = zbus::blocking::Connection::session().map_err(|err| err.to_string())?;
+    let proxy = zbus::blocking::Proxy::new(
+        &connection,
+        KGLOBALACCEL_SERVICE,
+        KGLOBALACCEL_PATH,
+        KGLOBALACCEL_INTERFACE,
+    )
+    .map_err(|err| err.to_string())?;
+    let method = if active { "doRegister" } else { "setInactive" };
+    proxy
+        .call::<_, _, ()>(method, &(reopen_shortcut_action_id(),))
+        .map_err(|err| err.to_string())
+}
 
 struct State {
     windows: HashMap<String, TrackedWindow>,
@@ -314,6 +341,14 @@ impl Runtime {
         if state.snapshot_buffer.is_none() && changed {
             Self::mark_changed(&mut state);
         }
+        crate::observability::set_gauge(
+            crate::observability::Gauge::TrackedWindows,
+            state.windows.len(),
+        );
+        crate::observability::set_gauge(
+            crate::observability::Gauge::AttentionPending,
+            state.attention.len(),
+        );
     }
 
     fn remove(&self, id: &str) {
@@ -331,6 +366,14 @@ impl Runtime {
             state.history_generation = state.history_generation.wrapping_add(1);
             Self::mark_changed(&mut state);
         }
+        crate::observability::set_gauge(
+            crate::observability::Gauge::TrackedWindows,
+            state.windows.len(),
+        );
+        crate::observability::set_gauge(
+            crate::observability::Gauge::AttentionPending,
+            state.attention.len(),
+        );
         drop(state);
         if let Some(window) = removed
             && is_history_worthy(&window)
@@ -381,6 +424,14 @@ impl Runtime {
             state.history_generation = state.history_generation.wrapping_add(1);
         }
         Self::mark_changed(&mut state);
+        crate::observability::set_gauge(
+            crate::observability::Gauge::TrackedWindows,
+            state.windows.len(),
+        );
+        crate::observability::set_gauge(
+            crate::observability::Gauge::AttentionPending,
+            state.attention.len(),
+        );
         drop(state);
         let database = self.0.database.lock().unwrap();
         for window in closed {
@@ -437,6 +488,7 @@ impl Runtime {
         state.recovery_write_in_flight = false;
         match result {
             Ok(_) => {
+                crate::observability::increment(crate::observability::Counter::PersistenceWrites);
                 if state.generation == generation {
                     state.recovery_dirty = false;
                     state.recovery_due = None;
@@ -467,6 +519,7 @@ impl Runtime {
         state.current_write_in_flight = false;
         match result {
             Ok(()) => {
+                crate::observability::increment(crate::observability::Counter::PersistenceWrites);
                 if state.generation == generation {
                     state.current_dirty = false;
                     state.current_due = None;
@@ -491,6 +544,10 @@ impl Runtime {
                 windows, attention, ..
             } = &mut *state;
             reconcile_attention_states(windows, attention, now);
+            crate::observability::set_gauge(
+                crate::observability::Gauge::AttentionPending,
+                attention.len(),
+            );
             attention
                 .iter()
                 .filter_map(|(id, attention)| {
@@ -500,7 +557,11 @@ impl Runtime {
                 .collect::<Vec<_>>()
         };
         for window in targets {
+            crate::observability::increment(crate::observability::Counter::AttentionAttempts);
             let result = send_enter_to_terminal(&window);
+            if result.is_err() {
+                crate::observability::increment(crate::observability::Counter::AttentionFailures);
+            }
             let mut state = self.0.state.lock().unwrap();
             if !state
                 .windows
@@ -821,6 +882,7 @@ impl WindowFeed {
 
     #[zbus(name = "UpsertWindow")]
     fn upsert_window(&self, payload: &str) {
+        crate::observability::increment(crate::observability::Counter::KwinUpserts);
         match serde_json::from_str(payload) {
             Ok(window) => self.0.upsert(window, false),
             Err(err) => eprintln!("Tracker rejected KWin payload: {err}"),
@@ -829,6 +891,7 @@ impl WindowFeed {
 
     #[zbus(name = "ReplaceSnapshot")]
     fn replace_snapshot(&self, payload: &str) {
+        crate::observability::increment(crate::observability::Counter::KwinSnapshots);
         let windows = match serde_json::from_str::<Vec<TrackedWindow>>(payload) {
             Ok(windows) => windows,
             Err(err) => {
@@ -836,6 +899,11 @@ impl WindowFeed {
                 return;
             }
         };
+        crate::observability::record(
+            crate::observability::Event::new("kwin-feed", "replace-snapshot")
+                .object(&windows.len().to_string())
+                .reason("authoritative-resync"),
+        );
         self.begin_snapshot();
         for window in windows {
             self.0.upsert(window, false);
@@ -845,6 +913,7 @@ impl WindowFeed {
 
     #[zbus(name = "WindowActivated")]
     fn window_activated(&self, payload: &str) {
+        crate::observability::increment(crate::observability::Counter::KwinActivations);
         if let Ok(window) = serde_json::from_str(payload) {
             self.0.upsert(window, true);
         }
@@ -852,6 +921,7 @@ impl WindowFeed {
 
     #[zbus(name = "RemoveWindow")]
     fn remove_window(&self, id: &str) {
+        crate::observability::increment(crate::observability::Counter::KwinRemovals);
         self.0.remove(id);
     }
 
@@ -994,6 +1064,19 @@ impl TrackerApi {
             .history(REOPEN_HISTORY_SCAN_LIMIT);
         let result = history.and_then(|history| reopen_latest_history_entry(&self.0, &history));
         serde_json::to_string(&result).unwrap()
+    }
+
+    #[zbus(name = "SetReopenShortcutActive")]
+    fn set_reopen_shortcut_active(&self, active: bool) -> bool {
+        match set_reopen_shortcut_active(active) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!(
+                    "tracker_shortcut event=set_reopen_active_failed active={active} error={err}"
+                );
+                false
+            }
+        }
     }
 
     #[zbus(name = "DismissRecovery")]
@@ -1230,9 +1313,10 @@ pub fn run_tracker_daemon() -> Result<(), String> {
     database.prune_shell_surface_history()?;
     let boot_id = read_boot_id();
     let previous_boot = database.meta("boot_id")?.unwrap_or_default();
+    let same_boot = previous_boot == boot_id;
     let previous_clean = database.meta("clean_shutdown")?.as_deref() == Some("true");
     let recovery_pending = !previous_boot.is_empty() && previous_boot != boot_id && !previous_clean;
-    let persisted_entries = if previous_boot == boot_id {
+    let persisted_entries = if same_boot {
         database.current_window_entries()?
     } else {
         Vec::new()
@@ -1282,6 +1366,15 @@ pub fn run_tracker_daemon() -> Result<(), String> {
         }),
         database: Mutex::new(database),
     }));
+    crate::observability::set_gauge(
+        crate::observability::Gauge::TrackedWindows,
+        runtime.0.state.lock().unwrap().windows.len(),
+    );
+    crate::observability::record(
+        crate::observability::Event::new("tracker", "state-loaded")
+            .reason(if same_boot { "same-boot" } else { "new-boot" })
+            .transition("database", "runtime"),
+    );
 
     if auto_enter_enabled {
         let due = Instant::now() + Duration::from_secs(5);
@@ -1305,7 +1398,8 @@ pub fn run_tracker_daemon() -> Result<(), String> {
     }
 
     let recovery_runtime = runtime.clone();
-    std::thread::spawn(move || {
+    crate::observability::spawn_named("tracker-persistence", move |worker| {
+        worker.set_state("waiting");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
                 std::thread::sleep(Duration::from_millis(250));
@@ -1318,13 +1412,15 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             }
         }));
         if result.is_err() {
+            crate::observability::increment(crate::observability::Counter::WorkerPanics);
             eprintln!("Tracker persistence worker panicked; restarting daemon");
             std::process::exit(1);
         }
     });
 
     let attention_runtime = runtime.clone();
-    std::thread::spawn(move || {
+    crate::observability::spawn_named("tracker-attention", move |worker| {
+        worker.set_state("waiting");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
                 std::thread::sleep(Duration::from_millis(250));
@@ -1332,13 +1428,15 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             }
         }));
         if result.is_err() {
+            crate::observability::increment(crate::observability::Counter::WorkerPanics);
             eprintln!("Tracker attention worker panicked; restarting daemon");
             std::process::exit(1);
         }
     });
 
     let reconciliation_runtime = runtime.clone();
-    std::thread::spawn(move || {
+    crate::observability::spawn_named("tracker-reconcile", move |worker| {
+        worker.set_state("waiting");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
                 if let Err(err) = reconciliation_runtime.reconcile_stale_kwin_windows() {
@@ -1348,6 +1446,7 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             }
         }));
         if result.is_err() {
+            crate::observability::increment(crate::observability::Counter::WorkerPanics);
             eprintln!("Tracker KWin reconciliation worker panicked; restarting daemon");
             std::process::exit(1);
         }
@@ -1359,7 +1458,8 @@ pub fn run_tracker_daemon() -> Result<(), String> {
         signal_hook::consts::SIGINT,
     ])
     .map_err(|err| err.to_string())?;
-    std::thread::spawn(move || {
+    crate::observability::spawn_named("tracker-signals", move |worker| {
+        worker.set_state("waiting");
         if signals.forever().next().is_some() {
             let recovery_ok = shutdown_runtime.write_recovery_if_due(true).is_ok();
             let current_ok = shutdown_runtime.persist_current_if_due(true).is_ok();
@@ -1406,7 +1506,8 @@ mod tests {
         ATTENTION_RECHECK_DELAY, AttentionState, attention_retry_delay,
         first_launched_history_report, is_history_worthy, layout_reconciliation_poll_interval,
         normalized_terminal_title, reconcile_attention_states, record_attention_attempt,
-        reopenable_history_ids_with, terminal_dbus_service_names, tracked_window_state_changed,
+        reopen_shortcut_action_id, reopenable_history_ids_with, terminal_dbus_service_names,
+        tracked_window_state_changed,
     };
     use crate::tracker::restore::LaunchUnavailableCode;
     use crate::tracker::{HistoryEntry, RestoreReport, RestoreSpec, TrackedWindow};
@@ -1420,6 +1521,19 @@ mod tests {
         assert_eq!(
             layout_reconciliation_poll_interval(Duration::from_secs(2)),
             Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn browser_passthrough_targets_only_the_launcher_reopen_action() {
+        assert_eq!(
+            reopen_shortcut_action_id(),
+            [
+                "kwin",
+                "applicationlauncher-reopen-latest",
+                "KWin",
+                "Reopen recently closed window",
+            ]
         );
     }
 

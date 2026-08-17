@@ -1,3 +1,5 @@
+pub mod diagnostic_capture;
+pub mod observability;
 pub mod process;
 pub mod tracker;
 

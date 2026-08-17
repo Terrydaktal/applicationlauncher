@@ -361,16 +361,26 @@ fn kdotool_running() -> bool {
 }
 
 pub(crate) fn start_kwin_feed_watchdog() {
-    std::thread::spawn(|| {
+    crate::observability::spawn_named("kwin-feed-watchdog", |worker| {
+        worker.set_state("watching");
         let mut state = KwinFeedWatchdogState::default();
         loop {
             std::thread::sleep(KWIN_FEED_WATCHDOG_POLL_INTERVAL);
             let loaded = kwin_script_loaded();
             let scripting_busy = !loaded && kdotool_running();
-            if state.should_recover(Instant::now(), loaded, scripting_busy)
-                && let Err(err) = recover_kwin_feed()
-            {
-                eprintln!("Tracker KWin feed watchdog failed: {err}");
+            if state.should_recover(Instant::now(), loaded, scripting_busy) {
+                match recover_kwin_feed() {
+                    Ok(()) => {
+                        crate::observability::increment(
+                            crate::observability::Counter::KwinFeedRecoveries,
+                        );
+                        crate::observability::record(
+                            crate::observability::Event::new("kwin-feed", "recovered")
+                                .reason("watchdog-observed-missing"),
+                        );
+                    }
+                    Err(err) => eprintln!("Tracker KWin feed watchdog failed: {err}"),
+                }
             }
         }
     });
@@ -392,6 +402,9 @@ mod tests {
     fn kwin_feed_registers_the_documented_reopen_shortcut() {
         assert!(KWIN_MAIN_JS.contains("\"Ctrl+Shift+T\""));
         assert!(!KWIN_MAIN_JS.contains("\"Meta+Ctrl+Shift+T\""));
+        assert!(KWIN_MAIN_JS.contains("\"SetReopenShortcutActive\""));
+        assert!(!KWIN_MAIN_JS.contains("KGLOBALACCEL_SERVICE"));
+        assert!(KWIN_MAIN_JS.contains("updateReopenShortcutState();"));
     }
 
     #[test]

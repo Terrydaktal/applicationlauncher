@@ -121,7 +121,8 @@ pub enum LoadResult {
 }
 
 pub enum UiEvent {
-    FocusLauncher,
+    FocusLauncher { source_changes_pending: bool },
+    ShutdownLauncher,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

@@ -448,22 +448,33 @@ fn terminal_launch_plan(kind: &str, cwd: Option<&str>) -> Result<LaunchPlan, Lau
     required_executable("fish")?;
     if let Some((executable, _)) = command {
         required_executable(executable)?;
+        required_executable("bash")?;
     }
     let cwd = cwd
         .map(expand_home)
         .filter(|path| path.is_dir())
         .unwrap_or_else(home_directory);
-    let shell_command = command.map_or("exec fish", |(_, shell_command)| shell_command);
     Ok(LaunchPlan {
         program,
         arguments: vec![
             OsString::from("--working-directory"),
             cwd.into_os_string(),
             OsString::from("--command"),
-            OsString::from(format!("fish -lc '{shell_command}'")),
+            OsString::from(terminal_restore_invocation(
+                command.map(|(_, shell_command)| shell_command),
+            )),
         ],
         description: format!("{kind} terminal"),
     })
+}
+
+fn terminal_restore_invocation(shell_command: Option<&str>) -> String {
+    match shell_command {
+        Some(shell_command) => {
+            format!(r#"fish -lc 'exec bash -m -c \"{shell_command}; exec fish\"'"#)
+        }
+        None => "fish -l".into(),
+    }
 }
 
 fn terminal_shell_command(
@@ -471,10 +482,10 @@ fn terminal_shell_command(
 ) -> Result<Option<(&'static str, &'static str)>, LaunchUnavailable> {
     let command = match kind {
         "shell" => None,
-        "codex" => Some(("codex", "codex resume --last; exec fish")),
-        "agy" => Some(("agy", "agy -c; exec fish")),
-        "htop" => Some(("htop", "htop; exec fish")),
-        "nvtop" => Some(("nvtop", "nvtop; exec fish")),
+        "codex" => Some(("codex", "codex resume --last")),
+        "agy" => Some(("agy", "agy -c")),
+        "htop" => Some(("htop", "htop")),
+        "nvtop" => Some(("nvtop", "nvtop")),
         _ => {
             return Err(LaunchUnavailable {
                 code: LaunchUnavailableCode::UnsupportedTerminalKind,
@@ -592,6 +603,15 @@ mod tests {
             terminal_shell_command("unknown").unwrap_err().code,
             LaunchUnavailableCode::UnsupportedTerminalKind
         );
+    }
+
+    #[test]
+    fn terminal_restore_uses_a_monitor_mode_wrapper_for_job_control() {
+        assert_eq!(
+            terminal_restore_invocation(Some("codex resume --last")),
+            r#"fish -lc 'exec bash -m -c \"codex resume --last; exec fish\"'"#
+        );
+        assert_eq!(terminal_restore_invocation(None), "fish -l");
     }
 
     #[test]

@@ -231,6 +231,7 @@ pub(crate) struct App {
     audio_cache_receiver: Receiver<AudioCacheUpdate>,
     terminal_action_receiver: Receiver<Result<String, String>>,
     terminal_action_message: Option<(String, bool, Instant)>,
+    source_changes_pending: bool,
     auto_enter_update_sender: SyncSender<bool>,
     terminal_records: Vec<TerminalDbusRecord>,
     terminal_records_receiver: Option<Receiver<Result<Vec<TerminalDbusRecord>, String>>>,
@@ -461,6 +462,7 @@ impl App {
         force_theme: Option<String>,
         mode: LauncherMode,
         icon_only: bool,
+        source_changes_pending: bool,
         ui_event_rx: std::sync::mpsc::Receiver<UiEvent>,
     ) -> Self {
         // Install loaders to enable SVG and PNG image support
@@ -497,8 +499,10 @@ impl App {
         let (_terminal_action_tx, terminal_action_rx) = std::sync::mpsc::channel();
         let (auto_enter_update_sender, auto_enter_update_receiver) =
             std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
+        applicationlauncher::observability::spawn_named("auto-enter-settings", move |worker| {
+            worker.set_state("waiting");
             'worker: while let Ok(mut enabled) = auto_enter_update_receiver.recv() {
+                worker.set_state("updating");
                 loop {
                     while let Ok(latest) = auto_enter_update_receiver.try_recv() {
                         enabled = latest;
@@ -519,6 +523,7 @@ impl App {
                         }
                     }
                 }
+                worker.set_state("waiting");
             }
         });
         let (popup_event_tx, popup_event_rx) = std::sync::mpsc::channel();
@@ -527,13 +532,15 @@ impl App {
         let rapid_polling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let kwin_window_feed_repaint_ctx = cc.egui_ctx.clone();
         let kwin_window_feed_inbox = Arc::clone(&window_feed_inbox);
-        std::thread::spawn(move || {
+        applicationlauncher::observability::spawn_named("kwin-feed-setup", move |worker| {
+            worker.set_state("connecting");
             let result =
                 setup_kwin_window_feed(kwin_window_feed_inbox, kwin_window_feed_repaint_ctx);
             let _ = kwin_window_feed_setup_tx.send(result);
         });
 
-        std::thread::spawn(move || {
+        applicationlauncher::observability::spawn_named("tracker-status", move |worker| {
+            worker.set_state("connecting");
             for _ in 0..30 {
                 if let Ok(client) = applicationlauncher::tracker::TrackerClient::connect()
                     && let Ok(status) = client.status()
@@ -637,6 +644,7 @@ impl App {
             audio_cache_receiver: audio_cache_rx,
             terminal_action_receiver: terminal_action_rx,
             terminal_action_message: None,
+            source_changes_pending,
             auto_enter_update_sender,
             terminal_records: Vec::new(),
             terminal_records_receiver: None,
@@ -667,7 +675,8 @@ impl App {
         app.start_process_tree_cache_refresh();
 
         let audio_repaint_ctx = cc.egui_ctx.clone();
-        std::thread::spawn(move || {
+        applicationlauncher::observability::spawn_named("audio-monitor", move |worker| {
+            worker.set_state("polling");
             let mut recent_active_pipewire_nodes: HashMap<u32, std::time::Instant> = HashMap::new();
             let mut last_update = None;
             loop {
@@ -906,7 +915,17 @@ impl App {
 
         ctx.request_repaint_after(lifetime.saturating_sub(elapsed));
         egui::Area::new(egui::Id::new("terminal_action_message"))
-            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -18.0])
+            .anchor(
+                egui::Align2::CENTER_BOTTOM,
+                [
+                    0.0,
+                    if self.source_changes_pending {
+                        -54.0
+                    } else {
+                        -18.0
+                    },
+                ],
+            )
             .order(egui::Order::Tooltip)
             .show(ctx, |ui| {
                 let color = if success {
@@ -918,6 +937,29 @@ impl App {
                     .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 24, 245))
                     .show(ui, |ui| {
                         ui.label(egui::RichText::new(message).color(color).strong());
+                    });
+            });
+    }
+
+    fn show_source_changes_warning(&self, ctx: &egui::Context) {
+        if !self.source_changes_pending {
+            return;
+        }
+
+        egui::Area::new(egui::Id::new("source_changes_warning"))
+            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -18.0])
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                egui::Frame::popup(&ctx.style())
+                    .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 24, 245))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Source changes have not been built; running the existing release",
+                            )
+                            .color(egui::Color32::from_rgb(240, 196, 92))
+                            .strong(),
+                        );
                     });
             });
     }
