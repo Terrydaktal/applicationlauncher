@@ -1,5 +1,36 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowGeometry {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl WindowGeometry {
+    pub fn is_valid(self) -> bool {
+        self.width > 0 && self.height > 0
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputGeometry {
+    pub name: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    #[serde(default = "default_scale_milli")]
+    pub scale_milli: i32,
+}
+
+fn default_scale_milli() -> i32 {
+    1_000
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TrackedWindow {
@@ -19,9 +50,15 @@ pub struct TrackedWindow {
     #[serde(default)]
     pub height: i32,
     #[serde(default)]
+    pub normal_geometry: Option<WindowGeometry>,
+    #[serde(default)]
     pub minimized: bool,
     #[serde(default)]
     pub maximized: bool,
+    #[serde(default)]
+    pub maximized_horizontally: bool,
+    #[serde(default)]
+    pub maximized_vertically: bool,
     #[serde(default)]
     pub fullscreen: bool,
     #[serde(default)]
@@ -38,6 +75,22 @@ pub struct TrackedWindow {
     pub on_all_desktops: bool,
     #[serde(default)]
     pub output: String,
+    #[serde(default)]
+    pub output_geometry: Option<OutputGeometry>,
+    #[serde(default)]
+    pub activities: Vec<String>,
+    #[serde(default)]
+    pub stacking_order: i32,
+    #[serde(default)]
+    pub keep_above: bool,
+    #[serde(default)]
+    pub keep_below: bool,
+    #[serde(default)]
+    pub shaded: bool,
+    #[serde(default)]
+    pub skip_pager: bool,
+    #[serde(default)]
+    pub no_border: bool,
     #[serde(default)]
     pub opened_at_ms: i64,
     #[serde(default)]
@@ -158,9 +211,41 @@ pub struct TrackerStatus {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RestoreReport {
+    #[serde(default)]
+    pub operation_id: Option<String>,
+    #[serde(default)]
+    pub in_progress: bool,
+    #[serde(default)]
+    pub started_at_ms: i64,
+    #[serde(default)]
+    pub finished_at_ms: Option<i64>,
     pub matched: usize,
     pub launched: usize,
     pub failures: Vec<String>,
+    #[serde(default)]
+    pub outcomes: Vec<WindowRestoreOutcome>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WindowRestoreOutcome {
+    pub title: String,
+    pub saved_window_id: String,
+    #[serde(default)]
+    pub restored_window_id: Option<String>,
+    #[serde(default)]
+    pub status: RestoreOutcomeStatus,
+    #[serde(default)]
+    pub detail: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreOutcomeStatus {
+    #[default]
+    Pending,
+    Exact,
+    Adjusted,
+    Failed,
 }
 
 pub fn now_ms() -> i64 {

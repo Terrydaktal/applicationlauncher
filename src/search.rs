@@ -1,3 +1,4 @@
+use fuzzy_rank::fields::FieldRankModel;
 use fuzzy_rank::fields::fuzzy::{
     MatchedFieldHighlight, MetadataCandidate, MetadataQuery, PreparedMetadataCandidate,
     PreparedMetadataField, SearchField, dedup_push_search_field,
@@ -175,6 +176,7 @@ pub(crate) fn rank_prepared_documents(
     scores: &[f64],
     base_query: &MetadataQuery,
     typo_query: &MetadataQuery,
+    field_rank_model: Option<&FieldRankModel>,
 ) -> Vec<(usize, SearchRank)> {
     let mut matches = Vec::new();
     for (index, document) in documents.iter().enumerate() {
@@ -189,7 +191,11 @@ pub(crate) fn rank_prepared_documents(
         matches.push((candidate, rank, index));
     }
 
-    typo_query.sort_matches_prepared_with(&mut matches);
+    if let Some(model) = field_rank_model.filter(|model| model.is_active()) {
+        typo_query.sort_matches_prepared_with_model_and(&mut matches, model, 256);
+    } else {
+        typo_query.sort_matches_prepared_with(&mut matches);
+    }
     matches
         .into_iter()
         .map(|(_, rank, index)| (index, rank))
@@ -203,6 +209,7 @@ pub(crate) fn ranked_app_matches(
     show_system_settings_modules: bool,
     base_query: &MetadataQuery,
     typo_query: &MetadataQuery,
+    field_rank_model: Option<&FieldRankModel>,
 ) -> Vec<RankedAppMatch> {
     let pinned_positions = pinned_apps
         .iter()
@@ -222,7 +229,7 @@ pub(crate) fn ranked_app_matches(
         })
         .collect::<Vec<_>>();
 
-    rank_prepared_documents(documents, &scores, base_query, typo_query)
+    rank_prepared_documents(documents, &scores, base_query, typo_query, field_rank_model)
         .into_iter()
         .filter_map(|(index, rank)| {
             let app = apps.get(index)?;
@@ -255,9 +262,10 @@ pub(crate) fn ranked_window_matches(
     documents: &[PreparedSearchDocument],
     base_query: &MetadataQuery,
     typo_query: &MetadataQuery,
+    field_rank_model: Option<&FieldRankModel>,
 ) -> Vec<RankedWindowMatch> {
     let scores = vec![0.0; documents.len()];
-    rank_prepared_documents(documents, &scores, base_query, typo_query)
+    rank_prepared_documents(documents, &scores, base_query, typo_query, field_rank_model)
         .into_iter()
         .filter_map(|(index, rank)| {
             let window = windows.get(index)?;
@@ -761,6 +769,7 @@ pub(crate) fn window_sort_title_key(win: &WindowInfo) -> String {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn compare_windows_by_last_activation(
     left: &WindowInfo,
     right: &WindowInfo,

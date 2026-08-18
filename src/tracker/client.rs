@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use zbus::blocking::{Connection, Proxy};
 
 use super::{
@@ -62,6 +62,26 @@ impl TrackerClient {
     }
     pub fn restore_snapshot(&self, id: i64) -> Result<RestoreReport, String> {
         decode_result(&self.call("RestoreSnapshot", &(id,))?)
+    }
+    pub fn restore_report(&self, operation_id: &str) -> Result<Option<RestoreReport>, String> {
+        serde_json::from_str(&self.call("GetRestoreReport", &(operation_id,))?)
+            .map_err(|err| err.to_string())
+    }
+    pub fn wait_for_restore_report(
+        &self,
+        mut report: RestoreReport,
+    ) -> Result<RestoreReport, String> {
+        let Some(operation_id) = report.operation_id.clone() else {
+            return Ok(report);
+        };
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while report.in_progress && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            report = self.restore_report(&operation_id)?.ok_or_else(|| {
+                format!("Restore operation {operation_id} is no longer available")
+            })?;
+        }
+        Ok(report)
     }
     pub fn restore_recovery(&self) -> Result<RestoreReport, String> {
         decode_result(&self.call("RestoreRecovery", &())?)

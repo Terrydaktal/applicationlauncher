@@ -10,6 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 mod models;
 use models::*;
 mod config;
+mod ranking_model;
 use config::*;
 mod audio;
 use audio::*;
@@ -23,6 +24,29 @@ mod search;
 use search::*;
 mod app;
 use app::{App, BorderOverlay, get_monitors, load_window_size};
+
+fn launcher_native_options(width: f32, height: f32, title: &str) -> eframe::NativeOptions {
+    let wgpu_options = eframe::egui_wgpu::WgpuConfiguration {
+        // FIFO can block the only GUI thread indefinitely while KWin or the
+        // NVIDIA driver holds every swapchain image. Mailbox keeps the newest
+        // frame without tying input handling to the compositor's frame pace.
+        present_mode: wgpu::PresentMode::AutoNoVsync,
+        desired_maximum_frame_latency: Some(1),
+        ..Default::default()
+    };
+    eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_always_on_top()
+            .with_inner_size([width, height])
+            .with_resizable(true),
+        renderer: eframe::Renderer::Wgpu,
+        wgpu_options,
+        ..Default::default()
+    }
+}
 mod popups;
 use popups::*;
 mod diagnostics;
@@ -394,16 +418,7 @@ fn main() -> eframe::Result {
 
     let title = "Open Application Windows";
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(title)
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_always_on_top()
-            .with_inner_size([width, height])
-            .with_resizable(true),
-        ..Default::default()
-    };
+    let options = launcher_native_options(width, height, title);
 
     eframe::run_native(
         title,
@@ -433,4 +448,20 @@ fn main() -> eframe::Result {
             )))
         }),
     )
+}
+
+#[cfg(test)]
+mod native_options_tests {
+    use super::launcher_native_options;
+
+    #[test]
+    fn launcher_uses_non_blocking_mailbox_presentation() {
+        let options = launcher_native_options(800.0, 600.0, "test");
+        assert_eq!(options.renderer, eframe::Renderer::Wgpu);
+        assert_eq!(
+            options.wgpu_options.present_mode,
+            wgpu::PresentMode::AutoNoVsync
+        );
+        assert_eq!(options.wgpu_options.desired_maximum_frame_latency, Some(1));
+    }
 }

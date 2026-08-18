@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,11 @@ const KWIN_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(2);
 const LAYOUT_RECONCILIATION_FAST_POLL: Duration = Duration::from_millis(40);
 const LAYOUT_RECONCILIATION_SLOW_POLL: Duration = Duration::from_millis(250);
 const LAYOUT_RECONCILIATION_FAST_PERIOD: Duration = Duration::from_secs(2);
+const LAYOUT_VERIFY_INITIAL_DELAY: Duration = Duration::from_millis(180);
+const LAYOUT_VERIFY_CONFIRM_DELAY: Duration = Duration::from_millis(350);
+const LAYOUT_VERIFY_FINAL_DELAY: Duration = Duration::from_millis(650);
+const LAYOUT_APPLY_ATTEMPTS: u8 = 3;
+const MAX_RESTORE_REPORTS: usize = 32;
 const KWIN_SERVICE: &str = "org.kde.KWin";
 const KWIN_PATH: &str = "/KWin";
 const KWIN_INTERFACE: &str = "org.kde.KWin";
@@ -78,12 +83,26 @@ struct State {
     restore_specs: HashMap<String, RestoreSpec>,
     restore_claims: HashSet<String>,
     history_restore_retry_after: HashMap<i64, Instant>,
+    restore_sequence: u64,
+    restore_reports: HashMap<String, RestoreReport>,
+    restore_report_order: VecDeque<String>,
 }
 
 struct AttentionState {
     due: Instant,
     consecutive_failures: u8,
     signature: String,
+}
+
+struct LayoutProgress {
+    current_window_id: String,
+    target: super::restore::LayoutTarget,
+    attempts: u8,
+    exact_observations: u8,
+    verify_after: Instant,
+    ambiguous_match: bool,
+    last_mismatch: Option<String>,
+    successful_apply: bool,
 }
 
 fn attention_retry_delay(consecutive_failures: u8) -> Duration {
@@ -154,6 +173,80 @@ impl Runtime {
 
     fn release_restore(&self, key: &str) {
         self.0.state.lock().unwrap().restore_claims.remove(key);
+    }
+
+    fn register_restore_report(&self, mut report: RestoreReport) -> RestoreReport {
+        let mut state = self.0.state.lock().unwrap();
+        state.restore_sequence = state.restore_sequence.wrapping_add(1);
+        let operation_id = format!("{}-restore-{}", state.run_id, state.restore_sequence);
+        report.operation_id = Some(operation_id.clone());
+        while state.restore_report_order.len() >= MAX_RESTORE_REPORTS {
+            if let Some(expired) = state.restore_report_order.pop_front() {
+                state.restore_reports.remove(&expired);
+            }
+        }
+        state.restore_report_order.push_back(operation_id.clone());
+        state.restore_reports.insert(operation_id, report.clone());
+        report
+    }
+
+    fn restore_report(&self, operation_id: &str) -> Option<RestoreReport> {
+        self.0
+            .state
+            .lock()
+            .unwrap()
+            .restore_reports
+            .get(operation_id)
+            .cloned()
+    }
+
+    fn update_restore_outcome(
+        &self,
+        operation_id: &str,
+        outcome_index: usize,
+        restored_window_id: Option<String>,
+        status: super::RestoreOutcomeStatus,
+        detail: String,
+    ) {
+        let mut state = self.0.state.lock().unwrap();
+        let Some(report) = state.restore_reports.get_mut(operation_id) else {
+            return;
+        };
+        let Some(outcome) = report.outcomes.get_mut(outcome_index) else {
+            return;
+        };
+        if restored_window_id.is_some() {
+            outcome.restored_window_id = restored_window_id;
+        }
+        outcome.status = status;
+        outcome.detail = detail;
+    }
+
+    fn add_restore_failure(&self, operation_id: &str, failure: String) {
+        if let Some(report) = self
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .restore_reports
+            .get_mut(operation_id)
+        {
+            report.failures.push(failure);
+        }
+    }
+
+    fn finish_restore_report(&self, operation_id: &str) {
+        if let Some(report) = self
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .restore_reports
+            .get_mut(operation_id)
+        {
+            report.in_progress = false;
+            report.finished_at_ms = Some(now_ms());
+        }
     }
 
     fn excluded_history_restores(&self) -> HashSet<i64> {
@@ -287,6 +380,7 @@ impl Runtime {
             .and_then(|buffer| buffer.get(&incoming.id))
             .or_else(|| state.windows.get(&incoming.id))
             .cloned();
+        retain_normal_geometry(&mut incoming, previous.as_ref());
         incoming.opened_at_ms = previous
             .as_ref()
             .map_or(timestamp, |window| window.opened_at_ms);
@@ -622,74 +716,282 @@ impl Runtime {
 
     fn schedule_layout_reconciliation(
         &self,
-        specs: Vec<(TrackedWindow, super::RestoreSpec)>,
+        pending: Vec<super::restore::PendingRestore>,
         history_id: Option<i64>,
         baseline_ids: HashSet<String>,
         claim: Option<String>,
+        operation_id: String,
     ) {
         let runtime = self.clone();
         std::thread::spawn(move || {
             let started = Instant::now();
             let deadline = Instant::now() + Duration::from_secs(20);
+            let outputs = super::restore::current_output_geometries();
+            let mut progress = HashMap::<usize, LayoutProgress>::new();
+            let mut matched_ids = HashMap::<usize, String>::new();
+            let mut completed = HashSet::<usize>::new();
             loop {
                 let current = runtime.windows();
-                let final_attempt = Instant::now() >= deadline;
-                let candidates = if history_id.is_some() {
-                    current
-                        .iter()
-                        .filter(|window| !baseline_ids.contains(&window.id))
-                        .cloned()
-                        .collect::<Vec<_>>()
-                } else {
-                    current.clone()
-                };
-                let matched = super::restore::matching_window_count(&specs, &candidates);
-                if matched == specs.len() || final_attempt {
-                    let (_, failures) =
-                        super::restore::apply_matching_layouts(&specs, &candidates, true);
-                    for failure in failures {
-                        eprintln!("Session layout restore: {failure}");
-                    }
+                let now = Instant::now();
+                let used_ids = matched_ids.values().cloned().collect::<HashSet<_>>();
+                let waiting_indices = (0..pending.len())
+                    .filter(|index| !matched_ids.contains_key(index))
+                    .collect::<Vec<_>>();
+                let waiting = waiting_indices
+                    .iter()
+                    .map(|index| pending[*index].clone())
+                    .collect::<Vec<_>>();
+                for assignment in super::restore::assign_pending_windows(
+                    &waiting,
+                    &current,
+                    &baseline_ids,
+                    &used_ids,
+                ) {
+                    let pending_index = waiting_indices[assignment.pending_index];
+                    let item = &pending[pending_index];
+                    let target = super::restore::layout_target(&item.wanted, &outputs);
+                    let apply_result = super::restore::apply_layout_once(
+                        &assignment.window_id,
+                        &item.wanted,
+                        &target,
+                    );
+                    let successful_apply = apply_result.is_ok();
+                    let last_mismatch = apply_result.err();
+                    runtime.update_restore_outcome(
+                        &operation_id,
+                        item.outcome_index,
+                        Some(assignment.window_id.clone()),
+                        super::RestoreOutcomeStatus::Pending,
+                        "Matched a KWin window and applied its saved layout; verification is pending"
+                            .into(),
+                    );
+                    matched_ids.insert(pending_index, assignment.window_id.clone());
+                    progress.insert(
+                        pending_index,
+                        LayoutProgress {
+                            current_window_id: assignment.window_id,
+                            target,
+                            attempts: 1,
+                            exact_observations: 0,
+                            verify_after: now + LAYOUT_VERIFY_INITIAL_DELAY,
+                            ambiguous_match: assignment.ambiguous,
+                            last_mismatch,
+                            successful_apply,
+                        },
+                    );
                 }
-                if matched == specs.len() {
-                    if let Some(history_id) = history_id {
-                        match runtime
-                            .0
-                            .database
-                            .lock()
-                            .unwrap()
-                            .remove_history(history_id)
-                        {
-                            Ok(()) => {
-                                let mut state = runtime.0.state.lock().unwrap();
-                                state.history_generation = state.history_generation.wrapping_add(1);
-                                state.history_restore_retry_after.remove(&history_id);
+
+                let due = progress
+                    .iter()
+                    .filter(|(index, state)| {
+                        !completed.contains(index) && now >= state.verify_after
+                    })
+                    .map(|(index, _)| *index)
+                    .collect::<Vec<_>>();
+                for pending_index in due {
+                    let item = &pending[pending_index];
+                    let Some(state) = progress.get_mut(&pending_index) else {
+                        continue;
+                    };
+                    let Some(actual) = current
+                        .iter()
+                        .find(|window| window.id == state.current_window_id)
+                    else {
+                        state.last_mismatch = Some("The matched KWin window disappeared".into());
+                        if now < deadline {
+                            matched_ids.remove(&pending_index);
+                            progress.remove(&pending_index);
+                        }
+                        continue;
+                    };
+                    match super::restore::verify_layout(actual, &item.wanted, &state.target) {
+                        Ok(()) if state.exact_observations == 0 => {
+                            state.exact_observations = 1;
+                            state.verify_after = now + LAYOUT_VERIFY_CONFIRM_DELAY;
+                        }
+                        Ok(()) => {
+                            let mut qualifications = Vec::new();
+                            if let Some(adjustment) = state.target.adjustment.clone() {
+                                qualifications.push(adjustment);
                             }
-                            Err(err) => eprintln!(
-                                "Session restore matched, but history entry {history_id} could not be removed: {err}"
-                            ),
+                            if state.ambiguous_match {
+                                qualifications.push(
+                                    "multiple windows had equally strong identity metadata".into(),
+                                );
+                            }
+                            if !item.wanted.activities.is_empty() {
+                                qualifications.push(
+                                    "Plasma activity membership was recorded but cannot be applied by kdotool"
+                                        .into(),
+                                );
+                            }
+                            if item.wanted.skip_switcher {
+                                qualifications.push(
+                                    "skip-switcher state was recorded but cannot be applied by kdotool"
+                                        .into(),
+                                );
+                            }
+                            let status = if qualifications.is_empty() {
+                                super::RestoreOutcomeStatus::Exact
+                            } else {
+                                super::RestoreOutcomeStatus::Adjusted
+                            };
+                            let mut detail = format!(
+                                "Verified geometry and supported window state after {} layout attempt{}",
+                                state.attempts,
+                                if state.attempts == 1 { "" } else { "s" }
+                            );
+                            if !qualifications.is_empty() {
+                                detail.push_str(": ");
+                                detail.push_str(&qualifications.join("; "));
+                            }
+                            runtime.update_restore_outcome(
+                                &operation_id,
+                                item.outcome_index,
+                                Some(state.current_window_id.clone()),
+                                status,
+                                detail,
+                            );
+                            completed.insert(pending_index);
+                        }
+                        Err(mismatch) if state.attempts < LAYOUT_APPLY_ATTEMPTS => {
+                            state.last_mismatch = Some(mismatch);
+                            state.attempts += 1;
+                            match super::restore::apply_layout_once(
+                                &state.current_window_id,
+                                &item.wanted,
+                                &state.target,
+                            ) {
+                                Ok(()) => state.successful_apply = true,
+                                Err(err) => state.last_mismatch = Some(err),
+                            }
+                            state.exact_observations = 0;
+                            state.verify_after = now
+                                + if state.attempts == LAYOUT_APPLY_ATTEMPTS {
+                                    LAYOUT_VERIFY_FINAL_DELAY
+                                } else {
+                                    LAYOUT_VERIFY_CONFIRM_DELAY
+                                };
+                        }
+                        Err(mismatch) => {
+                            state.last_mismatch = Some(mismatch);
+                            let detail = format!(
+                                "Window appeared, but its application or KWin retained a different layout after {} attempts: {}",
+                                state.attempts,
+                                state.last_mismatch.as_deref().unwrap_or("unknown mismatch")
+                            );
+                            let status = if state.successful_apply {
+                                super::RestoreOutcomeStatus::Adjusted
+                            } else {
+                                super::RestoreOutcomeStatus::Failed
+                            };
+                            if status == super::RestoreOutcomeStatus::Failed {
+                                runtime.add_restore_failure(
+                                    &operation_id,
+                                    format!("{}: {detail}", item.wanted.title),
+                                );
+                            }
+                            runtime.update_restore_outcome(
+                                &operation_id,
+                                item.outcome_index,
+                                Some(state.current_window_id.clone()),
+                                status,
+                                detail,
+                            );
+                            completed.insert(pending_index);
                         }
                     }
-                    if let Some(claim) = claim.as_deref() {
-                        runtime.release_restore(claim);
-                    }
+                }
+
+                if completed.len() == pending.len() {
                     break;
                 }
-                if final_attempt {
-                    eprintln!(
-                        "Session layout restore timed out with {matched}/{} windows matched",
-                        specs.len()
-                    );
-                    if let Some(history_id) = history_id {
-                        runtime.defer_history_restore(history_id, "window_match_timeout");
-                    }
-                    if let Some(claim) = claim.as_deref() {
-                        runtime.release_restore(claim);
+                if now >= deadline {
+                    for (pending_index, item) in pending.iter().enumerate() {
+                        if completed.contains(&pending_index) {
+                            continue;
+                        }
+                        let detail = progress
+                            .get(&pending_index)
+                            .and_then(|state| state.last_mismatch.clone())
+                            .map(|mismatch| format!("Layout verification timed out: {mismatch}"))
+                            .unwrap_or_else(|| {
+                                if item.launched {
+                                    "No new matching KWin window appeared within 20 seconds".into()
+                                } else {
+                                    "The matched KWin window was unavailable during reconciliation"
+                                        .into()
+                                }
+                            });
+                        runtime.add_restore_failure(
+                            &operation_id,
+                            format!("{}: {detail}", item.wanted.title),
+                        );
+                        runtime.update_restore_outcome(
+                            &operation_id,
+                            item.outcome_index,
+                            matched_ids.get(&pending_index).cloned(),
+                            super::RestoreOutcomeStatus::Failed,
+                            detail,
+                        );
                     }
                     break;
                 }
                 std::thread::sleep(layout_reconciliation_poll_interval(started.elapsed()));
             }
+
+            let stacked = matched_ids
+                .iter()
+                .filter(|(index, _)| completed.contains(index))
+                .map(|(index, id)| (pending[*index].wanted.clone(), id.clone()))
+                .collect::<Vec<_>>();
+            if let Err(err) = super::restore::restore_stacking(&stacked) {
+                runtime.add_restore_failure(
+                    &operation_id,
+                    format!("Could not restore window stacking order: {err}"),
+                );
+            }
+
+            let current_window_ids = runtime
+                .0
+                .state
+                .lock()
+                .unwrap()
+                .windows
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>();
+            let all_windows_appeared = matched_ids.len() == pending.len()
+                && matched_ids
+                    .values()
+                    .all(|window_id| current_window_ids.contains(window_id));
+            if all_windows_appeared {
+                if let Some(history_id) = history_id {
+                    match runtime
+                        .0
+                        .database
+                        .lock()
+                        .unwrap()
+                        .remove_history(history_id)
+                    {
+                        Ok(()) => {
+                            let mut state = runtime.0.state.lock().unwrap();
+                            state.history_generation = state.history_generation.wrapping_add(1);
+                            state.history_restore_retry_after.remove(&history_id);
+                        }
+                        Err(err) => runtime.add_restore_failure(
+                            &operation_id,
+                            format!("Restored the window but could not remove history entry {history_id}: {err}"),
+                        ),
+                    }
+                }
+            } else if let Some(history_id) = history_id {
+                runtime.defer_history_restore(history_id, "window_match_timeout");
+            }
+            if let Some(claim) = claim.as_deref() {
+                runtime.release_restore(claim);
+            }
+            runtime.finish_restore_report(&operation_id);
         });
     }
 }
@@ -748,6 +1050,25 @@ fn tracked_window_state_changed(previous: &TrackedWindow, incoming: &TrackedWind
     comparable.updated_at_ms = incoming.updated_at_ms;
     comparable.opened_at_ms = incoming.opened_at_ms;
     comparable != *incoming
+}
+
+fn retain_normal_geometry(incoming: &mut TrackedWindow, previous: Option<&TrackedWindow>) {
+    if !incoming.maximized
+        && !incoming.maximized_horizontally
+        && !incoming.maximized_vertically
+        && !incoming.fullscreen
+        && incoming.width > 0
+        && incoming.height > 0
+    {
+        incoming.normal_geometry = Some(super::WindowGeometry {
+            x: incoming.x,
+            y: incoming.y,
+            width: incoming.width,
+            height: incoming.height,
+        });
+    } else if incoming.normal_geometry.is_none() {
+        incoming.normal_geometry = previous.and_then(|window| window.normal_geometry);
+    }
 }
 
 fn normalized_terminal_title(title: &str) -> String {
@@ -963,6 +1284,11 @@ impl TrackerApi {
         serde_json::to_string(&self.0.0.database.lock().unwrap().snapshots()).unwrap()
     }
 
+    #[zbus(name = "GetRestoreReport")]
+    fn get_restore_report(&self, operation_id: &str) -> String {
+        serde_json::to_string(&self.0.restore_report(operation_id)).unwrap()
+    }
+
     #[zbus(name = "CreateSnapshot")]
     fn create_snapshot(&self, name: &str) -> String {
         let windows = self.0.restorable_windows();
@@ -994,13 +1320,16 @@ impl TrackerApi {
             let snapshot = snapshot.ok_or_else(|| format!("Snapshot {id} does not exist"))?;
             let claim = format!("snapshot:{id}");
             self.0.claim_restore(claim.clone())?;
-            let report = super::restore_snapshot(&snapshot, &self.0.windows());
-            if report.launched > 0 {
+            let prepared =
+                super::restore::prepare_restore_specs(&snapshot.windows, &self.0.windows());
+            let report = self.0.register_restore_report(prepared.report);
+            if !prepared.pending.is_empty() {
                 self.0.schedule_layout_reconciliation(
-                    snapshot.windows,
+                    prepared.pending,
                     None,
-                    HashSet::new(),
+                    prepared.baseline_ids,
                     Some(claim),
+                    report.operation_id.clone().unwrap(),
                 );
             } else {
                 self.0.release_restore(&claim);
@@ -1028,13 +1357,16 @@ impl TrackerApi {
         let result = snapshot.and_then(|snapshot| {
             let claim = "recovery".to_string();
             self.0.claim_restore(claim.clone())?;
-            let report = super::restore_snapshot(&snapshot, &self.0.windows());
-            if report.launched > 0 {
+            let prepared =
+                super::restore::prepare_restore_specs(&snapshot.windows, &self.0.windows());
+            let report = self.0.register_restore_report(prepared.report);
+            if !prepared.pending.is_empty() {
                 self.0.schedule_layout_reconciliation(
-                    snapshot.windows,
+                    prepared.pending,
                     None,
-                    HashSet::new(),
+                    prepared.baseline_ids,
                     Some(claim),
+                    report.operation_id.clone().unwrap(),
                 );
             } else {
                 self.0.release_restore(&claim);
@@ -1160,14 +1492,19 @@ fn reopen_history_entry(runtime: &Runtime, id: i64) -> Result<RestoreReport, Str
         .collect::<HashSet<_>>();
     let claim = format!("history:{id}");
     runtime.claim_restore(claim.clone())?;
-    let report = super::restore::reopen_entry(&entry);
-    if report.launched > 0 {
+    let prepared = super::restore::prepare_restore_specs(
+        &[(entry.window.clone(), entry.restore.clone())],
+        &[],
+    );
+    let report = runtime.register_restore_report(prepared.report);
+    if !prepared.pending.is_empty() {
         runtime.clear_history_restore_deferment(id);
         runtime.schedule_layout_reconciliation(
-            vec![(entry.window, entry.restore)],
+            prepared.pending,
             Some(id),
             baseline_ids,
             Some(claim),
+            report.operation_id.clone().unwrap(),
         );
     } else {
         runtime.release_restore(&claim);
@@ -1363,6 +1700,9 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             restore_specs,
             restore_claims: HashSet::new(),
             history_restore_retry_after: HashMap::new(),
+            restore_sequence: 0,
+            restore_reports: HashMap::new(),
+            restore_report_order: VecDeque::new(),
         }),
         database: Mutex::new(database),
     }));
@@ -1506,8 +1846,8 @@ mod tests {
         ATTENTION_RECHECK_DELAY, AttentionState, attention_retry_delay,
         first_launched_history_report, is_history_worthy, layout_reconciliation_poll_interval,
         normalized_terminal_title, reconcile_attention_states, record_attention_attempt,
-        reopen_shortcut_action_id, reopenable_history_ids_with, terminal_dbus_service_names,
-        tracked_window_state_changed,
+        reopen_shortcut_action_id, reopenable_history_ids_with, retain_normal_geometry,
+        terminal_dbus_service_names, tracked_window_state_changed,
     };
     use crate::tracker::restore::LaunchUnavailableCode;
     use crate::tracker::{HistoryEntry, RestoreReport, RestoreSpec, TrackedWindow};
@@ -1521,6 +1861,45 @@ mod tests {
         assert_eq!(
             layout_reconciliation_poll_interval(Duration::from_secs(2)),
             Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn maximized_updates_preserve_the_last_normal_geometry() {
+        let previous = TrackedWindow {
+            normal_geometry: Some(crate::tracker::WindowGeometry {
+                x: 40,
+                y: 50,
+                width: 900,
+                height: 700,
+            }),
+            ..TrackedWindow::default()
+        };
+        let mut maximized = TrackedWindow {
+            x: 0,
+            y: 0,
+            width: 2_000,
+            height: 1_200,
+            maximized: true,
+            ..TrackedWindow::default()
+        };
+        retain_normal_geometry(&mut maximized, Some(&previous));
+        assert_eq!(maximized.normal_geometry, previous.normal_geometry);
+
+        maximized.maximized = false;
+        maximized.x = 100;
+        maximized.y = 110;
+        maximized.width = 1_000;
+        maximized.height = 800;
+        retain_normal_geometry(&mut maximized, Some(&previous));
+        assert_eq!(
+            maximized.normal_geometry,
+            Some(crate::tracker::WindowGeometry {
+                x: 100,
+                y: 110,
+                width: 1_000,
+                height: 800,
+            })
         );
     }
 

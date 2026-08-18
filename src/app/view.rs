@@ -1,6 +1,21 @@
 use super::*;
+
+struct WindowSortRecord {
+    window: WindowInfo,
+    app_key: String,
+    terminal_subgroup_key: Option<String>,
+    title_key: String,
+}
+
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Some(cpu_usage) = frame.info().cpu_usage {
+            let cpu_micros = (cpu_usage.max(0.0) * 1_000_000.0)
+                .min(u32::MAX as f32)
+                .round() as u32;
+            self.last_frame_cpu_micros
+                .store(cpu_micros, Ordering::Relaxed);
+        }
         self.flush_settings_save();
         if let Some(deadline) = self.settings_save_deadline {
             ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
@@ -336,7 +351,8 @@ impl eframe::App for App {
         }
 
         if self.has_active_audio {
-            let audio_repaint_ms = AUDIO_ACTIVE_REPAINT_MS;
+            let audio_repaint_ms =
+                audio_repaint_interval_ms(self.last_frame_cpu_micros.load(Ordering::Relaxed));
             ctx.request_repaint_after(std::time::Duration::from_millis(audio_repaint_ms));
         }
 
@@ -592,6 +608,7 @@ impl eframe::App for App {
                                     self.show_system_settings_modules,
                                     &base_query,
                                     &typo_query,
+                                    self.field_rank_model.as_ref(),
                                 );
                                         filtered_app_title_is_typos = Arc::new(ranked_apps
                                             .iter()
@@ -619,51 +636,82 @@ impl eframe::App for App {
 	                        }
 		                        LauncherMode::Windows => {
 		                            if !has_search_query {
-	                                filtered_windows = Arc::new(self.windows.clone());
-	                                let mut app_window_counts: HashMap<String, usize> =
-	                                    HashMap::new();
-	                                let mut terminal_subgroup_counts: HashMap<String, usize> =
-	                                    HashMap::new();
-	                                for win in filtered_windows.iter() {
-	                                    *app_window_counts
-	                                        .entry(window_grouping_key(win))
-	                                        .or_default() += 1;
-	                                    if is_terminal_class(&win.class.trim().to_lowercase()) {
-	                                        *terminal_subgroup_counts
-	                                            .entry(terminal_window_subgroup_key(win))
-	                                            .or_default() += 1;
+		                                let mut sortable_windows = self
+		                                    .windows
+		                                    .iter()
+		                                    .cloned()
+		                                    .map(|window| {
+		                                        let app_key = window_grouping_key(&window);
+		                                        let terminal_subgroup_key = is_terminal_class(
+		                                            &window.class.trim().to_lowercase(),
+		                                        )
+		                                        .then(|| terminal_window_subgroup_key(&window));
+		                                        let title_key = window_sort_title_key(&window);
+		                                        WindowSortRecord {
+		                                            window,
+		                                            app_key,
+		                                            terminal_subgroup_key,
+		                                            title_key,
+		                                        }
+		                                    })
+		                                    .collect::<Vec<_>>();
+		                                let mut app_window_counts: HashMap<String, usize> =
+		                                    HashMap::new();
+		                                let mut terminal_subgroup_counts: HashMap<String, usize> =
+		                                    HashMap::new();
+		                                for record in &sortable_windows {
+		                                    *app_window_counts
+		                                        .entry(record.app_key.clone())
+		                                        .or_default() += 1;
+		                                    if let Some(subgroup_key) =
+		                                        &record.terminal_subgroup_key
+		                                    {
+		                                        *terminal_subgroup_counts
+		                                            .entry(subgroup_key.clone())
+		                                            .or_default() += 1;
+		                                    }
+		                                }
+	                                sortable_windows.sort_by(|a, b| {
+	                                    if self.order_windows_by_last_activation {
+	                                        let activation_time_order = match (
+	                                            a.window.last_activated_at_ms,
+	                                            b.window.last_activated_at_ms,
+	                                        ) {
+	                                            (Some(a), Some(b)) => b.cmp(&a),
+	                                            (Some(_), None) => std::cmp::Ordering::Less,
+	                                            (None, Some(_)) => std::cmp::Ordering::Greater,
+	                                            (None, None) => std::cmp::Ordering::Equal,
+	                                        };
+	                                        return activation_time_order
+	                                            .then_with(|| {
+	                                                b.window.activation_sequence.cmp(
+	                                                    &a.window.activation_sequence,
+	                                                )
+	                                            })
+	                                            .then_with(|| a.title_key.cmp(&b.title_key))
+	                                            .then_with(|| a.window.id.cmp(&b.window.id));
 	                                    }
-	                                }
-                                Arc::make_mut(&mut filtered_windows).sort_by(|a, b| {
-                                    if self.order_windows_by_last_activation {
-                                        return compare_windows_by_last_activation(a, b);
-                                    }
-                                    let app_key_a = window_grouping_key(a);
-	                                    let app_key_b = window_grouping_key(b);
-	                                    let count_a =
-                                        app_window_counts.get(&app_key_a).copied().unwrap_or(0);
-                                    let count_b =
-                                        app_window_counts.get(&app_key_b).copied().unwrap_or(0);
-	                                    count_a
-	                                        .cmp(&count_b)
-	                                        .then_with(|| app_key_a.cmp(&app_key_b))
-	                                        .then_with(|| {
-	                                            let a_is_terminal =
-	                                                is_terminal_class(&a.class.trim().to_lowercase());
-	                                            let b_is_terminal =
-	                                                is_terminal_class(&b.class.trim().to_lowercase());
-	                                            match (a_is_terminal, b_is_terminal) {
-	                                                (true, true) if app_key_a == app_key_b => {
-	                                                    let subgroup_key_a =
-	                                                        terminal_window_subgroup_key(a);
-	                                                    let subgroup_key_b =
-	                                                        terminal_window_subgroup_key(b);
-	                                                    let subgroup_count_a = terminal_subgroup_counts
-	                                                        .get(&subgroup_key_a)
+		                                    let count_a =
+	                                        app_window_counts.get(&a.app_key).copied().unwrap_or(0);
+	                                    let count_b =
+	                                        app_window_counts.get(&b.app_key).copied().unwrap_or(0);
+		                                    count_a
+		                                        .cmp(&count_b)
+		                                        .then_with(|| a.app_key.cmp(&b.app_key))
+		                                        .then_with(|| {
+		                                            match (
+		                                                &a.terminal_subgroup_key,
+		                                                &b.terminal_subgroup_key,
+		                                            ) {
+		                                                (Some(subgroup_key_a), Some(subgroup_key_b))
+		                                                    if a.app_key == b.app_key =>
+		                                                {
+		                                                    let subgroup_count_a = terminal_subgroup_counts
+		                                                        .get(subgroup_key_a)
 	                                                        .copied()
 	                                                        .unwrap_or(0);
-	                                                    let subgroup_count_b = terminal_subgroup_counts
-	                                                        .get(&subgroup_key_b)
+		                                                    let subgroup_count_b = terminal_subgroup_counts
+		                                                        .get(subgroup_key_b)
 	                                                        .copied()
 	                                                        .unwrap_or(0);
 	                                                    subgroup_count_a
@@ -672,14 +720,18 @@ impl eframe::App for App {
 	                                                            subgroup_key_a.cmp(&subgroup_key_b)
 	                                                        })
 	                                                }
-	                                                _ => std::cmp::Ordering::Equal,
-	                                            }
-	                                        })
-	                                        .then_with(|| {
-	                                            window_sort_title_key(a).cmp(&window_sort_title_key(b))
-	                                        })
-	                                        .then_with(|| a.id.cmp(&b.id))
-					                                });
+		                                                _ => std::cmp::Ordering::Equal,
+		                                            }
+		                                        })
+		                                        .then_with(|| a.title_key.cmp(&b.title_key))
+		                                        .then_with(|| a.window.id.cmp(&b.window.id))
+						                                });
+		                                filtered_windows = Arc::new(
+		                                    sortable_windows
+		                                        .into_iter()
+		                                        .map(|record| record.window)
+		                                        .collect(),
+		                                );
                                     } else if let Some((base_query, typo_query)) =
                                         search_queries(&search_query)
                                     {
@@ -688,6 +740,7 @@ impl eframe::App for App {
                                     &self.window_search_documents,
                                     &base_query,
                                     &typo_query,
+                                    self.field_rank_model.as_ref(),
                                 );
                                         filtered_window_title_is_typos = Arc::new(ranked_windows
                                             .iter()
@@ -743,6 +796,7 @@ impl eframe::App for App {
                                 self.show_system_settings_modules,
                                 &base_query,
                                 &typo_query,
+                                self.field_rank_model.as_ref(),
                             );
 	                                    filtered_app_title_is_typos = Arc::new(ranked_apps
                                         .iter()
@@ -2763,7 +2817,10 @@ impl eframe::App for App {
                         if ui.button("Restore missing windows").clicked() {
                             self.recovery_prompt = false;
                             std::thread::spawn(|| {
-                                match applicationlauncher::tracker::TrackerClient::connect().and_then(|client| client.restore_recovery()) {
+                                match applicationlauncher::tracker::TrackerClient::connect().and_then(|client| {
+                                    let report = client.restore_recovery()?;
+                                    client.wait_for_restore_report(report)
+                                }) {
                                     Ok(report) => crate::diagnostics::write_stderr_line(&format!("Recovery restore: {} matched, {} launched, {} failures", report.matched, report.launched, report.failures.len())),
                                     Err(err) => crate::diagnostics::write_stderr_line(&format!("Recovery restore failed: {err}")),
                                 }
@@ -2780,7 +2837,7 @@ impl eframe::App for App {
         }
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         self.save_window_size();
     }
 }

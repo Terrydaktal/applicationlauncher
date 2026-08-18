@@ -486,14 +486,25 @@ fn persistence_equivalent(previous: &TrackedWindow, current: &TrackedWindow) -> 
         && previous.y == current.y
         && previous.width == current.width
         && previous.height == current.height
+        && previous.normal_geometry == current.normal_geometry
         && previous.minimized == current.minimized
         && previous.maximized == current.maximized
+        && previous.maximized_horizontally == current.maximized_horizontally
+        && previous.maximized_vertically == current.maximized_vertically
         && previous.fullscreen == current.fullscreen
         && previous.demands_attention == current.demands_attention
         && previous.active == current.active
         && previous.desktop == current.desktop
         && previous.on_all_desktops == current.on_all_desktops
         && previous.output == current.output
+        && previous.output_geometry == current.output_geometry
+        && previous.activities == current.activities
+        && previous.stacking_order == current.stacking_order
+        && previous.keep_above == current.keep_above
+        && previous.keep_below == current.keep_below
+        && previous.shaded == current.shaded
+        && previous.skip_pager == current.skip_pager
+        && previous.no_border == current.no_border
         && previous.opened_at_ms == current.opened_at_ms
         && previous.last_activated_at_ms == current.last_activated_at_ms
         && previous.activation_sequence == current.activation_sequence

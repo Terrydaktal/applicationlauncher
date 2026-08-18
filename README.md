@@ -24,6 +24,7 @@
 │   ├── observability.rs
 │   ├── audio.rs
 │   ├── models.rs
+│   ├── ranking_model.rs
 │   ├── search.rs
 │   └── main.rs
 ├── kwin/applicationlauncher-window-feed/
@@ -44,6 +45,7 @@
 - `src/observability.rs`: Shared bounded events, counters, workers, panic handling, and independent diagnostic endpoints.
 - `src/diagnostic_capture.rs`: Activated GUI/daemon evidence collector, checksums, privacy filtering, and debug doctor.
 - `src/search.rs`: Fuzzy ranking, transient-title normalization, sorting, and highlighting.
+- `src/ranking_model.rs`: Version-checked loading of an optional caller-owned field reranker.
 - `src/models.rs`: Shared window, application, feed, and audio data types.
 - `src/tracker/`: Daemon client, private SQLite persistence, restore policy, service installation, and D-Bus service.
 - `src/bin/applicationlauncherd.rs`: Persistent background tracker entry point.
@@ -274,6 +276,12 @@ OPERATION
     a frameless GUI window containing a search input, a main window list, and an
     application side panel. As you type, both lists are filtered using a fuzzy
     matcher.
+
+    If `APPLICATIONLAUNCHER_FIELD_RANK_MODEL` is set, or if
+    `$XDG_STATE_HOME/applicationlauncher/field-rank-model.json` exists, the
+    launcher loads a version-checked `fuzzy-rank::fields::FieldRankModel` and
+    reranks only the leading 256 metadata matches. Without a valid active model,
+    the deterministic fuzzy-rank ordering is unchanged.
 
     Keyboard Navigation:
         - Up/Down Arrows: Move selected window.

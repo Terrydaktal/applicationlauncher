@@ -18,3 +18,44 @@ pub(crate) const TERMINAL_DBUS_PATH: &str = "/org/xfce/Terminal";
 pub(crate) const TERMINAL_DBUS_INTERFACE: &str = "org.xfce.Terminal5";
 pub(crate) const TERMINAL_METADATA_RETRY_SECS: u64 = 5;
 pub(crate) const TERMINAL_ACTION_MESSAGE_SECS: u64 = 4;
+
+pub(crate) fn live_repaint_backoff(frame_cpu_micros: u32) -> std::time::Duration {
+    const FRAME_BUDGET_MICROS: u32 = 16_000;
+    const MAX_BACKOFF_MS: u64 = 100;
+
+    if frame_cpu_micros <= FRAME_BUDGET_MICROS {
+        return std::time::Duration::ZERO;
+    }
+
+    std::time::Duration::from_millis(u64::from(frame_cpu_micros / 1_000).clamp(1, MAX_BACKOFF_MS))
+}
+
+pub(crate) fn audio_repaint_interval_ms(frame_cpu_micros: u32) -> u64 {
+    let load_adjusted_ms = u64::from(frame_cpu_micros / 1_000).saturating_mul(3);
+    AUDIO_ACTIVE_REPAINT_MS.max(load_adjusted_ms).min(200)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_repaints_remain_immediate_while_frames_fit_the_budget() {
+        assert_eq!(live_repaint_backoff(16_000), std::time::Duration::ZERO);
+        assert_eq!(audio_repaint_interval_ms(16_000), AUDIO_ACTIVE_REPAINT_MS);
+    }
+
+    #[test]
+    fn expensive_frames_back_off_bounded_live_animation_work() {
+        assert_eq!(
+            live_repaint_backoff(40_000),
+            std::time::Duration::from_millis(40)
+        );
+        assert_eq!(audio_repaint_interval_ms(40_000), 120);
+        assert_eq!(
+            live_repaint_backoff(u32::MAX),
+            std::time::Duration::from_millis(100)
+        );
+        assert_eq!(audio_repaint_interval_ms(u32::MAX), 200);
+    }
+}

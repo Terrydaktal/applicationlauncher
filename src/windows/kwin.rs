@@ -2,6 +2,7 @@ use eframe::egui;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -210,6 +211,7 @@ pub(crate) fn build_window_info(
 pub(crate) fn setup_kwin_window_feed(
     inbox: Arc<Mutex<Option<Vec<WindowFeedEvent>>>>,
     repaint_ctx: egui::Context,
+    last_frame_cpu_micros: Arc<AtomicU32>,
 ) -> Result<(), String> {
     ensure_tracker_ready()?;
     std::thread::spawn(move || {
@@ -284,7 +286,13 @@ pub(crate) fn setup_kwin_window_feed(
                     previous_payloads = Some(current_payloads);
                     last_generation = generation;
                     if should_repaint {
-                        repaint_ctx.request_repaint();
+                        let delay =
+                            live_repaint_backoff(last_frame_cpu_micros.load(Ordering::Relaxed));
+                        if delay.is_zero() {
+                            repaint_ctx.request_repaint();
+                        } else {
+                            repaint_ctx.request_repaint_after(delay);
+                        }
                     }
                 }
                 Ok(None) => {}

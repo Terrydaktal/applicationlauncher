@@ -92,8 +92,26 @@ function serializeWindow(window) {
         }
     }
     var outputName = "";
+    var outputGeometry = null;
     if (window.output && window.output.name) {
         outputName = String(window.output.name);
+        var outputRect = window.output.geometry;
+        outputGeometry = {
+            name: outputName,
+            x: outputRect ? Math.round(outputRect.x) : 0,
+            y: outputRect ? Math.round(outputRect.y) : 0,
+            width: outputRect ? Math.round(outputRect.width) : 0,
+            height: outputRect ? Math.round(outputRect.height) : 0,
+            scaleMilli: typeof window.output.devicePixelRatio === "number"
+                ? Math.round(window.output.devicePixelRatio * 1000)
+                : 1000
+        };
+    }
+    var activities = [];
+    if (window.activities) {
+        for (var activityIndex = 0; activityIndex < window.activities.length; ++activityIndex) {
+            activities.push(String(window.activities[activityIndex]));
+        }
     }
 
     return {
@@ -109,6 +127,8 @@ function serializeWindow(window) {
         minimized: !!window.minimized,
         maximized: !!window.maximized ||
             (!!window.maximizedHorizontally && !!window.maximizedVertically),
+        maximizedHorizontally: !!window.maximizedHorizontally,
+        maximizedVertically: !!window.maximizedVertically,
         fullscreen: !!window.fullScreen,
         demandsAttention: !!window.demandsAttention,
         active: !!window.active,
@@ -116,7 +136,15 @@ function serializeWindow(window) {
         skipSwitcher: !!window.skipSwitcher,
         desktop: desktop,
         onAllDesktops: !!window.onAllDesktops,
-        output: outputName
+        output: outputName,
+        outputGeometry: outputGeometry,
+        activities: activities,
+        stackingOrder: typeof window.stackingOrder === "number" ? window.stackingOrder : 0,
+        keepAbove: !!window.keepAbove,
+        keepBelow: !!window.keepBelow,
+        shaded: !!window.shade,
+        skipPager: !!window.skipPager,
+        noBorder: !!window.noBorder
     };
 }
 
@@ -205,6 +233,16 @@ function trackWindow(window, deferInitialUpsert) {
             sendUpsert(window);
         });
     }
+    if (window.maximizedChanged) {
+        window.maximizedChanged.connect(function () {
+            sendUpsert(window);
+        });
+    }
+    if (window.fullScreenChanged) {
+        window.fullScreenChanged.connect(function () {
+            sendUpsert(window);
+        });
+    }
     if (window.activeChanged) {
         window.activeChanged.connect(function () {
             sendUpsert(window);
@@ -219,6 +257,23 @@ function trackWindow(window, deferInitialUpsert) {
         window.outputChanged.connect(function () {
             sendUpsert(window);
         });
+    }
+    var stateSignals = [
+        window.activitiesChanged,
+        window.stackingOrderChanged,
+        window.keepAboveChanged,
+        window.keepBelowChanged,
+        window.shadeChanged,
+        window.skipTaskbarChanged,
+        window.skipPagerChanged,
+        window.noBorderChanged
+    ];
+    for (var signalIndex = 0; signalIndex < stateSignals.length; ++signalIndex) {
+        if (stateSignals[signalIndex]) {
+            stateSignals[signalIndex].connect(function () {
+                sendUpsert(window);
+            });
+        }
     }
     if (window.closed) {
         window.closed.connect(function () {
@@ -255,6 +310,23 @@ workspace.windowRemoved.connect(function (window) {
         sendRemove(id);
     }
 });
+
+if (workspace.screensChanged) {
+    workspace.screensChanged.connect(function () {
+        for (var windowId in trackedWindows) {
+            if (!trackedWindows.hasOwnProperty(windowId)) {
+                continue;
+            }
+            for (var windowIndex = 0; windowIndex < workspace.stackingOrder.length; ++windowIndex) {
+                var window = workspace.stackingOrder[windowIndex];
+                if (window && String(window.internalId) === windowId) {
+                    sendUpsert(window);
+                    break;
+                }
+            }
+        }
+    });
+}
 
 workspace.windowActivated.connect(function (window) {
     updateReopenShortcutState();

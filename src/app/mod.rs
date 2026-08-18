@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
     Arc,
+    atomic::{AtomicU32, Ordering},
     mpsc::{Receiver, Sender, SyncSender},
 };
 use std::time::{Duration, Instant};
@@ -119,6 +120,55 @@ fn format_last_activation_age(timestamp_ms: Option<i64>) -> String {
     }
 }
 
+fn format_restore_report(report: applicationlauncher::tracker::RestoreReport) -> String {
+    use applicationlauncher::tracker::RestoreOutcomeStatus;
+
+    let exact = report
+        .outcomes
+        .iter()
+        .filter(|outcome| outcome.status == RestoreOutcomeStatus::Exact)
+        .count();
+    let adjusted = report
+        .outcomes
+        .iter()
+        .filter(|outcome| outcome.status == RestoreOutcomeStatus::Adjusted)
+        .count();
+    let failed = report
+        .outcomes
+        .iter()
+        .filter(|outcome| outcome.status == RestoreOutcomeStatus::Failed)
+        .count();
+    let phase = if report.in_progress {
+        "still running"
+    } else {
+        "finished"
+    };
+    let reported_failures = report.failures.len();
+    let mut lines = vec![format!(
+        "Restore {phase}: {} existing, {} launched, {exact} exact, {adjusted} adjusted, {failed} failed, {reported_failures} reported issues",
+        report.matched, report.launched,
+    )];
+    for outcome in report.outcomes {
+        let status = match outcome.status {
+            RestoreOutcomeStatus::Pending => "Pending",
+            RestoreOutcomeStatus::Exact => "Exact",
+            RestoreOutcomeStatus::Adjusted => "Adjusted",
+            RestoreOutcomeStatus::Failed => "Failed",
+        };
+        lines.push(format!("{status}: {} - {}", outcome.title, outcome.detail));
+    }
+    lines.join("\n")
+}
+
+fn finish_restore_action(
+    client: &applicationlauncher::tracker::TrackerClient,
+    report: applicationlauncher::tracker::RestoreReport,
+) -> Result<String, String> {
+    client
+        .wait_for_restore_report(report)
+        .map(format_restore_report)
+}
+
 fn run_history_action(
     state: Arc<std::sync::Mutex<HistoryPopupState>>,
     ctx: egui::Context,
@@ -151,6 +201,7 @@ pub(crate) struct App {
     window_icon_cache: HashMap<WindowIconCacheKey, Option<PathBuf>>,
     apps: Vec<AppInfo>,
     app_search_documents: Vec<PreparedSearchDocument>,
+    field_rank_model: Option<fuzzy_rank::fields::FieldRankModel>,
     pinned_apps: Vec<PathBuf>,
     search_query: String,
     selected_index: usize,
@@ -228,6 +279,7 @@ pub(crate) struct App {
     window_sender: SyncSender<Vec<WindowInfo>>,
     window_receiver: Receiver<Vec<WindowInfo>>,
     window_feed_inbox: Arc<std::sync::Mutex<Option<Vec<WindowFeedEvent>>>>,
+    last_frame_cpu_micros: Arc<AtomicU32>,
     audio_cache_receiver: Receiver<AudioCacheUpdate>,
     terminal_action_receiver: Receiver<Result<String, String>>,
     terminal_action_message: Option<(String, bool, Instant)>,
@@ -380,11 +432,13 @@ impl App {
                 if refresh_due {
                     refresh_history_popup(Arc::clone(&shared_state), ctx.clone());
                 }
-                ctx.request_repaint_after(Duration::from_millis(
-                    HISTORY_POPUP_REFRESH_INTERVAL_MS,
-                ));
+                ctx.request_repaint_after(Duration::from_millis(HISTORY_POPUP_REFRESH_INTERVAL_MS));
 
-                if ctx.input(|input| input.viewport().close_requested() || input.key_pressed(egui::Key::Escape) || input.key_pressed(egui::Key::F9)) {
+                if ctx.input(|input| {
+                    input.viewport().close_requested()
+                        || input.key_pressed(egui::Key::Escape)
+                        || input.key_pressed(egui::Key::F9)
+                }) {
                     let _ = event_sender.send(PopupEvent::CloseHistory);
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -394,52 +448,145 @@ impl App {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.heading("Window History and Sessions");
                     ui.add_space(8.0);
-                    let mut action: Option<Box<dyn FnOnce(applicationlauncher::tracker::TrackerClient) -> Result<String, String> + Send>> = None;
+                    let mut action: Option<
+                        Box<
+                            dyn FnOnce(
+                                    applicationlauncher::tracker::TrackerClient,
+                                ) -> Result<String, String>
+                                + Send,
+                        >,
+                    > = None;
                     let mut close = false;
                     if let Ok(mut state) = shared_state.lock() {
                         ui.horizontal(|ui| {
                             ui.selectable_value(&mut state.show_sessions, false, "Recently closed");
                             ui.selectable_value(&mut state.show_sessions, true, "Saved sessions");
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Close").clicked() { close = true; }
-                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Close").clicked() {
+                                        close = true;
+                                    }
+                                },
+                            );
                         });
                         ui.separator();
-                        if let Some(message) = &state.message { ui.label(message); ui.separator(); }
-                        if state.loading || state.action_pending { ui.spinner(); }
+                        if let Some(message) = &state.message {
+                            ui.label(message);
+                            ui.separator();
+                        }
+                        if state.loading || state.action_pending {
+                            ui.spinner();
+                        }
 
                         if state.show_sessions {
                             ui.horizontal(|ui| {
                                 ui.label("Name");
                                 ui.text_edit_singleline(&mut state.snapshot_name);
                                 if ui.button("Save current session").clicked() {
-                                    let name = if state.snapshot_name.trim().is_empty() { format!("Session {}", state.snapshots.len() + 1) } else { state.snapshot_name.trim().to_string() };
-                                    action = Some(Box::new(move |client| client.create_snapshot(&name).map(|_| format!("Saved session '{name}'"))));
+                                    let name = if state.snapshot_name.trim().is_empty() {
+                                        format!("Session {}", state.snapshots.len() + 1)
+                                    } else {
+                                        state.snapshot_name.trim().to_string()
+                                    };
+                                    action = Some(Box::new(move |client| {
+                                        client
+                                            .create_snapshot(&name)
+                                            .map(|_| format!("Saved session '{name}'"))
+                                    }));
                                     state.snapshot_name.clear();
                                 }
                             });
                             ui.add_space(8.0);
                             egui::ScrollArea::vertical().show(ui, |ui| {
                                 for snapshot in state.snapshots.clone() {
-                                    if snapshot.kind == "recovery" { continue; }
+                                    if snapshot.kind == "recovery" {
+                                        continue;
+                                    }
                                     ui.horizontal(|ui| {
-                                        ui.label(snapshot.name.clone().unwrap_or_else(|| "Unnamed session".into()));
-                                        ui.label(format!("{} windows, {}", snapshot.window_count, history_age(snapshot.created_at_ms)));
-                                        if ui.add_enabled(!state.action_pending, egui::Button::new("Restore")).clicked() { let id = snapshot.id; action = Some(Box::new(move |client| client.restore_snapshot(id).map(|report| format!("Restored: {} existing, {} launched, {} failures", report.matched, report.launched, report.failures.len())))); }
-                                        if ui.add_enabled(!state.action_pending, egui::Button::new("Delete")).clicked() { let id = snapshot.id; action = Some(Box::new(move |client| client.delete_snapshot(id).map(|_| "Session deleted".into()))); }
+                                        ui.label(
+                                            snapshot
+                                                .name
+                                                .clone()
+                                                .unwrap_or_else(|| "Unnamed session".into()),
+                                        );
+                                        ui.label(format!(
+                                            "{} windows, {}",
+                                            snapshot.window_count,
+                                            history_age(snapshot.created_at_ms)
+                                        ));
+                                        if ui
+                                            .add_enabled(
+                                                !state.action_pending,
+                                                egui::Button::new("Restore"),
+                                            )
+                                            .clicked()
+                                        {
+                                            let id = snapshot.id;
+                                            action = Some(Box::new(move |client| {
+                                                let report = client.restore_snapshot(id)?;
+                                                finish_restore_action(&client, report)
+                                            }));
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                !state.action_pending,
+                                                egui::Button::new("Delete"),
+                                            )
+                                            .clicked()
+                                        {
+                                            let id = snapshot.id;
+                                            action = Some(Box::new(move |client| {
+                                                client
+                                                    .delete_snapshot(id)
+                                                    .map(|_| "Session deleted".into())
+                                            }));
+                                        }
                                     });
                                     ui.separator();
                                 }
                             });
                         } else {
-                            if ui.add_enabled(!state.action_pending, egui::Button::new("Clear history")).clicked() { action = Some(Box::new(|client| client.clear_history().map(|_| "History cleared".into()))); }
+                            if ui
+                                .add_enabled(
+                                    !state.action_pending,
+                                    egui::Button::new("Clear history"),
+                                )
+                                .clicked()
+                            {
+                                action = Some(Box::new(|client| {
+                                    client.clear_history().map(|_| "History cleared".into())
+                                }));
+                            }
                             egui::ScrollArea::vertical().show(ui, |ui| {
                                 for entry in state.history.clone() {
                                     ui.horizontal(|ui| {
-                                        ui.vertical(|ui| { ui.label(&entry.window.title); ui.small(format!("{} | {}", entry.restore.app_key, history_age(entry.closed_at_ms))); });
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            if ui.add_enabled(!state.action_pending, egui::Button::new("Reopen")).clicked() { let id = entry.id; action = Some(Box::new(move |client| client.reopen_history(id).map(|report| format!("Reopened: {} existing, {} launched, {} failures", report.matched, report.launched, report.failures.len())))); }
+                                        ui.vertical(|ui| {
+                                            ui.label(&entry.window.title);
+                                            ui.small(format!(
+                                                "{} | {}",
+                                                entry.restore.app_key,
+                                                history_age(entry.closed_at_ms)
+                                            ));
                                         });
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .add_enabled(
+                                                        !state.action_pending,
+                                                        egui::Button::new("Reopen"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    let id = entry.id;
+                                                    action = Some(Box::new(move |client| {
+                                                        let report = client.reopen_history(id)?;
+                                                        finish_restore_action(&client, report)
+                                                    }));
+                                                }
+                                            },
+                                        );
                                     });
                                     ui.separator();
                                 }
@@ -450,7 +597,9 @@ impl App {
                         let _ = event_sender.send(PopupEvent::CloseHistory);
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
-                    if let Some(action) = action { run_history_action(Arc::clone(&shared_state), ctx.clone(), action); }
+                    if let Some(action) = action {
+                        run_history_action(Arc::clone(&shared_state), ctx.clone(), action);
+                    }
                 });
             },
         );
@@ -495,6 +644,7 @@ impl App {
 
         let (window_tx, window_rx) = std::sync::mpsc::sync_channel(1);
         let window_feed_inbox = Arc::new(std::sync::Mutex::new(None));
+        let last_frame_cpu_micros = Arc::new(AtomicU32::new(0));
         let (audio_cache_tx, audio_cache_rx) = std::sync::mpsc::sync_channel(1);
         let (_terminal_action_tx, terminal_action_rx) = std::sync::mpsc::channel();
         let (auto_enter_update_sender, auto_enter_update_receiver) =
@@ -532,10 +682,14 @@ impl App {
         let rapid_polling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let kwin_window_feed_repaint_ctx = cc.egui_ctx.clone();
         let kwin_window_feed_inbox = Arc::clone(&window_feed_inbox);
+        let kwin_window_feed_frame_cpu = Arc::clone(&last_frame_cpu_micros);
         applicationlauncher::observability::spawn_named("kwin-feed-setup", move |worker| {
             worker.set_state("connecting");
-            let result =
-                setup_kwin_window_feed(kwin_window_feed_inbox, kwin_window_feed_repaint_ctx);
+            let result = setup_kwin_window_feed(
+                kwin_window_feed_inbox,
+                kwin_window_feed_repaint_ctx,
+                kwin_window_feed_frame_cpu,
+            );
             let _ = kwin_window_feed_setup_tx.send(result);
         });
 
@@ -560,6 +714,7 @@ impl App {
             window_icon_cache: HashMap::new(),
             apps: Vec::new(),
             app_search_documents: Vec::new(),
+            field_rank_model: crate::ranking_model::load_field_rank_model(),
             pinned_apps,
             search_query: String::new(),
             selected_index: 0,
@@ -641,6 +796,7 @@ impl App {
             window_sender: window_tx.clone(),
             window_receiver: window_rx,
             window_feed_inbox,
+            last_frame_cpu_micros,
             audio_cache_receiver: audio_cache_rx,
             terminal_action_receiver: terminal_action_rx,
             terminal_action_message: None,
