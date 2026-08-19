@@ -29,7 +29,7 @@ impl eframe::App for App {
 
         let mut handled_focus_launcher = false;
         let mut focus_requested = false;
-        let mut source_changes_pending = None;
+        let mut deployment_warnings = None;
         let mut shutdown_requested = false;
         let mut ui_event_count = 0;
         for _ in 0..UI_EVENTS_PER_FRAME {
@@ -39,10 +39,11 @@ impl eframe::App for App {
             ui_event_count += 1;
             match event {
                 UiEvent::FocusLauncher {
-                    source_changes_pending: pending,
+                    source_changes_pending,
+                    symbols_unarchived,
                 } => {
                     focus_requested = true;
-                    source_changes_pending = Some(pending);
+                    deployment_warnings = Some((source_changes_pending, symbols_unarchived));
                 }
                 UiEvent::ShutdownLauncher => {
                     shutdown_requested = true;
@@ -56,8 +57,9 @@ impl eframe::App for App {
 
         if focus_requested {
             handled_focus_launcher = true;
-            if let Some(pending) = source_changes_pending {
-                self.source_changes_pending = pending;
+            if let Some((source_pending, symbols_unarchived)) = deployment_warnings {
+                self.source_changes_pending = source_pending;
+                self.symbols_unarchived = symbols_unarchived;
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -843,16 +845,44 @@ impl eframe::App for App {
                             }
                         }
 
-		                    if self.mode == LauncherMode::Windows {
-                            if search_query_changed {
-                                self.selected_index = 0;
-                                self.last_selected_window_id = None;
-                                self.active_pane = ActivePane::Windows;
+                    if self.mode == LauncherMode::Windows {
+                        if search_query_changed {
+                            self.selected_index = 0;
+                            self.last_selected_window_id = None;
+                            self.active_pane = ActivePane::Windows;
                             } else if let Some(ref last_id) = self.last_selected_window_id {
 	                            if let Some(pos) = filtered_windows.iter().position(|w| &w.id == last_id) {
 	                                self.selected_index = pos;
-	                            }
-	                        }
+                            }
+                        }
+                    }
+
+                    if search_query_changed
+                        && has_search_query
+                        && applicationlauncher::observability::mode()
+                            == applicationlauncher::observability::RuntimeMode::RuntimeActivated
+                    {
+                        let first_match = match self.mode {
+                            LauncherMode::Apps => filtered_apps
+                                .first()
+                                .map(|(app, _)| app.name.as_str()),
+                            LauncherMode::Windows => filtered_windows
+                                .first()
+                                .map(|window| window.title.as_str()),
+                        };
+                        let decision = format!(
+                            "{} matches; first result selected",
+                            match self.mode {
+                                LauncherMode::Apps => filtered_apps.len(),
+                                LauncherMode::Windows => filtered_windows.len(),
+                            }
+                        );
+                        let evidence = first_match.into_iter().collect::<Vec<_>>();
+                        applicationlauncher::observability::record_search_decision(
+                            &search_query,
+                            &decision,
+                            &evidence,
+                        );
                     }
 
                     let show_run_in_terminal_action = self.mode == LauncherMode::Windows
@@ -2788,7 +2818,7 @@ impl eframe::App for App {
                     if self.app_info_popup.is_some() {
                         self.show_app_info_popup(ctx);
                     }
-                    self.show_source_changes_warning(ctx);
+                    self.show_deployment_warnings(ctx);
                     self.show_terminal_action_message(ctx);
 
                     if let Some(ref resp) = text_edit_response {

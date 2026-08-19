@@ -89,6 +89,10 @@ OPTIONS
         Verify build IDs, symbolization data, diagnostic attachment, output
         permissions, required tools, and flight-recorder budgets.
 
+    replay <RING_OR_BUNDLE>
+        Replay the persisted typed boundary events from a flight-recorder ring
+        or diagnostic bundle and print the resulting deterministic state.
+
 OPERATION
     When launched, the application retrieves a list of all open windows using
     kdotool and installed desktop applications from the local system. It renders
@@ -118,6 +122,9 @@ EXAMPLES
 
     applicationlauncher --diagnose auto --perf
         Add a short call-graph profile for each running component.
+
+    applicationlauncher replay ~/.local/state/applicationlauncher/diagnostics/capture-...
+        Replay the persisted boundary events from a captured incident.
 
 FILES
     $HOME/.config/applicationlauncher/config.toml
@@ -209,6 +216,26 @@ fn main() -> eframe::Result {
             }
             Err(err) => {
                 eprintln!("Debug doctor failed: {err}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(position) = args.iter().position(|argument| argument == "replay") {
+        let input = args.get(position + 1).ok_or_else(|| {
+            eframe::Error::AppCreation("replay requires a ring file or diagnostic bundle".into())
+        })?;
+        match applicationlauncher::replay::replay_path(std::path::Path::new(input)) {
+            Ok(report) => match serde_json::to_string_pretty(&report) {
+                Ok(json) => println!("{json}"),
+                Err(err) => {
+                    eprintln!("Replay serialization failed: {err}");
+                    std::process::exit(1);
+                }
+            },
+            Err(err) => {
+                eprintln!("Replay failed: {err}");
                 std::process::exit(1);
             }
         }
@@ -315,6 +342,8 @@ fn main() -> eframe::Result {
     let mode = LauncherMode::Windows;
     let source_changes_pending = std::env::var_os("APPLICATIONLAUNCHER_SOURCE_CHANGES_PENDING")
         .is_some_and(|value| value == "1");
+    let symbols_unarchived = std::env::var_os("APPLICATIONLAUNCHER_SYMBOLS_UNARCHIVED")
+        .is_some_and(|value| value == "1");
     if args.iter().any(|arg| arg == "--shutdown") {
         let socket_path = get_socket_path(mode);
         if let Err(err) = send_launcher_control_request(&socket_path, "shutdown\n", true) {
@@ -335,10 +364,11 @@ fn main() -> eframe::Result {
     let listener = match std::os::unix::net::UnixListener::bind(&socket_path) {
         Ok(listener) => listener,
         Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
-            let focus_request = if source_changes_pending {
-                "focus-source-changes-pending\n"
-            } else {
-                "focus\n"
+            let focus_request = match (source_changes_pending, symbols_unarchived) {
+                (true, true) => "focus-deployment-warnings\n",
+                (true, false) => "focus-source-changes-pending\n",
+                (false, true) => "focus-symbols-unarchived\n",
+                (false, false) => "focus\n",
             };
             if send_launcher_control_request(&socket_path, focus_request, false).is_ok() {
                 focus_existing_launcher_window();
@@ -444,6 +474,7 @@ fn main() -> eframe::Result {
                 mode,
                 icon_only,
                 source_changes_pending,
+                symbols_unarchived,
                 ui_event_rx,
             )))
         }),

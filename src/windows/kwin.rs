@@ -186,7 +186,7 @@ pub(crate) fn build_window_info(
         })
         .clone();
 
-    Some(WindowInfo {
+    let window_info = WindowInfo {
         id,
         title: final_title,
         raw_title,
@@ -205,7 +205,25 @@ pub(crate) fn build_window_info(
         pid,
         last_activated_at_ms: None,
         activation_sequence: 0,
-    })
+    };
+    if applicationlauncher::observability::mode()
+        == applicationlauncher::observability::RuntimeMode::RuntimeActivated
+    {
+        applicationlauncher::observability::record_decision(
+            "window-identity",
+            window_info.class.as_str(),
+            &[
+                window_info.active_process.as_deref().unwrap_or(""),
+                window_info.desktop_file_name.as_deref().unwrap_or(""),
+                window_info
+                    .exe_path
+                    .as_deref()
+                    .and_then(|path| path.to_str())
+                    .unwrap_or(""),
+            ],
+        );
+    }
+    Some(window_info)
 }
 
 pub(crate) fn setup_kwin_window_feed(

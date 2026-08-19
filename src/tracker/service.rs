@@ -163,6 +163,10 @@ struct RuntimeInner {
 struct Runtime(Arc<RuntimeInner>);
 
 impl Runtime {
+    fn history_generation(&self) -> u64 {
+        self.0.state.lock().unwrap().history_generation
+    }
+
     fn claim_restore(&self, key: String) -> Result<(), String> {
         let mut state = self.0.state.lock().unwrap();
         if !state.restore_claims.insert(key.clone()) {
@@ -526,19 +530,54 @@ impl Runtime {
             crate::observability::Gauge::AttentionPending,
             state.attention.len(),
         );
+        let snapshot_generation = state.history_generation;
+        let window_count = state.windows.len();
         drop(state);
+        crate::observability::record_boundary(
+            crate::replay::BoundaryKind::WindowFeed,
+            "snapshot-applied",
+            &serde_json::json!({
+                "window_count": window_count,
+                "generation": snapshot_generation,
+                "closed_count": closed.len(),
+            })
+            .to_string(),
+        );
+        crate::observability::record_boundary(
+            crate::replay::BoundaryKind::TrackerMutation,
+            "history-write",
+            &serde_json::json!({
+                "closed_count": closed.len(),
+                "generation": snapshot_generation,
+            })
+            .to_string(),
+        );
         let database = self.0.database.lock().unwrap();
         for window in closed {
-            if is_history_worthy(&window)
-                && let Err(err) = database.add_history_with_restore(
-                    &window,
-                    closed_restores
-                        .get(&window.id)
-                        .unwrap_or(&super::infer_restore_spec(&window)),
-                    timestamp,
-                )
-            {
-                eprintln!("Tracker failed to append snapshot closure: {err}");
+            if is_history_worthy(&window) {
+                let operation_id = crate::observability::next_operation_id();
+                let result = if crate::replay::environment_should_inject(
+                    crate::replay::FaultPoint::TrackerWriteBusy,
+                    operation_id,
+                ) {
+                    crate::observability::record_boundary(
+                        crate::replay::BoundaryKind::FaultInjection,
+                        "tracker-write-busy",
+                        &serde_json::json!({ "operation_id": operation_id }).to_string(),
+                    );
+                    Err("fault injection: tracker write busy".to_string())
+                } else {
+                    database.add_history_with_restore(
+                        &window,
+                        closed_restores
+                            .get(&window.id)
+                            .unwrap_or(&super::infer_restore_spec(&window)),
+                        timestamp,
+                    )
+                };
+                if let Err(err) = result {
+                    eprintln!("Tracker failed to append snapshot closure: {err}");
+                }
             }
         }
         drop(database);
@@ -653,6 +692,16 @@ impl Runtime {
         for window in targets {
             crate::observability::increment(crate::observability::Counter::AttentionAttempts);
             let result = send_enter_to_terminal(&window);
+            crate::observability::record_boundary(
+                crate::replay::BoundaryKind::Attention,
+                "send-enter",
+                &serde_json::json!({
+                    "window_id": window.id,
+                    "succeeded": result.is_ok(),
+                    "error": result.as_ref().err().map(ToString::to_string),
+                })
+                .to_string(),
+            );
             if result.is_err() {
                 crate::observability::increment(crate::observability::Counter::AttentionFailures);
             }
@@ -1107,6 +1156,19 @@ fn dbus_bool(values: &HashMap<String, zbus::zvariant::OwnedValue>, key: &str) ->
 }
 
 fn send_enter_to_terminal(window: &TrackedWindow) -> Result<(), String> {
+    let operation_id = crate::observability::next_operation_id();
+    if crate::replay::environment_should_inject(
+        crate::replay::FaultPoint::TerminalSendFailure,
+        operation_id,
+    ) {
+        let error = "fault injection: terminal SendEnter failure".to_string();
+        crate::observability::record_boundary(
+            crate::replay::BoundaryKind::FaultInjection,
+            "terminal-send-failure",
+            &serde_json::json!({ "operation_id": operation_id }).to_string(),
+        );
+        return Err(error);
+    }
     let connection = zbus::blocking::connection::Builder::session()
         .map_err(|err| err.to_string())?
         .method_timeout(TERMINAL_DBUS_TIMEOUT)
@@ -1179,9 +1241,21 @@ fn send_enter_to_terminal(window: &TrackedWindow) -> Result<(), String> {
         "org.xfce.Terminal5",
     )
     .map_err(|err| err.to_string())?;
-    proxy
+    let result = proxy
         .call::<_, _, ()>("SendEnter", &(tab_uuid.as_str(),))
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string());
+    crate::observability::record_boundary(
+        crate::replay::BoundaryKind::TerminalAction,
+        "send-enter-dbus",
+        &serde_json::json!({
+            "window_id": window.id,
+            "service": service,
+            "succeeded": result.is_ok(),
+            "error": result.as_ref().err(),
+        })
+        .to_string(),
+    );
+    result
 }
 
 #[derive(Clone)]
@@ -1224,6 +1298,15 @@ impl WindowFeed {
             crate::observability::Event::new("kwin-feed", "replace-snapshot")
                 .object(&windows.len().to_string())
                 .reason("authoritative-resync"),
+        );
+        crate::observability::record_boundary(
+            crate::replay::BoundaryKind::WindowFeed,
+            "replace-snapshot",
+            &serde_json::json!({
+                "window_count": windows.len(),
+                "generation": self.0.history_generation(),
+            })
+            .to_string(),
         );
         self.begin_snapshot();
         for window in windows {

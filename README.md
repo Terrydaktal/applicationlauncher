@@ -22,6 +22,7 @@
 │   ├── diagnostics.rs
 │   ├── diagnostic_capture.rs
 │   ├── observability.rs
+│   ├── replay.rs
 │   ├── audio.rs
 │   ├── models.rs
 │   ├── ranking_model.rs
@@ -44,6 +45,7 @@
 - `src/diagnostics.rs`: GUI single-instance control and foreground activation.
 - `src/observability.rs`: Shared bounded events, counters, workers, panic handling, and independent diagnostic endpoints.
 - `src/diagnostic_capture.rs`: Activated GUI/daemon evidence collector, checksums, privacy filtering, and debug doctor.
+- `src/replay.rs`: Versioned boundary-event schema, persistent ring decoding, deterministic replay, and opt-in fault plans.
 - `src/search.rs`: Fuzzy ranking, transient-title normalization, sorting, and highlighting.
 - `src/ranking_model.rs`: Version-checked loading of an optional caller-owned field reranker.
 - `src/models.rs`: Shared window, application, feed, and audio data types.
@@ -195,10 +197,18 @@ The launcher writes its runtime data to:
   Private Rust panic reports with release backtraces. Reports are mode `0600`.
 - `$XDG_STATE_HOME/applicationlauncher/diagnostics/`
   Checksummed, bounded `--diagnose auto` bundles covering both GUI and daemon.
+- `$XDG_STATE_HOME/applicationlauncher/flight-recorder-gui.ring` and
+  `flight-recorder-daemon.ring`
+  Fixed-size, checksummed boundary-event rings retaining recent events across
+  ordinary process crashes without unbounded disk growth.
 - `$XDG_STATE_HOME/applicationlauncher/builds/by-build-id/`
   Exact release binaries, stripped copies, separate symbols, and build metadata.
   The archive keeps the newest three builds per component plus any build ID
   still used by a running launcher or daemon.
+
+The launcher wrapper warns when the running release has no matching archived
+debug-symbol artifact. Run `scripts/build-debuggable-release` after a release
+build to retain exact symbols for post-mortem diagnosis.
 
 ## Settings Window
 
@@ -266,6 +276,10 @@ OPTIONS
         modules, and checksums from the running GUI and daemon. Perf and full
         cores are explicit activated-only additions.
 
+    replay <RING_OR_BUNDLE>
+        Replay the persisted typed boundary events from a flight-recorder ring
+        or diagnostic bundle.
+
     debug-doctor
         Verify symbolization, diagnostic attachment, tools, private output, and
         bounded recorder behavior.
@@ -297,6 +311,10 @@ EXAMPLES
     applicationlauncher --diagnose auto
         Capture both running components without replacing or restarting them.
 
+    applicationlauncher replay ~/.local/state/applicationlauncher/diagnostics/capture-...
+        Replay typed boundary events from a captured incident and print the
+        deterministic state summary as JSON.
+
 FILES
     $HOME/.config/applicationlauncher/window_size.txt
         Stores the persisted width and height of the launcher window.
@@ -317,6 +335,11 @@ SECURITY NOTES
     Wayland isolates windows from querying each other directly. This tool relies on
     kdotool, which utilizes internal KWin D-Bus scripting interfaces to securely
     interact with KWin.
+
+    Fault injection is disabled unless both
+    APPLICATIONLAUNCHER_ALLOW_FAULT_INJECTION=1 and
+    APPLICATIONLAUNCHER_FAULT_INJECTION are set. It is intended only for
+    contained tests and diagnosis.
 
 EXIT STATUS
     0   Success.

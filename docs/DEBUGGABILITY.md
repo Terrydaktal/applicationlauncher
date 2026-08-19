@@ -39,8 +39,10 @@ snapshots.
 | Exact unstripped or separate debug artifact | At most 512 MiB per file |
 | Build archive retention | 3 builds per component, plus still-running build IDs |
 | Flight recorder | 512 events; oldest event is evicted first |
+| Persistent trace ring | 512 checksummed 4 KiB slots; 2 MiB per component |
 | Named workers | 64 concurrent entries |
 | Event string field | 96 UTF-8 bytes |
+| Boundary payload | 2 KiB |
 | Semantic snapshot | 1 MiB |
 | Panic log | 4 MiB per component |
 | Normal diagnostic bundle | 32 MiB, excluding an explicitly requested full core |
@@ -152,11 +154,41 @@ mapped by a running launcher or daemon. Override the count with
   explicitly requested.
 - Manifest traversal has fixed file-count and directory-depth bounds.
 - The recorder evicts before inserting past capacity.
+- The persistent trace writer uses a bounded non-blocking queue and writes the
+  payload before its commit header; incomplete slots are ignored during replay.
 - The worker registry refuses entries after its fixed maximum.
 - Daemon retry loops retain their existing sleep/backoff and do not emit an
   event on every poll.
 - Capture failures are accumulated in `capture.json`; one failed evidence source
   does not discard successful evidence from either process.
+
+## Boundary Replay And Fault Injection
+
+The persistent ring stores versioned typed boundary records for window-feed
+resynchronization, terminal actions, attention dispatch, tracker mutations,
+search decisions, icon resolution, timers, and explicitly injected faults. It
+does not record visible rows, fuzzy-rank candidates, spinner frames, or audio
+samples. This keeps normal rendering and search paths out of the persistence
+cost while retaining the external inputs and lifecycle decisions that can be
+replayed.
+
+Replay a ring or a captured bundle with:
+
+```bash
+applicationlauncher replay PATH_TO_RING_OR_BUNDLE
+```
+
+Replay validates sequence ordering, schema versions, checksums, and the
+deterministic state reducer. Decision explanations are recorded only while a
+diagnostic peer has explicitly activated runtime collection.
+
+Fault injection requires both `APPLICATIONLAUNCHER_ALLOW_FAULT_INJECTION=1`
+and a comma-separated `APPLICATIONLAUNCHER_FAULT_INJECTION` value. Supported
+points are `window-feed-drop`, `window-feed-duplicate`,
+`terminal-send-failure`, `tracker-write-busy`, and `diagnostic-response-delay`.
+An optional `APPLICATIONLAUNCHER_FAULT_SEED` applies the fault every Nth
+operation. The normal process path performs only a cheap disabled-plan check;
+no fault is active by default.
 
 ## Verification
 

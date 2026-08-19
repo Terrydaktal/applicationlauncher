@@ -92,6 +92,29 @@ pub(crate) fn handle_launcher_control_connection(
             );
             let _ = ui_event_tx.send(UiEvent::FocusLauncher {
                 source_changes_pending: true,
+                symbols_unarchived: false,
+            });
+            repaint_ctx.request_repaint();
+            let _ = stream.write_all(b"focus-requested\n");
+        }
+        "focus-symbols-unarchived" => {
+            applicationlauncher::observability::increment(
+                applicationlauncher::observability::Counter::FocusRequests,
+            );
+            let _ = ui_event_tx.send(UiEvent::FocusLauncher {
+                source_changes_pending: false,
+                symbols_unarchived: true,
+            });
+            repaint_ctx.request_repaint();
+            let _ = stream.write_all(b"focus-requested\n");
+        }
+        "focus-deployment-warnings" => {
+            applicationlauncher::observability::increment(
+                applicationlauncher::observability::Counter::FocusRequests,
+            );
+            let _ = ui_event_tx.send(UiEvent::FocusLauncher {
+                source_changes_pending: true,
+                symbols_unarchived: true,
             });
             repaint_ctx.request_repaint();
             let _ = stream.write_all(b"focus-requested\n");
@@ -106,6 +129,7 @@ pub(crate) fn handle_launcher_control_connection(
             );
             let _ = ui_event_tx.send(UiEvent::FocusLauncher {
                 source_changes_pending: false,
+                symbols_unarchived: false,
             });
             repaint_ctx.request_repaint();
             let _ = stream.write_all(b"focus-requested\n");
@@ -221,7 +245,12 @@ mod tests {
 
     #[test]
     fn focus_control_request_carries_source_change_state() {
-        for (request, expected) in [("focus\n", false), ("focus-source-changes-pending\n", true)] {
+        for (request, expected_source, expected_symbols) in [
+            ("focus\n", false, false),
+            ("focus-source-changes-pending\n", true, false),
+            ("focus-symbols-unarchived\n", false, true),
+            ("focus-deployment-warnings\n", true, true),
+        ] {
             let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
             client.write_all(request.as_bytes()).unwrap();
             let (event_tx, event_rx) = std::sync::mpsc::channel();
@@ -231,7 +260,11 @@ mod tests {
             match event_rx.recv().unwrap() {
                 UiEvent::FocusLauncher {
                     source_changes_pending,
-                } => assert_eq!(source_changes_pending, expected),
+                    symbols_unarchived,
+                } => {
+                    assert_eq!(source_changes_pending, expected_source);
+                    assert_eq!(symbols_unarchived, expected_symbols);
+                }
                 UiEvent::ShutdownLauncher => panic!("focus request became a shutdown request"),
             }
         }

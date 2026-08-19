@@ -10,6 +10,7 @@ daemon_binary="$repo_dir/target/release/applicationlauncherd"
 fuzzy_rank_dir="$(cd -- "$repo_dir/../fuzzy-rank" 2>/dev/null && pwd -P || true)"
 state_root="${XDG_STATE_HOME:-${HOME}/.local/state}"
 state_dir="$state_root/applicationlauncher"
+build_archive="${APPLICATIONLAUNCHER_BUILD_ARCHIVE:-$state_dir/builds}"
 build_log="$state_dir/launcher-build.log"
 runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 build_lock="$runtime_dir/applicationlauncher-build-v2.lock"
@@ -66,6 +67,19 @@ source_inputs_are_newer() {
 	fi
 
 	return 1
+}
+
+release_symbols_are_archived() {
+	local component binary build_id archive_dir
+	command -v readelf >/dev/null 2>&1 || return 0
+
+	for component in applicationlauncher applicationlauncherd; do
+		binary="$repo_dir/target/release/$component"
+		build_id="$(readelf -n "$binary" 2>/dev/null | sed -n 's/.*Build ID: //p' | sed -n '1p')"
+		[[ "$build_id" =~ ^[0-9a-fA-F]{16,}$ ]] || return 1
+		archive_dir="$build_archive/by-build-id/$build_id"
+		[[ -s "$archive_dir/$component.debug" && -s "$archive_dir/build-info.json" ]] || return 1
+	done
 }
 
 process_ids_for_executable() {
@@ -214,6 +228,10 @@ source_changes_pending=false
 if source_inputs_are_newer; then
 	source_changes_pending=true
 fi
+symbols_unarchived=false
+if ! release_symbols_are_archived; then
+	symbols_unarchived=true
+fi
 
 # Restart only when an already-built release binary differs from the running
 # process. Source changes are reported by the GUI and never compile here.
@@ -243,6 +261,12 @@ if [[ "$source_changes_pending" == true ]]; then
 	export APPLICATIONLAUNCHER_SOURCE_CHANGES_PENDING=1
 else
 	unset APPLICATIONLAUNCHER_SOURCE_CHANGES_PENDING
+fi
+
+if [[ "$symbols_unarchived" == true ]]; then
+	export APPLICATIONLAUNCHER_SYMBOLS_UNARCHIVED=1
+else
+	unset APPLICATIONLAUNCHER_SYMBOLS_UNARCHIVED
 fi
 
 exec "$binary" "$@"

@@ -1,8 +1,10 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -10,11 +12,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
+
+use crate::replay::{self, BoundaryKind, BoundaryRecord, DecisionRecord};
 
 pub const FLIGHT_RECORDER_CAPACITY: usize = 512;
 pub const MAX_NAMED_WORKERS: usize = 64;
 pub const MAX_EVENT_FIELD_BYTES: usize = 96;
+pub const MAX_EVENT_PAYLOAD_BYTES: usize = 2048;
 pub const MAX_SEMANTIC_SNAPSHOT_BYTES: usize = 1024 * 1024;
 pub const OBSERVABLE_CPU_BUDGET_PPM: u64 = 2_500;
 pub const EVENT_P99_LATENCY_BUDGET_NS: u64 = 50_000;
@@ -81,10 +86,11 @@ pub enum Counter {
     AttentionAttempts,
     AttentionFailures,
     WorkerPanics,
+    FlightRecorderDrops,
 }
 
 impl Counter {
-    const COUNT: usize = 13;
+    const COUNT: usize = 14;
     const ALL: [(Self, &'static str); Self::COUNT] = [
         (Self::DiagnosticRequests, "diagnostic_requests"),
         (Self::DiagnosticFailures, "diagnostic_failures"),
@@ -99,6 +105,7 @@ impl Counter {
         (Self::AttentionAttempts, "attention_attempts"),
         (Self::AttentionFailures, "attention_failures"),
         (Self::WorkerPanics, "worker_panics"),
+        (Self::FlightRecorderDrops, "flight_recorder_drops"),
     ];
 }
 
@@ -123,8 +130,10 @@ impl Gauge {
     ];
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FlightEvent {
+    #[serde(default)]
+    pub instance_id: u64,
     pub sequence: u64,
     pub monotonic_us: u64,
     pub unix_time_ms: u64,
@@ -139,6 +148,10 @@ pub struct FlightEvent {
     pub old_state: String,
     pub new_state: String,
     pub duration_us: Option<u64>,
+    #[serde(default)]
+    pub boundary: Option<BoundaryRecord>,
+    #[serde(default)]
+    pub decision: Option<DecisionRecord>,
 }
 
 pub struct Event<'a> {
@@ -151,6 +164,8 @@ pub struct Event<'a> {
     old_state: &'a str,
     new_state: &'a str,
     duration: Option<Duration>,
+    boundary: Option<BoundaryRecord>,
+    decision: Option<DecisionRecord>,
 }
 
 impl<'a> Event<'a> {
@@ -165,6 +180,8 @@ impl<'a> Event<'a> {
             old_state: "",
             new_state: "",
             duration: None,
+            boundary: None,
+            decision: None,
         }
     }
 
@@ -197,6 +214,52 @@ impl<'a> Event<'a> {
     pub const fn duration(mut self, duration: Duration) -> Self {
         self.duration = Some(duration);
         self
+    }
+
+    pub fn boundary(mut self, kind: BoundaryKind, action: &str, payload: &str) -> Self {
+        self.boundary = Some(BoundaryRecord {
+            schema_version: replay::TRACE_SCHEMA_VERSION,
+            kind,
+            action: redact_event_field(action),
+            payload: redact_event_payload(payload),
+        });
+        self
+    }
+
+    pub fn decision(mut self, subject: &str, decision: &str, evidence: &[&str]) -> Self {
+        self.decision = Some(DecisionRecord {
+            schema_version: replay::TRACE_SCHEMA_VERSION,
+            subject: redact_event_field(subject),
+            decision: redact_event_field(decision),
+            evidence: evidence
+                .iter()
+                .map(|value| redact_event_field(value))
+                .collect(),
+        });
+        self
+    }
+
+    #[cfg(test)]
+    pub fn build_for_test(self, sequence: u64) -> FlightEvent {
+        FlightEvent {
+            instance_id: 1,
+            sequence,
+            monotonic_us: 0,
+            unix_time_ms: 0,
+            thread_id: "test".to_string(),
+            thread_name: "test".to_string(),
+            category: self.category.to_string(),
+            action: self.action.to_string(),
+            operation_id: self.operation_id,
+            parent_event_id: self.parent_event_id,
+            object_id: self.object_id.to_string(),
+            reason: self.reason.to_string(),
+            old_state: self.old_state.to_string(),
+            new_state: self.new_state.to_string(),
+            duration_us: self.duration.map(|duration| duration.as_micros() as u64),
+            boundary: self.boundary,
+            decision: self.decision,
+        }
     }
 }
 
@@ -246,6 +309,7 @@ struct State {
     component: OnceLock<Component>,
     configured_mode: AtomicU8,
     mode: AtomicU8,
+    instance_id: u64,
     sequence: AtomicU64,
     operation_sequence: AtomicU64,
     worker_sequence: AtomicU64,
@@ -254,6 +318,7 @@ struct State {
     events: Mutex<BoundedFlightRecorder>,
     workers: Mutex<BTreeMap<u64, WorkerSnapshot>>,
     diagnostic_token: AtomicU64,
+    persistent: OnceLock<PersistentRecorder>,
 }
 
 impl State {
@@ -264,6 +329,7 @@ impl State {
             component: OnceLock::new(),
             configured_mode: AtomicU8::new(configured_mode as u8),
             mode: AtomicU8::new(configured_mode as u8),
+            instance_id: process_instance_id(),
             sequence: AtomicU64::new(0),
             operation_sequence: AtomicU64::new(0),
             worker_sequence: AtomicU64::new(0),
@@ -272,6 +338,7 @@ impl State {
             events: Mutex::new(BoundedFlightRecorder::new(FLIGHT_RECORDER_CAPACITY)),
             workers: Mutex::new(BTreeMap::new()),
             diagnostic_token: AtomicU64::new(0),
+            persistent: OnceLock::new(),
         }
     }
 }
@@ -312,6 +379,11 @@ pub fn initialize(component: Component) {
             Ordering::Release,
         );
     }
+    if state.configured_mode.load(Ordering::Acquire) != RuntimeMode::Minimal as u8 {
+        let _ = state
+            .persistent
+            .get_or_init(|| start_persistent_recorder(component));
+    }
     record(
         Event::new("process", "started")
             .object(component.as_str())
@@ -324,12 +396,17 @@ pub fn mode() -> RuntimeMode {
 }
 
 pub fn enable_observable_for_doctor() {
-    state()
+    let state = state();
+    state
         .configured_mode
         .store(RuntimeMode::Observable as u8, Ordering::Release);
-    state()
+    state
         .mode
         .store(RuntimeMode::Observable as u8, Ordering::Release);
+    let component = state.component.get().copied().unwrap_or(Component::Test);
+    let _ = state
+        .persistent
+        .get_or_init(|| start_persistent_recorder(component));
 }
 
 pub fn next_operation_id() -> u64 {
@@ -366,6 +443,7 @@ pub fn record(event: Event<'_>) -> Option<u64> {
     let sequence = state.sequence.fetch_add(1, Ordering::Relaxed) + 1;
     let thread = std::thread::current();
     let entry = FlightEvent {
+        instance_id: state.instance_id,
         sequence,
         monotonic_us: elapsed_us(state.started),
         unix_time_ms: now_ms(),
@@ -382,13 +460,164 @@ pub fn record(event: Event<'_>) -> Option<u64> {
         duration_us: event
             .duration
             .map(|duration| duration.as_micros().min(u128::from(u64::MAX)) as u64),
+        boundary: event.boundary,
+        decision: event.decision,
     };
     state
         .events
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(entry);
+        .push(entry.clone());
+    if let Some(persistent) = state.persistent.get() {
+        if persistent
+            .sender
+            .try_send(PersistentMessage::Event(entry))
+            .is_err()
+        {
+            state.counters[Counter::FlightRecorderDrops as usize].fetch_add(1, Ordering::Relaxed);
+        }
+    }
     Some(sequence)
+}
+
+pub fn record_boundary(kind: BoundaryKind, action: &str, payload: &str) -> Option<u64> {
+    record(Event::new("boundary", action).boundary(kind, action, payload))
+}
+
+pub fn record_decision(subject: &str, decision: &str, evidence: &[&str]) -> Option<u64> {
+    if mode() != RuntimeMode::RuntimeActivated {
+        return None;
+    }
+    let payload = serde_json::json!({
+        "decision": redact_event_field(decision),
+        "evidence": evidence
+            .iter()
+            .map(|value| redact_event_field(value))
+            .collect::<Vec<_>>(),
+    })
+    .to_string();
+    record(
+        Event::new("decision", subject)
+            .boundary(BoundaryKind::SearchDecision, subject, &payload)
+            .decision(subject, decision, evidence),
+    )
+}
+
+pub fn record_search_decision(query: &str, decision: &str, evidence: &[&str]) -> Option<u64> {
+    if mode() != RuntimeMode::RuntimeActivated {
+        return None;
+    }
+    let payload = serde_json::json!({
+        "query": redact_event_field(query),
+        "decision": redact_event_field(decision),
+        "evidence": evidence
+            .iter()
+            .map(|value| redact_event_field(value))
+            .collect::<Vec<_>>(),
+    })
+    .to_string();
+    record(
+        Event::new("decision", "search")
+            .boundary(BoundaryKind::SearchDecision, "search", &payload)
+            .decision("search", decision, evidence),
+    )
+}
+
+struct PersistentRecorder {
+    sender: SyncSender<PersistentMessage>,
+    path: PathBuf,
+}
+
+enum PersistentMessage {
+    Event(FlightEvent),
+    Flush(SyncSender<()>),
+}
+
+fn start_persistent_recorder(component: Component) -> PersistentRecorder {
+    let path = persistent_trace_path(component);
+    let (sender, receiver) = mpsc::sync_channel::<PersistentMessage>(64);
+    let writer_path = path.clone();
+    let _ = std::thread::Builder::new()
+        .name(format!("trace-writer-{}", component.as_str()))
+        .spawn(move || persistent_trace_writer(&writer_path, receiver));
+    PersistentRecorder { sender, path }
+}
+
+fn persistent_trace_writer(path: &Path, receiver: mpsc::Receiver<PersistentMessage>) {
+    let worker = register_worker("flight-recorder-writer");
+    worker.set_state("opening");
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if ensure_private_directory(parent).is_err() {
+        return;
+    }
+    let Ok(file) = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+    else {
+        return;
+    };
+    #[cfg(unix)]
+    let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    let _ =
+        file.set_len((replay::PERSISTENT_RING_SLOT_BYTES * replay::PERSISTENT_RING_SLOTS) as u64);
+    worker.set_state("writing");
+    while let Ok(message) = receiver.recv() {
+        match message {
+            PersistentMessage::Event(event) => {
+                let Ok(payload) = serde_json::to_vec(&event) else {
+                    continue;
+                };
+                let Some(header) = replay::encode_ring_header(event.sequence, &payload) else {
+                    continue;
+                };
+                let offset = replay::ring_slot_offset(event.sequence);
+                if write_all_at(
+                    &file,
+                    &payload,
+                    offset + replay::PERSISTENT_RING_HEADER_BYTES as u64,
+                )
+                .is_err()
+                {
+                    continue;
+                }
+                let _ = write_all_at(&file, &header, offset);
+            }
+            PersistentMessage::Flush(acknowledgement) => {
+                let _ = file.sync_data();
+                let _ = acknowledgement.send(());
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &File, bytes: &[u8], mut offset: u64) -> std::io::Result<()> {
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        let written = file.write_at(remaining, offset)?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "persistent trace write made no progress",
+            ));
+        }
+        remaining = &remaining[written..];
+        offset += written as u64;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_all_at(_file: &File, _bytes: &[u8], _offset: u64) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "persistent trace storage requires Unix file offsets",
+    ))
 }
 
 pub struct WorkerGuard {
@@ -513,6 +742,8 @@ pub struct RuntimeSnapshot {
     gauges: BTreeMap<&'static str, i64>,
     workers: Vec<WorkerSnapshot>,
     events: Vec<FlightEvent>,
+    persistent_trace: Option<String>,
+    enabled_fault_points: Vec<&'static str>,
     budgets: Budgets,
 }
 
@@ -561,6 +792,11 @@ pub fn runtime_snapshot() -> RuntimeSnapshot {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .snapshot(),
+        persistent_trace: state
+            .persistent
+            .get()
+            .map(|recorder| recorder.path.display().to_string()),
+        enabled_fault_points: crate::replay::FaultPlan::from_environment().enabled_points(),
         budgets: Budgets {
             observable_cpu_ppm: OBSERVABLE_CPU_BUDGET_PPM,
             event_p99_latency_ns: EVENT_P99_LATENCY_BUDGET_NS,
@@ -576,6 +812,7 @@ pub fn runtime_snapshot() -> RuntimeSnapshot {
 }
 
 pub fn runtime_snapshot_json() -> Result<String, String> {
+    flush_persistent_trace();
     let mut snapshot = runtime_snapshot();
     loop {
         let json = serde_json::to_string_pretty(&snapshot).map_err(|err| err.to_string())?;
@@ -587,6 +824,24 @@ pub fn runtime_snapshot_json() -> Result<String, String> {
         }
         let remove = (snapshot.events.len() / 4).max(1);
         snapshot.events.drain(..remove);
+    }
+}
+
+pub fn persistent_trace_path(component: Component) -> PathBuf {
+    state_dir().join(format!("flight-recorder-{}.ring", component.as_str()))
+}
+
+pub fn flush_persistent_trace() {
+    let Some(recorder) = state().persistent.get() else {
+        return;
+    };
+    let (sender, receiver) = mpsc::sync_channel(1);
+    if recorder
+        .sender
+        .try_send(PersistentMessage::Flush(sender))
+        .is_ok()
+    {
+        let _ = receiver.recv_timeout(Duration::from_millis(250));
     }
 }
 
@@ -693,6 +948,19 @@ fn handle_diagnostic_connection(mut stream: std::os::unix::net::UnixStream) {
     let request = std::str::from_utf8(&request[..request_len])
         .unwrap_or_default()
         .trim();
+    if replay::environment_faults_enabled()
+        && replay::environment_should_inject(
+            replay::FaultPoint::DiagnosticResponseDelay,
+            next_operation_id(),
+        )
+    {
+        record_boundary(
+            BoundaryKind::FaultInjection,
+            "diagnostic-response-delay",
+            r#"{"delay_ms":250}"#,
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
     let mut fields = request.split_whitespace();
     match fields.next().unwrap_or_default() {
         "ping" => {
@@ -1062,6 +1330,8 @@ fn redact_event_field(value: &str) -> String {
         "apikey",
         "secret",
         "token=",
+        "\"token\"",
+        "token:",
     ]
     .iter()
     .any(|needle| lowercase.contains(needle))
@@ -1070,6 +1340,30 @@ fn redact_event_field(value: &str) -> String {
     } else {
         truncate_field(value)
     }
+}
+
+fn redact_event_payload(value: &str) -> String {
+    let lowercase = value.to_ascii_lowercase();
+    if [
+        "password",
+        "passwd",
+        "authorization",
+        "api_key",
+        "apikey",
+        "secret",
+        "token=",
+        "\"token\"",
+        "token:",
+    ]
+    .iter()
+    .any(|needle| lowercase.contains(needle))
+    {
+        return r#"{"redacted":true}"#.to_string();
+    }
+    if value.len() > MAX_EVENT_PAYLOAD_BYTES {
+        return r#"{"truncated":true}"#.to_string();
+    }
+    value.to_string()
 }
 
 fn truncate_field(value: &str) -> String {
@@ -1119,6 +1413,14 @@ fn elapsed_us(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+fn process_instance_id() -> u64 {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    time ^ (u64::from(std::process::id()) << 32)
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1133,6 +1435,7 @@ mod tests {
 
     fn test_event(sequence: u64, value: &str) -> FlightEvent {
         FlightEvent {
+            instance_id: 1,
             sequence,
             monotonic_us: sequence,
             unix_time_ms: sequence,
@@ -1147,6 +1450,8 @@ mod tests {
             old_state: value.into(),
             new_state: value.into(),
             duration_us: None,
+            boundary: None,
+            decision: None,
         }
     }
 
@@ -1179,6 +1484,27 @@ mod tests {
             "[redacted]"
         );
         assert_eq!(redact_event_field("window-feed"), "window-feed");
+    }
+
+    #[test]
+    fn boundary_payloads_are_private_and_bounded() {
+        let private = Event::new("boundary", "test")
+            .boundary(
+                BoundaryKind::TerminalAction,
+                "send",
+                r#"{"token":"secret"}"#,
+            )
+            .build_for_test(1);
+        assert_eq!(private.boundary.unwrap().payload, r#"{"redacted":true}"#);
+
+        let oversized = Event::new("boundary", "test")
+            .boundary(
+                BoundaryKind::TerminalAction,
+                "send",
+                &format!(r#"{{"value":"{}"}}"#, "x".repeat(MAX_EVENT_PAYLOAD_BYTES)),
+            )
+            .build_for_test(2);
+        assert_eq!(oversized.boundary.unwrap().payload, r#"{"truncated":true}"#);
     }
 
     #[test]

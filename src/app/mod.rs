@@ -284,6 +284,7 @@ pub(crate) struct App {
     terminal_action_receiver: Receiver<Result<String, String>>,
     terminal_action_message: Option<(String, bool, Instant)>,
     source_changes_pending: bool,
+    symbols_unarchived: bool,
     auto_enter_update_sender: SyncSender<bool>,
     terminal_records: Vec<TerminalDbusRecord>,
     terminal_records_receiver: Option<Receiver<Result<Vec<TerminalDbusRecord>, String>>>,
@@ -612,6 +613,7 @@ impl App {
         mode: LauncherMode,
         icon_only: bool,
         source_changes_pending: bool,
+        symbols_unarchived: bool,
         ui_event_rx: std::sync::mpsc::Receiver<UiEvent>,
     ) -> Self {
         // Install loaders to enable SVG and PNG image support
@@ -801,6 +803,7 @@ impl App {
             terminal_action_receiver: terminal_action_rx,
             terminal_action_message: None,
             source_changes_pending,
+            symbols_unarchived,
             auto_enter_update_sender,
             terminal_records: Vec::new(),
             terminal_records_receiver: None,
@@ -1075,7 +1078,7 @@ impl App {
                 egui::Align2::CENTER_BOTTOM,
                 [
                     0.0,
-                    if self.source_changes_pending {
+                    if self.source_changes_pending || self.symbols_unarchived {
                         -54.0
                     } else {
                         -18.0
@@ -1097,8 +1100,8 @@ impl App {
             });
     }
 
-    fn show_source_changes_warning(&self, ctx: &egui::Context) {
-        if !self.source_changes_pending {
+    fn show_deployment_warnings(&self, ctx: &egui::Context) {
+        if !self.source_changes_pending && !self.symbols_unarchived {
             return;
         }
 
@@ -1109,13 +1112,24 @@ impl App {
                 egui::Frame::popup(&ctx.style())
                     .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 24, 245))
                     .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "Source changes have not been built; running the existing release",
-                            )
-                            .color(egui::Color32::from_rgb(240, 196, 92))
-                            .strong(),
-                        );
+                        if self.source_changes_pending {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Source changes have not been built; running the existing release",
+                                )
+                                .color(egui::Color32::from_rgb(240, 196, 92))
+                                .strong(),
+                            );
+                        }
+                        if self.symbols_unarchived {
+                            ui.label(
+                                egui::RichText::new(
+                                    "This release has no archived debug symbols; run scripts/build-debuggable-release",
+                                )
+                                .color(egui::Color32::from_rgb(240, 196, 92))
+                                .strong(),
+                            );
+                        }
                     });
             });
     }

@@ -330,6 +330,40 @@ impl App {
             0,
         );
         let events = coalesce_window_feed_events(events);
+        let mut events = events;
+        if applicationlauncher::replay::environment_faults_enabled() {
+            let fault_operation = applicationlauncher::observability::next_operation_id();
+            if applicationlauncher::replay::environment_should_inject(
+                applicationlauncher::replay::FaultPoint::WindowFeedDrop,
+                fault_operation,
+            ) {
+                applicationlauncher::observability::record_boundary(
+                    applicationlauncher::replay::BoundaryKind::FaultInjection,
+                    "window-feed-drop",
+                    &serde_json::json!({
+                        "operation_id": fault_operation,
+                        "event_count": events.len(),
+                    })
+                    .to_string(),
+                );
+                return;
+            }
+            if applicationlauncher::replay::environment_should_inject(
+                applicationlauncher::replay::FaultPoint::WindowFeedDuplicate,
+                fault_operation,
+            ) {
+                applicationlauncher::observability::record_boundary(
+                    applicationlauncher::replay::BoundaryKind::FaultInjection,
+                    "window-feed-duplicate",
+                    &serde_json::json!({
+                        "operation_id": fault_operation,
+                        "event_count": events.len(),
+                    })
+                    .to_string(),
+                );
+                events.extend(events.clone());
+            }
+        }
         let theme = self
             .force_theme
             .as_deref()

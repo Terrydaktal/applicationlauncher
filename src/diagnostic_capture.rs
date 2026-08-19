@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::observability::{
     self, Component, DIAGNOSTIC_CAPTURE_BUDGET_SECS, DIAGNOSTIC_OUTPUT_BUDGET_BYTES,
 };
+use crate::replay;
 
 const COMMAND_OUTPUT_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const STACK_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
@@ -189,6 +190,7 @@ fn capture_target(
         &directory.join("semantic-snapshot.json"),
         semantic.as_bytes(),
     )?;
+    copy_persistent_trace(target.component, directory, budget, errors);
 
     let authorization = socket_request(
         &target.socket,
@@ -239,6 +241,24 @@ fn capture_target(
         executable_device_inode,
         elf_build_id,
     })
+}
+
+fn copy_persistent_trace(
+    component: Component,
+    directory: &Path,
+    budget: &mut OutputBudget,
+    errors: &mut Vec<String>,
+) {
+    let source = observability::persistent_trace_path(component);
+    match std::fs::read(&source) {
+        Ok(contents) => {
+            if let Err(err) = budget.write(&directory.join("flight-recorder.ring"), &contents) {
+                errors.push(err);
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => errors.push(format!("could not copy {}: {err}", source.display())),
+    }
 }
 
 fn capture_proc_state(
@@ -826,6 +846,9 @@ pub fn run_debug_doctor() -> Result<(PathBuf, DoctorReport), String> {
         ),
     });
 
+    // Let the asynchronous recorder drain before measuring idle process CPU;
+    // otherwise the benchmark measures the intentional diagnostic burst.
+    observability::flush_persistent_trace();
     let server = observability::start_diagnostic_server(Component::Test)?;
     let cpu_before = process_cpu_time_us();
     let idle_started = Instant::now();
@@ -934,6 +957,26 @@ pub fn run_debug_doctor() -> Result<(PathBuf, DoctorReport), String> {
         detail: private_write
             .map(|()| "mode 0600".into())
             .unwrap_or_else(|err| err),
+    });
+
+    observability::flush_persistent_trace();
+    let trace_path = observability::persistent_trace_path(Component::Test);
+    let trace_result = replay::read_ring_file(&trace_path).map(|events| {
+        let report = replay::replay_events(&events);
+        (events.len(), report.rejected_events, report.errors.len())
+    });
+    checks.push(DoctorCheck {
+        name: "persistent-trace-replay".into(),
+        required: true,
+        passed: trace_result
+            .as_ref()
+            .is_ok_and(|(_, rejected, errors)| *rejected == 0 && *errors == 0),
+        detail: trace_result.map_or_else(
+            |err| err,
+            |(events, rejected, errors)| {
+                format!("read {events} events; replay rejected {rejected}; replay errors {errors}")
+            },
+        ),
     });
 
     let report = DoctorReport {

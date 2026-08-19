@@ -121,7 +121,10 @@ pub enum LoadResult {
 }
 
 pub enum UiEvent {
-    FocusLauncher { source_changes_pending: bool },
+    FocusLauncher {
+        source_changes_pending: bool,
+        symbols_unarchived: bool,
+    },
     ShutdownLauncher,
 }
 
