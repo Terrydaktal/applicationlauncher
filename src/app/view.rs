@@ -2841,25 +2841,37 @@ impl eframe::App for App {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.label("The previous system session ended unexpectedly. A recovery snapshot is available.");
+                    ui.label("A saved window session is available. Restore it?");
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("Restore missing windows").clicked() {
                             self.recovery_prompt = false;
                             std::thread::spawn(|| {
-                                match applicationlauncher::tracker::TrackerClient::connect().and_then(|client| {
-                                    let report = client.restore_recovery()?;
-                                    client.wait_for_restore_report(report)
-                                }) {
-                                    Ok(report) => crate::diagnostics::write_stderr_line(&format!("Recovery restore: {} matched, {} launched, {} failures", report.matched, report.launched, report.failures.len())),
-                                    Err(err) => crate::diagnostics::write_stderr_line(&format!("Recovery restore failed: {err}")),
+                                match applicationlauncher::tracker::TrackerClient::connect()
+                                    .and_then(|client| {
+                                        let report = client.restore_recovery()?;
+                                        client.wait_for_restore_report(report)
+                                    }) {
+                                    Ok(report) => crate::diagnostics::write_stderr_line(&format!(
+                                        "Recovery restore: {} matched, {} launched, {} failures",
+                                        report.matched,
+                                        report.launched,
+                                        report.failures.len()
+                                    )),
+                                    Err(err) => crate::diagnostics::write_stderr_line(&format!(
+                                        "Recovery restore failed: {err}"
+                                    )),
                                 }
                             });
                         }
                         if ui.button("Not now").clicked() {
                             self.recovery_prompt = false;
                             std::thread::spawn(|| {
-                                if let Ok(client) = applicationlauncher::tracker::TrackerClient::connect() { let _ = client.dismiss_recovery(); }
+                                if let Ok(client) =
+                                    applicationlauncher::tracker::TrackerClient::connect()
+                                {
+                                    let _ = client.dismiss_recovery();
+                                }
                             });
                         }
                     });

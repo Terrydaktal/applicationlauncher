@@ -281,13 +281,22 @@ pub fn infer_restore_spec(window: &TrackedWindow) -> RestoreSpec {
             .as_ref()
             .map(|details| details.0.as_str())
             .unwrap_or("");
-        if title.contains("codex") || process_name == "codex" {
+        let process_executable = process.as_ref().and_then(|details| details.2.as_deref());
+        if title.contains("codex")
+            || terminal_process_matches(process_name, process_executable, "codex")
+        {
             "codex"
-        } else if title.contains("agy") || process_name == "agy" {
+        } else if title.contains("agy")
+            || terminal_process_matches(process_name, process_executable, "agy")
+        {
             "agy"
-        } else if title.contains("htop") || process_name == "htop" {
+        } else if title.contains("htop")
+            || terminal_process_matches(process_name, process_executable, "htop")
+        {
             "htop"
-        } else if title.contains("nvtop") || process_name == "nvtop" {
+        } else if title.contains("nvtop")
+            || terminal_process_matches(process_name, process_executable, "nvtop")
+        {
             "nvtop"
         } else {
             "shell"
@@ -306,6 +315,26 @@ pub fn infer_restore_spec(window: &TrackedWindow) -> RestoreSpec {
         terminal_kind,
         safe_arguments: Vec::new(),
     }
+}
+
+pub(crate) fn terminal_process_matches(
+    name: &str,
+    executable: Option<&str>,
+    expected: &str,
+) -> bool {
+    let matches = |value: &str| {
+        let normalized = value
+            .chars()
+            .filter(|character| character.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        normalized == expected || (expected == "codex" && normalized.starts_with("codexcodemode"))
+    };
+    matches(name)
+        || executable
+            .and_then(|path| std::path::Path::new(path).file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(matches)
 }
 
 fn terminal_process_details(root_pid: i32) -> (String, Option<String>, Option<String>) {
@@ -358,4 +387,24 @@ fn title_path_hint(title: &str) -> Option<String> {
         .map(str::trim)
         .find(|part| part == &"~" || part.starts_with("~/") || part.starts_with('/'))
         .map(ToOwned::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminal_process_matches;
+
+    #[test]
+    fn codex_code_mode_processes_restore_as_codex() {
+        assert!(terminal_process_matches("codex-code-mode", None, "codex"));
+        assert!(terminal_process_matches(
+            "codex-code-mode",
+            Some("/home/user/codex-code-mode-host"),
+            "codex"
+        ));
+        assert!(!terminal_process_matches(
+            "fish",
+            Some("/usr/bin/fish"),
+            "codex"
+        ));
+    }
 }

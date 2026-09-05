@@ -341,6 +341,16 @@ impl TrackerDatabase {
             .map_err(|err| err.to_string())
     }
 
+    pub fn snapshot_kind_exists(&self, kind: &str) -> Result<bool, String> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM snapshots WHERE kind=?1)",
+                [kind],
+                |row| row.get(0),
+            )
+            .map_err(|err| err.to_string())
+    }
+
     pub fn create_snapshot(
         &mut self,
         name: Option<&str>,
@@ -362,6 +372,28 @@ impl TrackerDatabase {
                 .collect::<Result<HashMap<_, _>, _>>()
                 .map_err(|err| err.to_string())?
         };
+        let entries = windows
+            .iter()
+            .cloned()
+            .map(|window| {
+                let restore = cached_restore
+                    .get(&window.id)
+                    .and_then(|restore| serde_json::from_str::<super::RestoreSpec>(restore).ok())
+                    .unwrap_or_else(|| super::infer_restore_spec(&window));
+                (window, restore)
+            })
+            .collect::<Vec<_>>();
+        self.create_snapshot_with_entries(name, kind, boot_id, &entries, created_at_ms)
+    }
+
+    pub fn create_snapshot_with_entries(
+        &mut self,
+        name: Option<&str>,
+        kind: &str,
+        boot_id: &str,
+        entries: &[(TrackedWindow, RestoreSpec)],
+        created_at_ms: i64,
+    ) -> Result<i64, String> {
         let tx = self
             .connection
             .transaction()
@@ -376,11 +408,7 @@ impl TrackerDatabase {
         )
         .map_err(|err| err.to_string())?;
         let id = tx.last_insert_rowid();
-        for (ordinal, window) in windows.iter().enumerate() {
-            let restore = cached_restore
-                .get(&window.id)
-                .and_then(|restore| serde_json::from_str::<super::RestoreSpec>(restore).ok())
-                .unwrap_or_else(|| super::infer_restore_spec(window));
+        for (ordinal, (window, restore)) in entries.iter().enumerate() {
             tx.execute("INSERT INTO snapshot_windows(snapshot_id,ordinal,payload_json,restore_json) VALUES(?1,?2,?3,?4)", params![id, ordinal as i64, serde_json::to_string(window).unwrap(), serde_json::to_string(&restore).unwrap()]).map_err(|err| err.to_string())?;
         }
         tx.commit().map_err(|err| err.to_string())?;
@@ -554,9 +582,52 @@ mod tests {
         assert_eq!(db.prune_shell_surface_history().unwrap(), 1);
         assert_eq!(db.history(10).unwrap().len(), 1);
         let id = db
-            .create_snapshot(Some("test"), "named", "boot", &[window], now_ms())
+            .create_snapshot(Some("test"), "named", "boot", &[window.clone()], now_ms())
             .unwrap();
         assert_eq!(db.snapshot(id).unwrap().unwrap().summary.window_count, 1);
+        let recovery_window = TrackedWindow {
+            id: "recovery-window".into(),
+            title: "htop - Terminal".into(),
+            class: "xfce4-terminal".into(),
+            updated_at_ms: now_ms(),
+            ..Default::default()
+        };
+        let recovery_restore = RestoreSpec {
+            terminal_kind: Some("htop".into()),
+            ..Default::default()
+        };
+        db.create_snapshot_with_entries(
+            None,
+            "recovery",
+            "boot-a",
+            &[(recovery_window.clone(), recovery_restore.clone())],
+            now_ms(),
+        )
+        .unwrap();
+        db.create_snapshot_with_entries(
+            None,
+            "recovery",
+            "boot-b",
+            &[(window.clone(), restore.clone())],
+            now_ms(),
+        )
+        .unwrap();
+        let recovery_snapshots = db
+            .snapshots()
+            .unwrap()
+            .into_iter()
+            .filter(|snapshot| snapshot.kind == "recovery")
+            .collect::<Vec<_>>();
+        assert_eq!(recovery_snapshots.len(), 1);
+        assert!(db.snapshot_kind_exists("recovery").unwrap());
+        assert_eq!(
+            db.snapshot(recovery_snapshots[0].id)
+                .unwrap()
+                .unwrap()
+                .windows[0]
+                .1,
+            restore
+        );
         let history_id = db.history(10).unwrap().first().unwrap().id;
         db.remove_history(history_id).unwrap();
         assert!(db.history(10).unwrap().is_empty());

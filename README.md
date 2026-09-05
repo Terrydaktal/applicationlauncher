@@ -78,7 +78,7 @@ The project builds a native `eframe` / `egui` GUI and a separate user-session da
 - Persistent tracking:
   `applicationlauncherd` owns the window-feed D-Bus service, records current and closed windows in SQLite WAL mode, and survives GUI closure. The GUI fetches a snapshot only when a generation counter changes.
 - Recovery:
-  State is debounced to disk. An unclean previous boot produces a restore prompt; a same-boot daemon restart does not. The prior recovery snapshot is preserved until restored or dismissed.
+  State is debounced to disk. The latest automatic checkpoint is offered on every new boot, including after a clean reboot, and after an unclean daemon restart. A confirmed same-boot mass disappearance of tracked windows also creates a protected recovery candidate. The candidate is kept until the user restores or dismisses it, so a launcher or daemon crash while the prompt is open cannot replace it with an empty or partial state.
 - Restoration:
   Existing matching windows are reused and repositioned, only missing windows are launched, and unrelated windows are never closed. Terminal replay is restricted to shell/CWD, `codex resume --last`, `agy -c`, `htop`, and `nvtop`.
 - Recent window reopening:

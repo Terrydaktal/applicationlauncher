@@ -37,6 +37,13 @@ const SNAPSHOT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(5);
 const REOPEN_HISTORY_SCAN_LIMIT: usize = 10_000;
 const REOPEN_LAUNCH_ATTEMPT_LIMIT: usize = 4;
 const HISTORY_RESTORE_RETRY_DELAY: Duration = Duration::from_secs(30);
+const RECOVERY_KIND: &str = "recovery";
+const RECOVERY_PENDING_META: &str = "recovery_pending";
+const RECOVERY_CHECK_PENDING_META: &str = "recovery_check_pending";
+const MASS_DISAPPEARANCE_MIN_WINDOWS: usize = 3;
+const MASS_DISAPPEARANCE_CONFIRM_DELAY: Duration = Duration::from_secs(2);
+const MASS_DISAPPEARANCE_MAX_CONFIRM_ATTEMPTS: u8 = 5;
+const MASS_REMOVAL_WINDOW: Duration = Duration::from_secs(3);
 
 fn reopen_shortcut_action_id() -> Vec<&'static str> {
     vec![
@@ -70,6 +77,10 @@ struct State {
     history_generation: u64,
     activation_sequence: i64,
     recovery_pending: bool,
+    checkpoint_guarded: bool,
+    mass_disappearance: Option<MassDisappearanceCheck>,
+    removal_burst: Option<RemovalBurst>,
+    recovery_check_sequence: u64,
     run_id: String,
     boot_id: String,
     recovery_dirty: bool,
@@ -86,12 +97,31 @@ struct State {
     restore_sequence: u64,
     restore_reports: HashMap<String, RestoreReport>,
     restore_report_order: VecDeque<String>,
+    recovery_restore_operations: HashSet<String>,
 }
 
 struct AttentionState {
     due: Instant,
     consecutive_failures: u8,
     signature: String,
+}
+
+struct MassDisappearanceCheck {
+    token: u64,
+    baseline_entries: Vec<(TrackedWindow, RestoreSpec)>,
+    baseline_count: usize,
+    attempts: u8,
+}
+
+struct RemovalBurst {
+    started: Instant,
+    baseline_entries: Vec<(TrackedWindow, RestoreSpec)>,
+}
+
+#[derive(Clone)]
+struct MassDisappearanceTrigger {
+    token: u64,
+    baseline_entries: Vec<(TrackedWindow, RestoreSpec)>,
 }
 
 struct LayoutProgress {
@@ -102,7 +132,6 @@ struct LayoutProgress {
     verify_after: Instant,
     ambiguous_match: bool,
     last_mismatch: Option<String>,
-    successful_apply: bool,
 }
 
 fn attention_retry_delay(consecutive_failures: u8) -> Duration {
@@ -122,6 +151,44 @@ fn record_attention_attempt(attention: &mut AttentionState, now: Instant, succee
         attention.consecutive_failures = attention.consecutive_failures.saturating_add(1);
         attention.due = now + attention_retry_delay(attention.consecutive_failures);
     }
+}
+
+fn is_mass_disappearance(previous_count: usize, current_count: usize) -> bool {
+    previous_count >= MASS_DISAPPEARANCE_MIN_WINDOWS
+        && previous_count.saturating_sub(current_count) >= MASS_DISAPPEARANCE_MIN_WINDOWS
+        && current_count <= previous_count / 2
+}
+
+fn should_offer_recovery(
+    previous_boot: &str,
+    current_boot: &str,
+    previous_clean: bool,
+    persisted_pending: bool,
+    persisted_check: bool,
+    snapshot_exists: bool,
+) -> bool {
+    snapshot_exists
+        && ((!previous_boot.is_empty() && previous_boot != current_boot)
+            || (!previous_boot.is_empty() && previous_boot == current_boot && !previous_clean)
+            || persisted_pending
+            || persisted_check)
+}
+
+fn state_snapshot_entries(state: &State) -> Vec<(TrackedWindow, RestoreSpec)> {
+    state
+        .windows
+        .values()
+        .filter(|window| is_history_worthy(window))
+        .cloned()
+        .map(|window| {
+            let restore = state
+                .restore_specs
+                .get(&window.id)
+                .cloned()
+                .unwrap_or_else(|| super::infer_restore_spec(&window));
+            (window, restore)
+        })
+        .collect()
 }
 
 fn reconcile_attention_states(
@@ -240,16 +307,19 @@ impl Runtime {
     }
 
     fn finish_restore_report(&self, operation_id: &str) {
-        if let Some(report) = self
-            .0
-            .state
-            .lock()
-            .unwrap()
-            .restore_reports
-            .get_mut(operation_id)
-        {
-            report.in_progress = false;
-            report.finished_at_ms = Some(now_ms());
+        let recovery_restore_succeeded = {
+            let mut state = self.0.state.lock().unwrap();
+            let succeeded = if let Some(report) = state.restore_reports.get_mut(operation_id) {
+                report.in_progress = false;
+                report.finished_at_ms = Some(now_ms());
+                restore_report_succeeded(report)
+            } else {
+                false
+            };
+            state.recovery_restore_operations.remove(operation_id) && succeeded
+        };
+        if recovery_restore_succeeded {
+            self.complete_recovery_decision();
         }
     }
 
@@ -360,6 +430,250 @@ impl Runtime {
             .get_or_insert_with(|| Instant::now() + Duration::from_millis(500));
     }
 
+    fn begin_mass_disappearance_check(
+        state: &mut State,
+        baseline_entries: Vec<(TrackedWindow, RestoreSpec)>,
+        current_count: usize,
+    ) -> Option<MassDisappearanceTrigger> {
+        if state.recovery_pending
+            || state.checkpoint_guarded
+            || state.mass_disappearance.is_some()
+            || !is_mass_disappearance(baseline_entries.len(), current_count)
+        {
+            return None;
+        }
+
+        state.recovery_check_sequence = state.recovery_check_sequence.wrapping_add(1);
+        let token = state.recovery_check_sequence;
+        state.checkpoint_guarded = true;
+        state.mass_disappearance = Some(MassDisappearanceCheck {
+            token,
+            baseline_count: baseline_entries.len(),
+            baseline_entries: baseline_entries.clone(),
+            attempts: 0,
+        });
+        Some(MassDisappearanceTrigger {
+            token,
+            baseline_entries,
+        })
+    }
+
+    fn set_recovery_metadata(&self, pending: bool, checking: bool) -> Result<(), String> {
+        let database = self.0.database.lock().unwrap();
+        database.set_meta(
+            RECOVERY_PENDING_META,
+            if pending { "true" } else { "false" },
+        )?;
+        database.set_meta(
+            RECOVERY_CHECK_PENDING_META,
+            if checking { "true" } else { "false" },
+        )
+    }
+
+    fn complete_recovery_decision(&self) {
+        {
+            let mut state = self.0.state.lock().unwrap();
+            state.recovery_pending = false;
+            state.checkpoint_guarded = false;
+            state.mass_disappearance = None;
+            state.removal_burst = None;
+            state.recovery_dirty = true;
+            state
+                .recovery_due
+                .get_or_insert_with(|| Instant::now() + Duration::from_secs(30));
+        }
+        if let Err(err) = self.set_recovery_metadata(false, false) {
+            eprintln!("Tracker failed to persist recovery decision: {err}");
+        }
+    }
+
+    fn persist_mass_disappearance_candidate(&self, trigger: MassDisappearanceTrigger) {
+        let is_current = self
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .mass_disappearance
+            .as_ref()
+            .is_some_and(|check| check.token == trigger.token);
+        if !is_current {
+            return;
+        }
+
+        if let Err(err) = self.set_recovery_metadata(false, true) {
+            eprintln!("Tracker failed to mark recovery check in progress: {err}");
+        }
+        let boot_id = self.0.state.lock().unwrap().boot_id.clone();
+        let result = self
+            .0
+            .database
+            .lock()
+            .unwrap()
+            .create_snapshot_with_entries(
+                None,
+                RECOVERY_KIND,
+                &boot_id,
+                &trigger.baseline_entries,
+                now_ms(),
+            );
+        let candidate_written = match result {
+            Ok(_) => {
+                crate::observability::increment(crate::observability::Counter::PersistenceWrites);
+                crate::observability::record_boundary(
+                    crate::replay::BoundaryKind::TrackerMutation,
+                    "recovery-candidate-written",
+                    &serde_json::json!({
+                        "token": trigger.token,
+                        "window_count": trigger.baseline_entries.len(),
+                    })
+                    .to_string(),
+                );
+                true
+            }
+            Err(err) => {
+                eprintln!("Tracker failed to persist recovery candidate: {err}");
+                false
+            }
+        };
+        if candidate_written {
+            self.schedule_mass_disappearance_confirmation(trigger.token);
+        } else {
+            let runtime = self.clone();
+            crate::observability::spawn_named("tracker-recovery-retry", move |worker| {
+                worker.set_state("waiting");
+                std::thread::sleep(Duration::from_secs(1));
+                worker.set_state("retrying");
+                runtime.persist_mass_disappearance_candidate(trigger);
+            });
+        }
+    }
+
+    fn schedule_mass_disappearance_confirmation(&self, token: u64) {
+        let runtime = self.clone();
+        crate::observability::spawn_named("tracker-mass-confirm", move |worker| {
+            worker.set_state("waiting");
+            std::thread::sleep(MASS_DISAPPEARANCE_CONFIRM_DELAY);
+            worker.set_state("checking");
+            runtime.confirm_mass_disappearance(token);
+        });
+    }
+
+    fn kwin_baseline_existing_count(&self, ids: &[String]) -> Result<usize, String> {
+        let connection = zbus::blocking::connection::Builder::session()
+            .map_err(|err| err.to_string())?
+            .method_timeout(KWIN_RECONCILIATION_TIMEOUT)
+            .build()
+            .map_err(|err| err.to_string())?;
+        let proxy =
+            zbus::blocking::Proxy::new(&connection, KWIN_SERVICE, KWIN_PATH, KWIN_INTERFACE)
+                .map_err(|err| err.to_string())?;
+        let mut existing = 0;
+        for id in ids {
+            let details: HashMap<String, zbus::zvariant::OwnedValue> = proxy
+                .call("getWindowInfo", &(id.as_str(),))
+                .map_err(|err| format!("KWin rejected recovery verification for {id}: {err}"))?;
+            if !details.is_empty() {
+                existing += 1;
+            }
+        }
+        Ok(existing)
+    }
+
+    fn confirm_mass_disappearance(&self, token: u64) {
+        let (baseline_count, baseline_ids, current_count, attempts) = {
+            let state = self.0.state.lock().unwrap();
+            let Some(check) = state
+                .mass_disappearance
+                .as_ref()
+                .filter(|check| check.token == token)
+            else {
+                return;
+            };
+            (
+                check.baseline_count,
+                check
+                    .baseline_entries
+                    .iter()
+                    .map(|(window, _)| window.id.clone())
+                    .collect::<Vec<_>>(),
+                state.windows.len(),
+                check.attempts,
+            )
+        };
+
+        if !is_mass_disappearance(baseline_count, current_count) {
+            let mut state = self.0.state.lock().unwrap();
+            if state
+                .mass_disappearance
+                .as_ref()
+                .is_some_and(|check| check.token == token)
+            {
+                state.mass_disappearance = None;
+                state.checkpoint_guarded = false;
+                state.recovery_dirty = true;
+                state
+                    .recovery_due
+                    .get_or_insert_with(|| Instant::now() + Duration::from_secs(30));
+            }
+            drop(state);
+            if let Err(err) = self.set_recovery_metadata(false, false) {
+                eprintln!("Tracker failed to clear recovery check: {err}");
+            }
+            return;
+        }
+
+        let kwin_result = self.kwin_baseline_existing_count(&baseline_ids);
+        let confirm = match kwin_result {
+            Ok(existing) => {
+                existing <= baseline_count / 2
+                    || attempts >= MASS_DISAPPEARANCE_MAX_CONFIRM_ATTEMPTS
+            }
+            Err(err) => {
+                eprintln!("Tracker recovery verification unavailable: {err}");
+                attempts >= MASS_DISAPPEARANCE_MAX_CONFIRM_ATTEMPTS
+            }
+        };
+        if !confirm {
+            let mut state = self.0.state.lock().unwrap();
+            if let Some(check) = state
+                .mass_disappearance
+                .as_mut()
+                .filter(|check| check.token == token)
+            {
+                check.attempts = check.attempts.saturating_add(1);
+            } else {
+                return;
+            }
+            drop(state);
+            self.schedule_mass_disappearance_confirmation(token);
+            return;
+        }
+
+        let mut state = self.0.state.lock().unwrap();
+        if state
+            .mass_disappearance
+            .as_ref()
+            .is_some_and(|check| check.token == token)
+        {
+            state.mass_disappearance = None;
+            state.recovery_pending = true;
+            state.checkpoint_guarded = true;
+        }
+        drop(state);
+        if let Err(err) = self.set_recovery_metadata(true, false) {
+            eprintln!("Tracker failed to persist recovery prompt state: {err}");
+        }
+        crate::observability::record_boundary(
+            crate::replay::BoundaryKind::TrackerMutation,
+            "recovery-candidate-confirmed",
+            &serde_json::json!({
+                "token": token,
+                "window_count": baseline_count,
+            })
+            .to_string(),
+        );
+    }
+
     fn expire_snapshot_if_needed(state: &mut State) {
         if state
             .snapshot_deadline
@@ -378,6 +692,9 @@ impl Runtime {
         let restore = super::infer_restore_spec(&incoming);
         let mut state = self.0.state.lock().unwrap();
         Self::expire_snapshot_if_needed(&mut state);
+        if state.snapshot_buffer.is_none() && state.mass_disappearance.is_none() {
+            state.removal_burst = None;
+        }
         let previous = state
             .snapshot_buffer
             .as_ref()
@@ -457,12 +774,33 @@ impl Runtime {
             buffer.remove(id);
             return;
         }
+        let now = Instant::now();
+        let removal_burst = state
+            .removal_burst
+            .take()
+            .filter(|burst| now.duration_since(burst.started) <= MASS_REMOVAL_WINDOW)
+            .unwrap_or_else(|| RemovalBurst {
+                started: now,
+                baseline_entries: state_snapshot_entries(&state),
+            });
         let removed = state.windows.remove(id);
         state.attention.remove(id);
         let restore = state.restore_specs.remove(id);
+        let mut mass_trigger = None;
         if removed.is_some() {
             state.history_generation = state.history_generation.wrapping_add(1);
             Self::mark_changed(&mut state);
+            if is_mass_disappearance(removal_burst.baseline_entries.len(), state.windows.len()) {
+                let current_count = state.windows.len();
+                mass_trigger = Self::begin_mass_disappearance_check(
+                    &mut state,
+                    removal_burst.baseline_entries.clone(),
+                    current_count,
+                );
+            }
+            if mass_trigger.is_none() {
+                state.removal_burst = Some(removal_burst);
+            }
         }
         crate::observability::set_gauge(
             crate::observability::Gauge::TrackedWindows,
@@ -485,6 +823,9 @@ impl Runtime {
         {
             eprintln!("Tracker failed to append window history: {err}");
         }
+        if let Some(trigger) = mass_trigger {
+            self.persist_mass_disappearance_candidate(trigger);
+        }
     }
 
     fn finish_snapshot(&self) {
@@ -496,6 +837,10 @@ impl Runtime {
             return;
         };
         state.snapshot_deadline = None;
+        let baseline_entries = state_snapshot_entries(&state);
+        let mass_trigger =
+            Self::begin_mass_disappearance_check(&mut state, baseline_entries, buffer.len());
+        state.removal_burst = None;
         for (id, window) in &state.windows {
             if !buffer.contains_key(id) {
                 closed.push(window.clone());
@@ -581,6 +926,9 @@ impl Runtime {
             }
         }
         drop(database);
+        if let Some(trigger) = mass_trigger {
+            self.persist_mass_disappearance_candidate(trigger);
+        }
         if let Err(err) = self.persist_current_if_due(true) {
             eprintln!("Tracker failed to persist current windows: {err}");
         }
@@ -589,7 +937,7 @@ impl Runtime {
     fn write_recovery_if_due(&self, force: bool) -> Result<(), String> {
         let (windows, boot_id, generation) = {
             let mut state = self.0.state.lock().unwrap();
-            if state.recovery_pending {
+            if state.recovery_pending || state.checkpoint_guarded {
                 return Ok(());
             }
             if state.recovery_write_in_flight
@@ -600,23 +948,17 @@ impl Runtime {
             }
             state.recovery_write_in_flight = true;
             (
-                state
-                    .windows
-                    .values()
-                    .filter(|window| is_history_worthy(window))
-                    .cloned()
-                    .collect::<Vec<_>>(),
+                state_snapshot_entries(&state),
                 state.boot_id.clone(),
                 state.generation,
             )
         };
-        let result = self.0.database.lock().unwrap().create_snapshot(
-            None,
-            "recovery",
-            &boot_id,
-            &windows,
-            now_ms(),
-        );
+        let result = self
+            .0
+            .database
+            .lock()
+            .unwrap()
+            .create_snapshot_with_entries(None, RECOVERY_KIND, &boot_id, &windows, now_ms());
         let mut state = self.0.state.lock().unwrap();
         state.recovery_write_in_flight = false;
         match result {
@@ -804,7 +1146,6 @@ impl Runtime {
                         &item.wanted,
                         &target,
                     );
-                    let successful_apply = apply_result.is_ok();
                     let last_mismatch = apply_result.err();
                     runtime.update_restore_outcome(
                         &operation_id,
@@ -825,7 +1166,6 @@ impl Runtime {
                             verify_after: now + LAYOUT_VERIFY_INITIAL_DELAY,
                             ambiguous_match: assignment.ambiguous,
                             last_mismatch,
-                            successful_apply,
                         },
                     );
                 }
@@ -906,13 +1246,12 @@ impl Runtime {
                         Err(mismatch) if state.attempts < LAYOUT_APPLY_ATTEMPTS => {
                             state.last_mismatch = Some(mismatch);
                             state.attempts += 1;
-                            match super::restore::apply_layout_once(
+                            if let Err(err) = super::restore::apply_layout_once(
                                 &state.current_window_id,
                                 &item.wanted,
                                 &state.target,
                             ) {
-                                Ok(()) => state.successful_apply = true,
-                                Err(err) => state.last_mismatch = Some(err),
+                                state.last_mismatch = Some(err);
                             }
                             state.exact_observations = 0;
                             state.verify_after = now
@@ -929,22 +1268,15 @@ impl Runtime {
                                 state.attempts,
                                 state.last_mismatch.as_deref().unwrap_or("unknown mismatch")
                             );
-                            let status = if state.successful_apply {
-                                super::RestoreOutcomeStatus::Adjusted
-                            } else {
-                                super::RestoreOutcomeStatus::Failed
-                            };
-                            if status == super::RestoreOutcomeStatus::Failed {
-                                runtime.add_restore_failure(
-                                    &operation_id,
-                                    format!("{}: {detail}", item.wanted.title),
-                                );
-                            }
+                            runtime.add_restore_failure(
+                                &operation_id,
+                                format!("{}: {detail}", item.wanted.title),
+                            );
                             runtime.update_restore_outcome(
                                 &operation_id,
                                 item.outcome_index,
                                 Some(state.current_window_id.clone()),
-                                status,
+                                super::RestoreOutcomeStatus::Failed,
                                 detail,
                             );
                             completed.insert(pending_index);
@@ -1051,6 +1383,16 @@ fn layout_reconciliation_poll_interval(elapsed: Duration) -> Duration {
     } else {
         LAYOUT_RECONCILIATION_SLOW_POLL
     }
+}
+
+fn restore_report_succeeded(report: &RestoreReport) -> bool {
+    report.failures.is_empty()
+        && report.outcomes.iter().all(|outcome| {
+            matches!(
+                outcome.status,
+                super::RestoreOutcomeStatus::Exact | super::RestoreOutcomeStatus::Adjusted
+            )
+        })
 }
 
 fn is_attention_terminal(window: &TrackedWindow) -> bool {
@@ -1444,6 +1786,13 @@ impl TrackerApi {
                 super::restore::prepare_restore_specs(&snapshot.windows, &self.0.windows());
             let report = self.0.register_restore_report(prepared.report);
             if !prepared.pending.is_empty() {
+                self.0
+                    .0
+                    .state
+                    .lock()
+                    .unwrap()
+                    .recovery_restore_operations
+                    .insert(report.operation_id.clone().unwrap());
                 self.0.schedule_layout_reconciliation(
                     prepared.pending,
                     None,
@@ -1453,12 +1802,12 @@ impl TrackerApi {
                 );
             } else {
                 self.0.release_restore(&claim);
+                if restore_report_succeeded(&report) {
+                    self.0.complete_recovery_decision();
+                }
             }
             Ok(report)
         });
-        if result.is_ok() {
-            self.0.0.state.lock().unwrap().recovery_pending = false;
-        }
         serde_json::to_string(&result).unwrap()
     }
 
@@ -1496,7 +1845,7 @@ impl TrackerApi {
 
     #[zbus(name = "DismissRecovery")]
     fn dismiss_recovery(&self) {
-        self.0.0.state.lock().unwrap().recovery_pending = false;
+        self.0.complete_recovery_decision();
         let _ = self
             .0
             .0
@@ -1734,8 +2083,22 @@ pub fn run_tracker_daemon() -> Result<(), String> {
     let boot_id = read_boot_id();
     let previous_boot = database.meta("boot_id")?.unwrap_or_default();
     let same_boot = previous_boot == boot_id;
+    let new_boot = !previous_boot.is_empty() && previous_boot != boot_id;
     let previous_clean = database.meta("clean_shutdown")?.as_deref() == Some("true");
-    let recovery_pending = !previous_boot.is_empty() && previous_boot != boot_id && !previous_clean;
+    let recovery_snapshot_exists = database.snapshot_kind_exists(RECOVERY_KIND)?;
+    let persisted_recovery_pending =
+        database.meta(RECOVERY_PENDING_META)?.as_deref() == Some("true");
+    let persisted_recovery_check =
+        database.meta(RECOVERY_CHECK_PENDING_META)?.as_deref() == Some("true");
+    let recovery_pending = should_offer_recovery(
+        &previous_boot,
+        &boot_id,
+        previous_clean,
+        persisted_recovery_pending,
+        persisted_recovery_check,
+        recovery_snapshot_exists,
+    );
+    let checkpoint_guarded = recovery_pending;
     let persisted_entries = if same_boot {
         database.current_window_entries()?
     } else {
@@ -1756,6 +2119,11 @@ pub fn run_tracker_daemon() -> Result<(), String> {
         .collect::<HashMap<_, _>>();
     database.set_meta("boot_id", &boot_id)?;
     database.set_meta("clean_shutdown", "false")?;
+    database.set_meta(
+        RECOVERY_PENDING_META,
+        if recovery_pending { "true" } else { "false" },
+    )?;
+    database.set_meta(RECOVERY_CHECK_PENDING_META, "false")?;
     database.set_meta("recovery_dismissed", "false")?;
     let run_id = run_id();
     database.set_meta("run_id", &run_id)?;
@@ -1770,6 +2138,10 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             history_generation: 0,
             activation_sequence,
             recovery_pending,
+            checkpoint_guarded,
+            mass_disappearance: None,
+            removal_burst: None,
+            recovery_check_sequence: 0,
             run_id,
             boot_id,
             recovery_dirty: false,
@@ -1786,6 +2158,7 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             restore_sequence: 0,
             restore_reports: HashMap::new(),
             restore_report_order: VecDeque::new(),
+            recovery_restore_operations: HashSet::new(),
         }),
         database: Mutex::new(database),
     }));
@@ -1795,7 +2168,7 @@ pub fn run_tracker_daemon() -> Result<(), String> {
     );
     crate::observability::record(
         crate::observability::Event::new("tracker", "state-loaded")
-            .reason(if same_boot { "same-boot" } else { "new-boot" })
+            .reason(if new_boot { "new-boot" } else { "same-boot" })
             .transition("database", "runtime"),
     );
 
@@ -1927,13 +2300,65 @@ mod tests {
 
     use super::{
         ATTENTION_RECHECK_DELAY, AttentionState, attention_retry_delay,
-        first_launched_history_report, is_history_worthy, layout_reconciliation_poll_interval,
-        normalized_terminal_title, reconcile_attention_states, record_attention_attempt,
-        reopen_shortcut_action_id, reopenable_history_ids_with, retain_normal_geometry,
+        first_launched_history_report, is_history_worthy, is_mass_disappearance,
+        layout_reconciliation_poll_interval, normalized_terminal_title, reconcile_attention_states,
+        record_attention_attempt, reopen_shortcut_action_id, reopenable_history_ids_with,
+        restore_report_succeeded, retain_normal_geometry, should_offer_recovery,
         terminal_dbus_service_names, tracked_window_state_changed,
     };
     use crate::tracker::restore::LaunchUnavailableCode;
     use crate::tracker::{HistoryEntry, RestoreReport, RestoreSpec, TrackedWindow};
+
+    #[test]
+    fn mass_disappearance_requires_a_real_burst() {
+        assert!(is_mass_disappearance(50, 0));
+        assert!(is_mass_disappearance(50, 24));
+        assert!(is_mass_disappearance(3, 0));
+        assert!(!is_mass_disappearance(2, 0));
+        assert!(!is_mass_disappearance(10, 6));
+        assert!(!is_mass_disappearance(5, 3));
+    }
+
+    #[test]
+    fn recovery_is_offered_for_new_boots_and_interrupted_decisions() {
+        assert!(should_offer_recovery(
+            "boot-a", "boot-b", true, false, false, true
+        ));
+        assert!(should_offer_recovery(
+            "boot-a", "boot-a", false, true, false, true
+        ));
+        assert!(should_offer_recovery(
+            "boot-a", "boot-a", true, false, true, true
+        ));
+        assert!(!should_offer_recovery(
+            "boot-a", "boot-a", true, false, false, true
+        ));
+        assert!(!should_offer_recovery(
+            "boot-a", "boot-b", true, false, false, false
+        ));
+    }
+
+    #[test]
+    fn partial_recovery_remains_available_for_retry() {
+        let successful = RestoreReport {
+            outcomes: vec![crate::tracker::WindowRestoreOutcome {
+                status: crate::tracker::RestoreOutcomeStatus::Exact,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(restore_report_succeeded(&successful));
+
+        let partial = RestoreReport {
+            failures: vec!["terminal did not appear".into()],
+            outcomes: vec![crate::tracker::WindowRestoreOutcome {
+                status: crate::tracker::RestoreOutcomeStatus::Failed,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!restore_report_succeeded(&partial));
+    }
 
     #[test]
     fn reopened_windows_use_fast_initial_reconciliation() {

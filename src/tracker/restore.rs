@@ -310,8 +310,10 @@ fn window_match_score(
     {
         score += 80;
     }
-    if restore.terminal_kind.is_some() {
-        if restore.terminal_kind == current_restore.terminal_kind {
+    let restore_terminal_kind = effective_terminal_kind(restore);
+    let current_terminal_kind = effective_terminal_kind(current_restore);
+    if restore_terminal_kind.is_some() {
+        if restore_terminal_kind == current_terminal_kind {
             score += 500;
         } else if wanted_title != current_title {
             return None;
@@ -563,23 +565,37 @@ pub(crate) fn apply_layout_once(
     wanted: &TrackedWindow,
     target: &LayoutTarget,
 ) -> Result<(), String> {
-    let args = layout_args(current_id, wanted, target);
-    let mut command = Command::new(crate::process::kdotool_path());
-    command.args(&args);
-    let status = crate::process::status_with_timeout(command, Duration::from_secs(3))
-        .map_err(|err| err.to_string())?;
-    status
-        .success()
-        .then_some(())
-        .ok_or_else(|| format!("kdotool exited with {status}"))
+    let batches = layout_command_batches(current_id, wanted, target);
+    for (index, args) in batches.iter().enumerate() {
+        if index > 0 {
+            // KWin applies frameGeometry asynchronously. A second geometry write in
+            // the same script can otherwise read and restore the pre-resize size.
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut command = Command::new(crate::process::kdotool_path());
+        command.args(args);
+        let status = crate::process::status_with_timeout(command, Duration::from_secs(3))
+            .map_err(|err| err.to_string())?;
+        if !status.success() {
+            return Err(format!(
+                "kdotool layout phase {} exited with {status}",
+                index + 1
+            ));
+        }
+    }
+    Ok(())
 }
 
-fn layout_args(id: &str, wanted: &TrackedWindow, target: &LayoutTarget) -> Vec<String> {
-    let mut args = Vec::new();
+fn layout_command_batches(
+    id: &str,
+    wanted: &TrackedWindow,
+    target: &LayoutTarget,
+) -> Vec<Vec<String>> {
+    let mut resize_args = Vec::new();
     if wanted.on_all_desktops {
-        args.extend(["set_desktop_for_window".into(), id.into(), "all".into()]);
+        resize_args.extend(["set_desktop_for_window".into(), id.into(), "all".into()]);
     } else if wanted.desktop > 0 {
-        args.extend([
+        resize_args.extend([
             "set_desktop_for_window".into(),
             id.into(),
             wanted.desktop.to_string(),
@@ -602,7 +618,7 @@ fn layout_args(id: &str, wanted: &TrackedWindow, target: &LayoutTarget) -> Vec<S
     ] {
         clear_state.extend(["--remove".into(), property.into()]);
     }
-    args.extend(state_args_with_window(clear_state, id));
+    resize_args.extend(state_args_with_window(clear_state, id));
 
     let mut pre_geometry_state = vec!["windowstate".into()];
     for (enabled, property) in [
@@ -617,17 +633,21 @@ fn layout_args(id: &str, wanted: &TrackedWindow, target: &LayoutTarget) -> Vec<S
         }
     }
     if pre_geometry_state.len() > 1 {
-        args.extend(state_args_with_window(pre_geometry_state, id));
+        resize_args.extend(state_args_with_window(pre_geometry_state, id));
     }
 
     if let Some(geometry) = target.geometry.filter(|geometry| geometry.is_valid()) {
-        args.extend([
+        resize_args.extend([
             "windowsize".into(),
             id.into(),
             geometry.width.to_string(),
             geometry.height.to_string(),
         ]);
-        args.extend([
+    }
+
+    let mut move_and_state_args = Vec::new();
+    if let Some(geometry) = target.geometry.filter(|geometry| geometry.is_valid()) {
+        move_and_state_args.extend([
             "windowmove".into(),
             id.into(),
             geometry.x.to_string(),
@@ -653,9 +673,13 @@ fn layout_args(id: &str, wanted: &TrackedWindow, target: &LayoutTarget) -> Vec<S
         state_args.extend(["--add".into(), "shaded".into()]);
     }
     if state_args.len() > 1 {
-        args.extend(state_args_with_window(state_args, id));
+        move_and_state_args.extend(state_args_with_window(state_args, id));
     }
-    args
+
+    [resize_args, move_and_state_args]
+        .into_iter()
+        .filter(|args| !args.is_empty())
+        .collect()
 }
 
 pub(crate) fn verify_layout(
@@ -817,7 +841,7 @@ fn launch(restore: &RestoreSpec) -> Result<(), String> {
 }
 
 fn launch_plan(restore: &RestoreSpec) -> Result<LaunchPlan, LaunchUnavailable> {
-    if let Some(kind) = restore.terminal_kind.as_deref() {
+    if let Some(kind) = effective_terminal_kind(restore) {
         return terminal_launch_plan(kind, restore.cwd.as_deref());
     }
     let key = restore.app_key.to_lowercase();
@@ -855,6 +879,18 @@ fn launch_plan(restore: &RestoreSpec) -> Result<LaunchPlan, LaunchUnavailable> {
         arguments: vec![OsString::from("launch"), desktop.clone().into_os_string()],
         description: format!("desktop entry {}", desktop.display()),
     })
+}
+
+fn effective_terminal_kind(restore: &RestoreSpec) -> Option<&str> {
+    let kind = restore.terminal_kind.as_deref()?;
+    if kind == "shell" {
+        for candidate in ["codex", "agy", "htop", "nvtop"] {
+            if super::terminal_process_matches("", restore.executable.as_deref(), candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    Some(kind)
 }
 
 fn validate_desktop_file(path: &Path) -> Result<(), LaunchUnavailable> {
@@ -1001,27 +1037,29 @@ fn terminal_launch_plan(kind: &str, cwd: Option<&str>) -> Result<LaunchPlan, Lau
         .map(expand_home)
         .filter(|path| path.is_dir())
         .unwrap_or_else(home_directory);
+    let mut arguments = vec![OsString::from("--working-directory"), cwd.into_os_string()];
+    arguments.extend(terminal_restore_arguments(
+        command.map(|(_, shell_command)| shell_command),
+    ));
     Ok(LaunchPlan {
         program,
-        arguments: vec![
-            OsString::from("--working-directory"),
-            cwd.into_os_string(),
-            OsString::from("--command"),
-            OsString::from(terminal_restore_invocation(
-                command.map(|(_, shell_command)| shell_command),
-            )),
-        ],
+        arguments,
         description: format!("{kind} terminal"),
     })
 }
 
-fn terminal_restore_invocation(shell_command: Option<&str>) -> String {
+fn terminal_restore_arguments(shell_command: Option<&str>) -> Vec<OsString> {
+    let mut arguments = vec![OsString::from("--execute"), OsString::from("fish")];
     match shell_command {
         Some(shell_command) => {
-            format!(r#"fish -lc 'exec bash -m -c \"{shell_command}; exec fish\"'"#)
+            arguments.extend([
+                OsString::from("-lc"),
+                OsString::from(format!("exec bash -m -c '{shell_command}; exec fish'")),
+            ]);
         }
-        None => "fish -l".into(),
+        None => arguments.push(OsString::from("-l")),
     }
+    arguments
 }
 
 fn terminal_shell_command(
@@ -1226,7 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_clears_maximization_before_sizing_and_reapplies_state() {
+    fn layout_splits_resize_and_move_to_preserve_the_requested_size() {
         let mut wanted = tracked_window("saved", "Editor", "org.example.Editor");
         wanted.maximized = true;
         wanted.keep_above = true;
@@ -1240,23 +1278,32 @@ mod tests {
             output_name: Some("DP-1".into()),
             adjustment: None,
         };
-        let args = layout_args("window", &wanted, &target);
-        let clear_index = args
+        let batches = layout_command_batches("window", &wanted, &target);
+        assert_eq!(batches.len(), 2);
+        let resize_args = &batches[0];
+        let move_args = &batches[1];
+        let clear_index = resize_args
             .windows(2)
             .position(|pair| pair == ["--remove", "maximized"])
             .unwrap();
-        let size_index = args
+        let size_index = resize_args
             .iter()
             .position(|argument| argument == "windowsize")
             .unwrap();
-        let add_index = args
+        let add_index = move_args
             .windows(2)
             .position(|pair| pair == ["--add", "maximized_horz"])
             .unwrap();
 
         assert!(clear_index < size_index);
-        assert!(size_index < add_index);
-        assert!(args.windows(2).any(|pair| pair == ["--add", "above"]));
+        assert!(
+            resize_args
+                .windows(2)
+                .any(|pair| pair == ["--add", "above"])
+        );
+        assert!(move_args.iter().any(|argument| argument == "windowmove"));
+        assert!(add_index > 0);
+        assert!(!resize_args.iter().any(|argument| argument == "windowmove"));
     }
 
     #[test]
@@ -1422,12 +1469,32 @@ mod tests {
     }
 
     #[test]
-    fn terminal_restore_uses_a_monitor_mode_wrapper_for_job_control() {
+    fn legacy_shell_snapshot_uses_its_codex_executable_identity() {
+        let restore = RestoreSpec {
+            terminal_kind: Some("shell".into()),
+            executable: Some("/opt/codex/codex-code-mode-host".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(effective_terminal_kind(&restore), Some("codex"));
+    }
+
+    #[test]
+    fn terminal_restore_passes_each_process_argument_without_nested_shell_quoting() {
         assert_eq!(
-            terminal_restore_invocation(Some("codex resume --last")),
-            r#"fish -lc 'exec bash -m -c \"codex resume --last; exec fish\"'"#
+            terminal_restore_arguments(Some("codex resume --last")),
+            [
+                "--execute",
+                "fish",
+                "-lc",
+                "exec bash -m -c 'codex resume --last; exec fish'"
+            ]
+            .map(OsString::from)
         );
-        assert_eq!(terminal_restore_invocation(None), "fish -l");
+        assert_eq!(
+            terminal_restore_arguments(None),
+            ["--execute", "fish", "-l"].map(OsString::from)
+        );
     }
 
     #[test]
