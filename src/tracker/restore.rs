@@ -57,6 +57,8 @@ pub fn restore_entries(entries: &[HistoryEntry], current: &[TrackedWindow]) -> R
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum LaunchUnavailableCode {
     UnsupportedTerminalKind,
+    MissingSshArguments,
+    MissingTmuxSession,
     MissingExecutable,
     MissingDesktopEntry,
     NonLaunchableDesktopEntry,
@@ -294,6 +296,31 @@ fn window_match_score(
     if app_key(wanted) != app_key(current) {
         return None;
     }
+    let wanted_is_ssh = is_ssh_restore(restore);
+    let current_is_ssh = is_ssh_restore(current_restore);
+    if wanted_is_ssh != current_is_ssh {
+        return None;
+    }
+    let wanted_tmux = effective_terminal_kind(restore) == Some("tmux");
+    let current_tmux = effective_terminal_kind(current_restore) == Some("tmux");
+    if wanted_tmux || current_tmux {
+        let (Some(wanted), Some(current)) = (&restore.tmux_session, &current_restore.tmux_session)
+        else {
+            return None;
+        };
+        if !wanted_tmux || !current_tmux || !super::tmux::same_session(wanted, current) {
+            return None;
+        }
+    }
+    if let (Some(wanted_args), Some(current_args)) = (
+        restore.ssh_arguments.as_ref(),
+        current_restore.ssh_arguments.as_ref(),
+    ) && !wanted_args.is_empty()
+        && !current_args.is_empty()
+        && wanted_args != current_args
+    {
+        return None;
+    }
     let mut score = 100;
     let wanted_title = stable_window_title(&wanted.title);
     let current_title = stable_window_title(&current.title);
@@ -322,7 +349,7 @@ fn window_match_score(
             (Some(wanted_cwd), Some(current_cwd)) if same_path(wanted_cwd, current_cwd) => {
                 score += 800;
             }
-            (Some(_), Some(_)) if wanted_title != current_title => return None,
+            (Some(_), Some(_)) if !wanted_tmux && wanted_title != current_title => return None,
             _ => {}
         }
     }
@@ -841,8 +868,15 @@ fn launch(restore: &RestoreSpec) -> Result<(), String> {
 }
 
 fn launch_plan(restore: &RestoreSpec) -> Result<LaunchPlan, LaunchUnavailable> {
+    if effective_terminal_kind(restore) == Some("tmux") {
+        return tmux_terminal_launch_plan(restore);
+    }
+    if is_ssh_restore(restore) {
+        let kind = effective_terminal_kind(restore).unwrap_or("shell");
+        return ssh_terminal_launch_plan(kind, restore);
+    }
     if let Some(kind) = effective_terminal_kind(restore) {
-        return terminal_launch_plan(kind, restore.cwd.as_deref());
+        return terminal_launch_plan(kind, restore);
     }
     let key = restore.app_key.to_lowercase();
     if key.contains("dolphin")
@@ -882,15 +916,27 @@ fn launch_plan(restore: &RestoreSpec) -> Result<LaunchPlan, LaunchUnavailable> {
 }
 
 fn effective_terminal_kind(restore: &RestoreSpec) -> Option<&str> {
+    if restore.tmux_session.is_some() {
+        return Some("tmux");
+    }
     let kind = restore.terminal_kind.as_deref()?;
     if kind == "shell" {
-        for candidate in ["codex", "agy", "htop", "nvtop"] {
+        for candidate in ["codex", "agy", "htop", "nvtop", "tmux"] {
             if super::terminal_process_matches("", restore.executable.as_deref(), candidate) {
                 return Some(candidate);
             }
         }
     }
     Some(kind)
+}
+
+fn is_ssh_restore(restore: &RestoreSpec) -> bool {
+    restore.ssh_arguments.is_some()
+        || restore
+            .executable
+            .as_deref()
+            .and_then(executable_name)
+            .is_some_and(|name| name.eq_ignore_ascii_case("ssh"))
 }
 
 fn validate_desktop_file(path: &Path) -> Result<(), LaunchUnavailable> {
@@ -1025,27 +1071,135 @@ fn resolve_desktop_file_in(
     })
 }
 
-fn terminal_launch_plan(kind: &str, cwd: Option<&str>) -> Result<LaunchPlan, LaunchUnavailable> {
-    let command = terminal_shell_command(kind)?;
+fn terminal_launch_plan(
+    kind: &str,
+    restore: &RestoreSpec,
+) -> Result<LaunchPlan, LaunchUnavailable> {
+    let command = terminal_shell_command(kind, &restore.safe_arguments)?;
     let program = required_executable("xfce4-terminal")?;
     required_executable("fish")?;
-    if let Some((executable, _)) = command {
+    if let Some((executable, _)) = &command {
         required_executable(executable)?;
         required_executable("bash")?;
     }
-    let cwd = cwd
+    let cwd = restore
+        .cwd
+        .as_deref()
         .map(expand_home)
         .filter(|path| path.is_dir())
         .unwrap_or_else(home_directory);
     let mut arguments = vec![OsString::from("--working-directory"), cwd.into_os_string()];
     arguments.extend(terminal_restore_arguments(
-        command.map(|(_, shell_command)| shell_command),
+        command
+            .as_ref()
+            .map(|(_, shell_command)| shell_command.as_str()),
     ));
     Ok(LaunchPlan {
         program,
         arguments,
         description: format!("{kind} terminal"),
     })
+}
+
+fn tmux_terminal_launch_plan(restore: &RestoreSpec) -> Result<LaunchPlan, LaunchUnavailable> {
+    let missing = |detail: String| LaunchUnavailable {
+        code: LaunchUnavailableCode::MissingTmuxSession,
+        detail,
+    };
+    if is_ssh_restore(restore) {
+        return Err(missing(
+            "Remote tmux sessions cannot be attached to a local tmux server".into(),
+        ));
+    }
+    let session = restore.tmux_session.as_ref().ok_or_else(|| missing(
+        "This older tmux record has no saved server/session identity; it cannot safely select a session".into()
+    ))?;
+    let tmux_arguments = super::tmux::attach_arguments(session)
+        .ok_or_else(|| missing("Invalid saved tmux session identity".into()))?;
+    required_executable("tmux")?;
+    super::tmux::verify_session(session).map_err(missing)?;
+    let program = required_executable("xfce4-terminal")?;
+    required_executable("fish")?;
+    let cwd = restore
+        .cwd
+        .as_deref()
+        .map(expand_home)
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(home_directory);
+    let mut arguments = vec![OsString::from("--working-directory"), cwd.into_os_string()];
+    arguments.extend(tmux_terminal_arguments(tmux_arguments));
+    Ok(LaunchPlan {
+        program,
+        arguments,
+        description: format!("tmux session {:?}", session.session_name),
+    })
+}
+
+fn tmux_terminal_arguments(tmux_arguments: Vec<String>) -> Vec<OsString> {
+    let mut arguments = [
+        "--execute",
+        "fish",
+        "-lc",
+        // Saved values are argv, never interpolated into shell source. Remove
+        // an inherited TMUX so attach cannot switch some other existing client.
+        "set -e TMUX; set -e TMUX_PANE; command tmux $argv; exec fish -l",
+        "--",
+    ]
+    .map(OsString::from)
+    .to_vec();
+    arguments.extend(tmux_arguments.into_iter().map(OsString::from));
+    arguments
+}
+
+fn ssh_terminal_launch_plan(
+    kind: &str,
+    restore: &RestoreSpec,
+) -> Result<LaunchPlan, LaunchUnavailable> {
+    let Some(connection_arguments) = restore
+        .ssh_arguments
+        .as_ref()
+        .filter(|arguments| !arguments.is_empty())
+    else {
+        return Err(LaunchUnavailable {
+            code: LaunchUnavailableCode::MissingSshArguments,
+            detail: "The saved SSH session has no usable connection arguments".into(),
+        });
+    };
+    let program = required_executable("xfce4-terminal")?;
+    required_executable("ssh")?;
+    let cwd = restore
+        .cwd
+        .as_deref()
+        .map(expand_home)
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(home_directory);
+    let mut arguments = vec![
+        OsString::from("--working-directory"),
+        cwd.into_os_string(),
+        OsString::from("--execute"),
+        OsString::from("ssh"),
+    ];
+    arguments.extend(connection_arguments.iter().cloned().map(OsString::from));
+    arguments.extend(
+        remote_command_arguments(kind, &restore.safe_arguments)
+            .into_iter()
+            .map(OsString::from),
+    );
+    Ok(LaunchPlan {
+        program,
+        arguments,
+        description: format!("ssh {kind} terminal"),
+    })
+}
+
+fn remote_command_arguments(kind: &str, saved_arguments: &[String]) -> Vec<&'static str> {
+    match kind {
+        "codex" => super::codex_resume_arguments(saved_arguments),
+        "agy" => vec!["agy", "-c"],
+        "htop" => vec!["htop"],
+        "nvtop" => vec!["nvtop"],
+        _ => Vec::new(),
+    }
 }
 
 fn terminal_restore_arguments(shell_command: Option<&str>) -> Vec<OsString> {
@@ -1064,10 +1218,16 @@ fn terminal_restore_arguments(shell_command: Option<&str>) -> Vec<OsString> {
 
 fn terminal_shell_command(
     kind: &str,
-) -> Result<Option<(&'static str, &'static str)>, LaunchUnavailable> {
+    saved_arguments: &[String],
+) -> Result<Option<(&'static str, String)>, LaunchUnavailable> {
     let command = match kind {
         "shell" => None,
-        "codex" => Some(("codex", "codex resume --last")),
+        "codex" => {
+            return Ok(Some((
+                "codex",
+                super::codex_resume_arguments(saved_arguments).join(" "),
+            )));
+        }
         "agy" => Some(("agy", "agy -c")),
         "htop" => Some(("htop", "htop")),
         "nvtop" => Some(("nvtop", "nvtop")),
@@ -1078,7 +1238,7 @@ fn terminal_shell_command(
             });
         }
     };
-    Ok(command)
+    Ok(command.map(|(executable, command)| (executable, command.to_string())))
 }
 
 fn home_directory() -> PathBuf {
@@ -1458,12 +1618,12 @@ mod tests {
 
     #[test]
     fn terminal_restore_kinds_are_explicit_and_unknown_kinds_are_rejected() {
-        assert_eq!(terminal_shell_command("shell").unwrap(), None);
+        assert_eq!(terminal_shell_command("shell", &[]).unwrap(), None);
         for kind in ["codex", "agy", "htop", "nvtop"] {
-            assert!(terminal_shell_command(kind).unwrap().is_some());
+            assert!(terminal_shell_command(kind, &[]).unwrap().is_some());
         }
         assert_eq!(
-            terminal_shell_command("unknown").unwrap_err().code,
+            terminal_shell_command("unknown", &[]).unwrap_err().code,
             LaunchUnavailableCode::UnsupportedTerminalKind
         );
     }
@@ -1477,6 +1637,179 @@ mod tests {
         };
 
         assert_eq!(effective_terminal_kind(&restore), Some("codex"));
+    }
+
+    fn tmux_restore(id: &str) -> RestoreSpec {
+        RestoreSpec {
+            terminal_kind: Some("tmux".into()),
+            executable: Some("/usr/bin/tmux".into()),
+            cwd: Some("/project".into()),
+            tmux_session: Some(super::super::TmuxSession {
+                socket_path: "/tmp/tmux-test/default".into(),
+                server_pid: 800,
+                session_id: id.into(),
+                session_name: "qwen".into(),
+                created_at: 123,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn old_tmux_shell_records_are_unavailable_instead_of_launching_blank_fish() {
+        let restore = RestoreSpec {
+            terminal_kind: Some("shell".into()),
+            executable: Some("/usr/bin/tmux (deleted)".into()),
+            ..Default::default()
+        };
+        assert_eq!(effective_terminal_kind(&restore), Some("tmux"));
+        assert_eq!(
+            unavailable_reason(&restore),
+            Some(LaunchUnavailableCode::MissingTmuxSession)
+        );
+    }
+
+    #[test]
+    fn tmux_sessions_do_not_match_other_sessions_or_ordinary_shells_with_same_title() {
+        let window = tracked_window("saved", "Terminal", "xfce4-terminal");
+        let saved = tmux_restore("$1");
+        let mut current = saved.clone();
+        assert!(window_match_score(&window, &saved, &window, &current).is_some());
+        current.tmux_session.as_mut().unwrap().session_id = "$2".into();
+        assert!(window_match_score(&window, &saved, &window, &current).is_none());
+        current = RestoreSpec {
+            terminal_kind: Some("shell".into()),
+            ..Default::default()
+        };
+        assert!(window_match_score(&window, &saved, &window, &current).is_none());
+        assert!(window_match_score(&window, &current, &window, &saved).is_none());
+    }
+
+    #[test]
+    fn renamed_tmux_session_can_match_even_if_client_start_directory_changed() {
+        let saved_window = tracked_window("saved", "Old title", "xfce4-terminal");
+        let current_window = tracked_window("current", "New title", "xfce4-terminal");
+        let saved = tmux_restore("$1");
+        let mut current = saved.clone();
+        current.cwd = Some("/other-directory".into());
+        current.tmux_session.as_mut().unwrap().session_name = "new name".into();
+        assert!(window_match_score(&saved_window, &saved, &current_window, &current).is_some());
+    }
+
+    #[test]
+    fn tmux_terminal_passes_saved_values_as_arguments_not_shell_source() {
+        let arguments =
+            tmux_terminal_arguments(vec!["-S".into(), "/tmp/a'; touch /tmp/bad; #".into()]);
+        assert_eq!(
+            arguments[3],
+            "set -e TMUX; set -e TMUX_PANE; command tmux $argv; exec fish -l"
+        );
+        assert_eq!(arguments[4], "--");
+        assert_eq!(arguments[6], "/tmp/a'; touch /tmp/bad; #");
+    }
+
+    #[test]
+    fn codex_restore_replays_only_the_saved_bypass_option() {
+        let saved = super::super::codex_restore_arguments(&[
+            "codex".into(),
+            "--dangerously-bypass-approvals-and-sandbox".into(),
+        ]);
+        let (_, command) = terminal_shell_command("codex", &saved).unwrap().unwrap();
+        assert_eq!(
+            command,
+            "codex resume --last --dangerously-bypass-approvals-and-sandbox"
+        );
+        assert_eq!(terminal_restore_arguments(Some(&command)), [
+            "--execute", "fish", "-lc",
+            "exec bash -m -c 'codex resume --last --dangerously-bypass-approvals-and-sandbox; exec fish'",
+        ].map(OsString::from));
+        assert_eq!(
+            remote_command_arguments("codex", &saved),
+            [
+                "codex",
+                "resume",
+                "--last",
+                "--dangerously-bypass-approvals-and-sandbox",
+            ]
+        );
+        for arguments in [
+            vec![],
+            vec!["--yolo; arbitrary-command".into()],
+            vec!["--config=arbitrary".into()],
+        ] {
+            assert_eq!(
+                terminal_shell_command("codex", &arguments)
+                    .unwrap()
+                    .unwrap()
+                    .1,
+                "codex resume --last"
+            );
+            assert_eq!(
+                remote_command_arguments("codex", &arguments),
+                ["codex", "resume", "--last"]
+            );
+        }
+        assert_eq!(
+            terminal_shell_command("htop", &saved).unwrap().unwrap().1,
+            "htop"
+        );
+        assert_eq!(
+            remote_command_arguments("shell", &saved),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn remote_nvtop_cannot_match_a_local_nvtop_window() {
+        let wanted = tracked_window("saved", "nvtop - Terminal", "xfce4-terminal");
+        let current = tracked_window("current", "nvtop - Terminal", "xfce4-terminal");
+        let remote = RestoreSpec {
+            terminal_kind: Some("nvtop".into()),
+            executable: Some("/usr/bin/ssh".into()),
+            ssh_arguments: Some(vec!["lewis@example.test".into()]),
+            ..Default::default()
+        };
+        let local = RestoreSpec {
+            terminal_kind: Some("nvtop".into()),
+            executable: Some("/usr/bin/nvtop".into()),
+            ..Default::default()
+        };
+
+        assert!(window_match_score(&wanted, &remote, &current, &local).is_none());
+    }
+
+    #[test]
+    fn old_ssh_snapshots_are_not_silently_launched_locally() {
+        let restore = RestoreSpec {
+            terminal_kind: Some("nvtop".into()),
+            executable: Some("/usr/bin/ssh".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unavailable_reason(&restore),
+            Some(LaunchUnavailableCode::MissingSshArguments)
+        );
+    }
+
+    #[test]
+    fn ssh_restore_appends_the_detected_remote_program() {
+        let restore = RestoreSpec {
+            terminal_kind: Some("nvtop".into()),
+            cwd: Some("~".into()),
+            ssh_arguments: Some(vec!["lewis@example.test".into()]),
+            ..Default::default()
+        };
+
+        let arguments = ssh_terminal_launch_plan("nvtop", &restore)
+            .unwrap()
+            .arguments;
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == [OsString::from("--execute"), OsString::from("ssh")])
+        );
+        assert_eq!(arguments.last(), Some(&OsString::from("nvtop")));
     }
 
     #[test]

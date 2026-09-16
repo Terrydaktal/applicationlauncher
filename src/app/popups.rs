@@ -21,9 +21,11 @@ impl App {
 
     pub(super) fn show_settings_native_viewport(&mut self, ctx: &egui::Context) {
         let Some(shared_state) = self.settings_popup_state.clone() else {
-            self.settings_popup_state = Some(Arc::new(std::sync::Mutex::new(
-                SettingsWindowState::new(self.launcher_settings_snapshot()),
-            )));
+            self.settings_popup_state =
+                Some(Arc::new(std::sync::Mutex::new(SettingsWindowState::new(
+                    self.launcher_settings_snapshot(),
+                    self.idle_codex_action.clone(),
+                ))));
             ctx.request_repaint();
             return;
         };

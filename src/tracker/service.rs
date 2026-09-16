@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use zbus::interface;
 
-use super::database::TrackerDatabase;
+use super::database::{PERIODIC_SNAPSHOT_INTERVAL_MS, TrackerDatabase, periodic_snapshot_delay};
 use super::{
     FEED_PATH, HistoryEntry, RestoreReport, RestoreSpec, SERVICE_NAME, TRACKER_PATH, TrackedWindow,
     TrackerStatus, is_compact_chromium_helper_surface, now_ms,
@@ -44,6 +44,7 @@ const MASS_DISAPPEARANCE_MIN_WINDOWS: usize = 3;
 const MASS_DISAPPEARANCE_CONFIRM_DELAY: Duration = Duration::from_secs(2);
 const MASS_DISAPPEARANCE_MAX_CONFIRM_ATTEMPTS: u8 = 5;
 const MASS_REMOVAL_WINDOW: Duration = Duration::from_secs(3);
+const PERIODIC_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 fn reopen_shortcut_action_id() -> Vec<&'static str> {
     vec![
@@ -69,6 +70,7 @@ fn set_reopen_shortcut_active(active: bool) -> Result<(), String> {
         .map_err(|err| err.to_string())
 }
 
+#[derive(Default)]
 struct State {
     windows: HashMap<String, TrackedWindow>,
     snapshot_buffer: Option<HashMap<String, TrackedWindow>>,
@@ -89,6 +91,9 @@ struct State {
     current_due: Option<Instant>,
     recovery_write_in_flight: bool,
     current_write_in_flight: bool,
+    initial_snapshot_received: bool,
+    periodic_due: Option<Instant>,
+    periodic_write_in_flight: bool,
     auto_enter_enabled: bool,
     attention: HashMap<String, AttentionState>,
     restore_specs: HashMap<String, RestoreSpec>,
@@ -847,6 +852,7 @@ impl Runtime {
             }
         }
         state.windows = buffer;
+        state.initial_snapshot_received = true;
         let closed_restores = closed
             .iter()
             .map(|window| {
@@ -974,6 +980,54 @@ impl Runtime {
                 state.recovery_due = Some(Instant::now() + Duration::from_secs(1));
                 Err(err)
             }
+        }
+    }
+
+    fn write_periodic_if_due(&self, now: Instant, timestamp_ms: i64) -> Result<(), String> {
+        let (windows, boot_id) = {
+            let mut state = self.0.state.lock().unwrap();
+            if state.periodic_write_in_flight || state.periodic_due.is_some_and(|due| now < due) {
+                return Ok(());
+            }
+            // One archive per five minutes; incomplete/empty feeds, active restores and
+            // write failures retry at most every 30 seconds without catch-up writes.
+            state.periodic_due = Some(now + PERIODIC_SNAPSHOT_RETRY_DELAY);
+            if !state.initial_snapshot_received
+                || state.snapshot_buffer.is_some()
+                || !state.restore_claims.is_empty()
+            {
+                return Ok(());
+            }
+            let windows = state_snapshot_entries(&state);
+            if windows.is_empty() {
+                return Ok(());
+            }
+            state.periodic_write_in_flight = true;
+            (windows, state.boot_id.clone())
+        };
+        let result = self
+            .0
+            .database
+            .lock()
+            .unwrap()
+            .create_periodic_snapshot_if_due(&boot_id, &windows, timestamp_ms);
+        let mut state = self.0.state.lock().unwrap();
+        state.periodic_write_in_flight = false;
+        match result {
+            Ok(Some(id)) => {
+                state.periodic_due =
+                    Some(now + Duration::from_millis(PERIODIC_SNAPSHOT_INTERVAL_MS as u64));
+                state.history_generation = state.history_generation.wrapping_add(1);
+                crate::observability::increment(crate::observability::Counter::PersistenceWrites);
+                crate::observability::record(
+                    crate::observability::Event::new("tracker", "periodic-snapshot-saved")
+                        .object(&id.to_string())
+                        .reason("retention-120-five-minute-plus-120-hourly"),
+                );
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(err) => Err(err),
         }
     }
 
@@ -1955,11 +2009,13 @@ fn reopen_latest_history_entry(
         first_launched_history_report(candidate_ids, |id| reopen_history_entry(runtime, id));
     if let Some((id, report)) = selected {
         eprintln!(
-            "tracker_restore event=reopen_latest_selected history_id={id} scanned={} excluded={} non_window={} unsupported_terminal={} missing_executable={} missing_desktop={} non_launchable_desktop={} prior_launch_failures={launch_failures}",
+            "tracker_restore event=reopen_latest_selected history_id={id} scanned={} excluded={} non_window={} unsupported_terminal={} missing_ssh_arguments={} missing_tmux_session={} missing_executable={} missing_desktop={} non_launchable_desktop={} prior_launch_failures={launch_failures}",
             stats.scanned,
             stats.excluded,
             stats.non_window,
             stats.unsupported_terminal,
+            stats.missing_ssh_arguments,
+            stats.missing_tmux_session,
             stats.missing_executable,
             stats.missing_desktop,
             stats.non_launchable_desktop,
@@ -1968,11 +2024,13 @@ fn reopen_latest_history_entry(
     }
 
     eprintln!(
-        "tracker_restore event=reopen_latest_unavailable scanned={} excluded={} non_window={} unsupported_terminal={} missing_executable={} missing_desktop={} non_launchable_desktop={} launch_failures={launch_failures}",
+        "tracker_restore event=reopen_latest_unavailable scanned={} excluded={} non_window={} unsupported_terminal={} missing_ssh_arguments={} missing_tmux_session={} missing_executable={} missing_desktop={} non_launchable_desktop={} launch_failures={launch_failures}",
         stats.scanned,
         stats.excluded,
         stats.non_window,
         stats.unsupported_terminal,
+        stats.missing_ssh_arguments,
+        stats.missing_tmux_session,
         stats.missing_executable,
         stats.missing_desktop,
         stats.non_launchable_desktop,
@@ -2000,6 +2058,8 @@ struct ReopenSelectionStats {
     excluded: usize,
     non_window: usize,
     unsupported_terminal: usize,
+    missing_ssh_arguments: usize,
+    missing_tmux_session: usize,
     missing_executable: usize,
     missing_desktop: usize,
     non_launchable_desktop: usize,
@@ -2040,6 +2100,12 @@ fn reopenable_history_ids_with(
                 match reason {
                     super::restore::LaunchUnavailableCode::UnsupportedTerminalKind => {
                         stats.unsupported_terminal += 1;
+                    }
+                    super::restore::LaunchUnavailableCode::MissingSshArguments => {
+                        stats.missing_ssh_arguments += 1;
+                    }
+                    super::restore::LaunchUnavailableCode::MissingTmuxSession => {
+                        stats.missing_tmux_session += 1;
                     }
                     super::restore::LaunchUnavailableCode::MissingExecutable => {
                         stats.missing_executable += 1;
@@ -2111,7 +2177,12 @@ pub fn run_tracker_daemon() -> Result<(), String> {
         .unwrap_or_default();
     let restore_specs = persisted_entries
         .iter()
-        .map(|(window, restore)| (window.id.clone(), restore.clone()))
+        .map(|(window, restore)| {
+            (
+                window.id.clone(),
+                super::refresh_live_restore_spec(window, restore.clone()),
+            )
+        })
         .collect::<HashMap<_, _>>();
     let persisted_windows = persisted_entries
         .into_iter()
@@ -2128,6 +2199,8 @@ pub fn run_tracker_daemon() -> Result<(), String> {
     let run_id = run_id();
     database.set_meta("run_id", &run_id)?;
     let auto_enter_enabled = database.meta("auto_enter")?.as_deref() == Some("true");
+    let periodic_due = Instant::now()
+        + periodic_snapshot_delay(database.last_periodic_snapshot_at_ms()?, now_ms());
 
     let runtime = Runtime(Arc::new(RuntimeInner {
         state: Mutex::new(State {
@@ -2150,6 +2223,9 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             current_due: None,
             recovery_write_in_flight: false,
             current_write_in_flight: false,
+            initial_snapshot_received: false,
+            periodic_due: Some(periodic_due),
+            periodic_write_in_flight: false,
             auto_enter_enabled,
             attention: HashMap::new(),
             restore_specs,
@@ -2204,6 +2280,9 @@ pub fn run_tracker_daemon() -> Result<(), String> {
                 }
                 if let Err(err) = recovery_runtime.persist_current_if_due(false) {
                     eprintln!("Tracker failed to persist current windows: {err}");
+                }
+                if let Err(err) = recovery_runtime.write_periodic_if_due(Instant::now(), now_ms()) {
+                    eprintln!("Tracker failed to write periodic snapshot: {err}");
                 }
             }
         }));
@@ -2299,15 +2378,158 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ATTENTION_RECHECK_DELAY, AttentionState, attention_retry_delay,
-        first_launched_history_report, is_history_worthy, is_mass_disappearance,
-        layout_reconciliation_poll_interval, normalized_terminal_title, reconcile_attention_states,
-        record_attention_attempt, reopen_shortcut_action_id, reopenable_history_ids_with,
-        restore_report_succeeded, retain_normal_geometry, should_offer_recovery,
-        terminal_dbus_service_names, tracked_window_state_changed,
+        ATTENTION_RECHECK_DELAY, AttentionState, PERIODIC_SNAPSHOT_RETRY_DELAY, Runtime,
+        RuntimeInner, State, attention_retry_delay, first_launched_history_report,
+        is_history_worthy, is_mass_disappearance, layout_reconciliation_poll_interval,
+        normalized_terminal_title, reconcile_attention_states, record_attention_attempt,
+        reopen_shortcut_action_id, reopenable_history_ids_with, restore_report_succeeded,
+        retain_normal_geometry, should_offer_recovery, terminal_dbus_service_names,
+        tracked_window_state_changed,
     };
     use crate::tracker::restore::LaunchUnavailableCode;
     use crate::tracker::{HistoryEntry, RestoreReport, RestoreSpec, TrackedWindow};
+
+    #[test]
+    fn periodic_archives_wait_for_complete_idle_sessions_without_replacing_recovery() {
+        let (mut database, _directory) = super::super::database::test_database();
+        let window = TrackedWindow {
+            id: "editor".into(),
+            title: "Editor".into(),
+            class: "org.example.Editor".into(),
+            x: 400,
+            y: 200,
+            width: 800,
+            height: 600,
+            ..Default::default()
+        };
+        let entries = vec![(window.clone(), RestoreSpec::default())];
+        let recovery = database
+            .create_snapshot_with_entries(None, "recovery", "old-boot", &entries, 1)
+            .unwrap();
+        let runtime = Runtime(std::sync::Arc::new(RuntimeInner {
+            database: std::sync::Mutex::new(database),
+            state: std::sync::Mutex::new(State {
+                windows: HashMap::from([(window.id.clone(), window.clone())]),
+                restore_specs: HashMap::from([(window.id.clone(), RestoreSpec::default())]),
+                boot_id: "boot".into(),
+                recovery_pending: true,
+                checkpoint_guarded: true,
+                ..Default::default()
+            }),
+        }));
+        let mut now = Instant::now();
+        let mut timestamp = 10_000;
+        let retry_ms = PERIODIC_SNAPSHOT_RETRY_DELAY.as_millis() as i64;
+        runtime.write_periodic_if_due(now, timestamp).unwrap();
+        assert_eq!(
+            runtime
+                .0
+                .database
+                .lock()
+                .unwrap()
+                .snapshots()
+                .unwrap()
+                .len(),
+            1
+        );
+        {
+            let mut state = runtime.0.state.lock().unwrap();
+            state.initial_snapshot_received = true;
+            state.snapshot_buffer = Some(state.windows.clone());
+        }
+        now += PERIODIC_SNAPSHOT_RETRY_DELAY;
+        timestamp += retry_ms;
+        runtime.write_periodic_if_due(now, timestamp).unwrap();
+        assert_eq!(
+            runtime
+                .0
+                .database
+                .lock()
+                .unwrap()
+                .snapshots()
+                .unwrap()
+                .len(),
+            1
+        );
+        {
+            let mut state = runtime.0.state.lock().unwrap();
+            state.snapshot_buffer = None;
+            state.restore_claims.insert("restore-in-progress".into());
+        }
+        now += PERIODIC_SNAPSHOT_RETRY_DELAY;
+        timestamp += retry_ms;
+        runtime.write_periodic_if_due(now, timestamp).unwrap();
+        assert_eq!(
+            runtime
+                .0
+                .database
+                .lock()
+                .unwrap()
+                .snapshots()
+                .unwrap()
+                .len(),
+            1
+        );
+        runtime.0.state.lock().unwrap().restore_claims.clear();
+        now += PERIODIC_SNAPSHOT_RETRY_DELAY;
+        timestamp += retry_ms;
+        runtime.write_periodic_if_due(now, timestamp).unwrap();
+        {
+            let database = runtime.0.database.lock().unwrap();
+            assert_eq!(database.snapshots().unwrap().len(), 2);
+            assert_eq!(
+                database.snapshot(recovery).unwrap().unwrap().windows,
+                entries
+            );
+        }
+        let interval = Duration::from_secs(300);
+        runtime
+            .write_periodic_if_due(
+                now + interval - Duration::from_millis(1),
+                timestamp + 300_000 - 1,
+            )
+            .unwrap();
+        assert_eq!(
+            runtime
+                .0
+                .database
+                .lock()
+                .unwrap()
+                .snapshots()
+                .unwrap()
+                .len(),
+            2
+        );
+        runtime
+            .write_periodic_if_due(now + interval, timestamp + 300_000)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .0
+                .database
+                .lock()
+                .unwrap()
+                .snapshots()
+                .unwrap()
+                .len(),
+            3
+        );
+        runtime.0.state.lock().unwrap().windows.clear();
+        runtime
+            .write_periodic_if_due(now + interval * 2, timestamp + 600_000)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .0
+                .database
+                .lock()
+                .unwrap()
+                .snapshots()
+                .unwrap()
+                .len(),
+            3
+        );
+    }
 
     #[test]
     fn mass_disappearance_requires_a_real_burst() {

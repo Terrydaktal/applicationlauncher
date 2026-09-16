@@ -1,12 +1,16 @@
 use eframe::egui;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::app::App;
-use crate::models::{LauncherSettings, SettingsWindowState};
+use crate::models::{IdleCodexActionState, LauncherSettings, SettingsWindowState};
 
 impl SettingsWindowState {
-    pub(crate) fn new(settings: LauncherSettings) -> Self {
+    pub(crate) fn new(
+        settings: LauncherSettings,
+        idle_codex_action: Arc<Mutex<IdleCodexActionState>>,
+    ) -> Self {
         let settings = settings.sanitized();
         Self {
             pending_ui_scale: settings.ui_scale,
@@ -15,6 +19,7 @@ impl SettingsWindowState {
             revision: 0,
             pending_save: None,
             save_deadline: None,
+            idle_codex_action,
         }
     }
 
@@ -285,6 +290,7 @@ pub(crate) fn render_deferred_settings_panel(
         state.save_changed_settings();
     }
 
+    render_idle_codex_action(ui, &state.idle_codex_action);
     ui.add_space(16.0);
     let mut close_requested = false;
     ui.vertical_centered(|ui| {
@@ -572,6 +578,93 @@ pub(crate) fn save_launcher_settings(settings: LauncherSettings) {
     }
 }
 
+struct IdleCodexJob {
+    state: Arc<Mutex<IdleCodexActionState>>,
+    ctx: egui::Context,
+    message: String,
+}
+
+impl Drop for IdleCodexJob {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.running = false;
+            state.message = Some(std::mem::take(&mut self.message));
+        }
+        self.ctx.request_repaint();
+        self.ctx.request_repaint_of(egui::ViewportId::ROOT);
+        self.ctx
+            .request_repaint_of(egui::ViewportId::from_hash_of("launcher_settings_popup"));
+    }
+}
+
+pub(crate) fn render_idle_codex_action(
+    ui: &mut egui::Ui,
+    shared: &Arc<Mutex<IdleCodexActionState>>,
+) {
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+    let Ok(mut state) = shared.lock() else {
+        return;
+    };
+    if ui
+        .add_enabled(
+            !state.running,
+            egui::Button::new("Stop idle Codex sessions..."),
+        )
+        .clicked()
+    {
+        state.confirmation = true;
+    }
+    ui.small("Only sessions with no spinner or attention request. Interrupts Codex, not its terminal or shell.");
+    let mut start = false;
+    if state.confirmation && !state.running {
+        ui.label("Send SIGINT to all verified idle Codex sessions? Busy, changed or unverified sessions will be skipped.");
+        ui.horizontal(|ui| {
+            if ui.button("Interrupt idle Codex").clicked() {
+                state.confirmation = false;
+                state.running = true;
+                state.message = None;
+                start = true;
+            }
+            if ui.button("Cancel").clicked() {
+                state.confirmation = false;
+            }
+        });
+    }
+    if state.running {
+        ui.small("Checking terminal state and interrupting idle Codex sessions...");
+    }
+    if let Some(message) = &state.message {
+        ui.small(message);
+    }
+    drop(state);
+
+    if start {
+        let mut job = IdleCodexJob {
+            state: shared.clone(),
+            ctx: ui.ctx().clone(),
+            message: "Idle Codex action did not complete; no automatic retry was scheduled.".into(),
+        };
+        // The job guard clears the busy state even if spawning or the worker fails.
+        if let Err(err) = std::thread::Builder::new()
+            .name("stop-idle-codex".into())
+            .spawn(move || {
+                let worker = applicationlauncher::observability::register_worker("stop-idle-codex");
+                worker.set_state("checking-idle-sessions");
+                job.message = match crate::windows::terminal::idle::stop_idle_codex() {
+                    Ok(message) => message,
+                    Err(error) => format!("Idle Codex action failed: {error}"),
+                };
+            })
+        {
+            crate::diagnostics::write_stderr_line(&format!(
+                "Could not start idle Codex action: {err}"
+            ));
+        }
+    }
+}
+
 pub(crate) fn settings_row_label(ui: &mut egui::Ui, label: &str) {
     ui.label(
         egui::RichText::new(label).color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
@@ -597,4 +690,72 @@ pub(crate) fn settings_slider_row(
         .changed();
     ui.end_row();
     changed
+}
+
+#[cfg(test)]
+mod idle_codex_action_tests {
+    use super::*;
+
+    #[test]
+    fn rendering_settings_never_arms_or_runs_the_action() {
+        let ctx = egui::Context::default();
+        let shared = Arc::new(Mutex::new(IdleCodexActionState::default()));
+        for _ in 0..3 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_idle_codex_action(ui, &shared);
+                });
+            });
+            let state = shared.lock().unwrap();
+            assert!(!state.confirmation);
+            assert!(!state.running);
+            assert!(state.message.is_none());
+        }
+    }
+
+    #[test]
+    fn reopening_settings_keeps_the_same_in_flight_action_and_result() {
+        let shared = Arc::new(Mutex::new(IdleCodexActionState {
+            running: true,
+            ..Default::default()
+        }));
+        let first = SettingsWindowState::new(LauncherSettings::default(), shared.clone());
+        drop(first);
+        let reopened = SettingsWindowState::new(LauncherSettings::default(), shared.clone());
+        assert!(reopened.idle_codex_action.lock().unwrap().running);
+        assert!(Arc::ptr_eq(&reopened.idle_codex_action, &shared));
+
+        drop(IdleCodexJob {
+            state: shared.clone(),
+            ctx: egui::Context::default(),
+            message: "mock action completed".into(),
+        });
+        let state = reopened.idle_codex_action.lock().unwrap();
+        assert!(!state.running);
+        assert_eq!(state.message.as_deref(), Some("mock action completed"));
+    }
+
+    #[test]
+    fn an_abandoned_job_clears_busy_without_scheduling_a_retry() {
+        let shared = Arc::new(Mutex::new(IdleCodexActionState {
+            running: true,
+            ..Default::default()
+        }));
+        let job = IdleCodexJob {
+            state: shared.clone(),
+            ctx: egui::Context::default(),
+            message: "Idle Codex action did not complete; no automatic retry was scheduled.".into(),
+        };
+        drop(job);
+        let state = shared.lock().unwrap();
+        assert!(!state.running);
+        assert!(!state.confirmation);
+        assert!(
+            state
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("did not complete")
+        );
+    }
 }

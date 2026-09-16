@@ -1,6 +1,6 @@
 [package]
 name = "applicationlauncher"
-version = "0.3.9"
+version = "0.4.0"
 edition = "2024"
 
 [dependencies]
@@ -19,6 +19,7 @@ zbus = "5.16.0"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 signal-hook = "0.3.18"
 libc = "0.2.174"
+libpulse-sys = "1.23.0"
 
 # Keep routine checks and tests compact. Full production DWARF remains enabled
 # in the release profile and is preserved by build-debuggable-release.

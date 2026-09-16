@@ -3,131 +3,47 @@ use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::time::Duration;
 
-use super::{
-    PIPEWIRE_ACTIVE_TOTAL_US_THRESHOLD, PIPEWIRE_ACTIVE_US_THRESHOLD, command_basename,
-    normalize_app_match_key, push_normalized_key_variants,
+use super::{command_basename, normalize_app_match_key};
+use crate::models::{AppInfo, AudioVisualization, PactlSinkInput, WindowAudioCache, WindowInfo};
+
+mod analysis;
+mod firefox;
+mod monitor;
+pub(crate) use firefox::{
+    FIREFOX_WORKER_TIMEOUT, FirefoxAudioInbox, FirefoxAudioProcess, apply_firefox_attribution,
+    start_firefox_audio_bridge,
 };
-use crate::models::{AppInfo, PactlSinkInput, WindowAudioCache, WindowInfo};
+pub(crate) use monitor::{AudioInbox, STALE_AUDIO_UPDATE, start_audio_monitor};
 
-pub(crate) fn sink_input_is_actively_rendering(
-    sink: &PactlSinkInput,
-    active_media_app_keys: &HashSet<String>,
-    observed_pipewire_node_ids: &HashSet<u32>,
-    active_pipewire_node_ids: &HashSet<u32>,
-    pipewire_activity_cache_valid: bool,
-) -> bool {
-    if sink_input_is_browser_like(sink) {
-        return sink_input_media_keys(sink)
-            .iter()
-            .any(|key| active_media_app_keys.contains(key));
-    }
-
-    // `pw-top` snapshots can miss short-lived activity, so only treat PipeWire
-    // as authoritative when this node actually appeared in the sampled output.
-    if !pipewire_activity_cache_valid {
-        return true;
-    }
-
-    let Some(id) = sink
-        .properties
-        .get("object.id")
-        .and_then(|id| id.parse::<u32>().ok())
-    else {
-        return true;
-    };
-
-    if !observed_pipewire_node_ids.contains(&id) {
-        return true;
-    }
-
-    active_pipewire_node_ids.contains(&id)
-}
-
-pub(crate) fn sink_input_level(
-    sink: &PactlSinkInput,
-    active_media_app_keys: &HashSet<String>,
-    observed_pipewire_node_ids: &HashSet<u32>,
-    active_pipewire_node_ids: &HashSet<u32>,
-    pipewire_activity_cache_valid: bool,
-) -> f32 {
+pub(crate) fn sink_input_can_visualize(sink: &PactlSinkInput) -> bool {
     if sink.mute || sink.corked {
-        return 0.0;
+        return false;
     }
-
     if sink
         .properties
         .get("media.category")
         .is_some_and(|category| !category.eq_ignore_ascii_case("Playback"))
     {
-        return 0.0;
+        return false;
     }
-
     if sink.properties.get("media.class").is_some_and(|class| {
         let class = class.to_ascii_lowercase();
         !class.contains("output") && !class.contains("playback")
     }) {
-        return 0.0;
+        return false;
     }
-
-    if !sink_input_is_actively_rendering(
-        sink,
-        active_media_app_keys,
-        observed_pipewire_node_ids,
-        active_pipewire_node_ids,
-        pipewire_activity_cache_valid,
-    ) {
-        return 0.0;
-    }
-
-    let mut total = 0.0;
-    let mut count = 0.0;
-    for channel in sink.volume.values() {
-        if let Ok(percent) = channel.value_percent.trim_end_matches('%').parse::<f32>() {
-            total += percent;
-            count += 1.0;
-        }
-    }
-
-    if count == 0.0 {
-        return 0.0;
-    }
-
-    let level = total / count / 100.0;
-    if level < 0.01 {
-        0.0
-    } else {
-        level.clamp(0.0, 1.5)
-    }
+    // Volume is only a mute gate, never the measured level or animation source.
+    sink.volume.is_empty()
+        || sink.volume.values().any(|channel| {
+            channel
+                .value_percent
+                .trim_end_matches('%')
+                .parse::<f32>()
+                .is_ok_and(|level| level > 0.0)
+        })
 }
 
-pub(crate) fn active_audio_level_for_sinks(
-    sinks: &[PactlSinkInput],
-    active_media_app_keys: &HashSet<String>,
-    observed_pipewire_node_ids: &HashSet<u32>,
-    active_pipewire_node_ids: &HashSet<u32>,
-    pipewire_activity_cache_valid: bool,
-) -> Option<f32> {
-    let mut max_level = 0.0f32;
-    for sink in sinks {
-        max_level = max_level.max(sink_input_level(
-            sink,
-            active_media_app_keys,
-            observed_pipewire_node_ids,
-            active_pipewire_node_ids,
-            pipewire_activity_cache_valid,
-        ));
-    }
-    (max_level > 0.0).then_some(max_level)
-}
-
-pub(crate) fn app_audio_level(
-    app: &AppInfo,
-    sink_inputs: &[PactlSinkInput],
-    active_media_app_keys: &HashSet<String>,
-    observed_pipewire_node_ids: &HashSet<u32>,
-    active_pipewire_node_ids: &HashSet<u32>,
-    pipewire_activity_cache_valid: bool,
-) -> Option<f32> {
+pub(crate) fn app_audio_sink_indices(app: &AppInfo, sink_inputs: &[PactlSinkInput]) -> Vec<u32> {
     let stem = app
         .desktop_file_path
         .file_stem()
@@ -135,53 +51,41 @@ pub(crate) fn app_audio_level(
         .map(normalize_app_match_key);
     let exec_name = command_basename(&app.exec).map(|name| normalize_app_match_key(&name));
     let app_name = normalize_app_match_key(&app.name);
-
-    let mut matches = Vec::new();
-    for sink in sink_inputs {
-        if sink_input_level(
-            sink,
-            active_media_app_keys,
-            observed_pipewire_node_ids,
-            active_pipewire_node_ids,
-            pipewire_activity_cache_valid,
-        ) <= 0.0
-        {
-            continue;
-        }
-
-        let candidates = [
-            sink.properties.get("application.id"),
-            sink.properties.get("application.name"),
-            sink.properties.get("application.icon_name"),
-            sink.properties.get("application.process.binary"),
-        ];
-
-        let matched = candidates.iter().flatten().any(|value| {
-            let normalized = normalize_app_match_key(value);
-            !normalized.is_empty()
-                && (normalized == app_name
-                    || stem.as_ref().is_some_and(|stem| normalized == *stem)
-                    || exec_name
-                        .as_ref()
-                        .is_some_and(|exec_name| normalized == *exec_name))
-        });
-
-        if matched {
-            matches.push(sink.clone());
-        }
-    }
-
-    active_audio_level_for_sinks(
-        &matches,
-        active_media_app_keys,
-        observed_pipewire_node_ids,
-        active_pipewire_node_ids,
-        pipewire_activity_cache_valid,
-    )
+    sink_inputs
+        .iter()
+        .filter(|sink| {
+            [
+                "application.id",
+                "application.name",
+                "application.icon_name",
+                "application.process.binary",
+            ]
+            .iter()
+            .filter_map(|key| sink.properties.get(*key))
+            .any(|value| {
+                let normalized = normalize_app_match_key(value);
+                !normalized.is_empty()
+                    && (normalized == app_name
+                        || stem.as_ref().is_some_and(|stem| normalized == *stem)
+                        || exec_name.as_ref().is_some_and(|exec| normalized == *exec))
+            })
+        })
+        .map(|sink| sink.index)
+        .collect()
 }
 
-pub(crate) fn quantize_audio_level(level: f32) -> u8 {
-    (level.clamp(0.0, 1.0) * 100.0).round() as u8
+pub(crate) fn visualization_for_sinks(
+    indices: &[u32],
+    measured: &HashMap<u32, AudioVisualization>,
+) -> Option<AudioVisualization> {
+    let mut result = AudioVisualization::default();
+    for visual in indices.iter().filter_map(|index| measured.get(index)) {
+        result.peak = result.peak.max(visual.peak);
+        for (target, value) in result.bands.iter_mut().zip(visual.bands) {
+            *target = (*target).max(value);
+        }
+    }
+    (result.peak > 0).then_some(result)
 }
 
 pub(crate) fn sink_match_signature(cache: &WindowAudioCache) -> HashMap<String, Vec<u32>> {
@@ -197,232 +101,138 @@ pub(crate) fn sink_match_signature(cache: &WindowAudioCache) -> HashMap<String, 
         .collect()
 }
 
-pub(crate) fn fetch_sink_inputs() -> Vec<PactlSinkInput> {
-    let output = applicationlauncher::process::output_with_timeout(
-        {
-            let mut command = Command::new("pactl");
-            command.args(["--format=json", "list", "sink-inputs"]);
-            command
-        },
-        Duration::from_secs(2),
-    );
-    match output {
-        Ok(out) if out.status.success() => {
-            serde_json::from_slice::<Vec<PactlSinkInput>>(&out.stdout).unwrap_or_default()
+#[derive(Default)]
+struct SinkWindowAttribution<'a> {
+    strength: u8,
+    candidates: usize,
+    window_id: Option<&'a str>,
+}
+
+pub(crate) fn build_window_audio_cache(
+    windows: &[WindowInfo],
+    sink_inputs: &[PactlSinkInput],
+) -> WindowAudioCache {
+    let mut cache = WindowAudioCache::default();
+    let mut owners: HashMap<u32, SinkWindowAttribution<'_>> = HashMap::new();
+    for window in windows {
+        let matches = find_sink_inputs_for_window(window, sink_inputs);
+        for sink in &matches {
+            let pid = sink
+                .properties
+                .get("application.process.id")
+                .and_then(|pid| pid.parse::<i32>().ok())
+                .filter(|pid| *pid > 0);
+            let strength = if pid.is_some() && window.pid == pid {
+                3
+            } else if pid
+                .is_some_and(|pid| window.process_chain.iter().any(|entry| entry.pid == pid))
+            {
+                2
+            } else {
+                1
+            };
+            let owner = owners.entry(sink.index).or_default();
+            if strength < owner.strength {
+                continue;
+            }
+            if strength > owner.strength {
+                *owner = SinkWindowAttribution {
+                    strength,
+                    ..Default::default()
+                };
+            }
+            if sink_window_identity_matches(sink, window)
+                && owner.window_id != Some(window.id.as_str())
+            {
+                owner.candidates += 1;
+                owner.window_id = Some(&window.id);
+            }
         }
-        _ => Vec::new(),
+
+        // Controls operate on the whole process, even when it owns several windows.
+        if !matches.is_empty() {
+            cache
+                .sink_matches
+                .insert(window.id.clone(), dedup_sink_inputs_for_controls(&matches));
+        }
     }
-}
-
-pub(crate) fn sink_input_media_keys(sink: &PactlSinkInput) -> HashSet<String> {
-    [
-        "application.id",
-        "application.name",
-        "application.icon_name",
-        "application.process.binary",
-        "node.name",
-    ]
-    .iter()
-    .filter_map(|key| sink.properties.get(*key))
-    .map(|value| normalize_app_match_key(value))
-    .filter(|value| !value.is_empty())
-    .collect()
-}
-
-pub(crate) fn sink_input_is_browser_like(sink: &PactlSinkInput) -> bool {
-    sink_input_media_keys(sink).iter().any(|key| {
-        matches!(
-            key.as_str(),
-            "firefox"
-                | "librewolf"
-                | "floorp"
-                | "zen"
-                | "googlechrome"
-                | "chrome"
-                | "chromium"
-                | "brave"
-                | "bravebrowser"
-                | "microsoftedge"
-                | "edge"
-                | "vivaldi"
-        )
-    })
-}
-
-pub(crate) fn mpris_service_names() -> Vec<String> {
-    let output = applicationlauncher::process::output_with_timeout(
-        {
-            let mut command = Command::new("busctl");
-            command.args(["--user", "list", "--no-legend"]);
-            command
-        },
-        Duration::from_secs(2),
-    );
-    match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|line| line.split_whitespace().next())
-            .filter(|name| name.starts_with("org.mpris.MediaPlayer2."))
-            .map(ToOwned::to_owned)
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-pub(crate) fn busctl_string_property(
-    service: &str,
-    interface: &str,
-    property: &str,
-) -> Option<String> {
-    let output = applicationlauncher::process::output_with_timeout(
-        {
-            let mut command = Command::new("busctl");
-            command.args([
-                "--user",
-                "get-property",
-                service,
-                "/org/mpris/MediaPlayer2",
-                interface,
-                property,
-            ]);
-            command
-        },
-        Duration::from_secs(2),
-    )
-    .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let first_quote = stdout.find('"')?;
-    let rest = &stdout[first_quote + 1..];
-    let second_quote = rest.find('"')?;
-    Some(rest[..second_quote].to_owned())
-}
-
-pub(crate) fn fetch_active_media_app_keys() -> HashSet<String> {
-    let mut keys = HashSet::new();
-    for service in mpris_service_names() {
-        let is_playing =
-            busctl_string_property(&service, "org.mpris.MediaPlayer2.Player", "PlaybackStatus")
-                .is_some_and(|status| status.eq_ignore_ascii_case("Playing"));
-        if !is_playing {
+    for sink in sink_inputs {
+        // A PID or browser name is not per-window evidence when it has multiple owners.
+        let Some(SinkWindowAttribution {
+            candidates: 1,
+            window_id: Some(window_id),
+            ..
+        }) = owners.get(&sink.index)
+        else {
             continue;
-        }
-
-        if let Some(identity) =
-            busctl_string_property(&service, "org.mpris.MediaPlayer2", "Identity")
-        {
-            push_normalized_key_variants(&mut keys, &identity);
-        }
-
-        if let Some(service_suffix) = service.strip_prefix("org.mpris.MediaPlayer2.") {
-            push_normalized_key_variants(&mut keys, service_suffix);
-            if let Some(base_name) = service_suffix.split(".instance_").next() {
-                push_normalized_key_variants(&mut keys, base_name);
-            }
+        };
+        if sink_input_can_visualize(sink) {
+            cache
+                .visualization_sinks
+                .entry((*window_id).to_owned())
+                .or_default()
+                .push(sink.index);
         }
     }
-    keys
+    cache
 }
 
-pub(crate) fn fetch_pipewire_activity() -> (HashSet<u32>, HashSet<u32>, bool) {
-    let output = applicationlauncher::process::output_with_timeout(
-        {
-            let mut command = Command::new("pw-top");
-            command.args(["-b", "-n", "1"]);
-            command
-        },
-        Duration::from_secs(2),
-    );
-    match output {
-        Ok(out) if out.status.success() => {
-            let mut observed_ids = HashSet::new();
-            let mut active_ids = HashSet::new();
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            for line in stdout.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty()
-                    || trimmed.starts_with("PipeWire")
-                    || trimmed.starts_with("ID ")
-                {
-                    continue;
-                }
-
-                let cols: Vec<&str> = trimmed.split_whitespace().collect();
-                if cols.len() < 6 {
-                    continue;
-                }
-
-                let Some(state) = cols.first().and_then(|value| value.chars().next()) else {
-                    continue;
-                };
-                if !matches!(state, 'R' | 'S' | 'I' | 'C' | 'X') {
-                    continue;
-                }
-
-                let Some(id) = cols.get(1).and_then(|value| value.parse::<u32>().ok()) else {
-                    continue;
-                };
-                observed_ids.insert(id);
-
-                let wait_us = cols
-                    .get(4)
-                    .and_then(|value| value.strip_suffix("us"))
-                    .and_then(|value| value.parse::<f32>().ok())
-                    .unwrap_or(0.0);
-                let busy_us = cols
-                    .get(5)
-                    .and_then(|value| value.strip_suffix("us"))
-                    .and_then(|value| value.parse::<f32>().ok())
-                    .unwrap_or(0.0);
-                let wait_active = wait_us >= PIPEWIRE_ACTIVE_US_THRESHOLD;
-                let busy_active = busy_us >= PIPEWIRE_ACTIVE_US_THRESHOLD;
-                let total_active = (wait_us + busy_us) >= PIPEWIRE_ACTIVE_TOTAL_US_THRESHOLD;
-                let is_active = (wait_active || busy_active) && total_active;
-
-                if is_active {
-                    active_ids.insert(id);
-                }
-            }
-
-            (observed_ids, active_ids, true)
-        }
-        _ => (HashSet::new(), HashSet::new(), false),
+fn sink_window_identity_matches(sink: &PactlSinkInput, window: &WindowInfo) -> bool {
+    let property = |key| {
+        sink.properties
+            .get(key)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+    };
+    if property("window.id").is_some_and(|id| id != window.id) {
+        return false;
     }
+    let title = if window.raw_title.trim().is_empty() {
+        &window.title
+    } else {
+        &window.raw_title
+    };
+    // media.name is a track/tab title, not a window identity. In particular, it
+    // cannot locate a background tab, and browsers retain inactive named streams.
+    property("window.name").is_none_or(|name| name == title.trim())
 }
 
 pub(crate) fn paint_audio_activity_ring(
     painter: &egui::Painter,
     rect: egui::Rect,
-    level: f32,
-    time_seconds: f32,
+    visual: AudioVisualization,
 ) {
-    let strength = level.clamp(0.12, 1.2);
     let center = rect.center();
-    let base_radius = rect.width().max(rect.height()) * 0.57;
-    let max_bar = (rect.width().max(rect.height()) * 0.18).clamp(4.0, 14.0);
+    let diameter = rect.width().max(rect.height());
+    // Keep the existing outer footprint, using the old empty gap for more travel.
+    let outer_radius = diameter * 0.57 + 1.0 + (diameter * 0.18).clamp(4.0, 14.0);
+    let inner_radius = diameter * 0.50 + 0.5;
+    let max_bar = outer_radius - inner_radius;
     let bars = 24;
 
     for i in 0..bars {
         let t = i as f32 / bars as f32;
         let angle = t * std::f32::consts::TAU;
-        let wave_a = ((time_seconds * 7.5 + t * 13.0).sin() * 0.5 + 0.5).powf(1.4);
-        let wave_b = ((time_seconds * 11.0 - t * 19.0).sin() * 0.5 + 0.5) * 0.45;
-        let bar_level = (0.25 + wave_a * 0.75 + wave_b).clamp(0.0, 1.0) * strength;
-        let inner = base_radius + 1.0;
-        let outer = inner + max_bar * bar_level;
+        let band = i * visual.bands.len() / bars;
+        let next = (band + 1) % visual.bands.len();
+        let fraction = (i * visual.bands.len() % bars) as f32 / bars as f32;
+        let bar_level = ((1.0 - fraction) * f32::from(visual.bands[band])
+            + fraction * f32::from(visual.bands[next]))
+            / 100.0;
+        if bar_level <= 0.0 {
+            continue;
+        }
+        let outer = inner_radius + max_bar * bar_level;
         let dir = egui::vec2(angle.cos(), angle.sin());
-        let alpha = (70.0 + 135.0 * bar_level).clamp(45.0, 210.0) as u8;
-        let color = if i % 3 == 0 {
-            egui::Color32::from_rgba_unmultiplied(126, 226, 255, alpha)
-        } else {
-            egui::Color32::from_rgba_unmultiplied(61, 174, 233, alpha)
-        };
+        let color = egui::Color32::from_rgba_unmultiplied(
+            (61.0 + 100.0 * bar_level) as u8,
+            (174.0 + 65.0 * bar_level) as u8,
+            255,
+            (40.0 + 215.0 * bar_level) as u8,
+        );
 
         painter.line_segment(
-            [center + dir * inner, center + dir * outer],
+            [center + dir * inner_radius, center + dir * outer],
             egui::Stroke::new((1.2 + 1.7 * bar_level).clamp(1.2, 3.0), color),
         );
     }
@@ -551,4 +361,423 @@ pub(crate) fn find_sink_inputs_for_window(
     }
 
     matches
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn painted_bars(size: f32, level: u8) -> Vec<([egui::Pos2; 2], egui::Stroke)> {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            paint_audio_activity_ring(
+                &ctx.layer_painter(egui::LayerId::background()),
+                egui::Rect::from_center_size(egui::pos2(100.0, 100.0), egui::vec2(size, size)),
+                AudioVisualization {
+                    peak: level,
+                    bands: [level; 8],
+                },
+            );
+        });
+        output
+            .shapes
+            .into_iter()
+            .filter_map(|shape| match shape.shape {
+                egui::Shape::LineSegment { points, stroke } => Some((points, stroke)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bars_have_more_travel_without_growing_the_outer_icon_footprint() {
+        for size in [12.0_f32, 16.0, 32.0, 64.0, 128.0] {
+            let quiet = painted_bars(size, 40);
+            let loud = painted_bars(size, 100);
+            assert_eq!(quiet.len(), 24);
+            assert_eq!(loud.len(), 24);
+            let center = egui::pos2(100.0, 100.0);
+            let outer_limit = size * 0.57 + 1.0 + (size * 0.18).clamp(4.0, 14.0);
+            for ((quiet, quiet_stroke), (loud, loud_stroke)) in quiet.iter().zip(&loud) {
+                assert_eq!(quiet[0], loud[0]);
+                assert!((loud[1].distance(center) - outer_limit).abs() < 0.001);
+                assert!(loud_stroke.color.a() > quiet_stroke.color.a());
+                if size == 32.0 {
+                    assert!(
+                        loud[1].distance(quiet[1]) > 4.0,
+                        "beat still moves less than a few pixels"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn silent_visuals_paint_no_bars() {
+        assert!(painted_bars(32.0, 0).is_empty());
+    }
+
+    pub(super) fn firefox_window(id: &str, pid: i32, title: &str) -> WindowInfo {
+        WindowInfo {
+            id: id.into(),
+            title: title.into(),
+            raw_title: title.into(),
+            class: "firefox".into(),
+            desktop_file_name: Some("firefox".into()),
+            minimized: Some(false),
+            demands_attention: false,
+            icon_path: None,
+            active_process: None,
+            exe_path: None,
+            cwd_path: None,
+            command_line: None,
+            command_summary: None,
+            geometry: None,
+            process_chain: Vec::new(),
+            pid: Some(pid),
+            last_activated_at_ms: None,
+            activation_sequence: 0,
+        }
+    }
+
+    pub(super) fn firefox_sink(index: u32, pid: i32) -> PactlSinkInput {
+        serde_json::from_value(serde_json::json!({
+            "index": index,
+            "volume": {"front-left": {"value_percent": "75%"}},
+            "properties": {
+                "application.process.id": pid.to_string(),
+                "application.name": "Firefox",
+                "application.process.binary": "firefox",
+                "media.name": "Music - YouTube",
+                "media.class": "Stream/Output/Audio"
+            }
+        }))
+        .unwrap()
+    }
+
+    struct MeasuredCache {
+        level_buckets: HashMap<String, u8>,
+        sink_matches: HashMap<String, Vec<PactlSinkInput>>,
+    }
+
+    fn measured_cache(
+        windows: &[WindowInfo],
+        sinks: &[PactlSinkInput],
+        measured: &HashMap<u32, AudioVisualization>,
+    ) -> MeasuredCache {
+        let routing = build_window_audio_cache(windows, sinks);
+        MeasuredCache {
+            level_buckets: routing
+                .visualization_sinks
+                .iter()
+                .filter_map(|(window, indices)| {
+                    visualization_for_sinks(indices, measured)
+                        .map(|visual| (window.clone(), visual.peak))
+                })
+                .collect(),
+            sink_matches: routing.sink_matches,
+        }
+    }
+
+    fn playing_cache(windows: &[WindowInfo], sinks: &[PactlSinkInput]) -> MeasuredCache {
+        let measured = sinks
+            .iter()
+            .map(|sink| {
+                (
+                    sink.index,
+                    AudioVisualization {
+                        peak: 75,
+                        bands: [75; 8],
+                    },
+                )
+            })
+            .collect();
+        measured_cache(windows, sinks, &measured)
+    }
+
+    #[test]
+    fn shared_firefox_pid_is_not_per_window_playback_evidence() {
+        let windows = [
+            firefox_window("first", 104545, "First search - Mozilla Firefox"),
+            firefox_window("second", 104545, "Second search - Mozilla Firefox"),
+        ];
+        let sinks: Vec<_> = (1..=8).map(|index| firefox_sink(index, 104545)).collect();
+        let cache = playing_cache(&windows, &sinks);
+        assert!(
+            cache.level_buckets.is_empty(),
+            "ambiguous browser audio must stay app-wide"
+        );
+        assert_eq!(
+            cache.sink_matches.len(),
+            2,
+            "application volume controls remain available"
+        );
+
+        let app = AppInfo {
+            name: "Firefox".into(),
+            exec: "firefox %u".into(),
+            icon_path: None,
+            comment: None,
+            desktop_file_path: "/usr/share/applications/firefox.desktop".into(),
+            is_settings_module: false,
+        };
+        assert_eq!(
+            app_audio_sink_indices(&app, &sinks),
+            (1..=8).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn single_firefox_window_keeps_background_tab_playback() {
+        let window = firefox_window("first", 100, "Unrelated search - Mozilla Firefox");
+        let cache = playing_cache(&[window], &[firefox_sink(1, 100)]);
+        assert_eq!(cache.level_buckets, HashMap::from([("first".into(), 75)]));
+    }
+
+    #[test]
+    fn direct_pid_does_not_light_up_other_firefox_process() {
+        let windows = [
+            firefox_window("first", 100, "First search"),
+            firefox_window("second", 200, "Second search"),
+        ];
+        let cache = playing_cache(&windows, &[firefox_sink(1, 100)]);
+        assert_eq!(cache.level_buckets, HashMap::from([("first".into(), 75)]));
+    }
+
+    #[test]
+    fn explicit_window_name_disambiguates_shared_pid_without_guessing_from_track() {
+        let windows = [
+            firefox_window("first", 100, "Music - YouTube"),
+            firefox_window("second", 100, "Other tab"),
+        ];
+        let mut sink = firefox_sink(1, 100);
+        assert!(
+            playing_cache(&windows, &[sink.clone()])
+                .level_buckets
+                .is_empty()
+        );
+
+        // A background tab can be playing in the second window even if the
+        // first window's visible title happens to equal the media title.
+        sink.properties
+            .insert("window.name".into(), "Other tab".into());
+        assert_eq!(
+            playing_cache(&windows, &[sink]).level_buckets,
+            HashMap::from([("second".into(), 75)])
+        );
+    }
+
+    #[test]
+    fn explicit_window_id_disambiguates_duplicate_titles() {
+        let windows = [
+            firefox_window("first", 100, "Same title"),
+            firefox_window("second", 100, "Same title"),
+        ];
+        let mut sink = firefox_sink(1, 100);
+        sink.properties
+            .insert("window.name".into(), "Same title".into());
+        assert!(
+            playing_cache(&windows, &[sink.clone()])
+                .level_buckets
+                .is_empty()
+        );
+        sink.properties.insert("window.id".into(), "second".into());
+        assert_eq!(
+            playing_cache(&windows, &[sink]).level_buckets,
+            HashMap::from([("second".into(), 75)])
+        );
+    }
+
+    #[test]
+    fn missing_or_conflicting_window_identity_does_not_fall_back_to_pid() {
+        let window = firefox_window("first", 100, "Current title");
+        let mut sink = firefox_sink(1, 100);
+        sink.properties
+            .insert("window.name".into(), "Previous title".into());
+        assert!(
+            playing_cache(std::slice::from_ref(&window), &[sink.clone()])
+                .level_buckets
+                .is_empty()
+        );
+        sink.properties
+            .insert("window.name".into(), "Current title".into());
+        sink.properties
+            .insert("window.id".into(), "closed-window".into());
+        assert!(playing_cache(&[window], &[sink]).level_buckets.is_empty());
+    }
+
+    #[test]
+    fn name_fallback_cannot_override_conflicting_direct_pid_metadata() {
+        let windows = [
+            firefox_window("first", 100, "First title"),
+            firefox_window("second", 200, "Second title"),
+        ];
+        let mut sink = firefox_sink(1, 100);
+        sink.properties
+            .insert("window.name".into(), "Second title".into());
+        assert!(
+            playing_cache(&windows, &[sink.clone()])
+                .level_buckets
+                .is_empty()
+        );
+        let reversed: Vec<_> = windows.into_iter().rev().collect();
+        assert!(playing_cache(&reversed, &[sink]).level_buckets.is_empty());
+    }
+
+    #[test]
+    fn direct_pid_takes_precedence_over_process_chain_candidates() {
+        let browser = firefox_window("browser", 100, "Music");
+        let mut terminal = firefox_window("terminal", 200, "Terminal");
+        terminal.class = "xfce4-terminal".into();
+        terminal
+            .process_chain
+            .push(crate::models::ProcessChainEntry {
+                pid: 100,
+                name: "firefox".into(),
+                exe_path: None,
+            });
+        let windows = [terminal, browser];
+        let sink = firefox_sink(1, 100);
+        assert_eq!(
+            playing_cache(&windows, &[sink.clone()]).level_buckets,
+            HashMap::from([("browser".into(), 75)])
+        );
+        let reversed: Vec<_> = windows.into_iter().rev().collect();
+        assert_eq!(
+            playing_cache(&reversed, &[sink]).level_buckets,
+            HashMap::from([("browser".into(), 75)])
+        );
+    }
+
+    #[test]
+    fn unique_process_chain_keeps_terminal_player_activity() {
+        let mut terminal = firefox_window("terminal", 200, "Player - Terminal");
+        terminal.class = "xfce4-terminal".into();
+        terminal
+            .process_chain
+            .push(crate::models::ProcessChainEntry {
+                pid: 100,
+                name: "player".into(),
+                exe_path: None,
+            });
+        let mut sink = firefox_sink(1, 100);
+        sink.properties
+            .insert("application.name".into(), "Player".into());
+        sink.properties
+            .insert("application.process.binary".into(), "player".into());
+        assert_eq!(
+            playing_cache(&[terminal], &[sink]).level_buckets,
+            HashMap::from([("terminal".into(), 75)])
+        );
+    }
+
+    #[test]
+    fn ambiguous_application_name_alone_does_not_identify_a_window() {
+        let windows = [
+            firefox_window("first", 100, "First title"),
+            firefox_window("second", 200, "Second title"),
+        ];
+        let mut sink = firefox_sink(1, 300);
+        sink.properties.remove("application.process.id");
+        assert!(playing_cache(&windows, &[sink]).level_buckets.is_empty());
+    }
+
+    #[test]
+    fn ownership_is_recomputed_when_windows_open_and_close() {
+        let mut windows = vec![firefox_window("first", 100, "First title")];
+        let sinks = [firefox_sink(1, 100)];
+        assert_eq!(playing_cache(&windows, &sinks).level_buckets.len(), 1);
+        windows.push(firefox_window("second", 100, "Second title"));
+        assert!(playing_cache(&windows, &sinks).level_buckets.is_empty());
+        windows.remove(0);
+        assert_eq!(
+            playing_cache(&windows, &sinks).level_buckets,
+            HashMap::from([("second".into(), 75)])
+        );
+    }
+
+    #[test]
+    fn multiple_streams_keep_the_max_level_and_one_volume_control() {
+        let window = firefox_window("first", 100, "Music");
+        let quiet = firefox_sink(1, 100);
+        let loud = firefox_sink(2, 100);
+        let cache = measured_cache(
+            &[window],
+            &[quiet, loud],
+            &HashMap::from([
+                (
+                    1,
+                    AudioVisualization {
+                        peak: 15,
+                        bands: [15; 8],
+                    },
+                ),
+                (
+                    2,
+                    AudioVisualization {
+                        peak: 90,
+                        bands: [90; 8],
+                    },
+                ),
+            ]),
+        );
+        assert_eq!(cache.level_buckets, HashMap::from([("first".into(), 90)]));
+        assert_eq!(cache.sink_matches["first"].len(), 1);
+    }
+
+    #[test]
+    fn mute_cork_capture_and_paused_browser_never_get_waveforms() {
+        let windows = [firefox_window("first", 100, "Music")];
+        let mut sink = firefox_sink(1, 100);
+        sink.mute = true;
+        assert!(
+            playing_cache(&windows, &[sink.clone()])
+                .level_buckets
+                .is_empty()
+        );
+        sink.mute = false;
+        sink.corked = true;
+        assert!(
+            playing_cache(&windows, &[sink.clone()])
+                .level_buckets
+                .is_empty()
+        );
+        sink.corked = false;
+        sink.properties
+            .insert("media.category".into(), "Capture".into());
+        assert!(
+            playing_cache(&windows, &[sink.clone()])
+                .level_buckets
+                .is_empty()
+        );
+        sink.properties.remove("media.category");
+        let cache = measured_cache(&windows, &[sink], &HashMap::new());
+        assert!(cache.level_buckets.is_empty());
+        assert_eq!(cache.sink_matches.len(), 1);
+    }
+
+    #[test]
+    fn configured_volume_is_not_playback_and_one_stream_cannot_light_another() {
+        let windows = [
+            firefox_window("first", 100, "First"),
+            firefox_window("second", 200, "Second"),
+        ];
+        let sinks = [firefox_sink(1, 100), firefox_sink(2, 200)];
+        assert!(
+            measured_cache(&windows, &sinks, &HashMap::new())
+                .level_buckets
+                .is_empty()
+        );
+        let measured = HashMap::from([(
+            2,
+            AudioVisualization {
+                peak: 37,
+                bands: [37; 8],
+            },
+        )]);
+        assert_eq!(
+            measured_cache(&windows, &sinks, &measured).level_buckets,
+            HashMap::from([("second".into(), 37)])
+        );
+    }
 }

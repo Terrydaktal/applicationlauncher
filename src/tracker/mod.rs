@@ -4,6 +4,7 @@ mod install;
 mod model;
 mod restore;
 mod service;
+mod tmux;
 
 pub use client::TrackerClient;
 pub use install::{ensure_tracker_installed, restart_tracker_service, tracker_binary_path};

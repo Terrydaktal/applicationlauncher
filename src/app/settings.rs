@@ -458,6 +458,7 @@ impl App {
                 ui.end_row();
             });
 
+        render_idle_codex_action(ui, &self.idle_codex_action);
         ui.add_space(16.0);
         ui.vertical_centered(|ui| {
             if ui

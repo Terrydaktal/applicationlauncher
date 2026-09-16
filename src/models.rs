@@ -170,17 +170,23 @@ pub enum WindowFeedEvent {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AudioCacheUpdate {
-    pub sink_inputs: Vec<PactlSinkInput>,
-    pub active_media_app_keys: HashSet<String>,
-    pub observed_pipewire_node_ids: HashSet<u32>,
-    pub active_pipewire_node_ids: HashSet<u32>,
-    pub pipewire_activity_cache_valid: bool,
+    pub sink_inputs: Arc<Vec<PactlSinkInput>>,
+    pub visualizations: HashMap<u32, AudioVisualization>,
+    pub captured_at: std::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AudioVisualization {
+    /// Display-normalised spectrum with measured onset emphasis, 0..=100.
+    pub bands: [u8; 8],
+    /// Absolute sample peak on the -60..0 dBFS display scale; zero means silence.
+    pub peak: u8,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct WindowAudioCache {
     pub sink_matches: HashMap<String, Vec<PactlSinkInput>>,
-    pub level_buckets: HashMap<String, u8>,
+    pub visualization_sinks: HashMap<String, Vec<u32>>,
 }
 
 pub struct SnapshotWindowDetails {
@@ -346,6 +352,14 @@ pub struct SettingsWindowState {
     pub revision: u64,
     pub pending_save: Option<LauncherSettings>,
     pub save_deadline: Option<std::time::Instant>,
+    pub idle_codex_action: Arc<std::sync::Mutex<IdleCodexActionState>>,
+}
+
+#[derive(Default)]
+pub struct IdleCodexActionState {
+    pub confirmation: bool,
+    pub running: bool,
+    pub message: Option<String>,
 }
 
 #[derive(Clone)]

@@ -1,6 +1,6 @@
 # applicationlauncher
 
-`applicationlauncher` is a Rust GUI launcher and persistent window-session tracker for KDE Plasma on Wayland. The GUI combines searchable open windows and installed applications. The companion `applicationlauncherd` process records window activation and closure history, maintains crash-recovery and named snapshots, and can restore missing windows without closing unrelated work.
+`applicationlauncher` is a Rust GUI launcher and persistent window-session tracker for KDE Plasma on Wayland. The GUI combines searchable open windows and installed applications. The companion `applicationlauncherd` process records window activation and closure history, maintains crash-recovery, five-minute, hourly and named snapshots, and can restore missing windows without closing unrelated work.
 
 ## Project Structure
 
@@ -24,13 +24,20 @@
 │   ├── observability.rs
 │   ├── replay.rs
 │   ├── audio.rs
+│   ├── audio/
+│   │   ├── analysis.rs
+│   │   ├── firefox.rs
+│   │   ├── monitor.rs
+│   │   └── monitor_integration_tests.rs
 │   ├── models.rs
 │   ├── ranking_model.rs
 │   ├── search.rs
 │   └── main.rs
 ├── kwin/applicationlauncher-window-feed/
+├── firefox/audio-bridge.js
 ├── scripts/
 │   ├── applicationlauncher
+│   ├── install-firefox-audio-bridge.py
 │   └── build-debuggable-release
 ├── docs/DEBUGGABILITY.md
 ├── Cargo.toml
@@ -41,7 +48,13 @@
 - `src/main.rs`: GUI CLI parsing, single-instance startup, and native window creation.
 - `src/app/`: Launcher state, feeds, commands, search-row rendering, settings, popups, and the `eframe` update loop.
 - `src/launch/`: Desktop-entry parsing and application/window launch actions.
-- `src/audio.rs`: Bounded audio activity sampling and waveform levels.
+- `src/audio.rs`: Stream-to-app/window attribution, volume controls and measured icon-ring rendering.
+- `src/audio/monitor.rs`: Named background worker using native PulseAudio per-playback-stream monitors. Publishes a single replaceable latest-result slot; never records a microphone or the mixed desktop output.
+- `src/audio/analysis.rs`: Fixed-memory stereo PCM analysis producing eight frequency-band levels and a peak level, with no saved audio.
+- `src/audio/firefox.rs`: Bounded off-GUI reader and exact window attribution for the optional Firefox bridge; rejects stale, incomplete, insecure or ambiguous snapshots.
+- `firefox/audio-bridge.js`: Privileged AutoConfig observer for Firefox tab playback, mute, title and window lifecycle events. Publishes only current window titles and audible tab titles to a private runtime snapshot, not URLs or page content.
+- `scripts/install-firefox-audio-bridge.py`: Installs that bridge into a Firefox installation, preserving existing AutoConfig with an idempotent marked loader and one backup. Takes the repository JavaScript as input; writes the loader, bridge and preference file under `--firefox-dir` (default `/usr/lib/firefox`). Does not edit profiles or restart Firefox.
+- `src/audio/monitor_integration_tests.rs`: Opt-in isolated null-sink tests for stream isolation, silence, pause/resume, mute, device moves and server loss, plus an explicit read-only live compatibility probe.
 - `src/diagnostics.rs`: GUI single-instance control and foreground activation.
 - `src/observability.rs`: Shared bounded events, counters, workers, panic handling, and independent diagnostic endpoints.
 - `src/diagnostic_capture.rs`: Activated GUI/daemon evidence collector, checksums, privacy filtering, and debug doctor.
@@ -50,6 +63,7 @@
 - `src/ranking_model.rs`: Version-checked loading of an optional caller-owned field reranker.
 - `src/models.rs`: Shared window, application, feed, and audio data types.
 - `src/tracker/`: Daemon client, private SQLite persistence, restore policy, service installation, and D-Bus service.
+- `src/tracker/tmux.rs`: Bounded, cached tmux client discovery and exact-session reattachment. Reads tmux client/server metadata and produces validated restore identities and attach arguments; it does not save pane contents or replay pane commands.
 - `src/bin/applicationlauncherd.rs`: Persistent background tracker entry point.
 - `src/windows/`: KWin snapshot consumption, process metadata, terminal integration, and icon resolution.
 - `kwin/applicationlauncher-window-feed/`: Transactional KWin script that sends compositor window events to the daemon.
@@ -79,13 +93,30 @@ The project builds a native `eframe` / `egui` GUI and a separate user-session da
   `applicationlauncherd` owns the window-feed D-Bus service, records current and closed windows in SQLite WAL mode, and survives GUI closure. The GUI fetches a snapshot only when a generation counter changes.
 - Recovery:
   State is debounced to disk. The latest automatic checkpoint is offered on every new boot, including after a clean reboot, and after an unclean daemon restart. A confirmed same-boot mass disappearance of tracked windows also creates a protected recovery candidate. The candidate is kept until the user restores or dismisses it, so a launcher or daemon crash while the prompt is open cannot replace it with an empty or partial state.
+- Tiered session history:
+  The daemon separately archives the current session every five minutes and keeps the newest 120 captures (about 10 hours). Once that tier is full, the first outgoing oldest snapshot is promoted to hourly history, then one in every 12 outgoing snapshots, keeping at most 120 hourly entries. The tiers do not overlap: promotion preserves the original snapshot ID, timestamp, window geometry and restore commands rather than copying or recapturing it. Together they hold about 10 hours of detailed history plus five older days during continuous operation. The first archive waits for a complete, nonempty window feed; snapshots are deferred during active restores. Capture timing and promotion progress persist across daemon restarts, missed intervals are not backfilled, and unchanged sessions are still archived. Retention is by count, not wall-clock expiry, so downtime does not expire older entries. A pending recovery decision does not stop these separate archives or allow them to replace the protected recovery checkpoint. Insertion, promotion, pruning and schedule updates are one SQLite transaction. Only the two automatic history tiers are pruned; named snapshots and the recovery checkpoint are excluded. Use `F9` -> `Saved sessions` to select a timestamped five-minute or hourly snapshot and restore it.
 - Restoration:
-  Existing matching windows are reused and repositioned, only missing windows are launched, and unrelated windows are never closed. Terminal replay is restricted to shell/CWD, `codex resume --last`, `agy -c`, `htop`, and `nvtop`.
+  Existing matching windows are reused and repositioned, only missing windows are launched, and unrelated windows are never closed. Terminal replay is restricted to shell/CWD, `codex resume --last`, `agy -c`, `htop`, `nvtop`, and reattachment to a saved live tmux session. Codex restoration and cloning preserve an explicitly observed `--dangerously-bypass-approvals-and-sandbox` (including `--yolo`) using an allowlist of replayable options; arbitrary original commands or prompt text are not replayed. Older snapshots without recorded options do not implicitly enable bypass mode.
+- tmux restoration:
+  Local tmux clients are saved with their server socket, session ID/name and creation time, including custom `-S`/`-L` servers. Existing windows are matched by session identity rather than title or working directory alone. Reopening attaches another client to that exact session without detaching or killing existing clients, starting a new server, or recreating pane commands. The session identity is checked again inside tmux when attaching so a restarted server cannot silently substitute a reused session ID. Live shell-only records are upgraded when metadata becomes available; older historical snapshots without an identity report that limitation instead of guessing. tmux processes do not survive a machine reboot: if the server/session is gone, restoration reports it as unavailable rather than opening a misleading blank shell. This is session reattachment, not a tmux session/pane backup system, and does not yet discover remote tmux sessions inside SSH.
 - Recent window reopening:
   The newest recently closed window can be reopened globally with `Ctrl+Shift+T`. The KWin shortcut is ignored while Chrome, Chromium, or Firefox is active, preserving browser tab-reopen behavior. A successful reopen removes that entry from the history list.
 
 - Window loading:
   Uses the KWin event feed for incremental updates, with bounded reconciliation through `kdotool`, then resolves metadata such as title, class, PID, icon, executable path, and terminal child processes.
+- Audio indicators:
+  Rings respond to actual playback samples, not volume-slider values, MPRIS status or a synthetic animation. Each PulseAudio sink input is monitored individually on its output's monitor source, with no default-source or mixed-output fallback. The worker analyses 16 kHz stereo into eight frequency bands (60 Hz to 6.5 kHz) and peaks in 20 ms blocks, publishing at most 25 updates/second. Silence, corking, mute and stale samples clear the indicator. Audio is consumed in memory and discarded, never saved or sent to the GUI; the GUI receives only bounded, quantised levels and displays the latest result rather than replaying an update backlog. Monitoring is capped at 32 streams with requested 100 ms buffers and 256 metadata records, and reconnects with bounded retry delays after server loss. No analysis, audio-server I/O or process spawning occurs in the drawing path.
+
+  Playback-stream change notifications refresh metadata without recreating healthy monitors. PipeWire emits these notifications when a monitor is attached, so treating every change as a disconnection would create a feedback loop and overload the shared audio services. Removal/replacement still invalidates immediately; refreshed identity, device, mute and cork state determine whether a monitor actually needs replacing.
+
+  Window waveforms still require an unambiguous stream owner. A shared browser PID or application name alone does not identify which window contains a playing background tab. When window-specific metadata is unavailable or ambiguous, audio remains indicated on the application tile instead of marking every window as playing. Volume controls remain application/process-wide. Matching uses the full window list, not just the currently searched results, and is cached separately from sample updates.
+
+  With the optional Firefox AutoConfig bridge installed, the launcher uses Firefox's own audible-tab ownership, including background tabs. A single audible browser window owns that process's measured sound; simultaneous audible windows require exact stream/tab title matches. Window binding requires an exact unique raw title and PID. Duplicate window/track titles or an out-of-date title cannot assign sound to the wrong window: they withhold the window waveform rather than guess. Firefox's delayed speaker-icon removal is explicitly excluded so pause/mute clears ownership promptly. Private runtime files expire after 12 seconds and include the process start identity, preventing PID reuse or browser crashes from retaining old ownership. A stopped reader also expires on the GUI side. No browser I/O is performed during rendering.
+
+  Playback meters are labelled `node.virtual=true` on PipeWire. Plasma therefore excludes these output-only analysis streams from its microphone indicator, leaving real microphone clients such as Whisper visible. The application does not impersonate another mixer, change Plasma settings or hide microphone streams. A native PulseAudio server may not implement PipeWire's virtual-node classification. Connecting meters are retired only after their asynchronous creation completes, with a bounded timeout/context reset, so cancelled creations do not accumulate orphan server streams.
+
+  Bar lengths use a slowly adapting shared loudness reference rather than a compressed absolute decibel scale. Measured increases in each frequency band's energy emphasise drum hits and note attacks, with a fast release and brighter strokes at high levels. Bars travel farther inside the existing outer ring footprint. A fixed noise floor and absolute sample-peak gate still suppress silence; steady sound does not generate artificial beats.
+
 - Application loading:
   Scans desktop files, parses launcher metadata, resolves icon names and icon files, and classifies likely settings modules separately from normal applications.
 - Search and sorting:
@@ -120,6 +151,30 @@ The project builds a native `eframe` / `egui` GUI and a separate user-session da
 - Single-instance behavior:
   Uses a Unix socket lock so a second launch request focuses the already-running instance.
 
+### Optional Firefox Audio Bridge
+
+Install once, then start Firefox normally at your next convenient browser restart:
+
+```sh
+sudo python3 scripts/install-firefox-audio-bridge.py
+```
+
+This is privileged browser-side JavaScript, not a WebExtension or a remote-debugging server. Only install trusted bridge code. The installer enables unrestricted **AutoConfig**, not unrestricted web pages or a disabled content sandbox. It preserves an existing dictionary AutoConfig and adds its own loader to that same file. Re-run after a Firefox package upgrade or configuration deployment removes the installed files. No existing browser windows are closed by installation.
+
+The pipeline is: Firefox playback/tab events -> coalesced atomic JSON -> launcher background reader -> exact window ownership -> existing per-stream PCM waveform. The bridge writes `$XDG_RUNTIME_DIR/applicationlauncher-firefox-audio/firefox-PID.json` (directory `0700`, file `0600`), including titles of private windows. There is no browsing-history archive, URL collection, saved audio or network endpoint. The file is deleted on normal browser shutdown and ignored after process exit or expiry.
+
+Focused tests:
+
+```sh
+node --test tests/firefox_audio_bridge.test.cjs
+uv run --no-project python -m unittest discover -s tests -p test_firefox_bridge_install.py
+cargo test --release --bin applicationlauncher audio::
+```
+
+`tests/firefox_bridge_integration.py` additionally runs real Firefox in a disposable installation/profile with a private null-sink PulseAudio server. Set `APPLICATIONLAUNCHER_TEST_PULSEAUDIO` to a PulseAudio executable and, if needed, `APPLICATIONLAUNCHER_TEST_PULSE_MODULES`/`LD_LIBRARY_PATH` to its private module/library directories; then run `dbus-run-session --config-file=tests/firefox-private-bus.conf -- uv run --no-project python tests/firefox_bridge_integration.py`. It never attaches to an existing browser or uses the desktop audio server. `tests/firefox_audio_test_driver.js` is fixture-only and is never installed by the real installer.
+
+For explicit live verification while Firefox is playing, enable `APPLICATIONLAUNCHER_TEST_LIVE_AUDIO=1 APPLICATIONLAUNCHER_TEST_FIREFOX_BRIDGE=1` and run `cargo test --release --bin applicationlauncher live_playback_monitor_probe -- --ignored --nocapture`. This reads individual playback samples for eight seconds and the existing tracker/bridge snapshots, checks stable monitor identities and measured attribution, and then disconnects its own monitors. It does not start microphone recording, save samples or change playback. Unlike the isolated tests, this probe uses the real audio server and requires an already-running launcher daemon.
+
 ## Features
 
 - Dual-panel layout with open windows and an application panel shown together.
@@ -130,6 +185,7 @@ The project builds a native `eframe` / `egui` GUI and a separate user-session da
 - Middle-click on a window entry to launch another instance of the underlying application.
 - Right-click on a window entry to open, clone, show metadata, close the application, or inspect its execution chain.
 - Optional close-on-blur behavior.
+- Settings includes **Stop idle Codex sessions...**, an explicit, confirmed action that sends one `SIGINT` to each verified local idle Codex process. It checks fresh terminal-tab metadata and window titles for spinners/attention, then rechecks process identity and foreground ownership before signalling through a PID handle. It requires a shell underneath Codex and never signals terminal windows, shells or whole process groups, never force-kills or retries, and does not run automatically. Unsupported/inactive tabs and ambiguous or changed sessions are skipped. This is a signal interrupt, not a literal TUI Ctrl+C keypress; Codex versions can handle the two differently. Title-based idle detection is conservative but cannot make the final title-read/signal boundary atomic with Codex starting a new turn.
 - Temporary border overlay support for highlighting a target window.
 
 ## Requirements
@@ -137,6 +193,7 @@ The project builds a native `eframe` / `egui` GUI and a separate user-session da
 - Linux
 - KDE Plasma on Wayland
 - `kdotool` available in `PATH`
+- `libpulse` (including development headers/pkg-config metadata for building), and a PulseAudio-compatible server such as `pipewire-pulse` for playback visualisation. `pactl` is used only for user-requested volume/mute changes.
 
 Install Rust dependencies and build with Cargo. `kdotool` is the main external runtime dependency used for window activation, raising, and closing.
 
@@ -156,6 +213,16 @@ scripts/build-debuggable-release
 This post-link step has no runtime CPU cost. See
 [`docs/DEBUGGABILITY.md`](docs/DEBUGGABILITY.md) for the stateful production
 debuggability contract and explicit CPU, latency, RSS, and size budgets.
+
+Focused audio verification:
+
+```bash
+cargo test --release --bin applicationlauncher audio::
+APPLICATIONLAUNCHER_TEST_PULSEAUDIO=/usr/bin/pulseaudio cargo test --release --bin applicationlauncher isolated_server_stream_isolation -- --ignored --nocapture
+cargo test --release --bin applicationlauncher measured_filter_bank_throughput -- --ignored --nocapture
+```
+
+The integration test starts only its own private PulseAudio server with null outputs and a simulated microphone; it never modifies the desktop audio server or plays sound through hardware. It needs a PulseAudio executable, not just `pipewire-pulse`. An extracted package can be used with `APPLICATIONLAUNCHER_TEST_PULSE_MODULES` and its library directories in `LD_LIBRARY_PATH`. The separately opt-in `live_playback_monitor_probe` test requires `APPLICATIONLAUNCHER_TEST_LIVE_AUDIO=1`; it attaches playback-only monitors for five seconds and prints aggregate counts, not audio or window metadata.
 
 ## Run
 
@@ -188,7 +255,7 @@ The launcher writes its runtime data to:
 - `$HOME/.config/applicationlauncher/pinned_apps.txt`
   Stores pinned application desktop file paths in display order.
 - `$XDG_STATE_HOME/applicationlauncher/history.sqlite3`
-  Private SQLite WAL database containing current windows, closed-window history, recovery state, and named snapshots. History is retained until manually cleared.
+  Private SQLite WAL database containing current windows, closed-window history, recovery state, up to 120 five-minute snapshots plus 120 older hourly snapshots, and named snapshots. Named snapshots remain until manually deleted; automatic snapshot retention does not prune closed-window history.
 - `$HOME/.config/systemd/user/applicationlauncherd.service`
   Auto-installed tracker service with restart-on-failure behavior.
 - `$HOME/.local/bin/applicationlauncherd`

@@ -7,6 +7,16 @@ struct WindowSortRecord {
     title_key: String,
 }
 
+pub(super) fn open_window_count_label(ui: &egui::Ui, count: usize) -> (egui::Label, f32) {
+    let galley = ui.painter().layout_no_wrap(
+        count.to_string(),
+        egui::FontId::proportional(12.0),
+        egui::Color32::from_gray(140),
+    );
+    let width = galley.size().x;
+    (egui::Label::new(galley).selectable(false), width)
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if let Some(cpu_usage) = frame.info().cpu_usage {
@@ -253,7 +263,7 @@ impl eframe::App for App {
                 );
                 self.app_search_documents = self.apps.iter().map(app_search_document).collect();
                 self.apps_generation = self.apps_generation.wrapping_add(1);
-                self.refresh_app_audio_levels();
+                self.refresh_app_audio_routing();
                 self.background_apps_receiver = None;
                 ctx.request_repaint();
                 if self.background_apps_refresh_queued {
@@ -287,7 +297,7 @@ impl eframe::App for App {
                             self.app_search_documents =
                                 self.apps.iter().map(app_search_document).collect();
                             self.apps_generation = self.apps_generation.wrapping_add(1);
-                            self.refresh_app_audio_levels();
+                            self.refresh_app_audio_routing();
                             self.selected_index = 0;
                             self.side_panel_selected_index = 0;
                             self.active_pane = ActivePane::Apps;
@@ -326,36 +336,45 @@ impl eframe::App for App {
             }
         }
 
-        if !handled_focus_launcher {
-            let mut latest_audio_update = None;
-            for _ in 0..AUDIO_UPDATES_PER_FRAME {
-                match self.audio_cache_receiver.try_recv() {
-                    Ok(update) => {
-                        latest_audio_update = Some(update);
-                    }
-                    Err(_) => break,
-                }
-            }
-            if let Some(update) = latest_audio_update {
-                let previous_has_active_audio = self.has_active_audio;
-                self.cached_sink_inputs = update.sink_inputs;
-                self.active_media_app_keys = update.active_media_app_keys;
-                self.observed_pipewire_node_ids = update.observed_pipewire_node_ids;
-                self.active_pipewire_node_ids = update.active_pipewire_node_ids;
-                self.pipewire_activity_cache_valid = update.pipewire_activity_cache_valid;
-                self.refresh_app_audio_levels();
-                self.has_active_audio = self.has_any_active_audio();
-                let window_audio_changed = self.refresh_window_audio_cache();
-                if window_audio_changed || self.has_active_audio != previous_has_active_audio {
-                    ctx.request_repaint();
-                }
+        if let Some(update) = self.firefox_audio_inbox.take_latest(ctx) {
+            let changed = !Arc::ptr_eq(&self.firefox_audio_processes, &update.processes);
+            self.firefox_audio_processes = update.processes;
+            self.last_firefox_audio_update = update.captured_at;
+            if changed {
+                self.refresh_window_audio_cache();
             }
         }
-
+        if !self.firefox_audio_processes.is_empty() {
+            if self.last_firefox_audio_update.elapsed() > FIREFOX_WORKER_TIMEOUT {
+                self.firefox_audio_processes = Arc::default();
+                self.refresh_window_audio_cache();
+            } else {
+                ctx.request_repaint_after(
+                    FIREFOX_WORKER_TIMEOUT.saturating_sub(self.last_firefox_audio_update.elapsed()),
+                );
+            }
+        }
+        if let Some(update) = self.audio_inbox.take_latest(ctx) {
+            let metadata_changed = !Arc::ptr_eq(&self.cached_sink_inputs, &update.sink_inputs);
+            self.cached_sink_inputs = update.sink_inputs;
+            self.last_audio_update = update.captured_at;
+            self.audio_visualizations = update.visualizations;
+            // PID/name matching is topology work, not work for every audio frame.
+            if metadata_changed {
+                self.refresh_app_audio_routing();
+                self.refresh_window_audio_cache();
+            }
+        }
+        if self.last_audio_update.elapsed() > STALE_AUDIO_UPDATE {
+            self.audio_visualizations.clear();
+        }
+        self.has_active_audio = !self.audio_visualizations.is_empty();
         if self.has_active_audio {
-            let audio_repaint_ms =
-                audio_repaint_interval_ms(self.last_frame_cpu_micros.load(Ordering::Relaxed));
-            ctx.request_repaint_after(std::time::Duration::from_millis(audio_repaint_ms));
+            // A dead worker must not leave a permanently animated icon. New measured
+            // bands request their own repaints; there is no synthetic animation timer.
+            ctx.request_repaint_after(
+                STALE_AUDIO_UPDATE.saturating_sub(self.last_audio_update.elapsed()),
+            );
         }
 
         if self.mode == LauncherMode::Windows
@@ -457,7 +476,13 @@ impl eframe::App for App {
                                 LauncherMode::Apps => "Search applications...",
                                 LauncherMode::Windows => "Search open windows...",
                             };
-                            let search_width = (ui.available_width() - 78.0).max(120.0);
+                            let (window_count_label, window_count_width) =
+                                open_window_count_label(ui, self.windows.len());
+                            let search_width = (ui.available_width()
+                                - 78.0
+                                - window_count_width
+                                - ui.spacing().item_spacing.x)
+                                .max(120.0);
                             let text_edit = egui::TextEdit::singleline(&mut self.search_query)
                                 .hint_text(hint_text)
                                 .desired_width(search_width)
@@ -468,6 +493,7 @@ impl eframe::App for App {
                             search_query_changed = response.changed();
                             text_edit_response = Some(response);
                             ui.add_space(8.0);
+                            ui.add(window_count_label).on_hover_text("Open windows");
                             let ordering_button = egui::Button::new(
                                 egui::RichText::new("↕").size(16.0),
                             )
@@ -1303,9 +1329,9 @@ impl eframe::App for App {
 			                                        let app = &filtered_apps[index].0;
 			                                        let tile_size = self.app_icon_tile_size;
                                                 let audio_level = self
-                                                    .app_audio_levels
+                                                    .app_audio_sinks
                                                     .get(&app.desktop_file_path)
-                                                    .copied();
+                                                    .and_then(|indices| visualization_for_sinks(indices, &self.audio_visualizations));
 
                                         let (rect, response) = ui.allocate_exact_size(
                                             egui::vec2(tile_size, tile_size),
@@ -1453,7 +1479,6 @@ impl eframe::App for App {
                                                         ui.painter(),
                                                         icon_rect,
                                                         level,
-                                                        ctx.input(|i| i.time) as f32,
                                                     );
                                                 }
 	                                        let label_rect = egui::Rect::from_min_max(
@@ -1665,9 +1690,9 @@ impl eframe::App for App {
 	                                        LauncherMode::Apps => {
 	                                            let app = &filtered_apps[index].0;
                                                 let audio_level = self
-                                                    .app_audio_levels
+                                                    .app_audio_sinks
                                                     .get(&app.desktop_file_path)
-                                                    .copied();
+                                                    .and_then(|indices| visualization_for_sinks(indices, &self.audio_visualizations));
 
 		                                            // Icon render
                                                 let (icon_rect, _) = child_ui.allocate_exact_size(
@@ -1679,7 +1704,6 @@ impl eframe::App for App {
                                                         child_ui.painter(),
                                                         icon_rect,
                                                         level,
-                                                        ctx.input(|i| i.time) as f32,
                                                     );
                                                 }
                                                 paint_icon_in_rect(
@@ -1899,9 +1923,9 @@ impl eframe::App for App {
 		                                            let win = &filtered_windows[index];
 	                                                let audio_level = self
                                                         .window_audio_cache
-                                                        .level_buckets
+                                                        .visualization_sinks
                                                         .get(&win.id)
-                                                        .map(|level| *level as f32 / 100.0);
+                                                        .and_then(|indices| visualization_for_sinks(indices, &self.audio_visualizations));
 
 		                                            // Icon render
                                                 let (icon_rect, _) = child_ui.allocate_exact_size(
@@ -1913,7 +1937,6 @@ impl eframe::App for App {
                                                         child_ui.painter(),
                                                         icon_rect,
                                                         level,
-                                                        ctx.input(|i| i.time) as f32,
                                                     );
                                                 }
                                                 paint_icon_in_rect(
@@ -2184,7 +2207,7 @@ impl eframe::App for App {
                                                                 if ui.button(mute_label).clicked() {
                                                                     current_mute = !current_mute;
                                                                     for cached_sink in
-                                                                        self.cached_sink_inputs.iter_mut()
+                                                                        Arc::make_mut(&mut self.cached_sink_inputs).iter_mut()
                                                                     {
                                                                         let same_group = cached_sink.index == sink_index
                                                                             || sink_process_id.as_ref().is_some_and(|pid| {
@@ -2208,7 +2231,7 @@ impl eframe::App for App {
                                                                 let mut vol_val = current_vol as u32;
                                                                 if ui.add(egui::Slider::new(&mut vol_val, 0..=100).show_value(true)).changed() {
                                                                     for cached_sink in
-                                                                        self.cached_sink_inputs.iter_mut()
+                                                                        Arc::make_mut(&mut self.cached_sink_inputs).iter_mut()
                                                                     {
                                                                         let same_group = cached_sink.index == sink_index
                                                                             || sink_process_id.as_ref().is_some_and(|pid| {
@@ -2349,9 +2372,9 @@ impl eframe::App for App {
 			                                                            let app = &item.0;
 			                                                            let tile_size = self.app_icon_tile_size;
                                                                     let audio_level = self
-                                                                        .app_audio_levels
+                                                                        .app_audio_sinks
                                                                         .get(&app.desktop_file_path)
-                                                                        .copied();
+                                                                        .and_then(|indices| visualization_for_sinks(indices, &self.audio_visualizations));
 		                                                            let is_selected = self.active_pane == ActivePane::Apps
 	                                                                && index == self.side_panel_selected_index;
                                                             let (rect, response) = ui.allocate_exact_size(
@@ -2479,8 +2502,6 @@ impl eframe::App for App {
                                                                             ui.painter(),
                                                                             icon_rect,
                                                                             level,
-                                                                            ctx.input(|i| i.time)
-                                                                                as f32,
                                                                         );
                                                                     }
 	                                                            let label_rect = egui::Rect::from_min_max(
@@ -2536,9 +2557,9 @@ impl eframe::App for App {
 			                                                    for (index, item) in filtered_apps.iter().enumerate() {
 	                                                        let app = &item.0;
                                                             let audio_level = self
-                                                                .app_audio_levels
+                                                                .app_audio_sinks
                                                                 .get(&app.desktop_file_path)
-                                                                .copied();
+                                                                .and_then(|indices| visualization_for_sinks(indices, &self.audio_visualizations));
 	                                                        let (rect, response) = ui.allocate_exact_size(
                                                             egui::vec2(ui.available_width(), app_row_height),
                                                             egui::Sense::click(),
@@ -2632,7 +2653,6 @@ impl eframe::App for App {
                                                                     child_ui.painter(),
                                                                     icon_rect,
                                                                     level,
-                                                                    ctx.input(|i| i.time) as f32,
                                                                 );
                                                             }
                                                             paint_icon_in_rect(

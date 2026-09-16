@@ -79,6 +79,14 @@ fn format_activation_time(timestamp_ms: Option<i64>) -> String {
     let Some(timestamp_ms) = timestamp_ms.filter(|timestamp| *timestamp > 0) else {
         return "Not recorded yet".to_string();
     };
+    format!(
+        "{} UTC ({})",
+        format_utc_timestamp(timestamp_ms),
+        history_age(timestamp_ms)
+    )
+}
+
+fn format_utc_timestamp(timestamp_ms: i64) -> String {
     let seconds = timestamp_ms.div_euclid(1000);
     let milliseconds = timestamp_ms.rem_euclid(1000);
     let days = seconds.div_euclid(86_400);
@@ -100,10 +108,27 @@ fn format_activation_time(timestamp_ms: Option<i64>) -> String {
     let month = month_prime + if month_prime < 10 { 3 } else { -9 };
     year += i64::from(month <= 2);
 
-    format!(
-        "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{milliseconds:03} UTC ({})",
-        history_age(timestamp_ms)
-    )
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{milliseconds:03}")
+}
+
+fn snapshot_label(snapshot: &applicationlauncher::tracker::SnapshotSummary) -> String {
+    if matches!(snapshot.kind.as_str(), "recent" | "hourly") {
+        let timestamp = format_utc_timestamp(snapshot.created_at_ms);
+        let minutes = timestamp
+            .rsplit_once(':')
+            .map_or(timestamp.as_str(), |(prefix, _)| prefix);
+        let tier = if snapshot.kind == "recent" {
+            "5-minute"
+        } else {
+            "Hourly"
+        };
+        format!("{tier} {minutes} UTC")
+    } else {
+        snapshot
+            .name
+            .clone()
+            .unwrap_or_else(|| "Unnamed session".into())
+    }
 }
 
 fn format_last_activation_age(timestamp_ms: Option<i64>) -> String {
@@ -266,6 +291,7 @@ pub(crate) struct App {
     process_chain_popup: Option<WindowInfo>,
     app_info_popup: Option<AppInfo>,
     settings_popup_state: Option<Arc<std::sync::Mutex<SettingsWindowState>>>,
+    idle_codex_action: Arc<std::sync::Mutex<IdleCodexActionState>>,
     settings_popup_applied_revision: u64,
     pending_settings_save: Option<LauncherSettings>,
     settings_save_deadline: Option<Instant>,
@@ -280,7 +306,10 @@ pub(crate) struct App {
     window_receiver: Receiver<Vec<WindowInfo>>,
     window_feed_inbox: Arc<std::sync::Mutex<Option<Vec<WindowFeedEvent>>>>,
     last_frame_cpu_micros: Arc<AtomicU32>,
-    audio_cache_receiver: Receiver<AudioCacheUpdate>,
+    audio_inbox: Arc<AudioInbox>,
+    firefox_audio_inbox: Arc<FirefoxAudioInbox>,
+    firefox_audio_processes: Arc<Vec<FirefoxAudioProcess>>,
+    last_firefox_audio_update: Instant,
     terminal_action_receiver: Receiver<Result<String, String>>,
     terminal_action_message: Option<(String, bool, Instant)>,
     source_changes_pending: bool,
@@ -295,12 +324,10 @@ pub(crate) struct App {
     missing_window_counts: HashMap<String, usize>,
     use_kwin_window_feed: bool,
     window_polling_started: bool,
-    cached_sink_inputs: Vec<PactlSinkInput>,
-    app_audio_levels: HashMap<PathBuf, f32>,
-    active_media_app_keys: HashSet<String>,
-    observed_pipewire_node_ids: HashSet<u32>,
-    active_pipewire_node_ids: HashSet<u32>,
-    pipewire_activity_cache_valid: bool,
+    cached_sink_inputs: Arc<Vec<PactlSinkInput>>,
+    app_audio_sinks: HashMap<PathBuf, Vec<u32>>,
+    audio_visualizations: HashMap<u32, AudioVisualization>,
+    last_audio_update: Instant,
     window_audio_cache: WindowAudioCache,
     has_active_audio: bool,
     app_scroll_sensitivity: f32,
@@ -360,9 +387,11 @@ impl App {
     fn open_settings_menu(&mut self) {
         self.settings_menu_scale_anchor = self.ui_scale;
         self.pending_ui_scale = self.ui_scale;
-        self.settings_popup_state = Some(Arc::new(std::sync::Mutex::new(
-            SettingsWindowState::new(self.launcher_settings_snapshot()),
-        )));
+        self.settings_popup_state =
+            Some(Arc::new(std::sync::Mutex::new(SettingsWindowState::new(
+                self.launcher_settings_snapshot(),
+                self.idle_codex_action.clone(),
+            ))));
         self.settings_popup_applied_revision = 0;
         self.show_settings_menu = true;
     }
@@ -498,51 +527,50 @@ impl App {
                                     state.snapshot_name.clear();
                                 }
                             });
+                            ui.small("Automatic history: 120 five-minute snapshots plus 120 older hourly snapshots.");
+                            ui.small("Named sessions are kept until deleted.");
                             ui.add_space(8.0);
                             egui::ScrollArea::vertical().show(ui, |ui| {
-                                for snapshot in state.snapshots.clone() {
+                                for snapshot in &state.snapshots {
                                     if snapshot.kind == "recovery" {
                                         continue;
                                     }
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            snapshot
-                                                .name
-                                                .clone()
-                                                .unwrap_or_else(|| "Unnamed session".into()),
-                                        );
-                                        ui.label(format!(
-                                            "{} windows, {}",
-                                            snapshot.window_count,
-                                            history_age(snapshot.created_at_ms)
-                                        ));
-                                        if ui
-                                            .add_enabled(
-                                                !state.action_pending,
-                                                egui::Button::new("Restore"),
-                                            )
-                                            .clicked()
-                                        {
-                                            let id = snapshot.id;
-                                            action = Some(Box::new(move |client| {
-                                                let report = client.restore_snapshot(id)?;
-                                                finish_restore_action(&client, report)
-                                            }));
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                !state.action_pending,
-                                                egui::Button::new("Delete"),
-                                            )
-                                            .clicked()
-                                        {
-                                            let id = snapshot.id;
-                                            action = Some(Box::new(move |client| {
-                                                client
-                                                    .delete_snapshot(id)
-                                                    .map(|_| "Session deleted".into())
-                                            }));
-                                        }
+                                    ui.push_id(snapshot.id, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(snapshot_label(snapshot));
+                                            ui.label(format!(
+                                                "{} windows, {}",
+                                                snapshot.window_count,
+                                                history_age(snapshot.created_at_ms)
+                                            ));
+                                            if ui
+                                                .add_enabled(
+                                                    !state.action_pending,
+                                                    egui::Button::new("Restore"),
+                                                )
+                                                .clicked()
+                                            {
+                                                let id = snapshot.id;
+                                                action = Some(Box::new(move |client| {
+                                                    let report = client.restore_snapshot(id)?;
+                                                    finish_restore_action(&client, report)
+                                                }));
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    !state.action_pending,
+                                                    egui::Button::new("Delete"),
+                                                )
+                                                .clicked()
+                                            {
+                                                let id = snapshot.id;
+                                                action = Some(Box::new(move |client| {
+                                                    client
+                                                        .delete_snapshot(id)
+                                                        .map(|_| "Session deleted".into())
+                                                }));
+                                            }
+                                        });
                                     });
                                     ui.separator();
                                 }
@@ -647,7 +675,8 @@ impl App {
         let (window_tx, window_rx) = std::sync::mpsc::sync_channel(1);
         let window_feed_inbox = Arc::new(std::sync::Mutex::new(None));
         let last_frame_cpu_micros = Arc::new(AtomicU32::new(0));
-        let (audio_cache_tx, audio_cache_rx) = std::sync::mpsc::sync_channel(1);
+        let audio_inbox = start_audio_monitor(cc.egui_ctx.clone());
+        let firefox_audio_inbox = start_firefox_audio_bridge(cc.egui_ctx.clone());
         let (_terminal_action_tx, terminal_action_rx) = std::sync::mpsc::channel();
         let (auto_enter_update_sender, auto_enter_update_receiver) =
             std::sync::mpsc::sync_channel(1);
@@ -785,6 +814,7 @@ impl App {
             process_chain_popup: None,
             app_info_popup: None,
             settings_popup_state: None,
+            idle_codex_action: Arc::default(),
             settings_popup_applied_revision: 0,
             pending_settings_save: None,
             settings_save_deadline: None,
@@ -799,7 +829,10 @@ impl App {
             window_receiver: window_rx,
             window_feed_inbox,
             last_frame_cpu_micros,
-            audio_cache_receiver: audio_cache_rx,
+            audio_inbox,
+            firefox_audio_inbox,
+            firefox_audio_processes: Arc::default(),
+            last_firefox_audio_update: Instant::now(),
             terminal_action_receiver: terminal_action_rx,
             terminal_action_message: None,
             source_changes_pending,
@@ -814,12 +847,10 @@ impl App {
             missing_window_counts: HashMap::new(),
             use_kwin_window_feed: false,
             window_polling_started: false,
-            cached_sink_inputs: Vec::new(),
-            app_audio_levels: HashMap::new(),
-            active_media_app_keys: HashSet::new(),
-            observed_pipewire_node_ids: HashSet::new(),
-            active_pipewire_node_ids: HashSet::new(),
-            pipewire_activity_cache_valid: false,
+            cached_sink_inputs: Arc::default(),
+            app_audio_sinks: HashMap::new(),
+            audio_visualizations: HashMap::new(),
+            last_audio_update: Instant::now(),
             window_audio_cache: WindowAudioCache::default(),
             has_active_audio: false,
             app_scroll_sensitivity: settings.app_scroll_sensitivity,
@@ -832,80 +863,6 @@ impl App {
         };
 
         app.start_process_tree_cache_refresh();
-
-        let audio_repaint_ctx = cc.egui_ctx.clone();
-        applicationlauncher::observability::spawn_named("audio-monitor", move |worker| {
-            worker.set_state("polling");
-            let mut recent_active_pipewire_nodes: HashMap<u32, std::time::Instant> = HashMap::new();
-            let mut last_update = None;
-            loop {
-                let sink_inputs = fetch_sink_inputs();
-                let has_active_playback = sink_inputs.iter().any(|sink| {
-                    !sink.mute
-                        && !sink.corked
-                        && sink
-                            .properties
-                            .get("media.category")
-                            .is_none_or(|category| category.eq_ignore_ascii_case("Playback"))
-                });
-                let active_media_app_keys =
-                    if has_active_playback && sink_inputs.iter().any(sink_input_is_browser_like) {
-                        fetch_active_media_app_keys()
-                    } else {
-                        HashSet::new()
-                    };
-                let (
-                    observed_pipewire_node_ids,
-                    active_pipewire_node_ids,
-                    pipewire_activity_cache_valid,
-                ) = if has_active_playback {
-                    fetch_pipewire_activity()
-                } else {
-                    (HashSet::new(), HashSet::new(), false)
-                };
-                let now = std::time::Instant::now();
-
-                if pipewire_activity_cache_valid {
-                    for id in active_pipewire_node_ids {
-                        recent_active_pipewire_nodes.insert(id, now);
-                    }
-                    recent_active_pipewire_nodes.retain(|_, last_seen| {
-                        now.duration_since(*last_seen).as_millis() <= AUDIO_ACTIVITY_GRACE_MS
-                    });
-                } else {
-                    recent_active_pipewire_nodes.clear();
-                }
-
-                let effective_active_pipewire_node_ids = recent_active_pipewire_nodes
-                    .keys()
-                    .copied()
-                    .collect::<HashSet<u32>>();
-
-                let update = AudioCacheUpdate {
-                    sink_inputs,
-                    active_media_app_keys,
-                    observed_pipewire_node_ids,
-                    active_pipewire_node_ids: effective_active_pipewire_node_ids,
-                    pipewire_activity_cache_valid,
-                };
-                if last_update.as_ref() != Some(&update) {
-                    match audio_cache_tx.try_send(update.clone()) {
-                        Ok(()) => {
-                            last_update = Some(update);
-                            audio_repaint_ctx.request_repaint();
-                        }
-                        Err(std::sync::mpsc::TrySendError::Full(_)) => {}
-                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
-                    }
-                }
-                let poll_ms = if has_active_playback {
-                    AUDIO_SINK_POLL_MS as u64
-                } else {
-                    AUDIO_IDLE_POLL_MS
-                };
-                std::thread::sleep(std::time::Duration::from_millis(poll_ms));
-            }
-        });
 
         match app.mode {
             LauncherMode::Apps => app.refresh_apps(),

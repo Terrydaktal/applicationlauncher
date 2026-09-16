@@ -62,7 +62,7 @@ pub(crate) fn launch_terminal_command(command: &str) {
 
 pub(crate) fn launch_fish_terminal(
     cd_target: Option<String>,
-    command_after_cd: Option<&'static str>,
+    command_after_cd: Option<String>,
     terminal_title: Option<String>,
 ) {
     std::thread::spawn(move || {
@@ -126,7 +126,7 @@ pub(crate) fn scrub_command_env(command: &mut Command) {
     command.env_remove("UV_ACTIVE");
 }
 
-pub(crate) fn clone_terminal_command_for_window(win: &WindowInfo) -> Option<&'static str> {
+pub(crate) fn clone_terminal_command_for_window(win: &WindowInfo) -> Option<String> {
     let mut values = vec![win.title.as_str(), win.class.as_str()];
     if let Some(process) = win.active_process.as_deref() {
         values.push(process);
@@ -142,14 +142,42 @@ pub(crate) fn clone_terminal_command_for_window(win: &WindowInfo) -> Option<&'st
     };
 
     if matches("codex") {
-        Some("codex resume --last")
+        let saved_arguments = codex_clone_arguments(&win.process_chain, win.pid, read_proc_cmdline);
+        Some(applicationlauncher::tracker::codex_resume_arguments(&saved_arguments).join(" "))
     } else if matches("agy") {
-        Some("agy -c")
+        Some("agy -c".into())
     } else if matches("htop") {
-        Some("htop")
+        Some("htop".into())
     } else {
         None
     }
+}
+
+fn codex_clone_arguments(
+    chain: &[crate::models::ProcessChainEntry],
+    terminal_pid: Option<i32>,
+    mut read_arguments: impl FnMut(i32) -> Option<Vec<String>>,
+) -> Vec<String> {
+    let Some(terminal_index) =
+        terminal_pid.and_then(|pid| chain.iter().position(|entry| entry.pid == pid))
+    else {
+        return Vec::new();
+    };
+    // Chains run leaf-to-root. Prefer the owning Codex over nested agents, and
+    // never borrow options from an ancestor above this terminal window.
+    chain[..terminal_index]
+        .iter()
+        .rev()
+        .find_map(|entry| {
+            let arguments = read_arguments(entry.pid)?;
+            let program = arguments.first()?;
+            let is_codex = Path::new(program)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "codex" || name.starts_with("codex-code-mode"));
+            is_codex.then(|| applicationlauncher::tracker::codex_restore_arguments(&arguments))
+        })
+        .unwrap_or_default()
 }
 
 pub(crate) fn source_terminal_title_for_clone(win: &WindowInfo) -> String {
@@ -492,4 +520,58 @@ pub(crate) fn launch_desktop_entry(desktop_file_path: &Path) -> bool {
     cmd.env_remove("VIRTUAL_ENV");
     cmd.env_remove("UV_ACTIVE");
     applicationlauncher::process::spawn_and_reap(cmd).is_ok()
+}
+
+#[cfg(test)]
+mod codex_clone_tests {
+    use super::*;
+
+    fn chain(pids: &[i32]) -> Vec<crate::models::ProcessChainEntry> {
+        pids.iter()
+            .map(|pid| crate::models::ProcessChainEntry {
+                pid: *pid,
+                name: String::new(),
+                exe_path: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn clone_preserves_the_owning_codex_options_not_nested_agent_options() {
+        let chain = chain(&[30, 20, 10, 1]);
+        let mut reads = Vec::new();
+        let arguments = codex_clone_arguments(&chain, Some(10), |pid| {
+            reads.push(pid);
+            Some(if pid == 20 {
+                vec!["codex".into(), "--yolo".into()]
+            } else {
+                vec!["codex".into()]
+            })
+        });
+        assert_eq!(arguments, ["--dangerously-bypass-approvals-and-sandbox"]);
+        assert_eq!(reads, vec![20]);
+        let arguments = codex_clone_arguments(&chain, Some(10), |pid| {
+            Some(if pid == 20 {
+                vec!["codex".into()]
+            } else {
+                vec!["codex".into(), "--yolo".into()]
+            })
+        });
+        assert!(arguments.is_empty());
+    }
+
+    #[test]
+    fn clone_does_not_read_an_unrelated_ancestor_or_an_unidentified_terminal() {
+        let chain = chain(&[20, 10, 1]);
+        let arguments = codex_clone_arguments(&chain, Some(10), |pid| {
+            assert_eq!(pid, 20);
+            Some(vec!["fish".into()])
+        });
+        assert!(arguments.is_empty());
+        for pid in [None, Some(99)] {
+            assert!(
+                codex_clone_arguments(&chain, pid, |_| panic!("unidentified terminal")).is_empty()
+            );
+        }
+    }
 }

@@ -125,19 +125,13 @@ impl App {
         self.apply_window_reconciliation(rebuilt);
     }
 
-    pub(super) fn refresh_app_audio_levels(&mut self) {
-        self.app_audio_levels.clear();
+    pub(super) fn refresh_app_audio_routing(&mut self) {
+        self.app_audio_sinks.clear();
         for app in &self.apps {
-            if let Some(level) = app_audio_level(
-                app,
-                &self.cached_sink_inputs,
-                &self.active_media_app_keys,
-                &self.observed_pipewire_node_ids,
-                &self.active_pipewire_node_ids,
-                self.pipewire_activity_cache_valid,
-            ) {
-                self.app_audio_levels
-                    .insert(app.desktop_file_path.clone(), level);
+            let indices = app_audio_sink_indices(app, &self.cached_sink_inputs);
+            if !indices.is_empty() {
+                self.app_audio_sinks
+                    .insert(app.desktop_file_path.clone(), indices);
             }
         }
     }
@@ -470,47 +464,20 @@ impl App {
     }
 
     pub(super) fn refresh_window_audio_cache(&mut self) -> bool {
-        let previous_level_buckets = self.window_audio_cache.level_buckets.clone();
+        let previous_sinks = self.window_audio_cache.visualization_sinks.clone();
         let previous_sink_signature = sink_match_signature(&self.window_audio_cache);
-        let mut new_cache = WindowAudioCache::default();
-        for window in &self.windows {
-            let sink_matches = find_sink_inputs_for_window(window, &self.cached_sink_inputs);
-            if !sink_matches.is_empty() {
-                new_cache.sink_matches.insert(
-                    window.id.clone(),
-                    dedup_sink_inputs_for_controls(&sink_matches),
-                );
-            }
+        let mut new_cache = build_window_audio_cache(&self.windows, &self.cached_sink_inputs);
+        apply_firefox_attribution(
+            &mut new_cache,
+            &self.windows,
+            &self.cached_sink_inputs,
+            &self.firefox_audio_processes,
+        );
 
-            if let Some(level) = active_audio_level_for_sinks(
-                &sink_matches,
-                &self.active_media_app_keys,
-                &self.observed_pipewire_node_ids,
-                &self.active_pipewire_node_ids,
-                self.pipewire_activity_cache_valid,
-            ) {
-                new_cache
-                    .level_buckets
-                    .insert(window.id.clone(), quantize_audio_level(level));
-            }
-        }
-
-        let changed = previous_level_buckets != new_cache.level_buckets
+        let changed = previous_sinks != new_cache.visualization_sinks
             || previous_sink_signature != sink_match_signature(&new_cache);
         self.window_audio_cache = new_cache;
         changed
-    }
-
-    pub(super) fn has_any_active_audio(&self) -> bool {
-        self.cached_sink_inputs.iter().any(|sink| {
-            sink_input_level(
-                sink,
-                &self.active_media_app_keys,
-                &self.observed_pipewire_node_ids,
-                &self.active_pipewire_node_ids,
-                self.pipewire_activity_cache_valid,
-            ) > 0.0
-        })
     }
 
     pub(super) fn refresh_windows(&mut self) {

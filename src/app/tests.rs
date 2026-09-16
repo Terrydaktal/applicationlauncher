@@ -4,6 +4,62 @@ mod tests {
     use super::*;
     use fuzzy_rank::fields::fuzzy::{MetadataCandidate, MetadataQuery, SearchField};
 
+    #[test]
+    fn open_window_count_is_small_muted_and_does_not_take_search_focus() {
+        let ctx = egui::Context::default();
+        for count in [0, 1, 9, 10, 99, 100, 1000] {
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let (label, width) = super::super::view::open_window_count_label(ui, count);
+                    let response = ui.add(label);
+                    assert!(!response.sense.is_focusable());
+                    assert!(!response.sense.senses_click());
+                    assert!(!response.sense.senses_drag());
+                    assert!((response.rect.width() - width).abs() < 1.0);
+                });
+            });
+            let text = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == count.to_string() => {
+                        Some(text)
+                    }
+                    _ => None,
+                })
+                .expect("the full window count should be painted");
+            let format = &text.galley.job.sections[0].format;
+            assert_eq!(format.font_id.size, 12.0);
+            assert_eq!(format.color, egui::Color32::from_gray(140));
+        }
+    }
+
+    #[test]
+    fn periodic_snapshot_labels_identify_the_tier_and_capture_time() {
+        let mut snapshot = applicationlauncher::tracker::SnapshotSummary {
+            id: 1,
+            name: None,
+            kind: "hourly".into(),
+            created_at_ms: 1_672_531_200_000,
+            window_count: 50,
+        };
+        assert_eq!(snapshot_label(&snapshot), "Hourly 2023-01-01 00:00 UTC");
+        snapshot.created_at_ms += 3_600_000;
+        assert_eq!(snapshot_label(&snapshot), "Hourly 2023-01-01 01:00 UTC");
+        snapshot.kind = "recent".into();
+        assert_eq!(snapshot_label(&snapshot), "5-minute 2023-01-01 01:00 UTC");
+        snapshot.created_at_ms += 300_000;
+        assert_eq!(snapshot_label(&snapshot), "5-minute 2023-01-01 01:05 UTC");
+        snapshot.kind = "named".into();
+        snapshot.name = Some("Before reconstruction".into());
+        assert_eq!(snapshot_label(&snapshot), "Before reconstruction");
+        assert_eq!(format_activation_time(None), "Not recorded yet");
+        assert!(
+            format_activation_time(Some(1_672_531_200_123))
+                .starts_with("2023-01-01 00:00:00.123 UTC (")
+        );
+    }
+
     fn test_window_info(title: &str) -> WindowInfo {
         WindowInfo {
             id: "test-window".to_string(),
