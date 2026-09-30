@@ -19,6 +19,8 @@ pub(crate) struct PendingRestore {
     pub outcome_index: usize,
     pub expected_window_id: Option<String>,
     pub launched: bool,
+    pub allow_recreated_tmux: bool,
+    pub partial_note: Option<String>,
 }
 
 #[derive(Debug)]
@@ -80,10 +82,16 @@ struct LaunchPlan {
     program: PathBuf,
     arguments: Vec<OsString>,
     description: String,
+    recreates_tmux: bool,
+    partial_note: Option<String>,
+    tmux_socket: Option<String>,
 }
 
 impl LaunchPlan {
     fn run(self) -> Result<(), String> {
+        if let Some(socket) = &self.tmux_socket {
+            super::tmux::ensure_socket_parent(socket)?;
+        }
         let mut command = Command::new(&self.program);
         command.args(self.arguments);
         crate::process::spawn_and_reap(command).map_err(|err| {
@@ -105,7 +113,7 @@ pub(crate) fn prepare_restore_specs(
     current: &[TrackedWindow],
 ) -> PreparedRestore {
     let baseline_ids = current.iter().map(|window| window.id.clone()).collect();
-    let existing = assign_windows(specs, current, &HashSet::new());
+    let existing = assign_windows(specs, current, &HashSet::new(), |_| false);
     let existing_by_spec = existing
         .into_iter()
         .map(|assignment| (assignment.pending_index, assignment))
@@ -137,11 +145,13 @@ pub(crate) fn prepare_restore_specs(
                 outcome_index,
                 expected_window_id: Some(existing.window_id.clone()),
                 launched: false,
+                allow_recreated_tmux: false,
+                partial_note: None,
             });
             continue;
         }
         match launch(restore) {
-            Ok(()) => {
+            Ok((allow_recreated_tmux, partial_note)) => {
                 report.launched += 1;
                 report.outcomes.push(WindowRestoreOutcome {
                     title: wanted.title.clone(),
@@ -156,6 +166,8 @@ pub(crate) fn prepare_restore_specs(
                     outcome_index,
                     expected_window_id: None,
                     launched: true,
+                    allow_recreated_tmux,
+                    partial_note,
                 });
             }
             Err(err) => {
@@ -217,7 +229,9 @@ pub(crate) fn assign_pending_windows(
         .filter(|window| !baseline_ids.contains(&window.id) && !used.contains(&window.id))
         .cloned()
         .collect::<Vec<_>>();
-    for mut assignment in assign_windows(&specs, &candidates, &used) {
+    for mut assignment in assign_windows(&specs, &candidates, &used, |index| {
+        pending[unresolved[index]].allow_recreated_tmux
+    }) {
         assignment.pending_index = unresolved[assignment.pending_index];
         used.insert(assignment.window_id.clone());
         assignments.push(assignment);
@@ -229,6 +243,7 @@ fn assign_windows(
     specs: &[(TrackedWindow, RestoreSpec)],
     current: &[TrackedWindow],
     used_ids: &HashSet<String>,
+    allow_recreated_tmux: impl Fn(usize) -> bool,
 ) -> Vec<WindowAssignment> {
     let mut pairs = Vec::new();
     let current_restores = current
@@ -241,9 +256,13 @@ fn assign_windows(
             .enumerate()
             .filter(|(_, window)| !used_ids.contains(&window.id))
         {
-            if let Some(score) =
-                window_match_score(wanted, restore, window, &current_restores[window_index])
-            {
+            if let Some(score) = window_match_score(
+                wanted,
+                restore,
+                window,
+                &current_restores[window_index],
+                allow_recreated_tmux(spec_index),
+            ) {
                 pairs.push((score, spec_index, window.id.clone()));
             }
         }
@@ -292,6 +311,7 @@ fn window_match_score(
     restore: &RestoreSpec,
     current: &TrackedWindow,
     current_restore: &RestoreSpec,
+    allow_recreated_tmux: bool,
 ) -> Option<i32> {
     if app_key(wanted) != app_key(current) {
         return None;
@@ -308,7 +328,11 @@ fn window_match_score(
         else {
             return None;
         };
-        if !wanted_tmux || !current_tmux || !super::tmux::same_session(wanted, current) {
+        if !wanted_tmux
+            || !current_tmux
+            || !(super::tmux::same_session(wanted, current)
+                || (allow_recreated_tmux && super::tmux::same_recreated_session(wanted, current)))
+        {
             return None;
         }
     }
@@ -861,10 +885,12 @@ fn state_args_with_window(mut args: Vec<String>, id: &str) -> Vec<String> {
     args
 }
 
-fn launch(restore: &RestoreSpec) -> Result<(), String> {
-    launch_plan(restore)
-        .map_err(|error| error.to_string())?
-        .run()
+fn launch(restore: &RestoreSpec) -> Result<(bool, Option<String>), String> {
+    let plan = launch_plan(restore).map_err(|error| error.to_string())?;
+    let recreates_tmux = plan.recreates_tmux;
+    let partial_note = plan.partial_note.clone();
+    plan.run()?;
+    Ok((recreates_tmux, partial_note))
 }
 
 fn launch_plan(restore: &RestoreSpec) -> Result<LaunchPlan, LaunchUnavailable> {
@@ -890,6 +916,9 @@ fn launch_plan(restore: &RestoreSpec) -> Result<LaunchPlan, LaunchUnavailable> {
             program,
             arguments,
             description: "Dolphin window".into(),
+            recreates_tmux: false,
+            partial_note: None,
+            tmux_socket: None,
         });
     }
     if key.contains("pcmanfm")
@@ -903,6 +932,9 @@ fn launch_plan(restore: &RestoreSpec) -> Result<LaunchPlan, LaunchUnavailable> {
             program,
             arguments,
             description: "PCManFM window".into(),
+            recreates_tmux: false,
+            partial_note: None,
+            tmux_socket: None,
         });
     }
     let desktop = resolve_desktop_file(restore)?;
@@ -912,6 +944,9 @@ fn launch_plan(restore: &RestoreSpec) -> Result<LaunchPlan, LaunchUnavailable> {
         program,
         arguments: vec![OsString::from("launch"), desktop.clone().into_os_string()],
         description: format!("desktop entry {}", desktop.display()),
+        recreates_tmux: false,
+        partial_note: None,
+        tmux_socket: None,
     })
 }
 
@@ -1098,6 +1133,9 @@ fn terminal_launch_plan(
         program,
         arguments,
         description: format!("{kind} terminal"),
+        recreates_tmux: false,
+        partial_note: None,
+        tmux_socket: None,
     })
 }
 
@@ -1114,10 +1152,7 @@ fn tmux_terminal_launch_plan(restore: &RestoreSpec) -> Result<LaunchPlan, Launch
     let session = restore.tmux_session.as_ref().ok_or_else(|| missing(
         "This older tmux record has no saved server/session identity; it cannot safely select a session".into()
     ))?;
-    let tmux_arguments = super::tmux::attach_arguments(session)
-        .ok_or_else(|| missing("Invalid saved tmux session identity".into()))?;
     required_executable("tmux")?;
-    super::tmux::verify_session(session).map_err(missing)?;
     let program = required_executable("xfce4-terminal")?;
     required_executable("fish")?;
     let cwd = restore
@@ -1126,12 +1161,70 @@ fn tmux_terminal_launch_plan(restore: &RestoreSpec) -> Result<LaunchPlan, Launch
         .map(expand_home)
         .filter(|path| path.is_dir())
         .unwrap_or_else(home_directory);
+    let (tmux_arguments, recreates_tmux) =
+        match super::tmux::session_status(session).map_err(missing)? {
+            super::tmux::SessionStatus::Exact => (
+                super::tmux::attach_arguments(session)
+                    .ok_or_else(|| missing("Invalid saved tmux session identity".into()))?,
+                false,
+            ),
+            super::tmux::SessionStatus::Missing => {
+                let pane = restore.tmux_pane.as_ref();
+                let pane_cwd = if let Some(pane) = pane {
+                    let path = expand_home(&pane.cwd);
+                    if !path.is_dir() {
+                        return Err(missing(format!(
+                            "Saved tmux pane directory {:?} no longer exists",
+                            pane.cwd
+                        )));
+                    }
+                    path
+                } else {
+                    cwd.clone()
+                };
+                if let Some(pane) = pane {
+                    match pane.kind.as_str() {
+                        "codex" | "agy" | "htop" | "nvtop" => {
+                            required_executable(&pane.kind)?;
+                        }
+                        "shell" | "unsupported" => {}
+                        other => {
+                            return Err(missing(format!(
+                                "Saved tmux pane program {other:?} is not safe to replay"
+                            )));
+                        }
+                    }
+                }
+                (
+                    super::tmux::recreate_arguments(session, pane, &pane_cwd).ok_or_else(|| {
+                        missing("Invalid saved tmux session name or pane metadata".into())
+                    })?,
+                    true,
+                )
+            }
+        };
     let mut arguments = vec![OsString::from("--working-directory"), cwd.into_os_string()];
     arguments.extend(tmux_terminal_arguments(tmux_arguments));
     Ok(LaunchPlan {
         program,
         arguments,
         description: format!("tmux session {:?}", session.session_name),
+        recreates_tmux,
+        partial_note: if recreates_tmux && restore.tmux_pane.is_none() {
+            Some("The saved snapshot has no tmux pane details; the named session was opened, but its previous program could not be recovered or verified".into())
+        } else if recreates_tmux
+            && restore
+                .tmux_pane
+                .as_ref()
+                .is_some_and(|pane| pane.kind == "unsupported")
+        {
+            Some("The saved tmux pane ran an unsupported program; the named session was opened without replaying that program".into())
+        } else if recreates_tmux {
+            Some("The named tmux session was opened from saved pane metadata; its previous pane contents and exact interactive program state could not be verified".into())
+        } else {
+            None
+        },
+        tmux_socket: recreates_tmux.then(|| session.socket_path.clone()),
     })
 }
 
@@ -1189,6 +1282,9 @@ fn ssh_terminal_launch_plan(
         program,
         arguments,
         description: format!("ssh {kind} terminal"),
+        recreates_tmux: false,
+        partial_note: None,
+        tmux_socket: None,
     })
 }
 
@@ -1324,7 +1420,7 @@ mod tests {
             tracked_window("current-b", "Document B", "org.example.Editor"),
             tracked_window("current-a", "Document A", "org.example.Editor"),
         ];
-        let assignments = assign_windows(&specs, &current, &HashSet::new())
+        let assignments = assign_windows(&specs, &current, &HashSet::new(), |_| false)
             .into_iter()
             .map(|assignment| (assignment.pending_index, assignment.window_id))
             .collect::<HashMap<_, _>>();
@@ -1357,6 +1453,8 @@ mod tests {
             outcome_index: 0,
             expected_window_id: None,
             launched: true,
+            allow_recreated_tmux: false,
+            partial_note: None,
         }];
         let old = tracked_window("old", "Editor", "org.example.Editor");
         let new = tracked_window("new", "Editor", "org.example.Editor");
@@ -1674,15 +1772,15 @@ mod tests {
         let window = tracked_window("saved", "Terminal", "xfce4-terminal");
         let saved = tmux_restore("$1");
         let mut current = saved.clone();
-        assert!(window_match_score(&window, &saved, &window, &current).is_some());
+        assert!(window_match_score(&window, &saved, &window, &current, false).is_some());
         current.tmux_session.as_mut().unwrap().session_id = "$2".into();
-        assert!(window_match_score(&window, &saved, &window, &current).is_none());
+        assert!(window_match_score(&window, &saved, &window, &current, false).is_none());
         current = RestoreSpec {
             terminal_kind: Some("shell".into()),
             ..Default::default()
         };
-        assert!(window_match_score(&window, &saved, &window, &current).is_none());
-        assert!(window_match_score(&window, &current, &window, &saved).is_none());
+        assert!(window_match_score(&window, &saved, &window, &current, false).is_none());
+        assert!(window_match_score(&window, &current, &window, &saved, false).is_none());
     }
 
     #[test]
@@ -1693,7 +1791,35 @@ mod tests {
         let mut current = saved.clone();
         current.cwd = Some("/other-directory".into());
         current.tmux_session.as_mut().unwrap().session_name = "new name".into();
-        assert!(window_match_score(&saved_window, &saved, &current_window, &current).is_some());
+        assert!(
+            window_match_score(&saved_window, &saved, &current_window, &current, false).is_some()
+        );
+    }
+
+    #[test]
+    fn recreated_tmux_window_matches_only_after_launch_and_never_by_title_alone() {
+        let saved_window = tracked_window("saved", "Terminal", "xfce4-terminal");
+        let current_window = tracked_window("current", "codex - Terminal", "xfce4-terminal");
+        let saved = tmux_restore("$7");
+        let mut current = saved.clone();
+        let session = current.tmux_session.as_mut().unwrap();
+        session.server_pid = 900;
+        session.session_id = "$0".into();
+        session.created_at = 456;
+        assert!(
+            window_match_score(&saved_window, &saved, &current_window, &current, false).is_none()
+        );
+        assert!(
+            window_match_score(&saved_window, &saved, &current_window, &current, true).is_some()
+        );
+        current.tmux_session.as_mut().unwrap().session_name = "other".into();
+        assert!(
+            window_match_score(&saved_window, &saved, &current_window, &current, true).is_none()
+        );
+        current.tmux_session = None;
+        assert!(
+            window_match_score(&saved_window, &saved, &current_window, &current, true).is_none()
+        );
     }
 
     #[test]
@@ -1775,7 +1901,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(window_match_score(&wanted, &remote, &current, &local).is_none());
+        assert!(window_match_score(&wanted, &remote, &current, &local, false).is_none());
     }
 
     #[test]

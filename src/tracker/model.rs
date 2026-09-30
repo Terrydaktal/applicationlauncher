@@ -175,6 +175,15 @@ pub struct TmuxSession {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TmuxPaneRestore {
+    pub cwd: String,
+    /// Only allowlisted kinds are replayed; unsupported programs reopen as a shell.
+    pub kind: String,
+    #[serde(default)]
+    pub safe_arguments: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RestoreSpec {
     pub app_key: String,
     pub desktop_file: Option<String>,
@@ -190,6 +199,8 @@ pub struct RestoreSpec {
     pub ssh_arguments: Option<Vec<String>>,
     #[serde(default)]
     pub tmux_session: Option<TmuxSession>,
+    #[serde(default)]
+    pub tmux_pane: Option<TmuxPaneRestore>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -302,6 +313,7 @@ pub fn infer_restore_spec(window: &TrackedWindow) -> RestoreSpec {
         .and_then(|details| {
             super::tmux::capture_session(details.4, &details.3, details.1.as_deref())
         });
+    let tmux_pane = tmux_session.as_ref().and_then(super::tmux::capture_pane);
     let process_is_ssh = process
         .as_ref()
         .is_some_and(|details| terminal_process_matches(&details.0, details.2.as_deref(), "ssh"));
@@ -362,6 +374,7 @@ pub fn infer_restore_spec(window: &TrackedWindow) -> RestoreSpec {
             .unwrap_or_default(),
         ssh_arguments,
         tmux_session,
+        tmux_pane,
     }
 }
 
@@ -379,8 +392,18 @@ fn merge_live_restore_spec(mut stored: RestoreSpec, inferred: RestoreSpec) -> Re
         stored.cwd = inferred.cwd;
         stored.ssh_arguments = None;
         stored.safe_arguments.clear();
-        if inferred.tmux_session.is_some() {
-            stored.tmux_session = inferred.tmux_session;
+        if let Some(session) = inferred.tmux_session {
+            if stored
+                .tmux_session
+                .as_ref()
+                .is_none_or(|old| !super::tmux::same_session(old, &session))
+            {
+                stored.tmux_pane = None;
+            }
+            stored.tmux_session = Some(session);
+            if inferred.tmux_pane.is_some() {
+                stored.tmux_pane = inferred.tmux_pane;
+            }
         }
         return stored;
     }
@@ -731,6 +754,11 @@ mod tests {
                 session_name: "one".into(),
                 created_at: 123,
             }),
+            tmux_pane: Some(TmuxPaneRestore {
+                cwd: "/project".into(),
+                kind: "codex".into(),
+                safe_arguments: Vec::new(),
+            }),
             ..Default::default()
         };
         for inferred in [
@@ -748,6 +776,7 @@ mod tests {
         ] {
             let merged = merge_live_restore_spec(stored.clone(), inferred);
             assert_eq!(merged.tmux_session, stored.tmux_session);
+            assert_eq!(merged.tmux_pane, stored.tmux_pane);
             assert_eq!(merged.terminal_kind.as_deref(), Some("tmux"));
         }
         let shell = RestoreSpec {
@@ -762,6 +791,17 @@ mod tests {
         let mut switched = stored.clone();
         switched.tmux_session.as_mut().unwrap().session_id = "$2".into();
         assert_eq!(merge_live_restore_spec(stored, switched.clone()), switched);
+        let mut switched_without_pane = switched.clone();
+        switched_without_pane
+            .tmux_session
+            .as_mut()
+            .unwrap()
+            .session_id = "$3".into();
+        switched_without_pane.tmux_pane = None;
+        assert_eq!(
+            merge_live_restore_spec(switched, switched_without_pane.clone()),
+            switched_without_pane
+        );
     }
 
     #[test]

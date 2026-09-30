@@ -941,7 +941,7 @@ impl Runtime {
     }
 
     fn write_recovery_if_due(&self, force: bool) -> Result<(), String> {
-        let (windows, boot_id, generation) = {
+        let (mut windows, boot_id, generation) = {
             let mut state = self.0.state.lock().unwrap();
             if state.recovery_pending || state.checkpoint_guarded {
                 return Ok(());
@@ -959,6 +959,7 @@ impl Runtime {
                 state.generation,
             )
         };
+        super::tmux::refresh_snapshot_panes(&mut windows);
         let result = self
             .0
             .database
@@ -984,7 +985,7 @@ impl Runtime {
     }
 
     fn write_periodic_if_due(&self, now: Instant, timestamp_ms: i64) -> Result<(), String> {
-        let (windows, boot_id) = {
+        let (mut windows, boot_id) = {
             let mut state = self.0.state.lock().unwrap();
             if state.periodic_write_in_flight || state.periodic_due.is_some_and(|due| now < due) {
                 return Ok(());
@@ -1005,6 +1006,7 @@ impl Runtime {
             state.periodic_write_in_flight = true;
             (windows, state.boot_id.clone())
         };
+        super::tmux::refresh_snapshot_panes(&mut windows);
         let result = self
             .0
             .database
@@ -1254,6 +1256,9 @@ impl Runtime {
                         }
                         Ok(()) => {
                             let mut qualifications = Vec::new();
+                            if let Some(note) = &item.partial_note {
+                                qualifications.push(note.clone());
+                            }
                             if let Some(adjustment) = state.target.adjustment.clone() {
                                 qualifications.push(adjustment);
                             }

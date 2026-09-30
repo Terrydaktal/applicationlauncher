@@ -1159,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn tmux_identity_survives_current_history_snapshots_and_database_reopen() {
+    fn tmux_pane_restore_survives_current_history_snapshots_and_database_reopen() {
         let (mut db, _directory) = test_database();
         let window = TrackedWindow {
             id: "tmux-window".into(),
@@ -1175,6 +1175,11 @@ mod tests {
                 session_id: "$7".into(),
                 session_name: "qwen".into(),
                 created_at: 123,
+            }),
+            tmux_pane: Some(super::super::TmuxPaneRestore {
+                cwd: "/project".into(),
+                kind: "codex".into(),
+                safe_arguments: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
             }),
             ..Default::default()
         };

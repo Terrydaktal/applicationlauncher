@@ -1,21 +1,24 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use super::TmuxSession;
+use super::{RestoreSpec, TmuxPaneRestore, TmuxSession, TrackedWindow};
 
 const QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 const CACHE_TTL: Duration = Duration::from_secs(2);
 const MAX_SERVERS: usize = 16;
 const MAX_CLIENTS: usize = 512;
 const MAX_METADATA_BYTES: usize = 128 * 1024;
+const MAX_PANE_PROCESSES: usize = 512;
+const SNAPSHOT_REFRESH_BUDGET: Duration = Duration::from_secs(1);
 const CLIENT_FORMAT: &str =
     "#{client_pid}\t#{session_id}\t#{session_created}\t#{pid}\t#{session_name}";
 const SESSION_FORMAT: &str = "#{session_id}\t#{session_created}\t#{pid}\t#{session_name}";
+const PANE_FORMAT: &str = "#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}";
 
 #[derive(Clone)]
 struct ClientSession {
@@ -26,6 +29,11 @@ struct ClientSession {
 struct CachedClients {
     checked_at: Instant,
     clients: Vec<ClientSession>,
+}
+
+struct CachedPane {
+    checked_at: Instant,
+    pane: Option<TmuxPaneRestore>,
 }
 
 pub(super) fn capture_session(
@@ -59,6 +67,258 @@ pub(super) fn capture_session(
     let mut matches = clients.iter().filter(|client| client.pid == client_pid);
     let session = matches.next()?.session.clone();
     matches.next().is_none().then_some(session)
+}
+
+pub(super) fn capture_pane(session: &TmuxSession) -> Option<TmuxPaneRestore> {
+    if !valid_session(session) {
+        return None;
+    }
+    static CACHE: OnceLock<Mutex<HashMap<(String, String, i32, u64), CachedPane>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = pane_cache_key(session);
+    let now = Instant::now();
+    {
+        let Ok(mut cache) = cache.try_lock() else {
+            return None;
+        };
+        if let Some(entry) = cache
+            .get(&key)
+            .filter(|entry| now.duration_since(entry.checked_at) < CACHE_TTL)
+        {
+            return entry.pane.clone();
+        }
+        cache.retain(|_, entry| now.duration_since(entry.checked_at) < CACHE_TTL);
+        if cache.len() >= MAX_CLIENTS {
+            return None;
+        }
+        cache.insert(
+            key.clone(),
+            CachedPane {
+                checked_at: now,
+                pane: None,
+            },
+        );
+    }
+    let pane = query_pane(session).ok().and_then(|text| parse_pane(&text));
+    if let Ok(mut cache) = cache.try_lock()
+        && let Some(entry) = cache.get_mut(&key).filter(|entry| entry.checked_at == now)
+    {
+        entry.pane = pane.clone();
+    }
+    pane
+}
+
+fn pane_cache_key(session: &TmuxSession) -> (String, String, i32, u64) {
+    (
+        session.socket_path.clone(),
+        session.session_id.clone(),
+        session.server_pid,
+        session.created_at,
+    )
+}
+
+pub(super) fn refresh_snapshot_panes(entries: &mut [(TrackedWindow, RestoreSpec)]) {
+    let deadline = Instant::now() + SNAPSHOT_REFRESH_BUDGET;
+    let mut refreshed: HashMap<(String, String, i32, u64), Option<TmuxPaneRestore>> =
+        HashMap::new();
+    for (_, restore) in entries {
+        let Some(session) = restore.tmux_session.as_ref() else {
+            continue;
+        };
+        let key = pane_cache_key(session);
+        let pane = if let Some(pane) = refreshed.get(&key) {
+            pane.clone()
+        } else {
+            if Instant::now() >= deadline || refreshed.len() >= MAX_CLIENTS {
+                break;
+            }
+            let pane = (session_status(session) == Ok(SessionStatus::Exact))
+                .then(|| capture_pane(session))
+                .flatten();
+            refreshed.insert(key, pane.clone());
+            pane
+        };
+        if let Some(pane) = pane {
+            restore.tmux_pane = Some(pane);
+        }
+    }
+}
+
+fn parse_pane(text: &str) -> Option<TmuxPaneRestore> {
+    let fields = text.trim_end_matches('\n').split('\t').collect::<Vec<_>>();
+    if fields.len() != 3 {
+        return None;
+    }
+    let pid: i32 = fields[0].parse().ok().filter(|pid| *pid > 0)?;
+    let path = Path::new(fields[1]);
+    if !path.is_absolute() || !valid_text(fields[1]) || !valid_text(fields[2]) {
+        return None;
+    }
+    if std::fs::metadata(format!("/proc/{pid}")).ok()?.uid() != rustix::process::getuid().as_raw() {
+        return None;
+    }
+    let (kind, program_pid) =
+        foreground_pane_program(pid).unwrap_or_else(|| (pane_program_kind(fields[2], None), pid));
+    let cwd = std::fs::read_link(format!("/proc/{program_pid}/cwd"))
+        .ok()
+        .and_then(|path| path.to_str().map(str::to_owned))
+        .filter(|cwd| Path::new(cwd).is_absolute() && valid_text(cwd))
+        .unwrap_or_else(|| fields[1].to_owned());
+    let arguments = if kind == "codex" {
+        std::fs::File::open(format!("/proc/{program_pid}/cmdline"))
+            .ok()
+            .and_then(|file| {
+                let mut bytes = Vec::new();
+                file.take((MAX_METADATA_BYTES + 1) as u64)
+                    .read_to_end(&mut bytes)
+                    .ok()?;
+                (bytes.len() <= MAX_METADATA_BYTES).then_some(bytes)
+            })
+            .map(|bytes| {
+                bytes
+                    .split(|byte| *byte == 0)
+                    .filter(|argument| !argument.is_empty())
+                    .map(|argument| String::from_utf8_lossy(argument).into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    Some(TmuxPaneRestore {
+        cwd,
+        kind: kind.into(),
+        safe_arguments: if kind == "codex" {
+            super::codex_restore_arguments(&arguments)
+        } else {
+            Vec::new()
+        },
+    })
+}
+
+struct PaneProcessStat {
+    name: String,
+    process_group: i32,
+    session: i32,
+    tty: i32,
+    foreground_group: i32,
+}
+
+fn pane_process_stat(pid: i32) -> Option<PaneProcessStat> {
+    if std::fs::metadata(format!("/proc/{pid}")).ok()?.uid() != rustix::process::getuid().as_raw() {
+        return None;
+    }
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_pane_process_stat(&text)
+}
+
+fn parse_pane_process_stat(text: &str) -> Option<PaneProcessStat> {
+    let (prefix, suffix) = text.rsplit_once(") ")?;
+    let name = prefix.split_once('(')?.1.to_owned();
+    let fields = suffix.split_whitespace().take(6).collect::<Vec<_>>();
+    Some(PaneProcessStat {
+        name,
+        process_group: fields.get(2)?.parse().ok()?,
+        session: fields.get(3)?.parse().ok()?,
+        tty: fields.get(4)?.parse().ok()?,
+        foreground_group: fields.get(5)?.parse().ok()?,
+    })
+}
+
+fn in_pane_foreground_group(process: &PaneProcessStat, pane: &PaneProcessStat) -> bool {
+    pane.tty > 0
+        && pane.foreground_group > 0
+        && process.session == pane.session
+        && process.tty == pane.tty
+        && process.process_group == pane.foreground_group
+}
+
+fn pane_program_kind(name: &str, executable: Option<&str>) -> &'static str {
+    if let Some(kind) = ["codex", "agy", "htop", "nvtop"]
+        .into_iter()
+        .find(|kind| super::terminal_process_matches(name, executable, kind))
+    {
+        kind
+    } else if ["fish", "bash", "zsh", "sh", "dash"]
+        .into_iter()
+        .any(|shell| super::terminal_process_matches(name, executable, shell))
+    {
+        "shell"
+    } else {
+        "unsupported"
+    }
+}
+
+fn foreground_pane_program(pane_pid: i32) -> Option<(&'static str, i32)> {
+    let root = pane_process_stat(pane_pid)?;
+    if root.tty <= 0 || root.foreground_group <= 0 {
+        return None;
+    }
+    let mut queue = VecDeque::from([pane_pid]);
+    let mut visited = HashSet::new();
+    let mut fallback = None;
+    while let Some(pid) = queue.pop_front() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        if visited.len() > MAX_PANE_PROCESSES {
+            return Some(("unsupported", pane_pid));
+        }
+        let Some(stat) = pane_process_stat(pid) else {
+            continue;
+        };
+        if in_pane_foreground_group(&stat, &root) {
+            let executable = std::fs::read_link(format!("/proc/{pid}/exe"))
+                .ok()
+                .and_then(|path| path.to_str().map(str::to_owned));
+            let kind = pane_program_kind(&stat.name, executable.as_deref());
+            if matches!(kind, "codex" | "agy" | "htop" | "nvtop") {
+                return Some((kind, pid));
+            }
+            if fallback.is_none()
+                || (kind == "unsupported" && fallback.is_some_and(|(old, _)| old == "shell"))
+            {
+                fallback = Some((kind, pid));
+            }
+        }
+        let mut children = String::new();
+        if let Ok(file) = std::fs::File::open(format!("/proc/{pid}/task/{pid}/children"))
+            && file
+                .take((MAX_PANE_PROCESSES * 16 + 1) as u64)
+                .read_to_string(&mut children)
+                .is_ok()
+        {
+            if children.len() > MAX_PANE_PROCESSES * 16 {
+                return Some(("unsupported", pane_pid));
+            }
+            queue.extend(
+                children
+                    .split_whitespace()
+                    .filter_map(|child| child.parse::<i32>().ok())
+                    .take(MAX_PANE_PROCESSES.saturating_sub(visited.len() + queue.len())),
+            );
+        }
+    }
+    fallback
+}
+
+fn query_pane(session: &TmuxSession) -> Result<String, String> {
+    owned_socket(Path::new(&session.socket_path))?;
+    let mut command =
+        Command::new(crate::process::executable_path("tmux").ok_or("tmux is not installed")?);
+    command
+        .args(["-N", "-S"])
+        .arg(&session.socket_path)
+        .args(["display-message", "-p", "-t"])
+        .arg(&session.session_id)
+        .arg(PANE_FORMAT);
+    let output = crate::process::output_with_timeout(command, QUERY_TIMEOUT)
+        .map_err(|err| format!("Could not query tmux pane: {err}"))?;
+    if !output.status.success() || output.stdout.len() > MAX_METADATA_BYTES {
+        return Err("The tmux server did not return usable pane metadata".into());
+    }
+    String::from_utf8(output.stdout).map_err(|_| "Invalid tmux pane metadata encoding".into())
 }
 
 fn socket_path(
@@ -214,11 +474,7 @@ fn parse_clients(socket: &Path, text: &str) -> Option<Vec<ClientSession>> {
 }
 
 fn query(socket: &Path, action: &str, format: &str) -> Result<String, String> {
-    let metadata = std::fs::metadata(socket)
-        .map_err(|_| "The saved tmux server socket is unavailable".to_owned())?;
-    if !metadata.file_type().is_socket() || metadata.uid() != rustix::process::getuid().as_raw() {
-        return Err("The tmux socket is not a socket owned by the current user".into());
-    }
+    owned_socket(socket)?;
     let mut command =
         Command::new(crate::process::executable_path("tmux").ok_or("tmux is not installed")?);
     command
@@ -233,6 +489,50 @@ fn query(socket: &Path, action: &str, format: &str) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|_| "Invalid tmux session metadata encoding".into())
 }
 
+fn owned_socket(socket: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(socket)
+        .map_err(|_| "The saved tmux server socket is unavailable".to_owned())?;
+    if !metadata.file_type().is_socket() || metadata.uid() != rustix::process::getuid().as_raw() {
+        return Err("The tmux socket is not a socket owned by the current user".into());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SessionStatus {
+    Exact,
+    Missing,
+}
+
+pub(super) fn session_status(session: &TmuxSession) -> Result<SessionStatus, String> {
+    if !valid_session(session) {
+        return Err("The saved tmux session identity is incomplete or invalid".into());
+    }
+    let socket = Path::new(&session.socket_path);
+    if !socket.exists() {
+        return Ok(SessionStatus::Missing);
+    }
+    let text = match query(socket, "list-sessions", SESSION_FORMAT) {
+        Ok(text) => text,
+        Err(_) if !socket.exists() => return Ok(SessionStatus::Missing),
+        Err(err) => return Err(err),
+    };
+    let mut exact = false;
+    for line in text.lines().take(MAX_CLIENTS + 1) {
+        let current = parse_session(socket, &line.split('\t').collect::<Vec<_>>())
+            .ok_or("The tmux server returned invalid session metadata")?;
+        exact |= same_session(session, &current);
+    }
+    if text.lines().count() > MAX_CLIENTS {
+        return Err("The tmux server returned too many sessions".into());
+    }
+    Ok(if exact {
+        SessionStatus::Exact
+    } else {
+        SessionStatus::Missing
+    })
+}
+
 pub(super) fn same_session(left: &TmuxSession, right: &TmuxSession) -> bool {
     valid_session(left)
         && valid_session(right)
@@ -242,32 +542,97 @@ pub(super) fn same_session(left: &TmuxSession, right: &TmuxSession) -> bool {
         && left.created_at == right.created_at
 }
 
+pub(super) fn same_recreated_session(saved: &TmuxSession, current: &TmuxSession) -> bool {
+    valid_session(saved)
+        && valid_session(current)
+        && saved.socket_path == current.socket_path
+        && saved.session_name == current.session_name
+}
+
+#[cfg(test)]
 pub(super) fn verify_session(session: &TmuxSession) -> Result<(), String> {
-    if !valid_session(session) {
-        return Err("The saved tmux session identity is incomplete or invalid".into());
-    }
-    let text = query(
-        Path::new(&session.socket_path),
-        "list-sessions",
-        SESSION_FORMAT,
-    )?;
-    if text
-        .lines()
-        .take(MAX_CLIENTS)
-        .filter_map(|line| {
-            parse_session(
-                Path::new(&session.socket_path),
-                &line.split('\t').collect::<Vec<_>>(),
-            )
-        })
-        .any(|current| same_session(session, &current))
-    {
-        Ok(())
-    } else {
-        Err(format!(
+    match session_status(session)? {
+        SessionStatus::Exact => Ok(()),
+        SessionStatus::Missing => Err(format!(
             "Saved tmux session {:?} no longer exists; its processes cannot be reattached after the tmux server exits or the computer reboots",
             session.session_name
-        ))
+        )),
+    }
+}
+
+pub(super) fn recreate_arguments(
+    session: &TmuxSession,
+    pane: Option<&TmuxPaneRestore>,
+    cwd: &Path,
+) -> Option<Vec<String>> {
+    if !valid_session(session) || !cwd.is_absolute() || !valid_session_name(&session.session_name) {
+        return None;
+    }
+    let mut arguments = vec![
+        "-S".into(),
+        session.socket_path.clone(),
+        "new-session".into(),
+        "-A".into(),
+        "-s".into(),
+        session.session_name.clone(),
+        "-c".into(),
+        cwd.to_str()?.into(),
+    ];
+    let command = match pane.map(|pane| pane.kind.as_str()).unwrap_or("shell") {
+        "shell" | "unsupported" => None,
+        "codex" => Some(super::codex_resume_arguments(&pane?.safe_arguments).join(" ")),
+        "agy" => Some("agy -c".into()),
+        "htop" => Some("htop".into()),
+        "nvtop" => Some("nvtop".into()),
+        _ => return None,
+    };
+    if let Some(command) = command {
+        arguments.extend([
+            "fish".into(),
+            "-lc".into(),
+            format!("{command}; exec fish -l"),
+        ]);
+    }
+    Some(arguments)
+}
+
+fn valid_session_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        && !name.starts_with('-')
+}
+
+pub(super) fn ensure_socket_parent(socket: &str) -> Result<(), String> {
+    let parent = Path::new(socket)
+        .parent()
+        .ok_or("The tmux socket has no parent directory")?;
+    match std::fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.is_dir() => return Ok(()),
+        Ok(_) => return Err("The tmux socket parent is not a directory".into()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(format!(
+                "Could not inspect the tmux socket directory: {err}"
+            ));
+        }
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(parent) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(parent)
+                .map_err(|err| format!("Could not inspect the tmux socket directory: {err}"))?;
+            if metadata.is_dir() && metadata.uid() == rustix::process::getuid().as_raw() {
+                Ok(())
+            } else {
+                Err("The tmux socket directory changed during creation".into())
+            }
+        }
+        Err(err) => Err(format!("Could not create the tmux socket directory: {err}")),
     }
 }
 
@@ -311,6 +676,18 @@ mod tests {
             session_name: "qwen".into(),
             created_at: 1788885095,
         }
+    }
+
+    #[test]
+    fn foreground_pane_group_excludes_background_jobs_and_other_ttys() {
+        let pane = parse_pane_process_stat("100 (fish) S 10 100 100 34840 200").unwrap();
+        let codex = parse_pane_process_stat("200 (codex) S 100 200 100 34840 200").unwrap();
+        let background = parse_pane_process_stat("300 (codex) S 100 300 100 34840 200").unwrap();
+        let other_tty = parse_pane_process_stat("400 (codex) S 100 200 100 34841 200").unwrap();
+        assert!(in_pane_foreground_group(&codex, &pane));
+        assert!(!in_pane_foreground_group(&background, &pane));
+        assert!(!in_pane_foreground_group(&other_tty, &pane));
+        assert!(parse_pane_process_stat("100 (fish) bad").is_none());
     }
 
     #[test]
@@ -409,6 +786,79 @@ mod tests {
     }
 
     #[test]
+    fn pane_cache_does_not_reuse_metadata_from_a_restarted_server() {
+        let saved = session();
+        let mut restarted = saved.clone();
+        restarted.server_pid += 1;
+        assert_ne!(pane_cache_key(&saved), pane_cache_key(&restarted));
+        restarted = saved.clone();
+        restarted.created_at += 1;
+        assert_ne!(pane_cache_key(&saved), pane_cache_key(&restarted));
+    }
+
+    #[test]
+    fn recreated_session_matches_only_the_saved_socket_and_name() {
+        let saved = session();
+        let mut current = saved.clone();
+        current.server_pid = 900;
+        current.session_id = "$0".into();
+        current.created_at += 60;
+        assert!(same_recreated_session(&saved, &current));
+        current.session_name = "other".into();
+        assert!(!same_recreated_session(&saved, &current));
+        current.session_name = saved.session_name.clone();
+        current.socket_path = "/tmp/other/socket".into();
+        assert!(!same_recreated_session(&saved, &current));
+        current.socket_path = saved.socket_path.clone();
+        current.created_at = saved.created_at - 1;
+        assert!(same_recreated_session(&saved, &current));
+    }
+
+    #[test]
+    fn recreate_uses_named_session_pane_directory_and_only_allowlisted_codex_options() {
+        let pane = TmuxPaneRestore {
+            cwd: "/project with spaces".into(),
+            kind: "codex".into(),
+            safe_arguments: vec![
+                "--yolo".into(),
+                "some untrusted prompt; touch /tmp/never-run".into(),
+            ],
+        };
+        let arguments = recreate_arguments(&session(), Some(&pane), Path::new(&pane.cwd)).unwrap();
+        assert_eq!(
+            arguments,
+            [
+                "-S",
+                "/tmp/tmux-test/default",
+                "new-session",
+                "-A",
+                "-s",
+                "qwen",
+                "-c",
+                "/project with spaces",
+                "fish",
+                "-lc",
+                "codex resume --last --dangerously-bypass-approvals-and-sandbox; exec fish -l",
+            ]
+        );
+        let mut dangerous = session();
+        dangerous.session_name = "qwen; kill-server".into();
+        assert!(recreate_arguments(&dangerous, Some(&pane), Path::new(&pane.cwd)).is_none());
+        let legacy = recreate_arguments(&session(), None, Path::new("/project")).unwrap();
+        assert_eq!(legacy.len(), 8);
+        let unsupported = TmuxPaneRestore {
+            kind: "unsupported".into(),
+            ..pane
+        };
+        assert_eq!(
+            recreate_arguments(&session(), Some(&unsupported), Path::new("/project"))
+                .unwrap()
+                .len(),
+            8
+        );
+    }
+
+    #[test]
     fn attach_is_exact_non_detaching_and_does_not_replay_saved_names_as_commands() {
         let mut saved = session();
         saved.session_name = "a; run-shell 'touch /tmp/bad'".into();
@@ -438,6 +888,7 @@ mod tests {
             std::process::id()
         );
         assert!(verify_session(&saved).is_err());
+        assert_eq!(session_status(&saved).unwrap(), SessionStatus::Missing);
         assert!(!Path::new(&saved.socket_path).exists());
     }
 
@@ -467,7 +918,9 @@ mod tests {
 
         fn wait_for_client(&self, pid: u32) {
             let deadline = Instant::now() + Duration::from_secs(2);
-            while !self.clients().iter().any(|client| client.pid == pid as i32) {
+            while !self.socket.exists()
+                || !self.clients().iter().any(|client| client.pid == pid as i32)
+            {
                 assert!(
                     Instant::now() < deadline,
                     "private control client failed to attach"
@@ -509,6 +962,118 @@ mod tests {
                 .spawn()
                 .unwrap(),
         )
+    }
+
+    #[test]
+    #[ignore = "requires tmux; creates and removes only an isolated private test server"]
+    fn private_server_recreates_named_session_and_attaches_second_client() {
+        use std::os::unix::fs::PermissionsExt;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("al-tmux-recreate-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let server = PrivateServer {
+            program: crate::process::executable_path("tmux")
+                .expect("tmux must be installed for this opt-in test"),
+            socket: directory.join("missing-parent/socket"),
+            directory,
+        };
+        let mut saved = session();
+        saved.socket_path = server.socket.display().to_string();
+        let arguments = recreate_arguments(&saved, None, &server.directory).unwrap();
+        assert_eq!(session_status(&saved).unwrap(), SessionStatus::Missing);
+        ensure_socket_parent(&saved.socket_path).unwrap();
+        assert_eq!(
+            std::fs::metadata(server.socket.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let mut first = control_client(&server.program, &arguments);
+        server.wait_for_client(first.0.id());
+        let text = query(&server.socket, "list-sessions", SESSION_FORMAT).unwrap();
+        let created = parse_session(
+            &server.socket,
+            &text.trim_end().split('\t').collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(same_recreated_session(&saved, &created));
+        assert_eq!(server.clients().len(), 1);
+        assert_eq!(
+            capture_pane(&created).unwrap().cwd,
+            server.directory.display().to_string()
+        );
+        let second = control_client(&server.program, &arguments);
+        server.wait_for_client(second.0.id());
+        assert_eq!(server.clients().len(), 2);
+        assert!(first.0.try_wait().unwrap().is_none());
+        assert_eq!(
+            query(&server.socket, "list-sessions", SESSION_FORMAT)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    #[ignore = "requires tmux, fish and htop; creates and removes only an isolated private test server"]
+    fn private_server_recovers_active_program_and_directory() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("al-tmux-pane-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let server = PrivateServer {
+            program: crate::process::executable_path("tmux")
+                .expect("tmux must be installed for this opt-in test"),
+            socket: directory.join("socket"),
+            directory,
+        };
+        assert!(crate::process::executable_path("fish").is_some());
+        assert!(crate::process::executable_path("htop").is_some());
+        let mut saved = session();
+        saved.socket_path = server.socket.display().to_string();
+        let pane = TmuxPaneRestore {
+            cwd: server.directory.display().to_string(),
+            kind: "htop".into(),
+            safe_arguments: Vec::new(),
+        };
+        let arguments = recreate_arguments(&saved, Some(&pane), &server.directory).unwrap();
+        let client = control_client(&server.program, &arguments);
+        server.wait_for_client(client.0.id());
+        let text = query(&server.socket, "list-sessions", SESSION_FORMAT).unwrap();
+        let created = parse_session(
+            &server.socket,
+            &text.trim_end().split('\t').collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut last_observed = String::new();
+        loop {
+            if let Ok(text) = query_pane(&created) {
+                last_observed = text.clone();
+                if let Some(found) = parse_pane(&text)
+                    && found.kind == "htop"
+                {
+                    assert_eq!(found.cwd, pane.cwd);
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "htop did not become the active pane program: {last_observed:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
