@@ -336,6 +336,8 @@ impl eframe::App for App {
             }
         }
 
+        self.update_tmux_metadata();
+
         if let Some(update) = self.firefox_audio_inbox.take_latest(ctx) {
             let changed = !Arc::ptr_eq(&self.firefox_audio_processes, &update.processes);
             self.firefox_audio_processes = update.processes;

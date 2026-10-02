@@ -210,7 +210,8 @@ impl App {
         true
     }
 
-    pub(super) fn apply_window_snapshot(&mut self, new_windows: Vec<WindowInfo>) {
+    pub(super) fn apply_window_snapshot(&mut self, mut new_windows: Vec<WindowInfo>) {
+        self.overlay_tmux_metadata(&mut new_windows);
         if self.windows.is_empty() {
             self.windows = new_windows;
             self.rebuild_window_search_documents();
@@ -222,6 +223,7 @@ impl App {
             self.missing_window_counts.clear();
             self.windows_generation = self.windows_generation.wrapping_add(1);
             self.refresh_window_audio_cache();
+            self.tmux_monitor.sync_windows(&self.windows);
             return;
         }
 
@@ -285,6 +287,7 @@ impl App {
             })
             .collect::<Vec<_>>();
         self.windows = merged;
+        self.tmux_monitor.sync_windows(&self.windows);
         applicationlauncher::observability::set_gauge(
             applicationlauncher::observability::Gauge::GuiWindows,
             self.windows.len(),
@@ -401,7 +404,7 @@ impl App {
                     needs_terminal_metadata_refresh |= terminal_payload
                         && terminal_record_for_window_title(&payload.title, &terminal_records)
                             .is_none();
-                    if let Some(window) = window_info_from_kwin_payload(
+                    if let Some(mut window) = window_info_from_kwin_payload(
                         payload,
                         &theme,
                         &mut self.window_icon_cache,
@@ -410,6 +413,9 @@ impl App {
                         &pid_to_ppid,
                         &terminal_records,
                     ) {
+                        if let Some(metadata) = self.tmux_metadata.get(&window.id) {
+                            metadata.apply(&mut window);
+                        }
                         self.missing_window_counts.remove(&window.id);
                         if let Some(existing) =
                             self.windows.iter_mut().find(|item| item.id == window.id)
@@ -448,6 +454,7 @@ impl App {
         }
 
         if changed {
+            self.tmux_monitor.sync_windows(&self.windows);
             applicationlauncher::observability::set_gauge(
                 applicationlauncher::observability::Gauge::GuiWindows,
                 self.windows.len(),
@@ -540,7 +547,8 @@ impl App {
         });
     }
 
-    pub(super) fn apply_window_reconciliation(&mut self, discovered: Vec<WindowInfo>) {
+    pub(super) fn apply_window_reconciliation(&mut self, mut discovered: Vec<WindowInfo>) {
+        self.overlay_tmux_metadata(&mut discovered);
         for window in &discovered {
             self.missing_window_counts.remove(&window.id);
         }
@@ -550,12 +558,47 @@ impl App {
             return;
         }
 
+        self.tmux_monitor.sync_windows(&self.windows);
         self.seed_window_icon_cache();
         self.update_cached_windows_without_rerank(&cache_updates);
         if search_changed {
             self.schedule_window_search_refresh();
         }
         self.refresh_window_audio_cache();
+    }
+
+    fn overlay_tmux_metadata(&self, windows: &mut [WindowInfo]) {
+        for window in windows {
+            if let Some(metadata) = self.tmux_metadata.get(&window.id) {
+                metadata.apply(window);
+            }
+        }
+    }
+
+    pub(super) fn update_tmux_metadata(&mut self) {
+        let Some(latest) = self.tmux_monitor.take_latest() else {
+            return;
+        };
+        self.tmux_metadata = latest;
+        let mut updates = Vec::new();
+        for window in &self.windows {
+            let mut updated = window.clone();
+            if let Some(metadata) = self.tmux_metadata.get(&window.id) {
+                metadata.apply(&mut updated);
+            } else if updated.tmux_pane.take().is_some() {
+                updated.title = normalize_terminal_title_marker_position(&updated.raw_title);
+                updated.active_process = None;
+                updated.cwd_path = None;
+                updated.command_line = None;
+                updated.command_summary = None;
+                updated.process_chain.clear();
+            }
+            if updated != *window {
+                updates.push(updated);
+            }
+        }
+        // Spinner frames follow the existing transient-title cache path, not fuzzy reranking.
+        self.apply_window_reconciliation(updates);
     }
 
     pub(super) fn start_background_app_load(&mut self) {

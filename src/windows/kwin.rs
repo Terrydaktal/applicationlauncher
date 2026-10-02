@@ -202,6 +202,7 @@ pub(crate) fn build_window_info(
         command_summary,
         geometry,
         process_chain,
+        tmux_pane: None,
         pid,
         last_activated_at_ms: None,
         activation_sequence: 0,

@@ -434,6 +434,7 @@ mod tests {
             command_summary: None,
             geometry: None,
             process_chain: Vec::new(),
+            tmux_pane: None,
             pid: Some(pid),
             last_activated_at_ms: None,
             activation_sequence: 0,

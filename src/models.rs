@@ -45,6 +45,7 @@ pub struct WindowInfo {
     pub command_summary: Option<String>,
     pub geometry: Option<(i32, i32, i32, i32)>,
     pub process_chain: Vec<ProcessChainEntry>,
+    pub tmux_pane: Option<applicationlauncher::tracker::LiveTmuxPane>,
     pub pid: Option<i32>,
     pub last_activated_at_ms: Option<i64>,
     pub activation_sequence: i64,

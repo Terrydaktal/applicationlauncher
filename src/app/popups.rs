@@ -155,7 +155,7 @@ impl App {
             searched,
         };
 
-        InfoPopupData {
+        let mut data = InfoPopupData {
             title: format!("Window Info: {}", window_info.title),
             heading: window_info.title.clone(),
             subtitle: "Window metadata, process details, and execution chain".to_string(),
@@ -262,7 +262,17 @@ impl App {
                     )
                 })
                 .collect(),
+        };
+        if let Some(pane) = &window_info.tmux_pane {
+            data.rows.extend([
+                row("Tmux session", pane.session.session_name.clone(), true),
+                row("Tmux socket", pane.session.socket_path.clone(), false),
+                row("Tmux client PID", pane.client_pid.to_string(), false),
+                row("Tmux active pane", pane.pane_id.clone(), false),
+                row("Tmux pane title", pane.title.clone(), false),
+            ]);
         }
+        data
     }
 
     pub(super) fn app_info_popup_data(&self, app_info: &AppInfo) -> InfoPopupData {
@@ -393,11 +403,13 @@ impl App {
             .cloned()
             .unwrap_or(window_snapshot);
 
+        let data = self.window_info_popup_data(&window_info);
+
         if !ctx.embed_viewports() {
             show_deferred_info_popup(
                 ctx,
                 egui::ViewportId::from_hash_of("launcher_process_chain_popup"),
-                self.window_info_popup_data(&window_info),
+                data,
                 [760.0, 680.0],
                 [520.0, 360.0],
                 PopupEvent::CloseWindowInfo,
@@ -413,7 +425,7 @@ impl App {
             .min_size([520.0, 360.0])
             .resizable(true)
             .collapsible(false)
-            .vscroll(true)
+            .vscroll(false)
             .order(egui::Order::Foreground)
             .frame(
                 egui::Frame::window(&ctx.style())
@@ -426,203 +438,9 @@ impl App {
             )
             .open(&mut is_open)
             .show(ctx, |ui| {
-                let searchable_label_color = egui::Color32::from_rgb(214, 184, 86);
-                let searchable_value_color = egui::Color32::from_rgb(255, 236, 170);
-                let neutral_label_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170);
-                let neutral_value_color = egui::Color32::WHITE;
-                let app_key = window_application_key(&window_info);
-                let exe_basename = window_info
-                    .exe_path
-                    .as_ref()
-                    .and_then(|path| path.file_name().and_then(|name| name.to_str()))
-                    .map(|name| name.to_string())
-                    .unwrap_or_else(|| "Unavailable".to_string());
-                let active_process_exe_path = window_info
-                    .active_process
-                    .as_ref()
-                    .and_then(|_| window_info.process_chain.first())
-                    .and_then(|entry| entry.exe_path.clone());
-                let active_process_desktop_file = window_info
-                    .active_process
-                    .as_deref()
-                    .and_then(|process| self.desktop_file_path_for_process(process))
-                    .map(|path| path.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "Unavailable".to_string());
-                let desktop_file_path = self
-                    .desktop_file_path_for_window(&window_info)
-                    .map(|path| path.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "Unavailable".to_string());
-                let cwd_search_value = window_info
-                    .cwd_path
-                    .as_ref()
-                    .map(|path| display_path(path))
-                    .unwrap_or_else(|| "Unavailable".to_string());
-                let class_is_searched = !window_info.class.eq_ignore_ascii_case(&app_key);
-
-                let info_row = |ui: &mut egui::Ui, label: &str, value: String, searched: bool| {
-                    let label_color = if searched {
-                        searchable_label_color
-                    } else {
-                        neutral_label_color
-                    };
-                    let value_color = if searched {
-                        searchable_value_color
-                    } else {
-                        neutral_value_color
-                    };
-                    ui.label(egui::RichText::new(label).color(label_color).strong());
-                    ui.label(egui::RichText::new(value).color(value_color).monospace());
-                    ui.end_row();
-                };
-
-                ui.heading(
-                    egui::RichText::new(&window_info.title)
-                        .color(egui::Color32::WHITE)
-                        .strong(),
-                );
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new("Window metadata, process details, and execution chain")
-                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170)),
-                );
-                ui.add_space(10.0);
-
-                egui::Grid::new("window_info_grid")
-                    .num_columns(2)
-                    .spacing([14.0, 8.0])
-                    .striped(true)
-                    .show(ui, |ui| {
-                        info_row(ui, "Title", window_info.title.clone(), true);
-                        info_row(ui, "Raw window title", window_info.raw_title.clone(), false);
-                        info_row(ui, "Application key", app_key.clone(), true);
-                        info_row(ui, "Window ID", window_info.id.clone(), false);
-                        info_row(ui, "Class", window_info.class.clone(), class_is_searched);
-                        info_row(ui, "Window desktop file", desktop_file_path, false);
-                        info_row(
-                            ui,
-                            "Window PID",
-                            window_info
-                                .pid
-                                .map(|pid| pid.to_string())
-                                .unwrap_or_else(|| "Unavailable".to_string()),
-                            false,
-                        );
-                        info_row(
-                            ui,
-                            "Active process",
-                            window_info
-                                .active_process
-                                .clone()
-                                .unwrap_or_else(|| "Unavailable".to_string()),
-                            true,
-                        );
-                        info_row(ui, "Window executable", exe_basename, true);
-                        info_row(
-                            ui,
-                            "Window executable path",
-                            window_info
-                                .exe_path
-                                .as_ref()
-                                .map(|path| path.to_string_lossy().to_string())
-                                .unwrap_or_else(|| "Unavailable".to_string()),
-                            false,
-                        );
-                        info_row(
-                            ui,
-                            "Active process executable path",
-                            active_process_exe_path
-                                .as_ref()
-                                .map(|path| path.to_string_lossy().to_string())
-                                .unwrap_or_else(|| "Unavailable".to_string()),
-                            false,
-                        );
-                        info_row(
-                            ui,
-                            "Active process desktop file",
-                            active_process_desktop_file,
-                            false,
-                        );
-                        info_row(ui, "Working directory", cwd_search_value, true);
-                        info_row(
-                            ui,
-                            "Command summary",
-                            window_info
-                                .command_summary
-                                .clone()
-                                .unwrap_or_else(|| "Unavailable".to_string()),
-                            true,
-                        );
-                        info_row(
-                            ui,
-                            "Command line",
-                            window_info
-                                .command_line
-                                .clone()
-                                .unwrap_or_else(|| "Unavailable".to_string()),
-                            true,
-                        );
-                        info_row(
-                            ui,
-                            "Geometry",
-                            window_info
-                                .geometry
-                                .map(|(x, y, width, height)| {
-                                    format!("x={}, y={}, width={}, height={}", x, y, width, height)
-                                })
-                                .unwrap_or_else(|| "Unavailable".to_string()),
-                            false,
-                        );
-                        info_row(
-                            ui,
-                            "Minimized",
-                            window_info
-                                .minimized
-                                .map(|value| value.to_string())
-                                .unwrap_or_else(|| "Unavailable".to_string()),
-                            false,
-                        );
-                        info_row(
-                            ui,
-                            "Last activated",
-                            format_activation_time(window_info.last_activated_at_ms),
-                            false,
-                        );
-                        info_row(
-                            ui,
-                            "Activation sequence",
-                            window_info.activation_sequence.to_string(),
-                            false,
-                        );
-                    });
-
-                ui.add_space(14.0);
-                ui.separator();
-                ui.add_space(10.0);
-                ui.label(
-                    egui::RichText::new("Execution chain")
-                        .color(egui::Color32::WHITE)
-                        .strong(),
-                );
-                ui.add_space(6.0);
-                for entry in &window_info.process_chain {
-                    ui.group(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("{} (pid {})", entry.name, entry.pid))
-                                .color(egui::Color32::WHITE)
-                                .strong(),
-                        );
-                        let path_text = entry
-                            .exe_path
-                            .as_ref()
-                            .map(|path| path.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "Executable path unavailable".to_string());
-                        ui.label(
-                            egui::RichText::new(path_text)
-                                .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160)),
-                        );
-                    });
-                    ui.add_space(6.0);
-                }
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| render_info_popup_panel(ui, &data));
             });
 
         if !is_open {

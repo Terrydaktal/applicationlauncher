@@ -238,6 +238,14 @@ pub(crate) fn terminal_display_title(
         .strip_prefix("- ")
         .unwrap_or(raw_title.trim());
 
+    let dynamic_title = strip_terminal_title_marker(raw_title);
+    // These titles already contain their program/context in the user's selected order.
+    if dynamic_title.starts_with("tmux: ")
+        || (is_codex_process(proc_name) && is_configured_codex_title(dynamic_title))
+    {
+        return format!("{dynamic_title} - Terminal");
+    }
+
     if normalize_app_match_key(proc_name) == "ssh"
         && let Some(title) = ssh_terminal_display_title(raw_title, parent_program)
     {
@@ -284,6 +292,72 @@ pub(crate) fn terminal_display_title(
     terminal_title_segments(raw_title, proc_name, command_summary, cwd, parent_program).join(" - ")
 }
 
+pub(crate) fn is_configured_codex_title(title: &str) -> bool {
+    [" | ", " - "].into_iter().any(|separator| {
+        title.split(separator).any(|part| {
+            (part == "codex" && title.contains(separator))
+                || part
+                    .strip_prefix("codex ")
+                    .is_some_and(|rest| rest.chars().next().is_some_and(is_braille_spinner_char))
+        })
+    })
+}
+
+pub(crate) fn tmux_codex_display_title(pane_title: &str, cwd: &str) -> String {
+    let spinner = pane_title.chars().find(|ch| is_braille_spinner_char(*ch));
+    let attention = crate::search::attention_required_frame(pane_title);
+    let mut clean = String::with_capacity(pane_title.len());
+    for (index, part) in pane_title.split(is_braille_spinner_char).enumerate() {
+        clean.push_str(if index == 0 {
+            part
+        } else {
+            part.trim_start_matches(' ')
+        });
+    }
+    if clean.contains(" - ") {
+        clean = clean.replace(" - ", " | ");
+    }
+    let mut body = clean.trim();
+    if let Some(marker) = attention
+        && let Some(rest) = body.strip_prefix(marker)
+    {
+        body = rest
+            .strip_prefix(" | ")
+            .or_else(|| rest.strip_prefix(" - "))
+            .unwrap_or(rest)
+            .trim_start_matches(' ');
+    }
+    // New selections put app/cwd first; legacy selections put the project last.
+    let configured_context = body
+        .strip_prefix("codex | ")
+        .or_else(|| body.strip_prefix("codex "))
+        .filter(|rest| rest.starts_with(['~', '/']));
+    let task = if let Some(rest) = configured_context {
+        rest.split_once(" | ").map_or("", |(_, task)| task)
+    } else if terminal_path_basename(cwd).is_some_and(|basename| body == basename) {
+        ""
+    } else {
+        body.rsplit_once(" | ").map_or(body, |(task, _)| task)
+    };
+
+    let mut title = String::from("codex: ");
+    if let Some(spinner) = spinner {
+        title.push(spinner);
+        title.push(' ');
+    }
+    if let Some(marker) = attention {
+        title.push_str(marker);
+        title.push(' ');
+    }
+    title.push_str(cwd);
+    if !task.is_empty() {
+        title.push_str(" - ");
+        title.push_str(&task.replace(" | ", " - "));
+    }
+    title.push_str(" - Terminal");
+    title
+}
+
 fn ssh_terminal_display_title(raw_title: &str, parent_program: Option<&str>) -> Option<String> {
     let dynamic_title = strip_terminal_title_marker(raw_title);
     let closing_bracket = dynamic_title.find(']')?;
@@ -314,6 +388,12 @@ fn strip_terminal_title_marker(raw_title: &str) -> &str {
         if let Some(dynamic_title) = raw_title
             .strip_suffix("Terminal")
             .and_then(|title| title.strip_suffix(separator))
+        {
+            return dynamic_title.trim();
+        }
+        if let Some(dynamic_title) = raw_title
+            .strip_prefix("Terminal")
+            .and_then(|title| title.strip_prefix(separator))
         {
             return dynamic_title.trim();
         }

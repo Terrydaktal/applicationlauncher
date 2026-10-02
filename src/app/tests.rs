@@ -77,6 +77,7 @@ mod tests {
             command_summary: Some("codex resume".to_string()),
             geometry: Some((0, 0, 800, 600)),
             process_chain: Vec::new(),
+            tmux_pane: None,
             pid: Some(1234),
             last_activated_at_ms: Some(0),
             activation_sequence: 1,
@@ -771,6 +772,111 @@ mod tests {
     fn codex_code_mode_uses_codex_terminal_title() {
         assert_eq!(terminal_primary_title("codex-code-mode", None), "codex");
         assert_eq!(terminal_primary_title("codex", None), "codex");
+    }
+
+    #[test]
+    fn canonical_tmux_codex_titles_cover_legacy_tasks_activity_and_real_directories() {
+        for (raw, expected) in [
+            (
+                "Check ChatGPT link access | diet",
+                "~/tasks/diet - Check ChatGPT link access",
+            ),
+            ("codex repair | diet", "~/tasks/diet - codex repair"),
+            (
+                "codex - ~/tasks/diet - Check ChatGPT link access",
+                "~/tasks/diet - Check ChatGPT link access",
+            ),
+            (
+                "codex \u{280b} ~/tasks/diet - Check ChatGPT link access",
+                "\u{280b} ~/tasks/diet - Check ChatGPT link access",
+            ),
+            (
+                "[ ! ] Action Required - codex - ~/tasks/diet - Check ChatGPT link access",
+                "[ ! ] Action Required ~/tasks/diet - Check ChatGPT link access",
+            ),
+            ("codex - ~", "~/tasks/diet"),
+            (
+                "\u{280b} Check ChatGPT link access | diet",
+                "\u{280b} ~/tasks/diet - Check ChatGPT link access",
+            ),
+            (
+                "[ ! ] Action Required | Check ChatGPT link access | diet",
+                "[ ! ] Action Required ~/tasks/diet - Check ChatGPT link access",
+            ),
+            (
+                "codex | ~/truncated/cwd... | Task | literal",
+                "~/tasks/diet - Task - literal",
+            ),
+            (
+                "codex \u{280b} ~/truncated/cwd... | Task | literal",
+                "\u{280b} ~/tasks/diet - Task - literal",
+            ),
+            ("Task | literal | diet", "~/tasks/diet - Task - literal"),
+            ("diet | diet", "~/tasks/diet - diet"),
+            ("diet", "~/tasks/diet"),
+            ("\u{280b} diet", "\u{280b} ~/tasks/diet"),
+        ] {
+            assert_eq!(
+                tmux_codex_display_title(raw, "~/tasks/diet"),
+                format!("codex: {expected} - Terminal")
+            );
+        }
+        assert_eq!(
+            tmux_codex_display_title("Task | old-project", "~/new folder"),
+            "codex: ~/new folder - Task - Terminal"
+        );
+    }
+
+    #[test]
+    fn configured_codex_and_tmux_titles_preserve_the_actual_desktop_field_order() {
+        for dynamic_title in [
+            "codex - ~/tasks/diet - Check ChatGPT link access",
+            "codex \u{280b} ~/tasks/diet - Check ChatGPT link access",
+            "[ ! ] Action Required - codex - ~/tasks/diet - Check ChatGPT link access",
+            "codex - ~",
+            "codex | ~/tasks/diet | Check ChatGPT link access",
+            "codex \u{280b} ~/tasks/diet | Check ChatGPT link access",
+            "[ ! ] Action Required | codex | ~/tasks/diet | Check ChatGPT link access",
+        ] {
+            let expected = format!("{dynamic_title} - Terminal");
+            for raw_title in [
+                dynamic_title.to_string(),
+                expected.clone(),
+                format!("Terminal - {dynamic_title}"),
+            ] {
+                assert_eq!(
+                    terminal_display_title(
+                        &raw_title,
+                        "codex",
+                        Some("codex resume --last"),
+                        Some("~/tasks/diet"),
+                        None,
+                    ),
+                    expected
+                );
+            }
+            let tmux_title = format!("tmux: diet - {expected}");
+            assert_eq!(
+                terminal_display_title(
+                    &tmux_title,
+                    "tmux: client",
+                    Some("tmux new-session -A -s diet"),
+                    Some("~"),
+                    None,
+                ),
+                tmux_title
+            );
+        }
+        assert_eq!(
+            terminal_display_title(
+                "codex - Terminal",
+                "codex",
+                None,
+                Some("~/tasks/diet"),
+                None
+            ),
+            "codex - ~/tasks/diet - Terminal"
+        );
     }
 
     #[test]

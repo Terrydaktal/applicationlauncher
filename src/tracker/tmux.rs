@@ -19,6 +19,211 @@ const CLIENT_FORMAT: &str =
     "#{client_pid}\t#{session_id}\t#{session_created}\t#{pid}\t#{session_name}";
 const SESSION_FORMAT: &str = "#{session_id}\t#{session_created}\t#{pid}\t#{session_name}";
 const PANE_FORMAT: &str = "#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}";
+// Literal C0/DEL bounds avoid colons that tmux treats as modifier separators.
+const LIVE_CLIENT_FORMAT: &str = "#{client_pid}\t#{session_id}\t#{session_created}\t#{pid}\t#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{s|[\x01-\x1f\x7f]| |g:pane_title}";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveTmuxPane {
+    pub client_pid: i32,
+    pub session: TmuxSession,
+    pub pane_id: String,
+    pub pane_pid: i32,
+    pub process_pid: i32,
+    pub process_name: String,
+    pub cwd: PathBuf,
+    pub title: String,
+}
+
+/// Read-only, fresh per-client pane metadata. Call from a background worker.
+/// Missing clients are returned as None; failed servers retain the last known
+/// value in the caller until its short expiry rather than flashing stale titles.
+pub fn capture_live_client_panes(client_pids: &[i32]) -> HashMap<i32, Option<LiveTmuxPane>> {
+    let deadline = Instant::now() + SNAPSHOT_REFRESH_BUDGET;
+    let mut sockets: HashMap<PathBuf, Vec<i32>> = HashMap::new();
+    let mut results = HashMap::new();
+    for &pid in client_pids.iter().take(MAX_CLIENTS) {
+        let Some(socket) = live_client_socket(pid) else {
+            results.insert(pid, None);
+            continue;
+        };
+        if sockets.len() < MAX_SERVERS || sockets.contains_key(&socket) {
+            sockets.entry(socket).or_default().push(pid);
+        }
+    }
+    for (socket, pids) in sockets {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Some(panes) = query(&socket, "list-clients", LIVE_CLIENT_FORMAT)
+            .ok()
+            .and_then(|text| parse_live_clients(&socket, &text))
+        else {
+            continue;
+        };
+        for pid in pids {
+            results.insert(pid, panes.get(&pid).and_then(resolve_live_pane));
+        }
+    }
+    results
+}
+
+fn live_client_socket(pid: i32) -> Option<PathBuf> {
+    let process = PathBuf::from(format!("/proc/{pid}"));
+    if pid <= 0 || std::fs::metadata(&process).ok()?.uid() != rustix::process::getuid().as_raw() {
+        return None;
+    }
+    let read = |name: &str| {
+        let mut bytes = Vec::new();
+        std::fs::File::open(process.join(name))
+            .ok()?
+            .take((MAX_METADATA_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        (bytes.len() <= MAX_METADATA_BYTES).then_some(bytes)
+    };
+    let command = read("cmdline")?;
+    let arguments: Vec<String> = command
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .map(|argument| String::from_utf8_lossy(argument).into_owned())
+        .collect();
+    let executable = std::fs::read_link(process.join("exe")).ok()?;
+    if executable
+        .file_name()?
+        .to_str()?
+        .trim_end_matches(" (deleted)")
+        != "tmux"
+    {
+        return None;
+    }
+    let environment = read("environ")?;
+    let cwd = std::fs::read_link(process.join("cwd")).ok();
+    socket_path(
+        &arguments,
+        &environment,
+        cwd.as_deref().and_then(Path::to_str),
+        rustix::process::getuid().as_raw(),
+    )
+}
+
+struct LiveClientRow {
+    pid: i32,
+    session: TmuxSession,
+    pane_id: String,
+    pane_pid: i32,
+    cwd: PathBuf,
+    title: String,
+}
+
+fn parse_live_clients(socket: &Path, text: &str) -> Option<HashMap<i32, LiveClientRow>> {
+    if text.len() > MAX_METADATA_BYTES {
+        return None;
+    }
+    let mut clients = HashMap::new();
+    for line in text.lines() {
+        if clients.len() >= MAX_CLIENTS {
+            return None;
+        }
+        let fields: Vec<_> = line.splitn(10, '\t').collect();
+        if fields.len() != 10 {
+            return None;
+        }
+        let pid = fields[0].parse().ok().filter(|pid| *pid > 0)?;
+        let pane_pid = fields[6].parse().ok().filter(|pid| *pid > 0)?;
+        let pane_number = fields[5].strip_prefix('%')?;
+        if pane_number.parse::<u64>().is_err()
+            || !Path::new(fields[7]).is_absolute()
+            || !valid_text(fields[7])
+            || fields[9].len() > 4096
+        {
+            return None;
+        }
+        let row = LiveClientRow {
+            pid,
+            session: parse_session(socket, &fields[1..5])?,
+            pane_id: fields[5].into(),
+            pane_pid,
+            cwd: PathBuf::from(fields[7]),
+            title: fields[9].chars().filter(|ch| !ch.is_control()).collect(),
+        };
+        if clients.insert(pid, row).is_some() {
+            return None;
+        }
+    }
+    Some(clients)
+}
+
+fn resolve_live_pane(row: &LiveClientRow) -> Option<LiveTmuxPane> {
+    let client = pane_process_stat(row.pid)?;
+    let pane = pane_process_stat(row.pane_pid)?;
+    let server = pane_process_stat(row.session.server_pid)?;
+    // Do not associate an unrelated/reused pane PID with a terminal client.
+    if !client.name.starts_with("tmux") || !server.name.starts_with("tmux") {
+        return None;
+    }
+    let process_pid = live_foreground_process(row.pane_pid)?;
+    let process = pane_process_stat(process_pid)?;
+    if !in_pane_foreground_group(&process, &pane) {
+        return None;
+    }
+    let cwd = std::fs::read_link(format!("/proc/{process_pid}/cwd"))
+        .ok()
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| row.cwd.clone());
+    Some(LiveTmuxPane {
+        client_pid: row.pid,
+        session: row.session.clone(),
+        pane_id: row.pane_id.clone(),
+        pane_pid: row.pane_pid,
+        process_pid,
+        process_name: process.name,
+        cwd,
+        title: row.title.clone(),
+    })
+}
+
+fn live_foreground_process(pane_pid: i32) -> Option<i32> {
+    let root = pane_process_stat(pane_pid)?;
+    let mut queue = VecDeque::from([(pane_pid, 0)]);
+    let mut visited = HashSet::new();
+    let mut best = None;
+    while let Some((pid, depth)) = queue.pop_front() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        if visited.len() > MAX_PANE_PROCESSES {
+            return None;
+        }
+        let Some(stat) = pane_process_stat(pid) else {
+            continue;
+        };
+        if stat.session != root.session || stat.tty != root.tty {
+            continue;
+        }
+        if in_pane_foreground_group(&stat, &root) && best.is_none_or(|old| (depth, pid) > old) {
+            best = Some((depth, pid));
+        }
+        let mut children = String::new();
+        if let Ok(file) = std::fs::File::open(format!("/proc/{pid}/task/{pid}/children"))
+            && file
+                .take((MAX_PANE_PROCESSES * 16 + 1) as u64)
+                .read_to_string(&mut children)
+                .is_ok()
+        {
+            if children.len() > MAX_PANE_PROCESSES * 16 {
+                return None;
+            }
+            queue.extend(
+                children
+                    .split_whitespace()
+                    .filter_map(|child| child.parse::<i32>().ok())
+                    .take(MAX_PANE_PROCESSES.saturating_sub(visited.len() + queue.len()))
+                    .map(|child| (child, depth + 1)),
+            );
+        }
+    }
+    best.map(|(_, pid)| pid)
+}
 
 #[derive(Clone)]
 struct ClientSession {
@@ -664,6 +869,64 @@ pub(super) fn attach_arguments(session: &TmuxSession) -> Option<Vec<String>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn live_client_rows_keep_client_pane_identity_and_spinner_titles() {
+        let text = "100\t$7\t123\t800\tdiet\t%1\t400\t/project/diet\tcodex\t\u{280b} diet\n101\t$7\t123\t800\tdiet\t%2\t500\t/project/other\tfish\tother\n";
+        let clients = parse_live_clients(Path::new("/tmp/tmux-test/default"), text).unwrap();
+        assert_eq!(clients.len(), 2);
+        assert_eq!(clients[&100].title, "\u{280b} diet");
+        assert_eq!(clients[&100].pane_id, "%1");
+        assert_eq!(clients[&101].pane_id, "%2");
+        assert_eq!(clients[&100].session, clients[&101].session);
+        assert!(parse_live_clients(Path::new("/tmp/socket"), &format!("{text}{text}")).is_none());
+        assert!(
+            parse_live_clients(Path::new("/tmp/socket"), &text.replace("%1", "not-a-pane"))
+                .is_none()
+        );
+        assert!(
+            parse_live_clients(
+                Path::new("/tmp/socket"),
+                &text.replace("/project/diet", "relative")
+            )
+            .is_none()
+        );
+        assert!(
+            parse_live_clients(
+                Path::new("/tmp/socket"),
+                &"x".repeat(MAX_METADATA_BYTES + 1)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    #[ignore = "read-only probe; requires APPLICATIONLAUNCHER_TEST_TMUX_CLIENT_PIDS"]
+    fn live_tmux_pane_probe() {
+        let pids: Vec<i32> = std::env::var("APPLICATIONLAUNCHER_TEST_TMUX_CLIENT_PIDS")
+            .expect("provide exact live tmux client PIDs")
+            .split(',')
+            .map(|pid| pid.parse().unwrap())
+            .collect();
+        let panes = capture_live_client_panes(&pids);
+        for pid in pids {
+            let pane = panes
+                .get(&pid)
+                .and_then(Option::as_ref)
+                .expect("each client must resolve to its own live pane");
+            assert_eq!(pane.client_pid, pid);
+            assert!(pane.cwd.is_absolute());
+            assert!(pane.process_pid > 0);
+            eprintln!(
+                "tmux client {pid}: session={} pane={} process={} cwd={} title={}",
+                pane.session.session_name,
+                pane.pane_id,
+                pane.process_name,
+                pane.cwd.display(),
+                pane.title
+            );
+        }
+    }
+
     fn args(arguments: &[&str]) -> Vec<String> {
         arguments.iter().map(|arg| (*arg).into()).collect()
     }
@@ -966,6 +1229,93 @@ mod tests {
 
     #[test]
     #[ignore = "requires tmux; creates and removes only an isolated private test server"]
+    fn private_server_live_titles_preserve_spinners_and_escape_record_controls() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("al-tmux-titles-{}-{nonce}", std::process::id()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let server = PrivateServer {
+            program: crate::process::executable_path("tmux").expect("tmux must be installed"),
+            socket: directory.join("server.sock"),
+            directory,
+        };
+        let arguments = args(&[
+            "-S",
+            server.socket.to_str().unwrap(),
+            "-f",
+            "/dev/null",
+            "new-session",
+            "-s",
+            "title-probe",
+            "--",
+            "/bin/sleep",
+            "60",
+        ]);
+        let client = control_client(&server.program, &arguments);
+        server.wait_for_client(client.0.id());
+        for (title, expected) in [
+            ("\u{280b} Working | test", "\u{280b} Working | test"),
+            ("\u{2819} Working | test", "\u{2819} Working | test"),
+            (
+                "[ ! ] Action Required | test",
+                "[ ! ] Action Required | test",
+            ),
+            (
+                "[ . ] Action Required | test",
+                "[ . ] Action Required | test",
+            ),
+        ] {
+            let mut command = server.command();
+            command.args(["select-pane", "-t", "=title-probe:.", "-T", title]);
+            assert!(
+                crate::process::output_with_timeout(command, Duration::from_secs(1))
+                    .unwrap()
+                    .status
+                    .success()
+            );
+            let text = query(&server.socket, "list-clients", LIVE_CLIENT_FORMAT).unwrap();
+            let rows = parse_live_clients(&server.socket, &text).unwrap();
+            assert_eq!(rows[&(client.0.id() as i32)].title, expected);
+            let panes = capture_live_client_panes(&[client.0.id() as i32]);
+            assert_eq!(
+                panes[&(client.0.id() as i32)].as_ref().unwrap().title,
+                expected
+            );
+        }
+        // Pane titles reject control bytes; exercise the exact formatter with a
+        // user option so record-delimiter sanitization is independently covered.
+        let mut command = server.command();
+        command.args([
+            "set-option",
+            "-g",
+            "@title-probe",
+            "\u{280b}a\tb\nc\rd\x1be\x7ff",
+        ]);
+        assert!(
+            crate::process::output_with_timeout(command, Duration::from_secs(1))
+                .unwrap()
+                .status
+                .success()
+        );
+        let text = query(
+            &server.socket,
+            "list-clients",
+            &LIVE_CLIENT_FORMAT.replace(":pane_title}", ":@title-probe}"),
+        )
+        .unwrap();
+        let rows = parse_live_clients(&server.socket, &text)
+            .unwrap_or_else(|| panic!("formatter left invalid row delimiters: {text:?}"));
+        assert_eq!(rows[&(client.0.id() as i32)].title, "\u{280b}a b c d e f");
+    }
+
+    #[test]
+    #[ignore = "requires tmux; creates and removes only an isolated private test server"]
     fn private_server_recreates_named_session_and_attaches_second_client() {
         use std::os::unix::fs::PermissionsExt;
         let nonce = std::time::SystemTime::now()
@@ -1074,6 +1424,11 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+        let clients = capture_live_client_panes(&[client.0.id() as i32]);
+        let live = clients[&(client.0.id() as i32)].as_ref().unwrap();
+        assert_eq!(live.process_name, "htop");
+        assert_eq!(live.cwd.to_str(), Some(pane.cwd.as_str()));
+        assert_eq!(live.session, created);
     }
 
     #[test]

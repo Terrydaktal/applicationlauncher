@@ -300,6 +300,8 @@ pub(crate) struct App {
     process_tree_cache_receiver: Option<Receiver<crate::windows::process::ProcessTree>>,
     deferred_window_feed_events: Vec<WindowFeedEvent>,
     terminal_metadata_apply_queued: bool,
+    tmux_monitor: TmuxMonitor,
+    tmux_metadata: HashMap<String, TmuxWindowMetadata>,
     popup_event_sender: Sender<PopupEvent>,
     popup_event_receiver: Receiver<PopupEvent>,
     window_sender: SyncSender<Vec<WindowInfo>>,
@@ -676,6 +678,10 @@ impl App {
         let window_feed_inbox = Arc::new(std::sync::Mutex::new(None));
         let last_frame_cpu_micros = Arc::new(AtomicU32::new(0));
         let audio_inbox = start_audio_monitor(cc.egui_ctx.clone());
+        let tmux_monitor = TmuxMonitor::new(
+            cc.egui_ctx.clone(),
+            force_theme.as_deref().unwrap_or("breeze-dark").to_string(),
+        );
         let firefox_audio_inbox = start_firefox_audio_bridge(cc.egui_ctx.clone());
         let (_terminal_action_tx, terminal_action_rx) = std::sync::mpsc::channel();
         let (auto_enter_update_sender, auto_enter_update_receiver) =
@@ -823,6 +829,8 @@ impl App {
             process_tree_cache_receiver: None,
             deferred_window_feed_events: Vec::new(),
             terminal_metadata_apply_queued: false,
+            tmux_monitor,
+            tmux_metadata: HashMap::new(),
             popup_event_sender: popup_event_tx,
             popup_event_receiver: popup_event_rx,
             window_sender: window_tx.clone(),
