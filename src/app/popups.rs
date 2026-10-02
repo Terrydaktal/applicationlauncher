@@ -263,6 +263,9 @@ impl App {
                 })
                 .collect(),
         };
+        let (window_versions, active_process_versions) = self.window_version_rows(window_info);
+        data.rows.extend(window_versions);
+        data.rows.extend(active_process_versions);
         if let Some(pane) = &window_info.tmux_pane {
             data.rows.extend([
                 row("Tmux session", pane.session.session_name.clone(), true),
@@ -273,6 +276,59 @@ impl App {
             ]);
         }
         data
+    }
+
+    fn window_version_rows(&self, window: &WindowInfo) -> (Vec<InfoPopupRow>, Vec<InfoPopupRow>) {
+        let target = WindowVersionTarget::for_window(window);
+        let lookup = self
+            .window_version_lookup
+            .as_ref()
+            .filter(|lookup| lookup.target == target);
+        let unavailable = || {
+            if lookup.is_some_and(|lookup| lookup.result.is_some()) {
+                "Unavailable".to_string()
+            } else {
+                "Loading...".to_string()
+            }
+        };
+        let versions = lookup.and_then(|lookup| lookup.result.as_ref());
+        let rows = |role: &str, version: Option<&crate::windows::versions::ProcessVersion>| {
+            [
+                (
+                    "version",
+                    version.and_then(|version| version.version.clone()),
+                ),
+                (
+                    "version source",
+                    version.and_then(|version| version.source.clone()),
+                ),
+                (
+                    "installed package",
+                    version.and_then(|version| version.package.clone()),
+                ),
+                (
+                    "ELF build ID",
+                    version.and_then(|version| version.build_id.clone()),
+                ),
+            ]
+            .into_iter()
+            .map(|(suffix, value)| InfoPopupRow {
+                label: format!("{role} {suffix}"),
+                value: value.unwrap_or_else(unavailable),
+                searched: false,
+            })
+            .collect()
+        };
+        let owner = rows(
+            "Window application",
+            versions.map(|versions| &versions.owner),
+        );
+        let active = if is_terminal_class(&window.class.to_lowercase()) {
+            rows("Active process", versions.map(|versions| &versions.active))
+        } else {
+            Vec::new()
+        };
+        (owner, active)
     }
 
     pub(super) fn app_info_popup_data(&self, app_info: &AppInfo) -> InfoPopupData {
@@ -403,6 +459,17 @@ impl App {
             .cloned()
             .unwrap_or(window_snapshot);
 
+        if let Some(lookup) = self.window_version_lookup.as_mut() {
+            lookup.poll();
+        }
+        let target = WindowVersionTarget::for_window(&window_info);
+        if self
+            .window_version_lookup
+            .as_ref()
+            .is_none_or(|lookup| lookup.target != target && lookup.result.is_some())
+        {
+            self.window_version_lookup = Some(WindowVersionLookup::start(target, ctx.clone()));
+        }
         let data = self.window_info_popup_data(&window_info);
 
         if !ctx.embed_viewports() {

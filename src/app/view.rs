@@ -2173,6 +2173,9 @@ impl eframe::App for App {
                                                         ui.close();
                                                     }
                                                     if ui.button("Show info").clicked() {
+                                                        if self.window_version_lookup.as_ref().is_some_and(|lookup| lookup.result.is_some()) {
+                                                            self.window_version_lookup = None;
+                                                        }
                                                         self.process_chain_popup = Some(win.clone());
                                                         ui.close();
                                                     }
