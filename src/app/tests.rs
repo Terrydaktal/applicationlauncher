@@ -84,6 +84,136 @@ mod tests {
         }
     }
 
+    #[test]
+    fn window_info_groups_window_fields_before_active_process_fields() {
+        let mut window = test_window_info("codex - ~/Dev/applicationlauncher - Terminal");
+        window.process_chain.push(ProcessChainEntry {
+            pid: 4321,
+            name: "codex".into(),
+            exe_path: Some(PathBuf::from("/usr/bin/codex")),
+        });
+        let version_rows = |role: &str| {
+            [
+                "version",
+                "version source",
+                "installed package",
+                "ELF build ID",
+            ]
+            .map(|suffix| InfoPopupRow {
+                label: format!("{role} {suffix}"),
+                value: "test version metadata".into(),
+                searched: false,
+                separator_before: false,
+            })
+            .to_vec()
+        };
+
+        for in_tmux in [false, true] {
+            window.tmux_pane = in_tmux.then(|| applicationlauncher::tracker::LiveTmuxPane {
+                client_pid: 123,
+                session: applicationlauncher::tracker::TmuxSession {
+                    socket_path: "/tmp/test-tmux.sock".into(),
+                    session_name: "test-session".into(),
+                    ..Default::default()
+                },
+                pane_id: "%0".into(),
+                pane_pid: 4320,
+                process_pid: 4321,
+                process_name: "codex".into(),
+                cwd: window.cwd_path.clone().unwrap(),
+                title: "working".into(),
+            });
+            let rows = super::super::popups::window_info_rows(
+                &window,
+                "/usr/share/applications/xfce4-terminal.desktop".into(),
+                "/usr/share/applications/codex.desktop".into(),
+                version_rows("Window application"),
+                version_rows("Active process"),
+            );
+            let mut labels = vec![
+                "Title",
+                "Raw window title",
+                "Application key",
+                "Window ID",
+                "Class",
+                "Window desktop file",
+                "Window PID",
+                "Window executable",
+                "Window executable path",
+                "Geometry",
+                "Minimized",
+                "Last activated",
+                "Activation sequence",
+                "Window application version",
+                "Window application version source",
+                "Window application installed package",
+                "Window application ELF build ID",
+                "Active process",
+                "Active process executable path",
+                "Active process desktop file",
+                "Working directory",
+                "Command summary",
+                "Command line",
+                "Active process version",
+                "Active process version source",
+                "Active process installed package",
+                "Active process ELF build ID",
+            ];
+            if in_tmux {
+                labels.extend([
+                    "Tmux session",
+                    "Tmux socket",
+                    "Tmux client PID",
+                    "Tmux active pane",
+                    "Tmux pane title",
+                ]);
+            }
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.label.as_str())
+                    .collect::<Vec<_>>(),
+                labels
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.separator_before)
+                    .map(|row| row.label.as_str())
+                    .collect::<Vec<_>>(),
+                ["Active process"]
+            );
+            let value = |label: &str| {
+                rows.iter()
+                    .find(|row| row.label == label)
+                    .unwrap()
+                    .value
+                    .as_str()
+            };
+            assert_eq!(value("Window executable path"), "/usr/bin/xfce4-terminal");
+            assert_eq!(value("Active process executable path"), "/usr/bin/codex");
+            assert_eq!(value("Window PID"), "1234");
+            assert_eq!(value("Geometry"), "x=0, y=0, width=800, height=600");
+            let mut searched_labels = vec![
+                "Title",
+                "Application key",
+                "Window executable",
+                "Active process",
+                "Working directory",
+                "Command summary",
+                "Command line",
+            ];
+            if in_tmux {
+                searched_labels.push("Tmux session");
+            }
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.searched)
+                    .map(|row| row.label.as_str())
+                    .collect::<Vec<_>>(),
+                searched_labels
+            );
+        }
+    }
+
     fn test_kwin_payload(title: &str, demands_attention: bool) -> KWinWindowPayload {
         KWinWindowPayload {
             id: "test-window".to_string(),

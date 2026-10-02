@@ -368,6 +368,7 @@ pub struct InfoPopupRow {
     pub label: String,
     pub value: String,
     pub searched: bool,
+    pub separator_before: bool,
 }
 
 #[derive(Clone)]

@@ -1,5 +1,146 @@
 use super::*;
 
+pub(super) fn window_info_rows(
+    window: &WindowInfo,
+    desktop_file_path: String,
+    active_process_desktop_file: String,
+    window_version_rows: Vec<InfoPopupRow>,
+    active_process_version_rows: Vec<InfoPopupRow>,
+) -> Vec<InfoPopupRow> {
+    let app_key = window_application_key(window);
+    let exe_basename = window
+        .exe_path
+        .as_ref()
+        .and_then(|path| path.file_name().and_then(|name| name.to_str()))
+        .unwrap_or("Unavailable")
+        .to_string();
+    let active_process_exe_path = window
+        .active_process
+        .as_ref()
+        .and_then(|_| window.process_chain.first())
+        .and_then(|entry| entry.exe_path.as_ref())
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Unavailable".to_string());
+    let cwd_search_value = window
+        .cwd_path
+        .as_ref()
+        .map(|path| display_path(path))
+        .unwrap_or_else(|| "Unavailable".to_string());
+    let class_is_searched = !window.class.eq_ignore_ascii_case(&app_key);
+    let row = |label: &str, value: String, searched: bool| InfoPopupRow {
+        label: label.to_string(),
+        value,
+        searched,
+        separator_before: false,
+    };
+
+    let mut rows = vec![
+        row("Title", window.title.clone(), true),
+        row("Raw window title", window.raw_title.clone(), false),
+        row("Application key", app_key, true),
+        row("Window ID", window.id.clone(), false),
+        row("Class", window.class.clone(), class_is_searched),
+        row("Window desktop file", desktop_file_path, false),
+        row(
+            "Window PID",
+            window
+                .pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "Unavailable".to_string()),
+            false,
+        ),
+        row("Window executable", exe_basename, true),
+        row(
+            "Window executable path",
+            window
+                .exe_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Unavailable".to_string()),
+            false,
+        ),
+        row(
+            "Geometry",
+            window
+                .geometry
+                .map(|(x, y, width, height)| {
+                    format!("x={x}, y={y}, width={width}, height={height}")
+                })
+                .unwrap_or_else(|| "Unavailable".to_string()),
+            false,
+        ),
+        row(
+            "Minimized",
+            window
+                .minimized
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "Unavailable".to_string()),
+            false,
+        ),
+        row(
+            "Last activated",
+            format_activation_time(window.last_activated_at_ms),
+            false,
+        ),
+        row(
+            "Activation sequence",
+            window.activation_sequence.to_string(),
+            false,
+        ),
+    ];
+    rows.extend(window_version_rows);
+    let mut active_process = row(
+        "Active process",
+        window
+            .active_process
+            .clone()
+            .unwrap_or_else(|| "Unavailable".to_string()),
+        true,
+    );
+    active_process.separator_before = true;
+    rows.push(active_process);
+    rows.extend([
+        row(
+            "Active process executable path",
+            active_process_exe_path,
+            false,
+        ),
+        row(
+            "Active process desktop file",
+            active_process_desktop_file,
+            false,
+        ),
+        row("Working directory", cwd_search_value, true),
+        row(
+            "Command summary",
+            window
+                .command_summary
+                .clone()
+                .unwrap_or_else(|| "Unavailable".to_string()),
+            true,
+        ),
+        row(
+            "Command line",
+            window
+                .command_line
+                .clone()
+                .unwrap_or_else(|| "Unavailable".to_string()),
+            true,
+        ),
+    ]);
+    rows.extend(active_process_version_rows);
+    if let Some(pane) = &window.tmux_pane {
+        rows.extend([
+            row("Tmux session", pane.session.session_name.clone(), true),
+            row("Tmux socket", pane.session.socket_path.clone(), false),
+            row("Tmux client PID", pane.client_pid.to_string(), false),
+            row("Tmux active pane", pane.pane_id.clone(), false),
+            row("Tmux pane title", pane.title.clone(), false),
+        ]);
+    }
+    rows
+}
+
 impl App {
     pub(super) fn process_popup_events(&mut self) {
         let mut restore_launcher_focus = false;
@@ -119,20 +260,6 @@ impl App {
     }
 
     pub(super) fn window_info_popup_data(&self, window_info: &WindowInfo) -> InfoPopupData {
-        let app_key = window_application_key(window_info);
-        let exe_basename = window_info
-            .exe_path
-            .as_ref()
-            .and_then(|path| path.file_name().and_then(|name| name.to_str()))
-            .unwrap_or("Unavailable")
-            .to_string();
-        let active_process_exe_path = window_info
-            .active_process
-            .as_ref()
-            .and_then(|_| window_info.process_chain.first())
-            .and_then(|entry| entry.exe_path.clone())
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|| "Unavailable".to_string());
         let active_process_desktop_file = window_info
             .active_process
             .as_deref()
@@ -143,111 +270,19 @@ impl App {
             .desktop_file_path_for_window(window_info)
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_else(|| "Unavailable".to_string());
-        let cwd_search_value = window_info
-            .cwd_path
-            .as_ref()
-            .map(|path| display_path(path))
-            .unwrap_or_else(|| "Unavailable".to_string());
-        let class_is_searched = !window_info.class.eq_ignore_ascii_case(&app_key);
-        let row = |label: &str, value: String, searched: bool| InfoPopupRow {
-            label: label.to_string(),
-            value,
-            searched,
-        };
+        let (window_versions, active_process_versions) = self.window_version_rows(window_info);
 
-        let mut data = InfoPopupData {
+        InfoPopupData {
             title: format!("Window Info: {}", window_info.title),
             heading: window_info.title.clone(),
             subtitle: "Window metadata, process details, and execution chain".to_string(),
-            rows: vec![
-                row("Title", window_info.title.clone(), true),
-                row("Raw window title", window_info.raw_title.clone(), false),
-                row("Application key", app_key, true),
-                row("Window ID", window_info.id.clone(), false),
-                row("Class", window_info.class.clone(), class_is_searched),
-                row("Window desktop file", desktop_file_path, false),
-                row(
-                    "Window PID",
-                    window_info
-                        .pid
-                        .map(|pid| pid.to_string())
-                        .unwrap_or_else(|| "Unavailable".to_string()),
-                    false,
-                ),
-                row(
-                    "Active process",
-                    window_info
-                        .active_process
-                        .clone()
-                        .unwrap_or_else(|| "Unavailable".to_string()),
-                    true,
-                ),
-                row("Window executable", exe_basename, true),
-                row(
-                    "Window executable path",
-                    window_info
-                        .exe_path
-                        .as_ref()
-                        .map(|path| path.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "Unavailable".to_string()),
-                    false,
-                ),
-                row(
-                    "Active process executable path",
-                    active_process_exe_path,
-                    false,
-                ),
-                row(
-                    "Active process desktop file",
-                    active_process_desktop_file,
-                    false,
-                ),
-                row("Working directory", cwd_search_value, true),
-                row(
-                    "Command summary",
-                    window_info
-                        .command_summary
-                        .clone()
-                        .unwrap_or_else(|| "Unavailable".to_string()),
-                    true,
-                ),
-                row(
-                    "Command line",
-                    window_info
-                        .command_line
-                        .clone()
-                        .unwrap_or_else(|| "Unavailable".to_string()),
-                    true,
-                ),
-                row(
-                    "Geometry",
-                    window_info
-                        .geometry
-                        .map(|(x, y, width, height)| {
-                            format!("x={x}, y={y}, width={width}, height={height}")
-                        })
-                        .unwrap_or_else(|| "Unavailable".to_string()),
-                    false,
-                ),
-                row(
-                    "Minimized",
-                    window_info
-                        .minimized
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "Unavailable".to_string()),
-                    false,
-                ),
-                row(
-                    "Last activated",
-                    format_activation_time(window_info.last_activated_at_ms),
-                    false,
-                ),
-                row(
-                    "Activation sequence",
-                    window_info.activation_sequence.to_string(),
-                    false,
-                ),
-            ],
+            rows: window_info_rows(
+                window_info,
+                desktop_file_path,
+                active_process_desktop_file,
+                window_versions,
+                active_process_versions,
+            ),
             execution_chain: window_info
                 .process_chain
                 .iter()
@@ -262,20 +297,7 @@ impl App {
                     )
                 })
                 .collect(),
-        };
-        let (window_versions, active_process_versions) = self.window_version_rows(window_info);
-        data.rows.extend(window_versions);
-        data.rows.extend(active_process_versions);
-        if let Some(pane) = &window_info.tmux_pane {
-            data.rows.extend([
-                row("Tmux session", pane.session.session_name.clone(), true),
-                row("Tmux socket", pane.session.socket_path.clone(), false),
-                row("Tmux client PID", pane.client_pid.to_string(), false),
-                row("Tmux active pane", pane.pane_id.clone(), false),
-                row("Tmux pane title", pane.title.clone(), false),
-            ]);
         }
-        data
     }
 
     fn window_version_rows(&self, window: &WindowInfo) -> (Vec<InfoPopupRow>, Vec<InfoPopupRow>) {
@@ -316,6 +338,7 @@ impl App {
                 label: format!("{role} {suffix}"),
                 value: value.unwrap_or_else(unavailable),
                 searched: false,
+                separator_before: false,
             })
             .collect()
         };
@@ -357,6 +380,7 @@ impl App {
             label: label.to_string(),
             value,
             searched,
+            separator_before: false,
         };
 
         InfoPopupData {
