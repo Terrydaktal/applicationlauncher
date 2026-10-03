@@ -5,6 +5,75 @@ mod tests {
     use fuzzy_rank::fields::fuzzy::{MetadataCandidate, MetadataQuery, SearchField};
 
     #[test]
+    fn deployment_notices_expire_after_exactly_three_seconds() {
+        let now = Instant::now();
+        let timer = ForegroundNoticeTimer::new(now);
+        assert_eq!(timer.remaining(now), Some(Duration::from_secs(3)));
+        assert_eq!(
+            timer.remaining(now + Duration::from_millis(2999)),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(timer.remaining(now + Duration::from_secs(3)), None);
+        assert_eq!(timer.remaining(now + Duration::from_secs(60)), None);
+    }
+
+    #[test]
+    fn deployment_notice_timer_does_not_restart_on_focused_frames() {
+        let now = Instant::now();
+        let mut timer = ForegroundNoticeTimer::new(now);
+        timer.update(now, true, false);
+        timer.update(now + Duration::from_secs(2), true, false);
+        assert_eq!(
+            timer.remaining(now + Duration::from_secs(2)),
+            Some(Duration::from_secs(1))
+        );
+        timer.update(now + Duration::from_secs(3), true, false);
+        assert_eq!(timer.remaining(now + Duration::from_secs(3)), None);
+    }
+
+    #[test]
+    fn deployment_notices_reappear_on_each_foreground_transition() {
+        let now = Instant::now();
+        let mut timer = ForegroundNoticeTimer::new(now);
+        timer.update(now, true, false);
+        for seconds in [10, 60, 3600] {
+            let foreground_at = now + Duration::from_secs(seconds);
+            timer.update(foreground_at - Duration::from_secs(1), false, false);
+            assert_eq!(timer.remaining(foreground_at), None);
+            timer.update(foreground_at, true, false);
+            assert_eq!(timer.remaining(foreground_at), Some(Duration::from_secs(3)));
+            assert_eq!(
+                timer.remaining(foreground_at + Duration::from_secs(3)),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_notices_reappear_on_shortcut_relaunch_even_if_already_focused() {
+        let now = Instant::now();
+        let mut timer = ForegroundNoticeTimer::new(now);
+        timer.update(now, true, false);
+        let relaunch_at = now + Duration::from_secs(30);
+        timer.update(relaunch_at, true, true);
+        assert_eq!(timer.remaining(relaunch_at), Some(Duration::from_secs(3)));
+        timer.update(relaunch_at + Duration::from_secs(3), true, false);
+        assert_eq!(timer.remaining(relaunch_at + Duration::from_secs(3)), None);
+    }
+
+    #[test]
+    fn deployment_notices_wait_for_actual_focus_after_delayed_foreground_request() {
+        let now = Instant::now();
+        let mut timer = ForegroundNoticeTimer::new(now);
+        timer.update(now, false, true);
+        let focused_at = now + Duration::from_secs(10);
+        timer.update(focused_at, false, false);
+        assert_eq!(timer.remaining(focused_at), None);
+        timer.update(focused_at, true, false);
+        assert_eq!(timer.remaining(focused_at), Some(Duration::from_secs(3)));
+    }
+
+    #[test]
     fn open_window_count_is_small_muted_and_does_not_take_search_focus() {
         let ctx = egui::Context::default();
         for count in [0, 1, 9, 10, 99, 100, 1000] {

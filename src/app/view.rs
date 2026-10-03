@@ -96,6 +96,12 @@ impl eframe::App for App {
             self.start_terminal_metadata_refresh();
         }
 
+        self.deployment_warning_timer.update(
+            Instant::now(),
+            ctx.input(|input| input.focused),
+            focus_requested,
+        );
+
         if ui_event_count == UI_EVENTS_PER_FRAME || handled_focus_launcher {
             ctx.request_repaint();
         }

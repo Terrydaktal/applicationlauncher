@@ -28,6 +28,34 @@ use crate::*;
 
 const HISTORY_POPUP_REFRESH_INTERVAL_MS: u64 = 750;
 const WINDOW_LAST_ACTIVATION_COLUMN_WIDTH: f32 = 42.0;
+const DEPLOYMENT_WARNING_DURATION: Duration = Duration::from_secs(3);
+
+struct ForegroundNoticeTimer {
+    visible_until: Instant,
+    was_focused: bool,
+}
+
+impl ForegroundNoticeTimer {
+    fn new(now: Instant) -> Self {
+        Self {
+            visible_until: now + DEPLOYMENT_WARNING_DURATION,
+            was_focused: false,
+        }
+    }
+
+    fn update(&mut self, now: Instant, focused: bool, focus_requested: bool) {
+        if focus_requested || (focused && !self.was_focused) {
+            self.visible_until = now + DEPLOYMENT_WARNING_DURATION;
+        }
+        self.was_focused = focused;
+    }
+
+    fn remaining(&self, now: Instant) -> Option<Duration> {
+        self.visible_until
+            .checked_duration_since(now)
+            .filter(|remaining| !remaining.is_zero())
+    }
+}
 
 #[derive(Default)]
 struct HistoryPopupState {
@@ -317,6 +345,7 @@ pub(crate) struct App {
     terminal_action_message: Option<(String, bool, Instant)>,
     source_changes_pending: bool,
     symbols_unarchived: bool,
+    deployment_warning_timer: ForegroundNoticeTimer,
     auto_enter_update_sender: SyncSender<bool>,
     terminal_records: Vec<TerminalDbusRecord>,
     terminal_records_receiver: Option<Receiver<Result<Vec<TerminalDbusRecord>, String>>>,
@@ -847,6 +876,7 @@ impl App {
             terminal_action_message: None,
             source_changes_pending,
             symbols_unarchived,
+            deployment_warning_timer: ForegroundNoticeTimer::new(now),
             auto_enter_update_sender,
             terminal_records: Vec::new(),
             terminal_records_receiver: None,
@@ -1045,7 +1075,7 @@ impl App {
                 egui::Align2::CENTER_BOTTOM,
                 [
                     0.0,
-                    if self.source_changes_pending || self.symbols_unarchived {
+                    if self.deployment_warning_remaining(Instant::now()).is_some() {
                         -54.0
                     } else {
                         -18.0
@@ -1067,10 +1097,17 @@ impl App {
             });
     }
 
+    fn deployment_warning_remaining(&self, now: Instant) -> Option<Duration> {
+        (self.source_changes_pending || self.symbols_unarchived)
+            .then(|| self.deployment_warning_timer.remaining(now))
+            .flatten()
+    }
+
     fn show_deployment_warnings(&self, ctx: &egui::Context) {
-        if !self.source_changes_pending && !self.symbols_unarchived {
+        let Some(remaining) = self.deployment_warning_remaining(Instant::now()) else {
             return;
-        }
+        };
+        ctx.request_repaint_after(remaining);
 
         egui::Area::new(egui::Id::new("source_changes_warning"))
             .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -18.0])
