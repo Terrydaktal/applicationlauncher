@@ -1,5 +1,351 @@
 use super::*;
 
+pub(super) fn virtual_items(
+    ui: &mut egui::Ui,
+    viewport: egui::Rect,
+    count: usize,
+    columns: usize,
+    height: f32,
+    gap: f32,
+    scroll_to: Option<usize>,
+) -> (std::ops::Range<usize>, Vec<f32>) {
+    let columns = columns.max(1);
+    let stride = height + gap;
+    let rows = count.div_ceil(columns);
+    let origin = ui.next_widget_position();
+    ui.set_height((rows as f32 * stride - gap).max(0.0));
+    if let Some(index) = scroll_to.filter(|index| *index < count) {
+        let target = egui::Rect::from_min_size(
+            origin + egui::vec2(0.0, (index / columns) as f32 * stride),
+            egui::vec2(ui.available_width(), height),
+        );
+        ui.scroll_to_rect(target, None);
+    }
+    let start = ((viewport.min.y / stride).floor().max(0.0) as usize).min(rows);
+    let end = ((viewport.max.y / stride).ceil().max(0.0) as usize + 1).min(rows);
+    let centers = (0..count)
+        .map(|index| origin.y + (index / columns) as f32 * stride + height / 2.0)
+        .collect();
+    ui.add_space(start as f32 * stride);
+    ((start * columns)..(end * columns).min(count), centers)
+}
+
+pub(super) fn grid_columns(width: f32, tile: f32, gap: f32) -> usize {
+    ((width + gap) / (tile + gap)).floor().max(1.0) as usize
+}
+
+pub(super) fn virtual_item<R>(
+    ui: &mut egui::Ui,
+    index: usize,
+    size: egui::Vec2,
+    render: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let (_, rect) = ui.allocate_space(size);
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .id(ui.id().with(("virtual-item", index)))
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    render(&mut child)
+}
+
+struct WindowSortRecord {
+    window: WindowInfo,
+    app_key: String,
+    terminal_subgroup_key: Option<String>,
+    title_key: String,
+}
+
+#[derive(Default)]
+pub(super) struct DefaultWindowsCache {
+    entry: Option<(bool, Arc<Vec<WindowInfo>>)>,
+}
+
+impl DefaultWindowsCache {
+    pub(super) fn invalidate(&mut self) {
+        self.entry = None;
+    }
+    pub(super) fn update(&mut self, updates: &[(WindowInfo, WindowInfo)]) {
+        if updates.iter().any(|(old, new)| {
+            old.last_activated_at_ms != new.last_activated_at_ms
+                || old.activation_sequence != new.activation_sequence
+        }) {
+            self.invalidate();
+            return;
+        }
+        if let Some((_, rows)) = &mut self.entry {
+            let changes: HashMap<_, _> = updates
+                .iter()
+                .map(|(_, new)| (new.id.as_str(), new))
+                .collect();
+            for row in Arc::make_mut(rows) {
+                if let Some(new) = changes.get(row.id.as_str()) {
+                    row.clone_from(new);
+                }
+            }
+        }
+    }
+    pub(super) fn get(
+        &mut self,
+        windows: &[WindowInfo],
+        recent_first: bool,
+    ) -> Arc<Vec<WindowInfo>> {
+        if let Some((recent, rows)) = &self.entry
+            && *recent == recent_first
+        {
+            return Arc::clone(rows);
+        }
+        let mut sortable_windows = windows
+            .iter()
+            .cloned()
+            .map(|window| {
+                let app_key = window_grouping_key(&window);
+                let terminal_subgroup_key = is_terminal_class(&window.class.trim().to_lowercase())
+                    .then(|| terminal_window_subgroup_key(&window));
+                let title_key = window_sort_title_key(&window);
+                WindowSortRecord {
+                    window,
+                    app_key,
+                    terminal_subgroup_key,
+                    title_key,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut app_window_counts: HashMap<String, usize> = HashMap::new();
+        let mut terminal_subgroup_counts: HashMap<String, usize> = HashMap::new();
+        for record in &sortable_windows {
+            *app_window_counts.entry(record.app_key.clone()).or_default() += 1;
+            if let Some(subgroup_key) = &record.terminal_subgroup_key {
+                *terminal_subgroup_counts
+                    .entry(subgroup_key.clone())
+                    .or_default() += 1;
+            }
+        }
+        sortable_windows.sort_by(|a, b| {
+            if recent_first {
+                let activation_time_order =
+                    match (a.window.last_activated_at_ms, b.window.last_activated_at_ms) {
+                        (Some(a), Some(b)) => b.cmp(&a),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    };
+                return activation_time_order
+                    .then_with(|| {
+                        b.window
+                            .activation_sequence
+                            .cmp(&a.window.activation_sequence)
+                    })
+                    .then_with(|| a.title_key.cmp(&b.title_key))
+                    .then_with(|| a.window.id.cmp(&b.window.id));
+            }
+            let count_a = app_window_counts.get(&a.app_key).copied().unwrap_or(0);
+            let count_b = app_window_counts.get(&b.app_key).copied().unwrap_or(0);
+            count_a
+                .cmp(&count_b)
+                .then_with(|| a.app_key.cmp(&b.app_key))
+                .then_with(
+                    || match (&a.terminal_subgroup_key, &b.terminal_subgroup_key) {
+                        (Some(subgroup_key_a), Some(subgroup_key_b)) if a.app_key == b.app_key => {
+                            let subgroup_count_a = terminal_subgroup_counts
+                                .get(subgroup_key_a)
+                                .copied()
+                                .unwrap_or(0);
+                            let subgroup_count_b = terminal_subgroup_counts
+                                .get(subgroup_key_b)
+                                .copied()
+                                .unwrap_or(0);
+                            subgroup_count_a
+                                .cmp(&subgroup_count_b)
+                                .then_with(|| subgroup_key_a.cmp(&subgroup_key_b))
+                        }
+                        _ => std::cmp::Ordering::Equal,
+                    },
+                )
+                .then_with(|| a.title_key.cmp(&b.title_key))
+                .then_with(|| a.window.id.cmp(&b.window.id))
+        });
+        let rows = Arc::new(
+            sortable_windows
+                .into_iter()
+                .map(|record| record.window)
+                .collect(),
+        );
+        self.entry = Some((recent_first, Arc::clone(&rows)));
+        rows
+    }
+}
+
+pub(super) fn index_pinned_apps(pins: &[PathBuf]) -> HashMap<PathBuf, usize> {
+    let mut positions = HashMap::with_capacity(pins.len());
+    for (index, path) in pins.iter().enumerate() {
+        positions.entry(path.clone()).or_insert(index);
+    }
+    positions
+}
+
+#[derive(Default)]
+pub(super) struct DefaultAppsCache {
+    entry: Option<((u64, u64, bool), Arc<Vec<(AppInfo, bool)>>)>,
+}
+
+impl DefaultAppsCache {
+    pub(super) fn get(
+        &mut self,
+        apps: &[AppInfo],
+        pins: &HashMap<PathBuf, usize>,
+        apps_generation: u64,
+        pins_generation: u64,
+        show_system_modules: bool,
+    ) -> Arc<Vec<(AppInfo, bool)>> {
+        let key = (apps_generation, pins_generation, show_system_modules);
+        if let Some((cached_key, apps)) = &self.entry {
+            if *cached_key == key {
+                return Arc::clone(apps);
+            }
+        }
+
+        // Reuse the list already required by the first render, not a second
+        // cloned row model. Live window titles never enter this cache.
+        let mut sorted: Vec<_> = apps
+            .iter()
+            .filter(|app| show_system_modules || !app.is_settings_module)
+            .map(|app| (app.clone(), pins.contains_key(&app.desktop_file_path)))
+            .collect();
+        sorted.sort_by_cached_key(|(app, pinned)| {
+            (
+                app.is_settings_module,
+                !pinned,
+                pins.get(&app.desktop_file_path)
+                    .copied()
+                    .unwrap_or(usize::MAX),
+                if *pinned {
+                    String::new()
+                } else {
+                    app.name.to_lowercase()
+                },
+            )
+        });
+        let sorted = Arc::new(sorted);
+        self.entry = Some((key, Arc::clone(&sorted)));
+        sorted
+    }
+}
+
+#[cfg(test)]
+mod default_apps_tests {
+    use super::*;
+
+    fn app(name: &str, settings: bool) -> AppInfo {
+        AppInfo {
+            name: name.into(),
+            exec: name.into(),
+            icon_path: None,
+            desktop_file_path: PathBuf::from(format!("/apps/{name}.desktop")),
+            comment: None,
+            is_settings_module: settings,
+        }
+    }
+
+    fn identities(apps: &[(AppInfo, bool)]) -> Vec<(String, bool)> {
+        apps.iter()
+            .map(|(app, pinned)| (app.name.clone(), *pinned))
+            .collect()
+    }
+
+    #[test]
+    fn cached_app_order_matches_the_original_comparator() {
+        let apps = vec![
+            app("Zulu", false),
+            app("alpha", false),
+            app("Beta", false),
+            app("Settings", true),
+            app("Another setting", true),
+        ];
+        for pins in [vec![], vec![0, 1], vec![1, 0], vec![3, 2, 4], vec![0, 0, 1]] {
+            let pins: Vec<_> = pins
+                .into_iter()
+                .map(|index| apps[index].desktop_file_path.clone())
+                .collect();
+            for show_modules in [false, true] {
+                let mut expected: Vec<_> = apps
+                    .iter()
+                    .filter(|app| show_modules || !app.is_settings_module)
+                    .map(|app| (app.clone(), pins.contains(&app.desktop_file_path)))
+                    .collect();
+                expected.sort_by(|a, b| {
+                    a.0.is_settings_module
+                        .cmp(&b.0.is_settings_module)
+                        .then_with(|| match (a.1, b.1) {
+                            (true, false) => std::cmp::Ordering::Less,
+                            (false, true) => std::cmp::Ordering::Greater,
+                            (true, true) => pinned_app_position(&pins, &a.0)
+                                .cmp(&pinned_app_position(&pins, &b.0)),
+                            (false, false) => a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()),
+                        })
+                });
+                let actual = DefaultAppsCache::default().get(
+                    &apps,
+                    &index_pinned_apps(&pins),
+                    0,
+                    0,
+                    show_modules,
+                );
+                assert_eq!(identities(&actual), identities(&expected));
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_frames_reuse_the_same_app_rows_without_cloning_or_sorting() {
+        let apps = vec![app("Example", false)];
+        let pins = HashMap::new();
+        let mut cache = DefaultAppsCache::default();
+        let first = cache.get(&apps, &pins, 1, 1, false);
+        assert_eq!(Arc::strong_count(&first), 2);
+        for _ in 0..100 {
+            let next = cache.get(&apps, &pins, 1, 1, false);
+            assert!(Arc::ptr_eq(&first, &next));
+        }
+    }
+
+    #[test]
+    fn installs_pin_changes_and_module_visibility_invalidate_the_cached_app_list() {
+        let mut cache = DefaultAppsCache::default();
+        let mut apps = vec![app("Zulu", false)];
+        let first = cache.get(&apps, &HashMap::new(), 1, 1, false);
+        apps.push(app("alpha", false));
+        apps.push(app("Settings", true));
+        let installed = cache.get(&apps, &HashMap::new(), 2, 1, false);
+        assert!(!Arc::ptr_eq(&first, &installed));
+        assert_eq!(
+            identities(&installed),
+            vec![("alpha".into(), false), ("Zulu".into(), false)]
+        );
+        let pins = index_pinned_apps(&[apps[0].desktop_file_path.clone()]);
+        let pinned = cache.get(&apps, &pins, 2, 2, false);
+        assert!(!Arc::ptr_eq(&installed, &pinned));
+        assert_eq!(pinned[0].0.name, "Zulu");
+        assert!(pinned[0].1);
+        let modules = cache.get(&apps, &pins, 2, 2, true);
+        assert!(!Arc::ptr_eq(&pinned, &modules));
+        assert_eq!(modules.len(), 3);
+        assert!(modules.last().unwrap().0.is_settings_module);
+    }
+
+    #[test]
+    fn pin_index_keeps_first_duplicate_and_path_equality_semantics() {
+        let pins = vec![
+            PathBuf::from("/apps/a.desktop"),
+            PathBuf::from("/apps/./a.desktop"),
+        ];
+        let positions = index_pinned_apps(&pins);
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions.get(Path::new("/apps/a.desktop")), Some(&0));
+    }
+}
+
 pub(crate) fn filtered_search_cache_key(
     mode: LauncherMode,
     query: &str,

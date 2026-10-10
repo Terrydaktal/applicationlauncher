@@ -5,6 +5,315 @@ mod tests {
     use fuzzy_rank::fields::fuzzy::{MetadataCandidate, MetadataQuery, SearchField};
 
     #[test]
+    fn default_window_cache_reuses_rows_and_refreshes_transient_titles() {
+        let mut windows = vec![test_window_info("codex - \u{280b} /project - Terminal")];
+        let mut cache = helpers::DefaultWindowsCache::default();
+        let first = cache.get(&windows, false);
+        for _ in 0..100 {
+            assert!(Arc::ptr_eq(&first, &cache.get(&windows, false)));
+        }
+        drop(first);
+        let old = windows[0].clone();
+        windows[0].title = "codex - \u{2819} /project - Terminal".into();
+        cache.update(&[(old, windows[0].clone())]);
+        assert_eq!(cache.get(&windows, false)[0].title, windows[0].title);
+        windows.push(test_window_info("codex - /other - Terminal"));
+        cache.invalidate();
+        assert_eq!(cache.get(&windows, false).len(), 2);
+    }
+
+    #[test]
+    fn cached_window_order_keeps_application_and_terminal_subgroup_rules() {
+        let make = |id: &str, class: &str, program: &str, title: &str| {
+            let mut window = test_window_info(title);
+            window.id = id.into();
+            window.class = class.into();
+            window.active_process = Some(program.into());
+            window.command_summary = Some(program.into());
+            window
+        };
+        let windows = vec![
+            make(
+                "c2",
+                "xfce4-terminal",
+                "codex",
+                "codex - \u{2819} z - Terminal",
+            ),
+            make("f", "xfce4-terminal", "fish", "fish - a - Terminal"),
+            make("browser", "firefox", "firefox", "Browser"),
+            make(
+                "c1",
+                "xfce4-terminal",
+                "codex",
+                "codex - \u{280b} a - Terminal",
+            ),
+        ];
+        let mut cache = helpers::DefaultWindowsCache::default();
+        assert_eq!(
+            cache
+                .get(&windows, false)
+                .iter()
+                .map(|w| w.id.as_str())
+                .collect::<Vec<_>>(),
+            ["browser", "f", "c1", "c2"]
+        );
+        let mut changed = windows.clone();
+        changed[0].last_activated_at_ms = Some(999);
+        cache.update(&[(windows[0].clone(), changed[0].clone())]);
+        assert_eq!(cache.get(&changed, true)[0].id, "c2");
+    }
+
+    #[test]
+    fn incremental_documents_prepare_only_changed_entries_and_drop_removed_entries() {
+        let mut windows = vec![test_window_info("first"), test_window_info("second")];
+        windows[0].id = "first".into();
+        windows[1].id = "second".into();
+        let mut documents = Vec::new();
+        let mut dirty = HashSet::new();
+        assert_eq!(
+            crate::search::update_window_search_documents(&windows, &mut documents, &mut dirty),
+            2
+        );
+        let first_allocation = documents[0].values.as_ptr();
+        windows[1].title = "changed".into();
+        dirty.insert("second".into());
+        assert_eq!(
+            crate::search::update_window_search_documents(&windows, &mut documents, &mut dirty),
+            1
+        );
+        assert_eq!(documents[0].values.as_ptr(), first_allocation);
+        assert_eq!(documents[1].values[0].1, "changed");
+        assert_eq!(
+            crate::search::update_window_search_documents(&windows, &mut documents, &mut dirty),
+            0
+        );
+        windows.remove(0);
+        assert_eq!(
+            crate::search::update_window_search_documents(&windows, &mut documents, &mut dirty),
+            0
+        );
+        assert_eq!(documents.len(), 1);
+        assert!(documents[0].key.ends_with("second"));
+    }
+
+    #[test]
+    fn unicode_highlights_keep_all_occurrences_and_exact_overlap_precedence() {
+        use fuzzy_rank::fields::fuzzy::MatchedFieldHighlight;
+        let title = "\u{280b} caf\u{e9} | Whisper | WHISPER | \u{3bb}";
+        let fields = [SearchField {
+            priority: 0,
+            value: "whisper",
+        }];
+        let highlights = [
+            MatchedFieldHighlight {
+                field_index: 0,
+                ranges: vec![(0, 7, false)],
+                focus_range: Some((0, 7)),
+            },
+            MatchedFieldHighlight {
+                field_index: 0,
+                ranges: vec![(0, 4, true)],
+                focus_range: Some((0, 4)),
+            },
+            MatchedFieldHighlight {
+                field_index: 9,
+                ranges: vec![(0, usize::MAX, false)],
+                focus_range: None,
+            },
+        ];
+        let (ranges, focus) =
+            crate::search::map_field_highlights_to_full_text(title, &fields, &highlights);
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|(s, e, exact)| (&title[*s..*e], *exact))
+                .collect::<Vec<_>>(),
+            [
+                ("Whis", true),
+                ("per", false),
+                ("WHIS", true),
+                ("PER", false)
+            ]
+        );
+        let first = title.find("Whisper").unwrap();
+        assert_eq!(focus, Some((first, first + 4)));
+    }
+
+    #[test]
+    fn virtual_rows_and_grids_render_only_viewport_and_preserve_geometry() {
+        for (columns, tile, gap) in [(1, 20.0, 0.0), (4, 48.0, 10.0)] {
+            let ctx = egui::Context::default();
+            let mut rendered = 0;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(260.0, 230.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
+                        let area = egui::ScrollArea::vertical()
+                            .max_height(200.0)
+                            .vertical_scroll_offset(500.0)
+                            .show_viewport(ui, |ui, viewport| {
+                                let (range, centers) = helpers::virtual_items(
+                                    ui, viewport, 400, columns, tile, gap, None,
+                                );
+                                assert!(range.start > 0);
+                                assert!(range.len() < 60);
+                                assert_eq!(centers.len(), 400);
+                                assert!((centers[columns] - centers[0] - tile - gap).abs() < 0.01);
+                                let mut render = |ui: &mut egui::Ui| {
+                                    for index in range.clone() {
+                                        helpers::virtual_item(
+                                            ui,
+                                            index,
+                                            egui::vec2(
+                                                if columns == 1 {
+                                                    ui.available_width()
+                                                } else {
+                                                    tile
+                                                },
+                                                tile,
+                                            ),
+                                            |ui| {
+                                                let (rect, _) = ui.allocate_exact_size(
+                                                    egui::vec2(
+                                                        if columns == 1 {
+                                                            ui.available_width()
+                                                        } else {
+                                                            tile
+                                                        },
+                                                        tile,
+                                                    ),
+                                                    egui::Sense::click(),
+                                                );
+                                                assert!(
+                                                    (rect.center().y - centers[index]).abs() < 0.1,
+                                                    "wrong position for {index}: {rect:?}, {}",
+                                                    centers[index]
+                                                );
+                                                rendered += 1;
+                                            },
+                                        );
+                                    }
+                                };
+                                if columns == 1 {
+                                    render(ui);
+                                } else {
+                                    ui.horizontal_wrapped(render);
+                                }
+                            });
+                        assert!(
+                            (area.content_size.y
+                                - (400_usize.div_ceil(columns) as f32 * (tile + gap) - gap))
+                                .abs()
+                                < 1.0
+                        );
+                    });
+                },
+            );
+            assert!(!output.shapes.is_empty());
+            assert!(rendered < 60);
+        }
+    }
+
+    #[test]
+    fn virtual_item_ids_remain_stable_when_the_viewport_moves() {
+        let ctx = egui::Context::default();
+        let mut previous = HashMap::new();
+        for offset in [0.0, 40.0, 0.0] {
+            let mut ids = HashMap::new();
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(260.0, 230.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        egui::ScrollArea::vertical()
+                            .max_height(200.0)
+                            .vertical_scroll_offset(offset)
+                            .show_viewport(ui, |ui, viewport| {
+                                let (range, _) =
+                                    helpers::virtual_items(ui, viewport, 400, 1, 20.0, 0.0, None);
+                                for index in range {
+                                    let response = helpers::virtual_item(
+                                        ui,
+                                        index,
+                                        egui::vec2(ui.available_width(), 20.0),
+                                        |ui| {
+                                            ui.allocate_response(
+                                                egui::vec2(ui.available_width(), 20.0),
+                                                egui::Sense::click(),
+                                            )
+                                        },
+                                    );
+                                    ids.insert(index, response.id);
+                                }
+                            });
+                    });
+                },
+            );
+            assert!(ids.contains_key(&5));
+            if let Some(id) = previous.get(&5) {
+                assert_eq!(*id, ids[&5]);
+            }
+            previous = ids;
+        }
+    }
+
+    #[test]
+    fn virtual_keyboard_selection_reaches_offscreen_and_partial_final_rows() {
+        for columns in [1, 4] {
+            let ctx = egui::Context::default();
+            ctx.style_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+            let mut selection_visible = false;
+            for frame in 0..3 {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(260.0, 230.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(200.0)
+                                .show_viewport(ui, |ui, viewport| {
+                                    let (range, centers) = helpers::virtual_items(
+                                        ui,
+                                        viewport,
+                                        403,
+                                        columns,
+                                        48.0,
+                                        10.0,
+                                        (frame == 0).then_some(402),
+                                    );
+                                    assert_eq!(centers.len(), 403);
+                                    selection_visible |= range.contains(&402);
+                                });
+                        });
+                    },
+                );
+            }
+            assert!(
+                selection_visible,
+                "offscreen selection lost for {columns} columns"
+            );
+        }
+    }
+
+    #[test]
     fn deployment_notices_expire_after_exactly_three_seconds() {
         let now = Instant::now();
         let timer = ForegroundNoticeTimer::new(now);

@@ -171,6 +171,40 @@ pub(crate) fn window_search_document(window: &WindowInfo) -> PreparedSearchDocum
     )
 }
 
+pub(crate) fn update_window_search_documents(
+    windows: &[WindowInfo],
+    documents: &mut Vec<PreparedSearchDocument>,
+    dirty: &mut HashSet<String>,
+) -> usize {
+    if dirty.is_empty() && documents.len() == windows.len() {
+        return 0;
+    }
+    let mut previous: HashMap<_, _> = std::mem::take(documents)
+        .into_iter()
+        .map(|document| {
+            (
+                document.key.rsplit('\0').next().unwrap_or("").to_string(),
+                document,
+            )
+        })
+        .collect();
+    let mut prepared = 0;
+    *documents = windows
+        .iter()
+        .map(|window| {
+            if !dirty.contains(&window.id)
+                && let Some(document) = previous.remove(&window.id)
+            {
+                return document;
+            }
+            prepared += 1;
+            window_search_document(window)
+        })
+        .collect();
+    dirty.clear();
+    prepared
+}
+
 pub(crate) fn rank_prepared_documents(
     documents: &[PreparedSearchDocument],
     scores: &[f64],
@@ -655,6 +689,16 @@ pub(crate) fn window_search_metadata_equal(left: &WindowInfo, right: &WindowInfo
         return false;
     }
 
+    if left.class == right.class
+        && left.active_process == right.active_process
+        && left.exe_path == right.exe_path
+        && left.cwd_path == right.cwd_path
+        && left.command_line == right.command_line
+        && left.command_summary == right.command_summary
+    {
+        return true;
+    }
+
     let without_title = |window: &WindowInfo| {
         window_search_values(window)
             .into_iter()
@@ -749,7 +793,7 @@ pub(crate) fn normalize_window_sort_title(title: &str) -> String {
         .to_lowercase()
 }
 
-fn normalize_window_identity_title(title: &str) -> String {
+pub(crate) fn normalize_window_identity_title(title: &str) -> String {
     let without_attention_frames = ATTENTION_REQUIRED_FRAMES
         .into_iter()
         .fold(title.to_string(), |normalized, frame| {
@@ -1030,12 +1074,14 @@ pub(crate) fn map_field_highlights_to_full_text(
         }
     }
 
-    let char_count = full_text.chars().count();
+    let mut char_offsets: Vec<_> = full_text.char_indices().map(|(byte, _)| byte).collect();
+    char_offsets.push(full_text.len());
+    let char_count = char_offsets.len() - 1;
     let mut char_status = vec![None; char_count];
 
     for (start, end, is_exact) in full_ranges {
-        let start_char = full_text[..start].chars().count();
-        let end_char = full_text[..end].chars().count();
+        let start_char = char_offsets.partition_point(|byte| *byte < start);
+        let end_char = char_offsets.partition_point(|byte| *byte < end);
         for idx in start_char..end_char {
             if idx < char_count {
                 if char_status[idx].is_none() || char_status[idx] == Some(false) {
@@ -1055,8 +1101,7 @@ pub(crate) fn map_field_highlights_to_full_text(
                 if seg_exact == is_exact {
                     // Continue segment
                 } else {
-                    let (byte_start, byte_end) =
-                        char_indices_to_byte_range_main(full_text, start_char, char_idx);
+                    let (byte_start, byte_end) = (char_offsets[start_char], char_offsets[char_idx]);
                     merged_ranges.push((byte_start, byte_end, seg_exact));
                     current_segment = Some((char_idx, is_exact));
                 }
@@ -1065,16 +1110,14 @@ pub(crate) fn map_field_highlights_to_full_text(
             }
         } else {
             if let Some((start_char, seg_exact)) = current_segment {
-                let (byte_start, byte_end) =
-                    char_indices_to_byte_range_main(full_text, start_char, char_idx);
+                let (byte_start, byte_end) = (char_offsets[start_char], char_offsets[char_idx]);
                 merged_ranges.push((byte_start, byte_end, seg_exact));
                 current_segment = None;
             }
         }
     }
     if let Some((start_char, seg_exact)) = current_segment {
-        let (byte_start, byte_end) =
-            char_indices_to_byte_range_main(full_text, start_char, char_count);
+        let (byte_start, byte_end) = (char_offsets[start_char], char_offsets[char_count]);
         merged_ranges.push((byte_start, byte_end, seg_exact));
     }
 

@@ -1,6 +1,111 @@
 use super::*;
+use crate::search::normalize_window_identity_title;
 
 const PROCESS_TREE_CACHE_MAX_AGE: Duration = Duration::from_millis(500);
+
+fn enrichment_reusable(checked_at: Option<Instant>, now: Instant) -> bool {
+    checked_at.is_some_and(|checked_at| {
+        now.saturating_duration_since(checked_at) < PROCESS_TREE_CACHE_MAX_AGE
+    })
+}
+
+fn transient_payload_update(window: &WindowInfo, payload: &KWinWindowPayload) -> bool {
+    !payload.skip_taskbar
+        && !payload.skip_switcher
+        && window.pid == (payload.pid > 0).then_some(payload.pid)
+        && &window.class
+            == if payload.class.trim().is_empty() {
+                &payload.desktop_file_name
+            } else {
+                &payload.class
+            }
+        && window.desktop_file_name.as_deref().unwrap_or("") == payload.desktop_file_name.trim()
+        && window.raw_title != payload.title
+        && (!is_terminal_class(&window.class.to_lowercase())
+            || window
+                .active_process
+                .as_deref()
+                .is_some_and(|program| !crate::windows::is_shell(program)))
+        && window.raw_title.chars().any(is_braille_spinner_char)
+            == payload.title.chars().any(is_braille_spinner_char)
+        && attention_required_frame(&window.raw_title).is_some()
+            == attention_required_frame(&payload.title).is_some()
+        && normalize_window_identity_title(&window.raw_title)
+            == normalize_window_identity_title(&payload.title)
+}
+
+fn audio_metadata_equal(old: &WindowInfo, new: &WindowInfo, sinks: &[PactlSinkInput]) -> bool {
+    old.pid == new.pid
+        && old.class == new.class
+        && old.active_process == new.active_process
+        && old.process_chain == new.process_chain
+        && (old.raw_title == new.raw_title
+            || (normalize_window_identity_title(&old.raw_title)
+                == normalize_window_identity_title(&new.raw_title)
+                && !sinks.iter().any(|sink| {
+                    sink.properties
+                        .get("window.name")
+                        .is_some_and(|name| name == &old.raw_title || name == &new.raw_title)
+                })))
+}
+
+#[cfg(test)]
+mod optimization_tests {
+    use super::*;
+    #[test]
+    fn title_fast_path_is_limited_to_same_identity_and_same_transient_state() {
+        let payload: KWinWindowPayload = serde_json::from_str(r#"{"id":"test","class":"xfce4-terminal","pid":-1,"title":"codex - \u280b project - Terminal"}"#).unwrap();
+        let mut cache = HashMap::new();
+        let mut window = window_info_from_kwin_payload(
+            payload.clone(),
+            "breeze-dark",
+            &mut cache,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        )
+        .unwrap();
+        window.active_process = Some("codex".into());
+        let mut changed = payload.clone();
+        changed.title = "codex - \u{2819} project - Terminal".into();
+        assert!(transient_payload_update(&window, &changed));
+        assert!(audio_metadata_equal(
+            &window,
+            &WindowInfo {
+                raw_title: changed.title.clone(),
+                ..window.clone()
+            },
+            &[]
+        ));
+        changed.pid = 42;
+        assert!(!transient_payload_update(&window, &changed));
+        changed = payload.clone();
+        changed.title = "codex - \u{2819} other - Terminal".into();
+        assert!(!transient_payload_update(&window, &changed));
+        changed = payload;
+        changed.title = "codex - project - Terminal".into();
+        assert!(!transient_payload_update(&window, &changed));
+    }
+
+    #[test]
+    fn transient_updates_do_not_extend_process_enrichment_deadline() {
+        let checked_at = Instant::now();
+        assert!(!enrichment_reusable(None, checked_at));
+        assert!(enrichment_reusable(
+            Some(checked_at),
+            checked_at + Duration::from_millis(499)
+        ));
+        assert!(!enrichment_reusable(
+            Some(checked_at),
+            checked_at + Duration::from_millis(500)
+        ));
+        assert!(!enrichment_reusable(
+            Some(checked_at),
+            checked_at + Duration::from_secs(5)
+        ));
+    }
+}
 
 pub(super) fn terminal_metadata_refresh_due(
     receiver_active: bool,
@@ -23,8 +128,12 @@ pub(super) fn process_tree_cache_refresh_due(
 }
 
 impl App {
-    fn rebuild_window_search_documents(&mut self) {
-        self.window_search_documents = self.windows.iter().map(window_search_document).collect();
+    pub(super) fn rebuild_window_search_documents(&mut self) {
+        crate::search::update_window_search_documents(
+            &self.windows,
+            &mut self.window_search_documents,
+            &mut self.dirty_window_search_documents,
+        );
     }
 
     pub(super) fn start_process_tree_cache_refresh(&mut self) {
@@ -139,6 +248,7 @@ impl App {
         &mut self,
         updates: &[(WindowInfo, WindowInfo)],
     ) {
+        self.default_windows_cache.update(updates);
         let Some(cache) = self.filtered_search_cache.as_mut() else {
             return;
         };
@@ -188,7 +298,7 @@ impl App {
     }
 
     pub(super) fn schedule_window_search_refresh(&mut self) {
-        self.rebuild_window_search_documents();
+        self.default_windows_cache.invalidate();
         if self.search_query.trim().is_empty() {
             self.pending_window_search_refresh_at = None;
             self.windows_generation = self.windows_generation.wrapping_add(1);
@@ -206,6 +316,8 @@ impl App {
             return false;
         }
 
+        self.rebuild_window_search_documents();
+
         self.windows_generation = self.windows_generation.wrapping_add(1);
         true
     }
@@ -214,7 +326,12 @@ impl App {
         self.overlay_tmux_metadata(&mut new_windows);
         if self.windows.is_empty() {
             self.windows = new_windows;
-            self.rebuild_window_search_documents();
+            self.default_windows_cache.invalidate();
+            self.dirty_window_search_documents
+                .extend(self.windows.iter().map(|window| window.id.clone()));
+            if !self.search_query.trim().is_empty() {
+                self.rebuild_window_search_documents();
+            }
             self.seed_window_icon_cache();
             applicationlauncher::observability::set_gauge(
                 applicationlauncher::observability::Gauge::GuiWindows,
@@ -268,6 +385,10 @@ impl App {
         let retained_ids: HashSet<String> = merged.iter().map(|window| window.id.clone()).collect();
         self.missing_window_counts
             .retain(|window_id, _| retained_ids.contains(window_id));
+        self.window_enrichment_checked_at
+            .retain(|window_id, _| retained_ids.contains(window_id));
+        self.dirty_window_search_documents
+            .retain(|window_id| retained_ids.contains(window_id));
 
         let old_by_id: HashMap<&str, &WindowInfo> = old_windows
             .iter()
@@ -279,6 +400,22 @@ impl App {
                     .get(window.id.as_str())
                     .is_none_or(|old| !window_search_metadata_equal(old, window))
             });
+        let audio_changed = old_windows.len() != merged.len()
+            || merged.iter().any(|window| {
+                old_by_id
+                    .get(window.id.as_str())
+                    .is_none_or(|old| !audio_metadata_equal(old, window, &self.cached_sink_inputs))
+            });
+        self.dirty_window_search_documents.extend(
+            merged
+                .iter()
+                .filter(|window| {
+                    old_by_id
+                        .get(window.id.as_str())
+                        .is_none_or(|old| !window_search_metadata_equal(old, window))
+                })
+                .map(|window| window.id.clone()),
+        );
         let cache_updates = merged
             .iter()
             .filter_map(|window| {
@@ -297,6 +434,9 @@ impl App {
         if search_changed {
             self.schedule_window_search_refresh();
         }
+        if audio_changed {
+            self.refresh_window_audio_cache();
+        }
     }
 
     pub(super) fn apply_window_feed_events(&mut self, events: Vec<WindowFeedEvent>) {
@@ -304,7 +444,22 @@ impl App {
             return;
         }
 
-        self.start_process_tree_cache_refresh();
+        let now = Instant::now();
+        let needs_enrichment = events.iter().any(|event| match event {
+            WindowFeedEvent::Upsert(payload) => !self.windows.iter().any(|window| {
+                window.id == payload.id
+                    && transient_payload_update(window, payload)
+                    && enrichment_reusable(
+                        self.window_enrichment_checked_at.get(&window.id).copied(),
+                        now,
+                    )
+            }),
+            WindowFeedEvent::Reset | WindowFeedEvent::Snapshot(_) => true,
+            WindowFeedEvent::Remove(_) => false,
+        });
+        if needs_enrichment {
+            self.start_process_tree_cache_refresh();
+        }
         if self.process_tree_cache.is_none() {
             self.deferred_window_feed_events.extend(events);
             self.deferred_window_feed_events =
@@ -372,6 +527,7 @@ impl App {
             .expect("process tree cache initialized");
         let terminal_records = self.terminal_records.clone();
         let mut changed = false;
+        let mut audio_changed = false;
         let mut search_changed = false;
         let mut cache_updates = Vec::new();
         let mut needs_terminal_metadata_refresh = false;
@@ -379,9 +535,12 @@ impl App {
         for event in events {
             match event {
                 WindowFeedEvent::Reset => {
+                    audio_changed |= !self.windows.is_empty();
                     changed |= !self.windows.is_empty();
                     search_changed |= !self.windows.is_empty();
                     self.windows.clear();
+                    self.window_enrichment_checked_at.clear();
+                    self.dirty_window_search_documents.clear();
                     self.missing_window_counts.clear();
                     self.last_selected_window_id = None;
                     cache_updates.clear();
@@ -391,6 +550,40 @@ impl App {
                 }
                 WindowFeedEvent::Upsert(payload) => {
                     let window_id = payload.id.clone();
+                    if let Some(existing) = self
+                        .windows
+                        .iter_mut()
+                        .find(|window| window.id == window_id)
+                        && transient_payload_update(existing, &payload)
+                        && enrichment_reusable(
+                            self.window_enrichment_checked_at.get(&window_id).copied(),
+                            now,
+                        )
+                    {
+                        let old = existing.clone();
+                        refresh_cached_transient_title(
+                            &mut existing.title,
+                            &existing.raw_title,
+                            &payload.title,
+                        );
+                        existing.raw_title = payload.title;
+                        existing.demands_attention = payload.demands_attention;
+                        existing.geometry = (payload.width > 0 && payload.height > 0).then_some((
+                            payload.x,
+                            payload.y,
+                            payload.width,
+                            payload.height,
+                        ));
+                        existing.minimized = Some(payload.minimized);
+                        existing.last_activated_at_ms = payload.last_activated_at_ms;
+                        existing.activation_sequence = payload.activation_sequence;
+                        audio_changed |=
+                            !audio_metadata_equal(&old, existing, &self.cached_sink_inputs);
+                        cache_updates.push((old, existing.clone()));
+                        self.missing_window_counts.remove(&window_id);
+                        changed = true;
+                        continue;
+                    }
                     let payload_class = if payload.class.trim().is_empty() {
                         payload.desktop_file_name.as_str()
                     } else {
@@ -413,6 +606,11 @@ impl App {
                         &pid_to_ppid,
                         &terminal_records,
                     ) {
+                        // Reused frames must not postpone the next process refresh.
+                        self.window_enrichment_checked_at.insert(
+                            window.id.clone(),
+                            self.process_tree_cache_updated_at.unwrap_or(now),
+                        );
                         if let Some(metadata) = self.tmux_metadata.get(&window.id) {
                             metadata.apply(&mut window);
                         }
@@ -424,11 +622,21 @@ impl App {
                             let window_search_changed =
                                 !window_search_metadata_equal(&old_window, &window);
                             search_changed |= window_search_changed;
+                            if window_search_changed {
+                                self.dirty_window_search_documents.insert(window.id.clone());
+                            }
+                            audio_changed |= !audio_metadata_equal(
+                                &old_window,
+                                &window,
+                                &self.cached_sink_inputs,
+                            );
                             *existing = window.clone();
                             if !window_search_changed {
                                 cache_updates.push((old_window, window));
                             }
                         } else {
+                            self.dirty_window_search_documents.insert(window.id.clone());
+                            audio_changed = true;
                             self.windows.push(window);
                             search_changed = true;
                         }
@@ -444,10 +652,13 @@ impl App {
                 }
                 WindowFeedEvent::Remove(id) => {
                     self.missing_window_counts.remove(&id);
+                    self.window_enrichment_checked_at.remove(&id);
+                    self.dirty_window_search_documents.remove(&id);
                     let previous_len = self.windows.len();
                     self.windows.retain(|window| window.id != id);
                     let removed = self.windows.len() != previous_len;
                     changed |= removed;
+                    audio_changed |= removed;
                     search_changed |= removed;
                 }
             }
@@ -463,7 +674,9 @@ impl App {
             if search_changed {
                 self.schedule_window_search_refresh();
             }
-            self.refresh_window_audio_cache();
+            if audio_changed {
+                self.refresh_window_audio_cache();
+            }
         }
         if needs_terminal_metadata_refresh {
             self.start_terminal_metadata_refresh();
@@ -549,7 +762,14 @@ impl App {
 
     pub(super) fn apply_window_reconciliation(&mut self, mut discovered: Vec<WindowInfo>) {
         self.overlay_tmux_metadata(&mut discovered);
+        let mut audio_changed = false;
         for window in &discovered {
+            let old = self.windows.iter().find(|old| old.id == window.id);
+            if old.is_none_or(|old| !window_search_metadata_equal(old, window)) {
+                self.dirty_window_search_documents.insert(window.id.clone());
+            }
+            audio_changed |=
+                old.is_none_or(|old| !audio_metadata_equal(old, window, &self.cached_sink_inputs));
             self.missing_window_counts.remove(&window.id);
         }
         let (changed, search_changed, cache_updates) =
@@ -564,7 +784,9 @@ impl App {
         if search_changed {
             self.schedule_window_search_refresh();
         }
-        self.refresh_window_audio_cache();
+        if audio_changed {
+            self.refresh_window_audio_cache();
+        }
     }
 
     fn overlay_tmux_metadata(&self, windows: &mut [WindowInfo]) {
@@ -582,6 +804,14 @@ impl App {
         self.tmux_metadata = latest;
         let mut updates = Vec::new();
         for window in &self.windows {
+            if window.tmux_pane.is_none() && !self.tmux_metadata.contains_key(&window.id) {
+                continue;
+            }
+            if let Some(metadata) = self.tmux_metadata.get(&window.id)
+                && window.tmux_pane.as_ref() == Some(&metadata.pane)
+            {
+                continue;
+            }
             let mut updated = window.clone();
             if let Some(metadata) = self.tmux_metadata.get(&window.id) {
                 metadata.apply(&mut updated);

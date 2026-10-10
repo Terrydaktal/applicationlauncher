@@ -253,11 +253,16 @@ pub(crate) struct App {
     mode: LauncherMode,
     windows: Vec<WindowInfo>,
     window_search_documents: Vec<PreparedSearchDocument>,
+    dirty_window_search_documents: HashSet<String>,
+    window_enrichment_checked_at: HashMap<String, Instant>,
     window_icon_cache: HashMap<WindowIconCacheKey, Option<PathBuf>>,
     apps: Vec<AppInfo>,
     app_search_documents: Vec<PreparedSearchDocument>,
     field_rank_model: Option<fuzzy_rank::fields::FieldRankModel>,
     pinned_apps: Vec<PathBuf>,
+    pinned_app_positions: HashMap<PathBuf, usize>,
+    default_apps_cache: helpers::DefaultAppsCache,
+    default_windows_cache: helpers::DefaultWindowsCache,
     search_query: String,
     selected_index: usize,
     side_panel_selected_index: usize,
@@ -706,6 +711,7 @@ impl App {
         let kdotool_path = get_kdotool_path();
         let (width, height) = load_window_size();
         let pinned_apps = load_pinned_apps();
+        let pinned_app_positions = helpers::index_pinned_apps(&pinned_apps);
         let settings = load_launcher_settings();
         cc.egui_ctx.set_zoom_factor(settings.ui_scale);
 
@@ -783,11 +789,16 @@ impl App {
             mode,
             windows: Vec::new(),
             window_search_documents: Vec::new(),
+            dirty_window_search_documents: HashSet::new(),
+            window_enrichment_checked_at: HashMap::new(),
             window_icon_cache: HashMap::new(),
             apps: Vec::new(),
             app_search_documents: Vec::new(),
             field_rank_model: crate::ranking_model::load_field_rank_model(),
             pinned_apps,
+            pinned_app_positions,
+            default_apps_cache: helpers::DefaultAppsCache::default(),
+            default_windows_cache: helpers::DefaultWindowsCache::default(),
             search_query: String::new(),
             selected_index: 0,
             side_panel_selected_index: 0,
@@ -1040,6 +1051,7 @@ impl App {
     }
 
     fn save_pinned_apps(&mut self) {
+        self.pinned_app_positions = helpers::index_pinned_apps(&self.pinned_apps);
         if let Ok(home) = std::env::var("HOME") {
             let dir = PathBuf::from(format!("{}/.config/applicationlauncher", home));
             let _ = std::fs::create_dir_all(&dir);
@@ -1055,6 +1067,16 @@ impl App {
             }
         }
         self.pinned_apps_generation = self.pinned_apps_generation.wrapping_add(1);
+    }
+
+    fn default_apps(&mut self) -> Arc<Vec<(AppInfo, bool)>> {
+        self.default_apps_cache.get(
+            &self.apps,
+            &self.pinned_app_positions,
+            self.apps_generation,
+            self.pinned_apps_generation,
+            self.show_system_settings_modules,
+        )
     }
 
     fn show_terminal_action_message(&mut self, ctx: &egui::Context) {

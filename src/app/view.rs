@@ -1,12 +1,5 @@
 use super::*;
 
-struct WindowSortRecord {
-    window: WindowInfo,
-    app_key: String,
-    terminal_subgroup_key: Option<String>,
-    title_key: String,
-}
-
 pub(super) fn open_window_count_label(ui: &egui::Ui, count: usize) -> (egui::Label, f32) {
     let galley = ui.painter().layout_no_wrap(
         count.to_string(),
@@ -272,14 +265,16 @@ impl eframe::App for App {
             .map(|rx| rx.try_recv())
         {
             Some(Ok(apps)) => {
-                self.apps = apps;
-                applicationlauncher::observability::set_gauge(
-                    applicationlauncher::observability::Gauge::InstalledApps,
-                    self.apps.len(),
-                );
-                self.app_search_documents = self.apps.iter().map(app_search_document).collect();
-                self.apps_generation = self.apps_generation.wrapping_add(1);
-                self.refresh_app_audio_routing();
+                if self.apps != apps {
+                    self.apps = apps;
+                    applicationlauncher::observability::set_gauge(
+                        applicationlauncher::observability::Gauge::InstalledApps,
+                        self.apps.len(),
+                    );
+                    self.app_search_documents = self.apps.iter().map(app_search_document).collect();
+                    self.apps_generation = self.apps_generation.wrapping_add(1);
+                    self.refresh_app_audio_routing();
+                }
                 self.background_apps_receiver = None;
                 ctx.request_repaint();
                 if self.background_apps_refresh_queued {
@@ -624,27 +619,7 @@ impl eframe::App for App {
 		                    match self.mode {
 	                        LauncherMode::Apps => {
 		                            if !has_search_query {
-	                                filtered_apps = Arc::new(self.apps
-                                    .iter()
-                                    .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
-                                    .map(|app| {
-                                        let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
-                                        (app.clone(), is_pinned)
-                                    })
-                                    .collect());
-	                                Arc::make_mut(&mut filtered_apps).sort_by(|a, b| {
-                                    a.0.is_settings_module
-                                        .cmp(&b.0.is_settings_module)
-                                        .then_with(|| match (a.1, b.1) {
-                                            (true, false) => std::cmp::Ordering::Less,
-                                            (false, true) => std::cmp::Ordering::Greater,
-                                            (true, true) => {
-                                                pinned_app_position(&self.pinned_apps, &a.0)
-                                                    .cmp(&pinned_app_position(&self.pinned_apps, &b.0))
-                                            }
-                                            (false, false) => a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()),
-                                        })
-				                                });
+                                    filtered_apps = self.default_apps();
                             } else if let Some((base_query, typo_query)) =
                                 search_queries(&search_query)
                             {
@@ -681,104 +656,10 @@ impl eframe::App for App {
 	                                    filtered_apps = Arc::new(Vec::new());
                                 }
 	                        }
-		                        LauncherMode::Windows => {
-		                            if !has_search_query {
-		                                let mut sortable_windows = self
-		                                    .windows
-		                                    .iter()
-		                                    .cloned()
-		                                    .map(|window| {
-		                                        let app_key = window_grouping_key(&window);
-		                                        let terminal_subgroup_key = is_terminal_class(
-		                                            &window.class.trim().to_lowercase(),
-		                                        )
-		                                        .then(|| terminal_window_subgroup_key(&window));
-		                                        let title_key = window_sort_title_key(&window);
-		                                        WindowSortRecord {
-		                                            window,
-		                                            app_key,
-		                                            terminal_subgroup_key,
-		                                            title_key,
-		                                        }
-		                                    })
-		                                    .collect::<Vec<_>>();
-		                                let mut app_window_counts: HashMap<String, usize> =
-		                                    HashMap::new();
-		                                let mut terminal_subgroup_counts: HashMap<String, usize> =
-		                                    HashMap::new();
-		                                for record in &sortable_windows {
-		                                    *app_window_counts
-		                                        .entry(record.app_key.clone())
-		                                        .or_default() += 1;
-		                                    if let Some(subgroup_key) =
-		                                        &record.terminal_subgroup_key
-		                                    {
-		                                        *terminal_subgroup_counts
-		                                            .entry(subgroup_key.clone())
-		                                            .or_default() += 1;
-		                                    }
-		                                }
-	                                sortable_windows.sort_by(|a, b| {
-	                                    if self.order_windows_by_last_activation {
-	                                        let activation_time_order = match (
-	                                            a.window.last_activated_at_ms,
-	                                            b.window.last_activated_at_ms,
-	                                        ) {
-	                                            (Some(a), Some(b)) => b.cmp(&a),
-	                                            (Some(_), None) => std::cmp::Ordering::Less,
-	                                            (None, Some(_)) => std::cmp::Ordering::Greater,
-	                                            (None, None) => std::cmp::Ordering::Equal,
-	                                        };
-	                                        return activation_time_order
-	                                            .then_with(|| {
-	                                                b.window.activation_sequence.cmp(
-	                                                    &a.window.activation_sequence,
-	                                                )
-	                                            })
-	                                            .then_with(|| a.title_key.cmp(&b.title_key))
-	                                            .then_with(|| a.window.id.cmp(&b.window.id));
-	                                    }
-		                                    let count_a =
-	                                        app_window_counts.get(&a.app_key).copied().unwrap_or(0);
-	                                    let count_b =
-	                                        app_window_counts.get(&b.app_key).copied().unwrap_or(0);
-		                                    count_a
-		                                        .cmp(&count_b)
-		                                        .then_with(|| a.app_key.cmp(&b.app_key))
-		                                        .then_with(|| {
-		                                            match (
-		                                                &a.terminal_subgroup_key,
-		                                                &b.terminal_subgroup_key,
-		                                            ) {
-		                                                (Some(subgroup_key_a), Some(subgroup_key_b))
-		                                                    if a.app_key == b.app_key =>
-		                                                {
-		                                                    let subgroup_count_a = terminal_subgroup_counts
-		                                                        .get(subgroup_key_a)
-	                                                        .copied()
-	                                                        .unwrap_or(0);
-		                                                    let subgroup_count_b = terminal_subgroup_counts
-		                                                        .get(subgroup_key_b)
-	                                                        .copied()
-	                                                        .unwrap_or(0);
-	                                                    subgroup_count_a
-	                                                        .cmp(&subgroup_count_b)
-	                                                        .then_with(|| {
-	                                                            subgroup_key_a.cmp(&subgroup_key_b)
-	                                                        })
-	                                                }
-		                                                _ => std::cmp::Ordering::Equal,
-		                                            }
-		                                        })
-		                                        .then_with(|| a.title_key.cmp(&b.title_key))
-		                                        .then_with(|| a.window.id.cmp(&b.window.id))
-						                                });
-		                                filtered_windows = Arc::new(
-		                                    sortable_windows
-		                                        .into_iter()
-		                                        .map(|record| record.window)
-		                                        .collect(),
-		                                );
+			                        LauncherMode::Windows => {
+                                    if has_search_query { self.rebuild_window_search_documents(); }
+                                if !has_search_query {
+                                    filtered_windows = self.default_windows_cache.get(&self.windows, self.order_windows_by_last_activation);
                                     } else if let Some((base_query, typo_query)) =
                                         search_queries(&search_query)
                                     {
@@ -812,27 +693,7 @@ impl eframe::App for App {
 
 		                    if self.mode == LauncherMode::Windows {
 		                        if !has_search_query {
-	                            filtered_apps = Arc::new(self.apps
-                                .iter()
-                                .filter(|app| self.show_system_settings_modules || !app.is_settings_module)
-                                .map(|app| {
-                                    let is_pinned = self.pinned_apps.contains(&app.desktop_file_path);
-                                    (app.clone(), is_pinned)
-                                })
-                                .collect());
-	                            Arc::make_mut(&mut filtered_apps).sort_by(|a, b| {
-		                                a.0.is_settings_module
-		                                    .cmp(&b.0.is_settings_module)
-		                                    .then_with(|| match (a.1, b.1) {
-	                                        (true, false) => std::cmp::Ordering::Less,
-	                                        (false, true) => std::cmp::Ordering::Greater,
-	                                        (true, true) => {
-                                            pinned_app_position(&self.pinned_apps, &a.0)
-                                                .cmp(&pinned_app_position(&self.pinned_apps, &b.0))
-			                    }
-		                                        (false, false) => a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()),
-		                                    })
-				                            });
+                            filtered_apps = self.default_apps();
                         } else if let Some((base_query, typo_query)) =
                             search_queries(&search_query)
                         {
@@ -1202,7 +1063,7 @@ impl eframe::App for App {
                             if total_items > 0 {
                                 let app = &filtered_apps[self.selected_index].0;
                                 let path = app.desktop_file_path.clone();
-                                if self.pinned_apps.contains(&path) {
+                                if self.pinned_app_positions.contains_key(&path) {
                                     if self.icon_only {
                                         if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::ArrowLeft)) {
                                             if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
@@ -1338,12 +1199,13 @@ impl eframe::App for App {
                             .wheel_scroll_multiplier(egui::vec2(1.0, sensitivity))
                             .id_salt("apps_main_icon_grid_scroll")
                             .max_height(list_height)
-                            .show(ui, |ui| {
+                            .show_viewport(ui, |ui, viewport| {
 	                                ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-	                                let mut rendered_columns = 0usize;
-	                                let mut first_row_y = None;
+                                    let rendered_columns = helpers::grid_columns(ui.available_width(), self.app_icon_tile_size, 12.0);
+                                    let (visible, _) = helpers::virtual_items(ui, viewport, total_items, rendered_columns, self.app_icon_tile_size, 12.0, scroll_to_selected.then_some(self.selected_index));
 	                                ui.horizontal_wrapped(|ui| {
-												for index in 0..total_items {
+												for index in visible {
+                                                helpers::virtual_item(ui, index, egui::vec2(self.app_icon_tile_size, self.app_icon_tile_size), |ui| {
 		                                        let is_selected = index == self.selected_index;
 			                                        let app = &filtered_apps[index].0;
 			                                        let tile_size = self.app_icon_tile_size;
@@ -1357,23 +1219,12 @@ impl eframe::App for App {
 	                                            egui::Sense::click(),
 	                                        );
 
-	                                        let center_y = rect.center().y;
-	                                        match first_row_y {
-	                                            None => {
-	                                                first_row_y = Some(center_y);
-	                                                rendered_columns = 1;
-	                                            }
-	                                            Some(row_y) if (center_y - row_y).abs() < 1.0 => {
-	                                                rendered_columns += 1;
-	                                            }
-	                                            Some(_) => {}
-	                                        }
 
 		                                        show_immediate_icon_tooltip(&response, &app.name);
 
                                         response.clone().context_menu(|ui| {
                                             let path = app.desktop_file_path.clone();
-                                            let is_pinned = self.pinned_apps.contains(&path);
+                                            let is_pinned = self.pinned_app_positions.contains_key(&path);
                                             let label = if is_pinned { "📌 Unpin application" } else { "📌 Pin application" };
                                             if ui.button(label).clicked() {
                                                 if is_pinned {
@@ -1512,7 +1363,7 @@ impl eframe::App for App {
                                             app_icon_size,
                                         );
 
-                                        if self.pinned_apps.contains(&app.desktop_file_path) {
+                                        if self.pinned_app_positions.contains_key(&app.desktop_file_path) {
                                             let badge_pos = egui::pos2(rect.max.x - 12.0, rect.min.y + 12.0);
                                             ui.painter().text(
                                                 badge_pos,
@@ -1542,6 +1393,7 @@ impl eframe::App for App {
                                                 ),
                                             );
                                         }
+                                                });
 	                                    }
 	                                });
 	                                self.rendered_app_grid_columns = rendered_columns.max(1);
@@ -1559,10 +1411,13 @@ impl eframe::App for App {
                                 LauncherMode::Windows => "windows_main_list_scroll",
 	                            })
 	                            .max_height(list_height)
-	                            .show(ui, |ui| {
+	                            .show_viewport(ui, |ui, viewport| {
                                     let previous_item_spacing = ui.spacing().item_spacing;
                                     ui.spacing_mut().item_spacing.y = 0.0;
-				                                for index in 0..total_items {
+                                    let (visible, centers) = helpers::virtual_items(ui, viewport, total_items, 1, row_height, 0.0, scroll_to_selected.then_some(self.selected_index));
+                                    rendered_window_row_centers = centers;
+				                                for index in visible {
+                                            helpers::virtual_item(ui, index, egui::vec2(ui.available_width(), row_height), |ui| {
                                             let terminal_action_label =
                                                 if self.mode == LauncherMode::Windows
                                                     && terminal_run_result_index == Some(index)
@@ -1600,9 +1455,6 @@ impl eframe::App for App {
 	                                        egui::Sense::click(),
 	                                    );
 	                                    let row_visual_rect = rect.intersect(ui.clip_rect());
-	                                    if self.mode == LauncherMode::Windows {
-	                                        rendered_window_row_centers.push(rect.center().y);
-	                                    }
 
                                      if is_selected && scroll_to_selected {
                                          response.scroll_to_me(None);
@@ -1827,7 +1679,7 @@ impl eframe::App for App {
 	                                                            .set_cursor_icon(egui::CursorIcon::Default);
 	                                                    }
                                                     }
-                                                if self.pinned_apps.contains(&app.desktop_file_path) {
+                                                if self.pinned_app_positions.contains_key(&app.desktop_file_path) {
                                                     text_ui.add_space(4.0);
                                                     text_ui.label(
                                                         egui::RichText::new("📌")
@@ -1858,7 +1710,7 @@ impl eframe::App for App {
                                                         .ctx()
                                                         .set_cursor_icon(egui::CursorIcon::Default);
                                                 }
-                                                if self.pinned_apps.contains(&app.desktop_file_path) {
+                                                if self.pinned_app_positions.contains_key(&app.desktop_file_path) {
                                                     child_ui.add_space(4.0);
                                                     child_ui.label(
                                                         egui::RichText::new("📌")
@@ -2122,7 +1974,7 @@ impl eframe::App for App {
                                                 LauncherMode::Apps => {
                                                     let app = &filtered_apps[index].0;
                                                     let path = app.desktop_file_path.clone();
-                                                    let is_pinned = self.pinned_apps.contains(&path);
+                                                    let is_pinned = self.pinned_app_positions.contains_key(&path);
                                                     let label = if is_pinned { "📌 Unpin application" } else { "📌 Pin application" };
                                                     if ui.button(label).clicked() {
                                                         if is_pinned {
@@ -2333,15 +2185,16 @@ impl eframe::App for App {
                                                     self.launch_app_and_exit(app, ctx);
                                                 } else if let LauncherMode::Windows = self.mode {
                                                     if terminal_action_label.is_some() {
-                                                        continue;
+                                                        return;
                                                     }
 											self.active_pane = ActivePane::Windows;
 											self.selected_index = index;
 											let win = &filtered_windows[index];
-											self.clone_window_and_exit(win, ctx);
-										}
-			                                    }
-		                                }
+												self.clone_window_and_exit(win, ctx);
+											}
+				                                    }
+                                            });
+			                                }
                                     ui.spacing_mut().item_spacing = previous_item_spacing;
 			                            });
                         if self.mode == LauncherMode::Windows {
@@ -2370,7 +2223,7 @@ impl eframe::App for App {
                                             .wheel_scroll_multiplier(egui::vec2(1.0, sensitivity))
                                             .id_salt("apps_side_panel_scroll")
                                             .max_height(list_height)
-                                            .show(ui, |ui| {
+                                            .show_viewport(ui, |ui, viewport| {
 		                                        if filtered_apps.is_empty() {
 		                                            self.rendered_side_panel_item_centers.clear();
 		                                            self.rendered_side_panel_grid_columns = 1;
@@ -2386,11 +2239,12 @@ impl eframe::App for App {
 	                                            );
 		                                                } else if self.icon_only {
 		                                                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
-		                                                    let mut rendered_columns = 0usize;
-		                                                    let mut first_row_y = None;
-		                                                    let mut rendered_item_centers = Vec::new();
+                                                        let rendered_columns = helpers::grid_columns(ui.available_width(), self.app_icon_tile_size, 10.0);
+                                                        let (visible, rendered_item_centers) = helpers::virtual_items(ui, viewport, filtered_apps.len(), rendered_columns, self.app_icon_tile_size, 10.0, scroll_to_side_selected.then_some(self.side_panel_selected_index));
 		                                                    ui.horizontal_wrapped(|ui| {
-				                                                        for (index, item) in filtered_apps.iter().enumerate() {
+                                                                for index in visible {
+                                                                    let item = &filtered_apps[index];
+                                                                    helpers::virtual_item(ui, index, egui::vec2(self.app_icon_tile_size, self.app_icon_tile_size), |ui| {
 			                                                            let app = &item.0;
 			                                                            let tile_size = self.app_icon_tile_size;
                                                                     let audio_level = self
@@ -2403,27 +2257,13 @@ impl eframe::App for App {
                                                                 egui::vec2(tile_size, tile_size),
 	                                                                egui::Sense::click(),
 	                                                            );
-		                                                            let center_y = rect.center().y;
-		                                                            rendered_item_centers.push(center_y);
-		                                                            match first_row_y {
-	                                                                None => {
-	                                                                    first_row_y = Some(center_y);
-	                                                                    rendered_columns = 1;
-	                                                                }
-	                                                                Some(row_y)
-	                                                                    if (center_y - row_y).abs() < 1.0 =>
-	                                                                {
-	                                                                    rendered_columns += 1;
-	                                                                }
-	                                                                Some(_) => {}
-	                                                            }
 	                                                            show_immediate_icon_tooltip(&response, &app.name);
                                                             if is_selected && scroll_to_side_selected {
                                                                 response.scroll_to_me(None);
                                                             }
 		                                                    response.clone().context_menu(|ui| {
 		                                                        let path = app.desktop_file_path.clone();
-		                                                        let is_pinned = self.pinned_apps.contains(&path);
+		                                                        let is_pinned = self.pinned_app_positions.contains_key(&path);
 	                                                        let label = if is_pinned { "📌 Unpin application" } else { "📌 Pin application" };
 	                                                        if ui.button(label).clicked() {
 	                                                            if is_pinned {
@@ -2539,7 +2379,7 @@ impl eframe::App for App {
                                                                 icon_rect,
                                                                 app_icon_size,
                                                             );
-                                                            if self.pinned_apps.contains(&app.desktop_file_path) {
+                                                            if self.pinned_app_positions.contains_key(&app.desktop_file_path) {
 		                                                        ui.painter().text(
 		                                                            egui::pos2(rect.max.x - 10.0, rect.min.y + 10.0),
 	                                                            egui::Align2::CENTER_CENTER,
@@ -2567,6 +2407,7 @@ impl eframe::App for App {
                                                                 );
                                                             }
 		                                                    let _ = index;
+                                                                    });
 		                                                        }
 	                                                    });
 		                                                    self.rendered_side_panel_grid_columns =
@@ -2576,7 +2417,11 @@ impl eframe::App for App {
 	                                                } else {
 	                                                    self.rendered_side_panel_item_centers.clear();
 	                                                    self.rendered_side_panel_grid_columns = 1;
-			                                                    for (index, item) in filtered_apps.iter().enumerate() {
+                                                        let gap = ui.spacing().item_spacing.y;
+                                                        let (visible, _) = helpers::virtual_items(ui, viewport, filtered_apps.len(), 1, app_row_height, gap, scroll_to_side_selected.then_some(self.side_panel_selected_index));
+                                                        for index in visible {
+                                                            let item = &filtered_apps[index];
+                                                            helpers::virtual_item(ui, index, egui::vec2(ui.available_width(), app_row_height), |ui| {
 	                                                        let app = &item.0;
                                                             let audio_level = self
                                                                 .app_audio_sinks
@@ -2588,7 +2433,7 @@ impl eframe::App for App {
                                                         );
 	                                                response.clone().context_menu(|ui| {
 	                                                    let path = app.desktop_file_path.clone();
-	                                                    let is_pinned = self.pinned_apps.contains(&path);
+	                                                    let is_pinned = self.pinned_app_positions.contains_key(&path);
 	                                                    let label = if is_pinned { "📌 Unpin application" } else { "📌 Pin application" };
 	                                                    if ui.button(label).clicked() {
 	                                                        if is_pinned {
@@ -2807,6 +2652,7 @@ impl eframe::App for App {
                                                         if label_clicked {
                                                             self.open_or_launch_app_and_exit(app, ctx);
                                                         }
+                                                            });
                                                     }
                                                 }
                                             });

@@ -82,7 +82,7 @@ pub struct TerminalWindowIdentity {
     pub ptys: HashSet<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppInfo {
     pub name: String,
     pub exec: String,
