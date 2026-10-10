@@ -31,7 +31,9 @@ fn launcher_native_options(width: f32, height: f32, title: &str) -> eframe::Nati
         // NVIDIA driver holds every swapchain image. Mailbox keeps the newest
         // frame without tying input handling to the compositor's frame pace.
         present_mode: wgpu::PresentMode::AutoNoVsync,
-        desired_maximum_frame_latency: Some(1),
+        // A single in-flight frame serializes CPU and GPU work during scrolling.
+        // Keep one spare frame so a high-refresh display is not starved.
+        desired_maximum_frame_latency: Some(2),
         ..Default::default()
     };
     eframe::NativeOptions {
@@ -488,13 +490,13 @@ mod native_options_tests {
     use super::launcher_native_options;
 
     #[test]
-    fn launcher_uses_non_blocking_mailbox_presentation() {
+    fn launcher_uses_non_blocking_pipelined_presentation() {
         let options = launcher_native_options(800.0, 600.0, "test");
         assert_eq!(options.renderer, eframe::Renderer::Wgpu);
         assert_eq!(
             options.wgpu_options.present_mode,
             wgpu::PresentMode::AutoNoVsync
         );
-        assert_eq!(options.wgpu_options.desired_maximum_frame_latency, Some(1));
+        assert_eq!(options.wgpu_options.desired_maximum_frame_latency, Some(2));
     }
 }

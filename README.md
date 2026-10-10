@@ -487,3 +487,10 @@ AUTHORS
 ## Session Restore Limits
 
 Browser windows are restored as application windows in the first release; exact tabs and URLs require browser-native session restore or a future browser extension. File-manager paths and terminal working directories are restored when reliable metadata is available. Failed or ambiguous items are reported rather than replaying unsafe commands.
+
+## Resource Optimizations
+
+The implemented [twelve-step optimization plan](docs/OPTIMIZATIONS.md) documents
+cache invalidation, worker/queue bounds, compatibility fallbacks and safe release
+verification commands. Its [regression inventory](tests/optimization-contracts.json)
+links each step to the tests protecting its behavior.

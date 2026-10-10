@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "scope": "Twelve behavior-preserving resource optimizations",
+  "profile": "release",
+  "steps": [
+    {
+      "id": "OPT-01", "owner": "src/tracker/tmux.rs",
+      "contract": "Verified client identity reuse; fresh titles each poll; shared-pane process reads once per poll",
+      "bound": "512 clients; 4096 cached process stats; per-poll scratch reset",
+      "tests": [{"path": "src/tracker/tmux.rs", "cases": ["private_server_live_titles_preserve_spinners_and_escape_record_controls"]}]
+    },
+    {
+      "id": "OPT-02", "owner": "src/app/helpers.rs",
+      "contract": "Viewport-only rendering preserves scroll geometry and stable IDs; non-FIFO presentation allows CPU/GPU overlap",
+      "bound": "Visible rows plus one overscan row; two frames in flight",
+      "tests": [{"path": "src/app/tests.rs", "cases": ["virtual_rows_and_grids_render_only_viewport_and_preserve_geometry", "virtual_item_ids_remain_stable_when_the_viewport_moves", "virtual_keyboard_selection_reaches_offscreen_and_partial_final_rows"]}, {"path": "src/main.rs", "cases": ["launcher_uses_non_blocking_pipelined_presentation"]}]
+    },
+    {
+      "id": "OPT-03", "owner": "src/app/helpers.rs",
+      "contract": "Cached ordering preserves app/subgroup rules, recent-first order and live titles",
+      "bound": "One cached row model; invalidate on sort inputs",
+      "tests": [{"path": "src/app/tests.rs", "cases": ["default_window_cache_reuses_rows_and_refreshes_transient_titles", "cached_window_order_keeps_application_and_terminal_subgroup_rules"]}]
+    },
+    {
+      "id": "OPT-04", "owner": "src/app/feed.rs",
+      "contract": "Transient title frames avoid redundant enrichment/audio routing without indefinitely delaying process changes",
+      "bound": "Fixed 500 ms metadata expiry, not extended by animation",
+      "tests": [{"path": "src/app/feed.rs", "cases": ["title_fast_path_is_limited_to_same_identity_and_same_transient_state", "transient_updates_do_not_extend_process_enrichment_deadline"]}]
+    },
+    {
+      "id": "OPT-05", "owner": "src/search.rs",
+      "contract": "Prepare only new or changed documents; unchanged allocations and ranking semantics persist",
+      "bound": "One prepared collection; dirty IDs limited to live windows",
+      "tests": [{"path": "src/app/tests.rs", "cases": ["incremental_documents_prepare_only_changed_entries_and_drop_removed_entries"]}]
+    },
+    {
+      "id": "OPT-06", "owner": "src/tracker/service.rs",
+      "contract": "Incremental IPC converges to exact latest state after delayed consumption, removals, reconnect and legacy fallback",
+      "bound": "4096 journal IDs or queued UI events, then authoritative resynchronization",
+      "tests": [{"path": "src/tracker/service.rs", "cases": ["incremental_tracker_feed_coalesces_latest_state_and_removed_ids", "bounded_tracker_journal_and_dirty_set_fall_back_to_full_resynchronization", "delayed_incremental_consumers_receive_exact_end_state", "private_bus_incremental_feed_and_legacy_fallback_preserve_end_state"]}, {"path": "src/windows/kwin.rs", "cases": ["inactive_ui_backlog_overflow_replaces_tombstones_with_authoritative_latest_state"]}]
+    },
+    {
+      "id": "OPT-07", "owner": "src/tracker/service.rs",
+      "contract": "Persist durable changes transactionally, preserve untouched records and concurrent dirty revisions, keep restore metadata fresh",
+      "bound": "4096 dirty IDs then full write; restore metadata expires after 500 ms",
+      "tests": [{"path": "src/tracker/database.rs", "cases": ["current_window_delta_writes_only_changed_ids_and_preserves_other_records", "persistence_ignores_spinner_and_attention_frames_but_preserves_real_changes"]}, {"path": "src/tracker/service.rs", "cases": ["persistence_in_flight_retains_newer_dirty_revisions", "restore_spec_cache_expires_without_postponement_and_rechecks_identity", "transient_tracker_frames_publish_without_scheduling_database_writes"]}]
+    },
+    {
+      "id": "OPT-08", "owner": "src/app/mod.rs",
+      "contract": "History/session lists refresh only on generation/run changes; successful mutations increment generation",
+      "bound": "One refresh worker and reusable connection per history popup",
+      "tests": [{"path": "src/tracker/service.rs", "cases": ["history_generation_tracks_manual_snapshot_creation_and_deletion"]}]
+    },
+    {
+      "id": "OPT-09", "owner": "src/launch/desktop.rs",
+      "contract": "Cached parsing detects installs, edits, deletes and locale changes; TryExec/icons remain fresh",
+      "bound": "4096 parsed paths; icon results scoped to each scan",
+      "tests": [{"path": "src/launch/desktop.rs", "cases": ["desktop_cache_reuses_parsing_and_invalidates_edits_locale_deletion_and_negatives", "cached_desktop_entry_rechecks_try_exec_and_icon_availability"]}]
+    },
+    {
+      "id": "OPT-10", "owner": "src/search.rs",
+      "contract": "One-pass Unicode offset mapping preserves repeated occurrences and exact-match overlap precedence",
+      "bound": "Offset table scoped to one string",
+      "tests": [{"path": "src/app/tests.rs", "cases": ["unicode_highlights_keep_all_occurrences_and_exact_overlap_precedence"]}]
+    },
+    {
+      "id": "OPT-11", "owner": "src/settings/persistence.rs",
+      "contract": "Ordered coalesced settings writes preserve final values and exit durability; failures cannot deadlock flush",
+      "bound": "Three pending paths and one in-flight write",
+      "tests": [{"path": "src/settings/persistence.rs", "cases": ["settings_writer_coalesces_bounded_pending_writes_and_preserves_order", "settings_writer_drop_flushes_the_latest_value", "settings_writer_reports_write_and_worker_failures_without_hanging"]}]
+    },
+    {
+      "id": "OPT-12", "owner": "src/process.rs",
+      "contract": "Event-driven collection drains both pipes, bounds output and timeouts, and reaps only owned helper groups",
+      "bound": "Four MiB per pipe; four reads per readiness turn; fixed deadline",
+      "tests": [{"path": "src/process.rs", "cases": ["collector_drains_both_pipes_and_bounds_each_capture", "collector_cleans_up_descendants_that_hold_pipes_after_leader_exit", "collector_handles_silent_children_closed_pipes_and_binary_output", "timeout_terminates_a_command_with_descendants", "pidfd_fallback_observes_exit_without_reaping_the_owned_child"]}]
+    }
+  ]
+}

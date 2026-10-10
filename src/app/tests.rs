@@ -5,6 +5,35 @@ mod tests {
     use fuzzy_rank::fields::fuzzy::{MetadataCandidate, MetadataQuery, SearchField};
 
     #[test]
+    fn optimization_inventory_references_all_twelve_steps_and_existing_regressions() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let inventory: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/optimization-contracts.json")).unwrap();
+        let steps = inventory["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 12);
+        for (index, step) in steps.iter().enumerate() {
+            assert_eq!(
+                step["id"].as_str().unwrap(),
+                format!("OPT-{:02}", index + 1)
+            );
+            assert!(root.join(step["owner"].as_str().unwrap()).is_file());
+            assert!(!step["contract"].as_str().unwrap().is_empty());
+            assert!(!step["bound"].as_str().unwrap().is_empty());
+            let tests = step["tests"].as_array().unwrap();
+            assert!(!tests.is_empty());
+            for test in tests {
+                let source =
+                    std::fs::read_to_string(root.join(test["path"].as_str().unwrap())).unwrap();
+                let cases = test["cases"].as_array().unwrap();
+                assert!(!cases.is_empty());
+                for case in cases {
+                    assert!(source.contains(&format!("fn {}(", case.as_str().unwrap())));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn default_window_cache_reuses_rows_and_refreshes_transient_titles() {
         let mut windows = vec![test_window_info("codex - \u{280b} /project - Terminal")];
         let mut cache = helpers::DefaultWindowsCache::default();
