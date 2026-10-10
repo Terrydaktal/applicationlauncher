@@ -10,6 +10,7 @@ impl SettingsWindowState {
     pub(crate) fn new(
         settings: LauncherSettings,
         idle_codex_action: Arc<Mutex<IdleCodexActionState>>,
+        terminal_maintenance: Arc<Mutex<crate::models::TerminalMaintenanceState>>,
     ) -> Self {
         let settings = settings.sanitized();
         Self {
@@ -20,6 +21,7 @@ impl SettingsWindowState {
             pending_save: None,
             save_deadline: None,
             idle_codex_action,
+            terminal_maintenance,
         }
     }
 
@@ -290,6 +292,8 @@ pub(crate) fn render_deferred_settings_panel(
         state.save_changed_settings();
     }
 
+    ui.heading("Terminal Maintenance");
+    crate::app::terminal_maintenance::settings_button(ui, &state.terminal_maintenance);
     render_idle_codex_action(ui, &state.idle_codex_action);
     ui.add_space(16.0);
     let mut close_requested = false;
@@ -719,9 +723,15 @@ mod idle_codex_action_tests {
             running: true,
             ..Default::default()
         }));
-        let first = SettingsWindowState::new(LauncherSettings::default(), shared.clone());
+        let maintenance: Arc<Mutex<crate::models::TerminalMaintenanceState>> = Arc::default();
+        let first = SettingsWindowState::new(
+            LauncherSettings::default(),
+            shared.clone(),
+            maintenance.clone(),
+        );
         drop(first);
-        let reopened = SettingsWindowState::new(LauncherSettings::default(), shared.clone());
+        let reopened =
+            SettingsWindowState::new(LauncherSettings::default(), shared.clone(), maintenance);
         assert!(reopened.idle_codex_action.lock().unwrap().running);
         assert!(Arc::ptr_eq(&reopened.idle_codex_action, &shared));
 

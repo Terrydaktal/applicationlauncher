@@ -184,6 +184,20 @@ pub struct TmuxPaneRestore {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TerminalTabRestore {
+    pub cwd: String,
+    pub kind: String,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub safe_arguments: Vec<String>,
+    #[serde(default)]
+    pub codex_session_id: Option<String>,
+    #[serde(default)]
+    pub tmux_session: Option<TmuxSession>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RestoreSpec {
     pub app_key: String,
     pub desktop_file: Option<String>,
@@ -201,6 +215,8 @@ pub struct RestoreSpec {
     pub tmux_session: Option<TmuxSession>,
     #[serde(default)]
     pub tmux_pane: Option<TmuxPaneRestore>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub terminal_tabs: Vec<TerminalTabRestore>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -375,6 +391,7 @@ pub fn infer_restore_spec(window: &TrackedWindow) -> RestoreSpec {
         ssh_arguments,
         tmux_session,
         tmux_pane,
+        terminal_tabs: Vec::new(),
     }
 }
 

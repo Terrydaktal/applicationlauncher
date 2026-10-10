@@ -4,6 +4,7 @@ mod install;
 mod model;
 mod restore;
 mod service;
+mod terminal_upgrade;
 mod tmux;
 
 pub use client::TrackerClient;
@@ -11,6 +12,7 @@ pub use install::{ensure_tracker_installed, restart_tracker_service, tracker_bin
 pub use model::*;
 pub use restore::{restore_entries, restore_snapshot};
 pub use service::run_tracker_daemon;
+pub use terminal_upgrade::{TerminalUpgradePhase, TerminalUpgradeReport, TerminalUpgradeWindow};
 pub use tmux::{LiveTmuxPane, capture_live_client_panes};
 
 pub const SERVICE_NAME: &str = "com.terrydaktal.ApplicationLauncher";

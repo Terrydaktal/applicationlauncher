@@ -103,6 +103,8 @@ struct State {
     restore_reports: HashMap<String, RestoreReport>,
     restore_report_order: VecDeque<String>,
     recovery_restore_operations: HashSet<String>,
+    terminal_upgrade_windows: HashSet<String>,
+    terminal_upgrade_closed: HashSet<String>,
 }
 
 struct AttentionState {
@@ -229,6 +231,7 @@ fn reconcile_attention_states(
 struct RuntimeInner {
     state: Mutex<State>,
     database: Mutex<TrackerDatabase>,
+    terminal_upgrades: Mutex<super::terminal_upgrade::UpgradeRegistry>,
 }
 
 #[derive(Clone)]
@@ -241,6 +244,11 @@ impl Runtime {
 
     fn claim_restore(&self, key: String) -> Result<(), String> {
         let mut state = self.0.state.lock().unwrap();
+        if state.restore_claims.contains("terminal-upgrade") {
+            return Err(
+                "Terminal maintenance is running; wait before restoring another session".into(),
+            );
+        }
         if !state.restore_claims.insert(key.clone()) {
             return Err(format!("restore operation {key} is already in progress"));
         }
@@ -780,6 +788,7 @@ impl Runtime {
             return;
         }
         let now = Instant::now();
+        let intentional_restart = state.terminal_upgrade_windows.contains(id);
         let removal_burst = state
             .removal_burst
             .take()
@@ -789,13 +798,17 @@ impl Runtime {
                 baseline_entries: state_snapshot_entries(&state),
             });
         let removed = state.windows.remove(id);
+        state.terminal_upgrade_windows.remove(id);
+        state.terminal_upgrade_closed.remove(id);
         state.attention.remove(id);
         let restore = state.restore_specs.remove(id);
         let mut mass_trigger = None;
         if removed.is_some() {
             state.history_generation = state.history_generation.wrapping_add(1);
             Self::mark_changed(&mut state);
-            if is_mass_disappearance(removal_burst.baseline_entries.len(), state.windows.len()) {
+            if !intentional_restart
+                && is_mass_disappearance(removal_burst.baseline_entries.len(), state.windows.len())
+            {
                 let current_count = state.windows.len();
                 mass_trigger = Self::begin_mass_disappearance_check(
                     &mut state,
@@ -803,7 +816,7 @@ impl Runtime {
                     current_count,
                 );
             }
-            if mass_trigger.is_none() {
+            if !intentional_restart && mass_trigger.is_none() {
                 state.removal_burst = Some(removal_burst);
             }
         }
@@ -817,6 +830,7 @@ impl Runtime {
         );
         drop(state);
         if let Some(window) = removed
+            && !intentional_restart
             && is_history_worthy(&window)
             && let Err(err) = self.0.database.lock().unwrap().add_history_with_restore(
                 &window,
@@ -843,15 +857,32 @@ impl Runtime {
         };
         state.snapshot_deadline = None;
         let baseline_entries = state_snapshot_entries(&state);
-        let mass_trigger =
-            Self::begin_mass_disappearance_check(&mut state, baseline_entries, buffer.len());
+        let expected_removals = baseline_entries
+            .iter()
+            .filter(|(window, _)| {
+                state.terminal_upgrade_windows.contains(&window.id)
+                    && !buffer.contains_key(&window.id)
+            })
+            .count();
+        let mass_trigger = Self::begin_mass_disappearance_check(
+            &mut state,
+            baseline_entries,
+            buffer.len() + expected_removals,
+        );
         state.removal_burst = None;
         for (id, window) in &state.windows {
-            if !buffer.contains_key(id) {
+            if !buffer.contains_key(id) && !state.terminal_upgrade_windows.contains(id) {
                 closed.push(window.clone());
             }
         }
         state.windows = buffer;
+        let live_ids = state.windows.keys().cloned().collect::<HashSet<_>>();
+        state
+            .terminal_upgrade_windows
+            .retain(|id| live_ids.contains(id));
+        state
+            .terminal_upgrade_closed
+            .retain(|id| live_ids.contains(id));
         state.initial_snapshot_received = true;
         let closed_restores = closed
             .iter()
@@ -869,6 +900,7 @@ impl Runtime {
         for window in &closed {
             state.restore_specs.remove(&window.id);
         }
+        state.restore_specs.retain(|id, _| live_ids.contains(id));
         if !closed.is_empty() {
             state.history_generation = state.history_generation.wrapping_add(1);
         }
@@ -1072,7 +1104,10 @@ impl Runtime {
             }
             let now = Instant::now();
             let State {
-                windows, attention, ..
+                windows,
+                attention,
+                terminal_upgrade_windows,
+                ..
             } = &mut *state;
             reconcile_attention_states(windows, attention, now);
             crate::observability::set_gauge(
@@ -1083,7 +1118,8 @@ impl Runtime {
                 .iter()
                 .filter_map(|(id, attention)| {
                     let window = windows.get(id)?;
-                    (attention.due <= now).then_some(window.clone())
+                    (attention.due <= now && !terminal_upgrade_windows.contains(id))
+                        .then_some(window.clone())
                 })
                 .collect::<Vec<_>>()
         };
@@ -1739,8 +1775,151 @@ impl WindowFeed {
 #[derive(Clone)]
 struct TrackerApi(Runtime);
 
+struct TerminalUpgradeProtection(Runtime);
+
+impl Drop for TerminalUpgradeProtection {
+    fn drop(&mut self) {
+        let mut state = self.0.0.state.lock().unwrap();
+        let retired = std::mem::take(&mut state.terminal_upgrade_closed);
+        let live_ids = state.windows.keys().cloned().collect::<HashSet<_>>();
+        state
+            .terminal_upgrade_windows
+            .retain(|id| retired.contains(id) && live_ids.contains(id));
+        state.restore_claims.remove("terminal-upgrade");
+        state.removal_burst = None;
+    }
+}
+
+impl super::terminal_upgrade::UpgradeBackend for Runtime {
+    fn windows(&self) -> Vec<TrackedWindow> {
+        self.windows()
+    }
+
+    fn backup(
+        &self,
+        all_windows: &[TrackedWindow],
+        targets: &[super::terminal_upgrade::UpgradeTarget],
+    ) -> Result<i64, String> {
+        let (boot, stored) = {
+            let state = self.0.state.lock().unwrap();
+            (state.boot_id.clone(), state.restore_specs.clone())
+        };
+        let mut entries = all_windows
+            .iter()
+            .map(|window| {
+                let mut restore = stored
+                    .get(&window.id)
+                    .cloned()
+                    .unwrap_or_else(|| super::infer_restore_spec(window));
+                if let Some(target) = targets.iter().find(|target| target.window.id == window.id) {
+                    restore.terminal_tabs = target.restore_tabs();
+                }
+                (window.clone(), restore)
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(window, _)| window.stacking_order);
+        self.0
+            .database
+            .lock()
+            .unwrap()
+            .create_terminal_upgrade_backup(&boot, &entries)
+    }
+
+    fn preflight(&self, target: &super::terminal_upgrade::UpgradeTarget) -> Result<(), String> {
+        super::terminal_upgrade::preflight_target(target, &self.windows())
+    }
+
+    fn launch_and_verify(
+        &self,
+        target: &super::terminal_upgrade::UpgradeTarget,
+    ) -> Result<String, String> {
+        super::terminal_upgrade::launch_replacement(target, || self.windows())
+    }
+
+    fn close_and_wait(
+        &self,
+        target: &super::terminal_upgrade::UpgradeTarget,
+    ) -> Result<(), String> {
+        let result = super::terminal_upgrade::close_original(target, || self.windows());
+        if result.is_ok() {
+            self.0
+                .state
+                .lock()
+                .unwrap()
+                .terminal_upgrade_closed
+                .insert(target.window.id.clone());
+        }
+        result
+    }
+
+    fn finish_layout(&self, windows: &[(TrackedWindow, String)]) -> Result<(), String> {
+        super::restore::restore_stacking(windows)
+    }
+}
+
 #[interface(name = "com.terrydaktal.ApplicationLauncher.Tracker1", spawn = false)]
 impl TrackerApi {
+    #[zbus(name = "BeginTerminalUpgradePreview")]
+    fn begin_terminal_upgrade_preview(&self) -> String {
+        let (id, preparation) = self.0.0.terminal_upgrades.lock().unwrap().begin();
+        if let Some(preparation) = preparation {
+            let runtime = self.0.clone();
+            let _ = std::thread::Builder::new()
+                .name("terminal-upgrade-preview".into())
+                .spawn(move || {
+                    let worker = crate::observability::register_worker("terminal-upgrade-preview");
+                    worker.set_state("inspecting-terminals");
+                    preparation.prepare(runtime.windows());
+                });
+        }
+        serde_json::to_string(&Ok::<_, String>(id)).unwrap()
+    }
+
+    #[zbus(name = "GetTerminalUpgradeReport")]
+    fn get_terminal_upgrade_report(&self, id: &str) -> String {
+        serde_json::to_string(&self.0.0.terminal_upgrades.lock().unwrap().report(id)).unwrap()
+    }
+
+    #[zbus(name = "StartTerminalUpgrade")]
+    fn start_terminal_upgrade(&self, id: &str, selected: Vec<String>, confirmed: bool) -> String {
+        let result = (|| {
+            let work = {
+                let registry = self.0.0.terminal_upgrades.lock().unwrap();
+                let mut state = self.0.0.state.lock().unwrap();
+                if state
+                    .restore_claims
+                    .iter()
+                    .any(|claim| claim != "terminal-upgrade")
+                {
+                    return Err(
+                        "Another session restore is in progress; wait for it to finish".to_string(),
+                    );
+                }
+                let work = registry.start(id, &selected, confirmed)?;
+                if let Some(work) = &work {
+                    state.terminal_upgrade_windows.extend(work.window_ids());
+                    state.restore_claims.insert("terminal-upgrade".into());
+                }
+                work
+            };
+            if let Some(work) = work {
+                let runtime = self.0.clone();
+                let protection = TerminalUpgradeProtection(runtime.clone());
+                std::thread::Builder::new()
+                    .name("terminal-upgrade".into())
+                    .spawn(move || {
+                        let _protection = protection;
+                        let worker = crate::observability::register_worker("terminal-upgrade");
+                        worker.set_state("backing-up-and-restarting-terminals");
+                        work.run(&runtime);
+                    })
+                    .map_err(|err| err.to_string())?;
+            }
+            self.0.0.terminal_upgrades.lock().unwrap().report(id)
+        })();
+        serde_json::to_string(&result).unwrap()
+    }
+
     #[zbus(name = "GetStatus")]
     fn get_status(&self) -> String {
         serde_json::to_string(&self.0.status()).unwrap()
@@ -2240,8 +2419,11 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             restore_reports: HashMap::new(),
             restore_report_order: VecDeque::new(),
             recovery_restore_operations: HashSet::new(),
+            terminal_upgrade_windows: HashSet::new(),
+            terminal_upgrade_closed: HashSet::new(),
         }),
         database: Mutex::new(database),
+        terminal_upgrades: Mutex::new(super::terminal_upgrade::UpgradeRegistry::default()),
     }));
     crate::observability::set_gauge(
         crate::observability::Gauge::TrackedWindows,
@@ -2395,6 +2577,122 @@ mod tests {
     use crate::tracker::{HistoryEntry, RestoreReport, RestoreSpec, TrackedWindow};
 
     #[test]
+    fn terminal_maintenance_closures_do_not_pollute_history_or_leave_stale_specs() {
+        for use_snapshot in [false, true] {
+            let (database, _directory) = super::super::database::test_database();
+            let terminal = TrackedWindow {
+                id: "terminal-being-restarted".into(),
+                title: "fish - Terminal".into(),
+                class: "xfce4-terminal".into(),
+                ..Default::default()
+            };
+            let unrelated = TrackedWindow {
+                id: "user-closed-editor".into(),
+                title: "Editor".into(),
+                class: "org.example.Editor".into(),
+                ..Default::default()
+            };
+            let windows = [terminal.clone(), unrelated.clone()]
+                .into_iter()
+                .map(|window| (window.id.clone(), window))
+                .collect::<HashMap<_, _>>();
+            let runtime = Runtime(std::sync::Arc::new(RuntimeInner {
+                database: std::sync::Mutex::new(database),
+                terminal_upgrades: std::sync::Mutex::new(
+                    crate::tracker::terminal_upgrade::UpgradeRegistry::default(),
+                ),
+                state: std::sync::Mutex::new(State {
+                    restore_specs: windows
+                        .keys()
+                        .map(|id| (id.clone(), RestoreSpec::default()))
+                        .collect(),
+                    windows,
+                    terminal_upgrade_windows: HashSet::from([terminal.id.clone()]),
+                    terminal_upgrade_closed: HashSet::from([terminal.id.clone()]),
+                    // This test must never request recovery from the user's desktop.
+                    checkpoint_guarded: true,
+                    ..Default::default()
+                }),
+            }));
+            if use_snapshot {
+                runtime.0.state.lock().unwrap().snapshot_buffer = Some(HashMap::new());
+                runtime.finish_snapshot();
+            } else {
+                runtime.remove(&terminal.id);
+                runtime.remove(&unrelated.id);
+            }
+            let state = runtime.0.state.lock().unwrap();
+            assert!(state.windows.is_empty());
+            assert!(state.terminal_upgrade_windows.is_empty());
+            assert!(state.terminal_upgrade_closed.is_empty());
+            assert!(state.restore_specs.is_empty());
+            assert!(state.mass_disappearance.is_none());
+            drop(state);
+            let history = runtime.0.database.lock().unwrap().history(10).unwrap();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].window.id, unrelated.id);
+        }
+    }
+
+    #[test]
+    fn terminal_maintenance_releases_the_claim_but_protects_a_late_removed_event() {
+        let (database, _directory) = super::super::database::test_database();
+        let retired = TrackedWindow {
+            id: "retired-terminal".into(),
+            class: "xfce4-terminal".into(),
+            ..Default::default()
+        };
+        let runtime = Runtime(std::sync::Arc::new(RuntimeInner {
+            database: std::sync::Mutex::new(database),
+            terminal_upgrades: std::sync::Mutex::new(
+                crate::tracker::terminal_upgrade::UpgradeRegistry::default(),
+            ),
+            state: std::sync::Mutex::new(State {
+                windows: HashMap::from([(retired.id.clone(), retired.clone())]),
+                terminal_upgrade_windows: HashSet::from([
+                    retired.id.clone(),
+                    "failed-and-still-open".into(),
+                ]),
+                terminal_upgrade_closed: HashSet::from([retired.id.clone()]),
+                restore_claims: HashSet::from(["terminal-upgrade".into()]),
+                checkpoint_guarded: true,
+                ..Default::default()
+            }),
+        }));
+        assert!(runtime.claim_restore("ordinary".into()).is_err());
+        drop(super::TerminalUpgradeProtection(runtime.clone()));
+        {
+            let state = runtime.0.state.lock().unwrap();
+            assert!(state.restore_claims.is_empty());
+            assert_eq!(
+                state.terminal_upgrade_windows,
+                HashSet::from([retired.id.clone()])
+            );
+        }
+        runtime.remove(&retired.id);
+        assert!(
+            runtime
+                .0
+                .state
+                .lock()
+                .unwrap()
+                .terminal_upgrade_windows
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .0
+                .database
+                .lock()
+                .unwrap()
+                .history(10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(runtime.claim_restore("ordinary".into()).is_ok());
+    }
+
+    #[test]
     fn periodic_archives_wait_for_complete_idle_sessions_without_replacing_recovery() {
         let (mut database, _directory) = super::super::database::test_database();
         let window = TrackedWindow {
@@ -2413,6 +2711,9 @@ mod tests {
             .unwrap();
         let runtime = Runtime(std::sync::Arc::new(RuntimeInner {
             database: std::sync::Mutex::new(database),
+            terminal_upgrades: std::sync::Mutex::new(
+                crate::tracker::terminal_upgrade::UpgradeRegistry::default(),
+            ),
             state: std::sync::Mutex::new(State {
                 windows: HashMap::from([(window.id.clone(), window.clone())]),
                 restore_specs: HashMap::from([(window.id.clone(), RestoreSpec::default())]),

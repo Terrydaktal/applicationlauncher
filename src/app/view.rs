@@ -411,6 +411,7 @@ impl eframe::App for App {
             && !self.show_history_popup
             && self.process_chain_popup.is_none()
             && self.app_info_popup.is_none()
+            && !self.terminal_maintenance_is_open()
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
@@ -2849,6 +2850,7 @@ impl eframe::App for App {
                     if self.app_info_popup.is_some() {
                         self.show_app_info_popup(ctx);
                     }
+                    self.show_terminal_maintenance(ctx);
                     self.show_deployment_warnings(ctx);
                     self.show_terminal_action_message(ctx);
 

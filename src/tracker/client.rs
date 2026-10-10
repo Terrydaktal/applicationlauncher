@@ -11,6 +11,26 @@ pub struct TrackerClient {
 }
 
 impl TrackerClient {
+    pub fn begin_terminal_upgrade_preview(&self) -> Result<String, String> {
+        decode_result(&self.call("BeginTerminalUpgradePreview", &())?)
+    }
+
+    pub fn terminal_upgrade_report(
+        &self,
+        id: &str,
+    ) -> Result<super::TerminalUpgradeReport, String> {
+        decode_result(&self.call("GetTerminalUpgradeReport", &(id,))?)
+    }
+
+    pub fn start_terminal_upgrade(
+        &self,
+        id: &str,
+        selected: &[String],
+        confirmed: bool,
+    ) -> Result<super::TerminalUpgradeReport, String> {
+        decode_result(&self.call("StartTerminalUpgrade", &(id, selected, confirmed))?)
+    }
+
     pub fn connect() -> Result<Self, String> {
         zbus::blocking::connection::Builder::session()
             .map_err(|err| err.to_string())?

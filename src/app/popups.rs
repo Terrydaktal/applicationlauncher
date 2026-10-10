@@ -166,6 +166,7 @@ impl App {
                 Some(Arc::new(std::sync::Mutex::new(SettingsWindowState::new(
                     self.launcher_settings_snapshot(),
                     self.idle_codex_action.clone(),
+                    self.terminal_maintenance.clone(),
                 ))));
             ctx.request_repaint();
             return;

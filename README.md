@@ -9,6 +9,7 @@
 ├── src/
 │   ├── bin/applicationlauncherd.rs
 │   ├── tracker/
+│   │   └── terminal_upgrade.rs
 │   ├── windows/
 │   ├── app/
 │   │   ├── commands.rs
@@ -16,6 +17,7 @@
 │   │   ├── helpers.rs
 │   │   ├── popups.rs
 │   │   ├── settings.rs
+│   │   ├── terminal_maintenance.rs
 │   │   ├── view.rs
 │   │   └── mod.rs
 │   ├── launch/
@@ -47,6 +49,8 @@
 
 - `src/main.rs`: GUI CLI parsing, single-instance startup, and native window creation.
 - `src/app/`: Launcher state, feeds, commands, search-row rendering, settings, popups, and the `eframe` update loop.
+- `src/app/terminal_maintenance.rs`: Separate terminal-restart confirmation/progress popup. Uses background D-Bus requests and never closes or launches terminals itself.
+- `src/tracker/terminal_upgrade.rs`: On-demand daemon-owned terminal inspection, bounded restart plans, explicit confirmation, pinned replacement binaries and per-window restart/verification. Receives the current tracked windows and selected plan IDs; produces a preview, named backup and progress/failure report.
 - `src/launch/`: Desktop-entry parsing and application/window launch actions.
 - `src/audio.rs`: Stream-to-app/window attribution, volume controls and measured icon-ring rendering.
 - `src/audio/monitor.rs`: Named background worker using native PulseAudio per-playback-stream monitors. Publishes a single replaceable latest-result slot; never records a microphone or the mixed desktop output.
@@ -295,6 +299,64 @@ Current settings cover:
   Row height, icon size, padding, text spacing, line height, title size, path size, and whether the subtitle path is shown
 - General:
   `Disable text select cursor (I-beam)`
+
+## Terminal Maintenance
+
+Open `F10` -> `Terminal Maintenance` -> `Restart terminal windows...`.
+Opening the separate popup only inspects terminals. Review every tab, select
+windows, acknowledge the possible loss of unsaved state, then press
+`Back up and restart selected terminals`. Busy windows are not selected by
+default. Windows already running their current on-disk executable need no
+restart and are excluded.
+
+The daemon first commits a FULL-synchronous named backup, retained until manually
+deleted in `F9` -> `Saved sessions` as `Before terminal restart ...`. It records
+window geometry, desktop, minimized/maximized state, stacking and all verified
+tabs with their directories, active-tab selection and allowlisted restore data.
+Replacement executables are pinned from the real running terminal's original
+filesystem path; this uses the currently built binary at that path, not a source
+scan or automatic compilation. The preview displays its path, build ID when
+available and SHA256. A replaced binary or changed window/tab identity invalidates
+the preview instead of guessing.
+
+Restarts run one window at a time in the daemon, off the GUI/event loop. New
+windows use `--disable-server` and independent systemd scopes, so they cannot
+accidentally reuse the old terminal server or be killed when the launcher or
+daemon stops. The worker verifies the replacement executable, every tab and
+placement before reporting success, then restores stacking and focus. Closing
+the popup or launcher does not cancel an already confirmed daemon job. Reopening
+the popup resumes progress reporting; refresh the preview for a new operation.
+
+All-tmux windows attach to their exact surviving server/session identities and
+are verified before the original window is asked to close. Ordinary terminals
+close before their programs restart, and the worker verifies the original
+non-tmux process has exited to avoid simultaneous writers to a Codex session.
+Supported replay is fish/bash/zsh login shells, `htop`, `nvtop`, `agy -c`
+and Codex by its **exact** session ID, read from its open rollout metadata or
+explicit resume arguments. This action never guesses with `codex resume --last`.
+Multi-tab upgrade backups require their saved tmux sessions to remain available
+when restored; they do not pretend to recover tmux pane memory after a server
+exit or reboot.
+
+SSH, arbitrary programs, missing metadata, ambiguous shared-server windows,
+background jobs and invalid placement are skipped. Scrollback, shell variables
+and in-flight non-tmux work are not recoverable. Activity in inactive tabs cannot
+always be determined: review all tabs before confirming. XFCE may require its own
+close confirmation; a close that does not complete within 30 seconds is reported
+without force-killing or repeating the request. Failed items are reported
+individually and the backup remains available. Confirmation plans expire after
+five minutes, detailed previews and reports are bounded, and duplicate starts do
+not repeat a restart. No terminal-maintenance polling or scanning runs during
+ordinary launcher use.
+
+Automated verification uses fake backends, temporary databases, argument
+inspection and headless egui rendering. These tests do not restart live terminals
+or attach to the user's desktop:
+
+```bash
+cargo test --lib terminal_upgrade
+cargo test --bin applicationlauncher app::terminal_maintenance
+```
 
 ## Keyboard and Mouse Behavior
 

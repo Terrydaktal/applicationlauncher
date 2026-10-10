@@ -894,6 +894,21 @@ fn launch(restore: &RestoreSpec) -> Result<(bool, Option<String>), String> {
 }
 
 fn launch_plan(restore: &RestoreSpec) -> Result<LaunchPlan, LaunchUnavailable> {
+    if !restore.terminal_tabs.is_empty() {
+        return Ok(LaunchPlan {
+            program: required_executable("xfce4-terminal")?,
+            arguments: terminal_tab_arguments(&restore.terminal_tabs).map_err(|detail| {
+                LaunchUnavailable {
+                    code: LaunchUnavailableCode::UnsupportedTerminalKind,
+                    detail,
+                }
+            })?,
+            description: "saved multi-tab terminal".into(),
+            recreates_tmux: false,
+            partial_note: None,
+            tmux_socket: None,
+        });
+    }
     if effective_terminal_kind(restore) == Some("tmux") {
         return tmux_terminal_launch_plan(restore);
     }
@@ -1312,6 +1327,123 @@ fn terminal_restore_arguments(shell_command: Option<&str>) -> Vec<OsString> {
     arguments
 }
 
+pub(super) fn valid_session_id(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn quote_argument(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "'\\''"))
+}
+
+pub(super) fn terminal_tab_arguments(
+    tabs: &[super::TerminalTabRestore],
+) -> Result<Vec<OsString>, String> {
+    if tabs.is_empty() || tabs.len() > 32 || tabs.iter().filter(|tab| tab.active).count() != 1 {
+        return Err("A terminal must have 1-32 tabs and exactly one active tab".into());
+    }
+    let mut arguments = vec!["--disable-server".into(), "--window".into()];
+    for (index, tab) in tabs.iter().enumerate() {
+        let cwd = expand_home(&tab.cwd);
+        if !cwd.is_absolute() || !cwd.is_dir() {
+            return Err(format!("Terminal directory {:?} is unavailable", tab.cwd));
+        }
+        let command = match tab.kind.as_str() {
+            "fish" | "bash" | "zsh" => {
+                required_executable(&tab.kind).map_err(|err| err.to_string())?;
+                vec![tab.kind.clone(), "-l".into()]
+            }
+            "tmux" => {
+                required_executable("tmux").map_err(|err| err.to_string())?;
+                let session = tab
+                    .tmux_session
+                    .as_ref()
+                    .ok_or("Missing tmux session identity")?;
+                // Upgrade backups only attach surviving sessions; never replay a pane's jobs.
+                if super::tmux::session_status(session).map_err(|err| err.to_string())?
+                    != super::tmux::SessionStatus::Exact
+                {
+                    return Err(format!(
+                        "tmux session {:?} no longer exists",
+                        session.session_name
+                    ));
+                }
+                let mut command = vec!["tmux".to_string()];
+                command
+                    .extend(super::tmux::attach_arguments(session).ok_or("Invalid tmux identity")?);
+                command
+            }
+            "codex" | "agy" | "htop" | "nvtop" => {
+                required_executable(&tab.kind).map_err(|err| err.to_string())?;
+                required_executable("fish").map_err(|err| err.to_string())?;
+                required_executable("bash").map_err(|err| err.to_string())?;
+                let argv = if tab.kind == "codex" {
+                    let id = tab
+                        .codex_session_id
+                        .as_deref()
+                        .filter(|id| valid_session_id(id))
+                        .ok_or(
+                            "The exact Codex session could not be identified; refusing --last",
+                        )?;
+                    let mut argv = vec!["codex".to_string(), "resume".into(), id.into()];
+                    argv.extend(
+                        super::codex_resume_arguments(&tab.safe_arguments)
+                            .into_iter()
+                            .skip(3)
+                            .map(String::from),
+                    );
+                    argv
+                } else {
+                    terminal_shell_command(&tab.kind, &[])
+                        .map_err(|err| err.to_string())?
+                        .ok_or("Missing terminal command")?
+                        .1
+                        .split_whitespace()
+                        .map(String::from)
+                        .collect()
+                };
+                let command = argv
+                    .iter()
+                    .map(|argument| quote_argument(argument))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                vec![
+                    "fish".into(),
+                    "-lc".into(),
+                    format!(
+                        "exec bash -m -c {}",
+                        quote_argument(&format!("{command}; exec fish"))
+                    ),
+                ]
+            }
+            other => return Err(format!("Unsupported terminal program {other:?}")),
+        };
+        if index > 0 {
+            arguments.push("--tab".into());
+        }
+        arguments.extend(["--working-directory".into(), cwd.into_os_string()]);
+        if tab.active {
+            arguments.push("--active-tab".into());
+        }
+        arguments.extend([
+            "--command".into(),
+            command
+                .iter()
+                .map(|argument| quote_argument(argument))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .into(),
+        ]);
+    }
+    Ok(arguments)
+}
+
 fn terminal_shell_command(
     kind: &str,
     saved_arguments: &[String],
@@ -1354,6 +1486,88 @@ fn expand_home(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_upgrade_replay_rejects_unknown_programs_missing_exact_ids_and_ambiguous_active_tabs()
+     {
+        let tab = super::super::TerminalTabRestore {
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            kind: "unsupported; touch /somewhere".into(),
+            active: true,
+            ..Default::default()
+        };
+        assert!(
+            terminal_tab_arguments(&[tab.clone()])
+                .unwrap_err()
+                .contains("Unsupported")
+        );
+        assert!(terminal_tab_arguments(&[]).is_err());
+        assert!(terminal_tab_arguments(&[tab.clone(), tab.clone()]).is_err());
+        let mut inactive = tab.clone();
+        inactive.active = false;
+        assert!(terminal_tab_arguments(&[inactive]).is_err());
+        assert!(!valid_session_id("--last"));
+        assert!(!valid_session_id(
+            "12345678-1234-5678-9abc-123456789abc;touch x"
+        ));
+        assert!(valid_session_id("12345678-1234-5678-9abc-123456789abc"));
+    }
+
+    #[test]
+    fn terminal_upgrade_multitab_arguments_force_a_new_server_and_preserve_tab_order_and_active_tab()
+     {
+        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+        let tabs = vec![
+            super::super::TerminalTabRestore {
+                cwd: cwd.clone(),
+                kind: "bash".into(),
+                active: false,
+                ..Default::default()
+            },
+            super::super::TerminalTabRestore {
+                cwd,
+                kind: "bash".into(),
+                active: true,
+                ..Default::default()
+            },
+        ];
+        let arguments = terminal_tab_arguments(&tabs)
+            .unwrap()
+            .into_iter()
+            .map(|argument| argument.into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(&arguments[..2], ["--disable-server", "--window"]);
+        assert_eq!(
+            arguments
+                .iter()
+                .filter(|argument| *argument == "--tab")
+                .count(),
+            1
+        );
+        assert_eq!(
+            arguments
+                .iter()
+                .filter(|argument| *argument == "--active-tab")
+                .count(),
+            1
+        );
+        let separator = arguments
+            .iter()
+            .position(|argument| argument == "--tab")
+            .unwrap();
+        let active = arguments
+            .iter()
+            .position(|argument| argument == "--active-tab")
+            .unwrap();
+        assert!(active > separator);
+        assert_eq!(
+            arguments
+                .iter()
+                .filter(|argument| *argument == "'bash' '-l'")
+                .count(),
+            2
+        );
+    }
 
     fn tracked_window(id: &str, title: &str, app: &str) -> TrackedWindow {
         TrackedWindow {

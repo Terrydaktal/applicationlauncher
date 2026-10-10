@@ -116,11 +116,17 @@ pub fn status_with_timeout(command: Command, timeout: Duration) -> io::Result<Ex
 }
 
 pub fn spawn_and_reap(command: Command) -> io::Result<()> {
+    spawn_and_reap_with_pid(command).map(|_| ())
+}
+
+/// Return the independently scoped child's identity without tying its lifetime to the daemon.
+pub fn spawn_and_reap_with_pid(command: Command) -> io::Result<u32> {
     let mut child = spawn_in_independent_scope(command)?;
+    let pid = child.id();
     thread::spawn(move || {
         let _ = child.wait();
     });
-    Ok(())
+    Ok(pid)
 }
 
 fn spawn_in_independent_scope(command: Command) -> io::Result<Child> {

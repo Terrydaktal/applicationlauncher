@@ -3,6 +3,7 @@ mod feed;
 mod helpers;
 mod popups;
 mod settings;
+pub(crate) mod terminal_maintenance;
 #[cfg(test)]
 mod tests;
 mod view;
@@ -321,6 +322,7 @@ pub(crate) struct App {
     app_info_popup: Option<AppInfo>,
     settings_popup_state: Option<Arc<std::sync::Mutex<SettingsWindowState>>>,
     idle_codex_action: Arc<std::sync::Mutex<IdleCodexActionState>>,
+    terminal_maintenance: Arc<std::sync::Mutex<TerminalMaintenanceState>>,
     settings_popup_applied_revision: u64,
     pending_settings_save: Option<LauncherSettings>,
     settings_save_deadline: Option<Instant>,
@@ -423,6 +425,7 @@ impl App {
             Some(Arc::new(std::sync::Mutex::new(SettingsWindowState::new(
                 self.launcher_settings_snapshot(),
                 self.idle_codex_action.clone(),
+                self.terminal_maintenance.clone(),
             ))));
         self.settings_popup_applied_revision = 0;
         self.show_settings_menu = true;
@@ -852,6 +855,7 @@ impl App {
             app_info_popup: None,
             settings_popup_state: None,
             idle_codex_action: Arc::default(),
+            terminal_maintenance: Arc::default(),
             settings_popup_applied_revision: 0,
             pending_settings_save: None,
             settings_save_deadline: None,

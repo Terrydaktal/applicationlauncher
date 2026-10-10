@@ -354,6 +354,17 @@ pub struct SettingsWindowState {
     pub pending_save: Option<LauncherSettings>,
     pub save_deadline: Option<std::time::Instant>,
     pub idle_codex_action: Arc<std::sync::Mutex<IdleCodexActionState>>,
+    pub terminal_maintenance: Arc<std::sync::Mutex<TerminalMaintenanceState>>,
+}
+
+#[derive(Default)]
+pub struct TerminalMaintenanceState {
+    pub open: bool,
+    pub worker_running: bool,
+    pub report: Option<applicationlauncher::tracker::TerminalUpgradeReport>,
+    pub selected: HashSet<String>,
+    pub confirmed: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Default)]

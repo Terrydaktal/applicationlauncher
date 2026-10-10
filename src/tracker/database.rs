@@ -493,6 +493,36 @@ impl TrackerDatabase {
         Ok(id)
     }
 
+    pub(super) fn create_terminal_upgrade_backup(
+        &mut self,
+        boot_id: &str,
+        entries: &[(TrackedWindow, RestoreSpec)],
+    ) -> Result<i64, String> {
+        let previous: i64 = self
+            .connection
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .map_err(|err| err.to_string())?;
+        self.connection
+            .pragma_update(None, "synchronous", "FULL")
+            .map_err(|err| err.to_string())?;
+        let timestamp = super::now_ms();
+        let result = self.create_snapshot_with_entries(
+            Some(&format!("Before terminal restart {timestamp}")),
+            "named",
+            boot_id,
+            entries,
+            timestamp,
+        );
+        let reset = self
+            .connection
+            .pragma_update(None, "synchronous", previous)
+            .map_err(|err| err.to_string());
+        match (result, reset) {
+            (Ok(id), Ok(())) => Ok(id),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+    }
+
     pub fn snapshots(&self) -> Result<Vec<SnapshotSummary>, String> {
         let mut statement = self.connection.prepare("SELECT s.id,s.name,s.kind,s.created_at_ms,COUNT(w.ordinal) FROM snapshots s LEFT JOIN snapshot_windows w ON w.snapshot_id=s.id GROUP BY s.id ORDER BY s.created_at_ms DESC,s.id DESC").map_err(|err| err.to_string())?;
         let rows = statement
@@ -732,6 +762,50 @@ pub(super) fn test_database() -> (TrackerDatabase, TestDatabaseDirectory) {
 mod tests {
     use super::*;
     use crate::tracker::{TrackedWindow, now_ms};
+
+    #[test]
+    fn terminal_upgrade_backup_is_named_durable_and_preserves_every_tab_and_geometry() {
+        let (mut database, directory) = test_database();
+        let mut entries = periodic_entries();
+        entries[0].1.terminal_tabs = vec![
+            super::super::TerminalTabRestore {
+                cwd: "/one".into(),
+                kind: "fish".into(),
+                active: false,
+                ..Default::default()
+            },
+            super::super::TerminalTabRestore {
+                cwd: "/two".into(),
+                kind: "codex".into(),
+                active: true,
+                codex_session_id: Some("12345678-1234-5678-9abc-123456789abc".into()),
+                ..Default::default()
+            },
+        ];
+        let id = database
+            .create_terminal_upgrade_backup("test-boot", &entries)
+            .unwrap();
+        let sync: i64 = database
+            .connection
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            sync, 1,
+            "restore NORMAL mode after the FULL-synchronous backup transaction"
+        );
+        drop(database);
+        let database = TrackerDatabase::open(&directory.0.join("history.sqlite3")).unwrap();
+        let saved = database.snapshot(id).unwrap().unwrap();
+        assert_eq!(saved.summary.kind, "named");
+        assert!(
+            saved
+                .summary
+                .name
+                .unwrap()
+                .starts_with("Before terminal restart ")
+        );
+        assert_eq!(saved.windows, entries);
+    }
 
     fn periodic_entries() -> Vec<(TrackedWindow, RestoreSpec)> {
         vec![(

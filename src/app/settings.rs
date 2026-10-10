@@ -458,6 +458,8 @@ impl App {
                 ui.end_row();
             });
 
+        ui.heading("Terminal Maintenance");
+        terminal_maintenance::settings_button(ui, &self.terminal_maintenance);
         render_idle_codex_action(ui, &self.idle_codex_action);
         ui.add_space(16.0);
         ui.vertical_centered(|ui| {
