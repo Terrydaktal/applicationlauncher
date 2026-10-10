@@ -450,7 +450,7 @@ fn main() -> eframe::Result {
 
     let options = launcher_native_options(width, height, title);
 
-    eframe::run_native(
+    let result = eframe::run_native(
         title,
         options,
         Box::new(move |cc| {
@@ -478,7 +478,9 @@ fn main() -> eframe::Result {
                 ui_event_rx,
             )))
         }),
-    )
+    );
+    settings::flush_writes();
+    result
 }
 
 #[cfg(test)]

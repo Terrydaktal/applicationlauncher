@@ -82,33 +82,199 @@ pub fn output_with_timeout(mut command: Command, timeout: Duration) -> io::Resul
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let stdout = child.stdout.take().map(read_pipe);
-    let stderr = child.stderr.take().map(read_pipe);
-    let deadline = Instant::now() + timeout;
+    #[cfg(target_os = "linux")]
+    {
+        return collect_child_output(&mut child, timeout);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let stdout = child.stdout.take().map(read_pipe);
+        let stderr = child.stderr.take().map(read_pipe);
+        let deadline = Instant::now() + timeout;
 
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                terminate_child(&mut child);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "command exceeded its deadline",
+                ));
+            }
+            thread::sleep(POLL_INTERVAL);
+        };
+
+        // A command can exit while a descendant still owns one of its pipes.
+        // Reap the leader and terminate the private group before joining readers.
+        terminate_process_group(child.id());
+
+        Ok(Output {
+            status,
+            stdout: join_pipe(stdout),
+            stderr: join_pipe(stderr),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn collect_child_output(child: &mut Child, timeout: Duration) -> io::Result<Output> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let mut group_cleaned = false;
+    let result = (|| {
+        let mut pipes = [
+            child
+                .stdout
+                .take()
+                .map(|pipe| std::fs::File::from(OwnedFd::from(pipe))),
+            child
+                .stderr
+                .take()
+                .map(|pipe| std::fs::File::from(OwnedFd::from(pipe))),
+        ];
+        for pipe in pipes.iter().flatten() {
+            let fd = pipe.as_raw_fd();
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
         }
-        if Instant::now() >= deadline {
-            terminate_child(&mut child);
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "command exceeded its deadline",
-            ));
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
+        let pidfd = (pidfd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(pidfd as i32) });
+        let deadline = Instant::now() + timeout;
+        let mut output = [Vec::new(), Vec::new()];
+        let mut status = None;
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            if status.is_some() && pipes.iter().all(Option::is_none) {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let mut descriptors = [
+                libc::pollfd {
+                    fd: pipes[0].as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: pipes[1].as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: if status.is_none() {
+                        pidfd.as_ref().map_or(-1, AsRawFd::as_raw_fd)
+                    } else {
+                        -1
+                    },
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let wait = if pidfd.is_none() {
+                remaining.min(POLL_INTERVAL)
+            } else {
+                remaining
+            };
+            let milliseconds = wait
+                .as_millis()
+                .saturating_add(u128::from(wait.subsec_nanos() % 1_000_000 != 0))
+                .min(i32::MAX as u128) as i32;
+            let ready = unsafe {
+                libc::poll(
+                    descriptors.as_mut_ptr(),
+                    descriptors.len() as _,
+                    milliseconds,
+                )
+            };
+            if ready < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if status.is_none() {
+                if pidfd.is_some() && descriptors[2].revents != 0 {
+                    // The unreaped leader still owns its PID, so cleanup cannot hit a reused group.
+                    terminate_process_group(child.id());
+                    group_cleaned = true;
+                    status = Some(child.wait()?);
+                } else if pidfd.is_none() && child_exit_pending(child.id())? {
+                    terminate_process_group(child.id());
+                    group_cleaned = true;
+                    status = Some(child.wait()?);
+                }
+            }
+            for index in 0..2 {
+                if descriptors[index].revents == 0 {
+                    continue;
+                }
+                // Bound each drain so a continuous writer cannot starve the deadline or other pipe.
+                for _ in 0..4 {
+                    let Some(pipe) = pipes[index].as_mut() else {
+                        break;
+                    };
+                    match pipe.read(&mut buffer) {
+                        Ok(0) => {
+                            pipes[index] = None;
+                            break;
+                        }
+                        Ok(length) => {
+                            let retained = length.min(
+                                (MAX_CAPTURE_BYTES as usize).saturating_sub(output[index].len()),
+                            );
+                            output[index].extend_from_slice(&buffer[..retained]);
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+            if Instant::now() >= deadline && (status.is_none() || pipes.iter().any(Option::is_some))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "command exceeded its deadline",
+                ));
+            }
         }
-        thread::sleep(POLL_INTERVAL);
+        let [stdout, stderr] = output;
+        Ok(Output {
+            status: status.unwrap(),
+            stdout,
+            stderr,
+        })
+    })();
+    if result.is_err() && !group_cleaned {
+        terminate_child(child);
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn child_exit_pending(pid: u32) -> io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
     };
-
-    // A command can exit while a descendant still owns one of its pipes.
-    // Reap the leader and terminate the private group before joining readers.
-    terminate_process_group(child.id());
-
-    Ok(Output {
-        status,
-        stdout: join_pipe(stdout),
-        stderr: join_pipe(stderr),
-    })
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    // Observe without reaping: the PID cannot be reused before group cleanup.
+    Ok(unsafe { info.si_pid() } == pid as i32)
 }
 
 pub fn status_with_timeout(command: Command, timeout: Duration) -> io::Result<ExitStatus> {
@@ -248,6 +414,7 @@ pub fn atomic_write(path: &std::path::Path, contents: &[u8]) -> io::Result<()> {
     result
 }
 
+#[cfg(not(target_os = "linux"))]
 fn read_pipe(pipe: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
     thread::spawn(move || {
         let mut output = Vec::new();
@@ -260,6 +427,7 @@ fn read_pipe(pipe: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
     })
 }
 
+#[cfg(not(target_os = "linux"))]
 fn join_pipe(pipe: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
     pipe.and_then(|thread| thread.join().ok())
         .unwrap_or_default()
@@ -349,6 +517,68 @@ mod tests {
 
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn collector_drains_both_pipes_and_bounds_each_capture() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "head -c 5000000 /dev/zero & head -c 5000000 /dev/zero >&2 & wait",
+        ]);
+        let output = output_with_timeout(command, Duration::from_secs(5)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), MAX_CAPTURE_BYTES as usize);
+        assert_eq!(output.stderr.len(), MAX_CAPTURE_BYTES as usize);
+        assert!(output.stdout.iter().all(|byte| *byte == 0));
+        assert!(output.stderr.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn collector_cleans_up_descendants_that_hold_pipes_after_leader_exit() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 & printf 'ok'; exit 0"]);
+        let output = output_with_timeout(command, Duration::from_secs(2)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ok");
+    }
+
+    #[test]
+    fn collector_handles_silent_children_closed_pipes_and_binary_output() {
+        for script in ["exit 7", "exec 1>&- 2>&-; sleep 0.02; exit 7"] {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            let output = output_with_timeout(command, Duration::from_secs(2)).unwrap();
+            assert_eq!(output.status.code(), Some(7));
+            assert!(output.stdout.is_empty());
+        }
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf '\\377\\000\\376'; printf error >&2"]);
+        let output = output_with_timeout(command, Duration::from_secs(2)).unwrap();
+        assert_eq!(output.stdout, [255, 0, 254]);
+        assert_eq!(output.stderr, b"error");
+        assert_eq!(
+            output_with_timeout(
+                Command::new("/applicationlauncher-no-such-test-executable"),
+                Duration::from_secs(1)
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pidfd_fallback_observes_exit_without_reaping_the_owned_child() {
+        let mut child = Command::new("sh").args(["-c", "exit 7"]).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !child_exit_pending(child.id()).unwrap() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(child_exit_pending(child.id()).unwrap());
+        assert_eq!(child.wait().unwrap().code(), Some(7));
     }
 
     #[test]

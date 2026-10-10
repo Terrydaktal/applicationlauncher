@@ -2769,6 +2769,14 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        if let Some(settings) = self.pending_settings_save.take() {
+            save_launcher_settings(settings);
+        }
+        if let Some(state) = &self.settings_popup_state
+            && let Ok(mut state) = state.lock()
+        {
+            state.flush_pending_save_now();
+        }
         self.save_window_size();
     }
 }

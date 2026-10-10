@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 use crate::app::App;
 use crate::models::{IdleCodexActionState, LauncherSettings, SettingsWindowState};
+mod persistence;
+pub(crate) use persistence::{flush_writes, queue_write};
 
 impl SettingsWindowState {
     pub(crate) fn new(
@@ -542,7 +544,6 @@ pub(crate) fn load_launcher_settings() -> LauncherSettings {
 pub(crate) fn save_launcher_settings(settings: LauncherSettings) {
     if let Ok(home) = std::env::var("HOME") {
         let dir = PathBuf::from(format!("{}/.config/applicationlauncher", home));
-        let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("settings.txt");
         let content = format!(
             "show_system_settings_modules={}\napp_icon_mode={}\nwin_icon_size={:.1}\nwin_top_padding={:.1}\nwin_bottom_padding={:.1}\nwin_left_padding={:.1}\nwin_right_padding={:.1}\nwin_row_height={:.1}\nwin_text_spacing={:.1}\nwin_line_height={:.1}\nwin_show_path={}\nwin_show_last_activation={}\nshow_run_in_terminal={}\nshow_cd_in_terminal={}\nauto_send_enter_on_attention={}\nwin_title_size={:.1}\nwin_path_size={:.1}\napp_icon_size={:.1}\napp_icon_tile_size={:.1}\napp_top_padding={:.1}\napp_bottom_padding={:.1}\napp_left_padding={:.1}\napp_right_padding={:.1}\napp_icon_show_name={}\napp_icon_name_size={:.1}\ndisable_ibeam={}\napp_scroll_sensitivity={:.2}\nwin_scroll_sensitivity={:.2}\nui_scale={:.2}\n",
@@ -576,9 +577,7 @@ pub(crate) fn save_launcher_settings(settings: LauncherSettings) {
             settings.win_scroll_sensitivity,
             settings.ui_scale
         );
-        if let Err(err) = applicationlauncher::process::atomic_write(&path, content.as_bytes()) {
-            eprintln!("Could not save launcher settings: {err}");
-        }
+        queue_write(path, content);
     }
 }
 

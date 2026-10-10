@@ -965,15 +965,11 @@ impl App {
     fn save_window_size(&self) {
         if let Ok(home) = std::env::var("HOME") {
             let dir = PathBuf::from(format!("{}/.config/applicationlauncher", home));
-            let _ = std::fs::create_dir_all(&dir);
             let path = dir.join("window_size.txt");
             let base_width = (self.width * self.ui_scale).clamp(300.0, 1920.0);
             let base_height = (self.height * self.ui_scale).clamp(200.0, 1080.0);
             let content = format!("{}\n{}", base_width, base_height);
-            if let Err(err) = applicationlauncher::process::atomic_write(&path, content.as_bytes())
-            {
-                eprintln!("Could not save launcher window size: {err}");
-            }
+            crate::settings::queue_write(path, content);
         }
     }
 
@@ -1080,17 +1076,13 @@ impl App {
         self.pinned_app_positions = helpers::index_pinned_apps(&self.pinned_apps);
         if let Ok(home) = std::env::var("HOME") {
             let dir = PathBuf::from(format!("{}/.config/applicationlauncher", home));
-            let _ = std::fs::create_dir_all(&dir);
             let path = dir.join("pinned_apps.txt");
             let mut content = String::new();
             for p in &self.pinned_apps {
                 content.push_str(&p.to_string_lossy());
                 content.push('\n');
             }
-            if let Err(err) = applicationlauncher::process::atomic_write(&path, content.as_bytes())
-            {
-                eprintln!("Could not save pinned applications: {err}");
-            }
+            crate::settings::queue_write(path, content);
         }
         self.pinned_apps_generation = self.pinned_apps_generation.wrapping_add(1);
     }
