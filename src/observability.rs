@@ -87,10 +87,11 @@ pub enum Counter {
     AttentionFailures,
     WorkerPanics,
     FlightRecorderDrops,
+    IgnoredIdleImeEvents,
 }
 
 impl Counter {
-    const COUNT: usize = 14;
+    const COUNT: usize = 15;
     const ALL: [(Self, &'static str); Self::COUNT] = [
         (Self::DiagnosticRequests, "diagnostic_requests"),
         (Self::DiagnosticFailures, "diagnostic_failures"),
@@ -106,6 +107,7 @@ impl Counter {
         (Self::AttentionFailures, "attention_failures"),
         (Self::WorkerPanics, "worker_panics"),
         (Self::FlightRecorderDrops, "flight_recorder_drops"),
+        (Self::IgnoredIdleImeEvents, "ignored_idle_ime_events"),
     ];
 }
 

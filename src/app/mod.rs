@@ -1,6 +1,7 @@
 mod commands;
 mod feed;
 mod helpers;
+mod input;
 mod popups;
 mod settings;
 pub(crate) mod terminal_maintenance;
@@ -339,6 +340,7 @@ pub(crate) struct App {
     window_receiver: Receiver<Vec<WindowInfo>>,
     window_feed_inbox: Arc<std::sync::Mutex<Option<Vec<WindowFeedEvent>>>>,
     last_frame_cpu_micros: Arc<AtomicU32>,
+    ime_input_filter: input::ImeInputFilter,
     audio_inbox: Arc<AudioInbox>,
     firefox_audio_inbox: Arc<FirefoxAudioInbox>,
     firefox_audio_processes: Arc<Vec<FirefoxAudioProcess>>,
@@ -872,6 +874,7 @@ impl App {
             window_receiver: window_rx,
             window_feed_inbox,
             last_frame_cpu_micros,
+            ime_input_filter: input::ImeInputFilter::default(),
             audio_inbox,
             firefox_audio_inbox,
             firefox_audio_processes: Arc::default(),

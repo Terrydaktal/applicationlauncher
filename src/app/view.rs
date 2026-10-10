@@ -18,6 +18,16 @@ pub(super) fn open_window_count_label(ui: &egui::Ui, count: usize) -> (egui::Lab
 }
 
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+        let ignored = self.ime_input_filter.filter(input);
+        if ignored != 0 {
+            applicationlauncher::observability::add(
+                applicationlauncher::observability::Counter::IgnoredIdleImeEvents,
+                ignored as u64,
+            );
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if let Some(cpu_usage) = frame.info().cpu_usage {
             let cpu_micros = (cpu_usage.max(0.0) * 1_000_000.0)
