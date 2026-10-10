@@ -500,6 +500,79 @@ fn live_playback_monitor_probe() {
     }
 }
 
+#[test]
+#[ignore = "read-only live attribution probe; requires APPLICATIONLAUNCHER_TEST_AUDIO_PID"]
+fn live_client_owned_playback_routes_measured_audio_to_the_actual_window() {
+    let pid: i32 = std::env::var("APPLICATIONLAUNCHER_TEST_AUDIO_PID")
+        .expect("set the PID of the application currently playing audio")
+        .parse()
+        .unwrap();
+    assert!(pid > 1);
+    let tracked = applicationlauncher::tracker::TrackerClient::connect()
+        .unwrap()
+        .windows()
+        .unwrap();
+    let windows: Vec<_> = tracked
+        .iter()
+        .map(|win| {
+            let mut window = crate::audio::tests::firefox_window(&win.id, win.pid, &win.title);
+            window.class = win.class.clone();
+            window
+        })
+        .collect();
+    let expected: Vec<_> = windows
+        .iter()
+        .filter(|window| window.pid == Some(pid))
+        .collect();
+    assert_eq!(
+        expected.len(),
+        1,
+        "probe requires one unambiguous application window"
+    );
+    let mut engine = Engine::connect(None).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut pcm_without_identity = HashSet::new();
+    while Instant::now() < deadline {
+        engine.step().unwrap();
+        let snapshot = engine.snapshot();
+        for index in snapshot.visualizations.keys() {
+            if engine.inputs[index]
+                .metadata
+                .properties
+                .get("application.process.id")
+                .is_none()
+            {
+                pcm_without_identity.insert(*index);
+            }
+        }
+        let cache = crate::audio::build_window_audio_cache(&windows, &snapshot.sink_inputs);
+        let Some(indices) = cache.visualization_sinks.get(&expected[0].id) else {
+            continue;
+        };
+        if let Some(visual) =
+            crate::audio::visualization_for_sinks(indices, &snapshot.visualizations)
+        {
+            assert!(indices.iter().all(|index| {
+                engine.inputs[index]
+                    .metadata
+                    .properties
+                    .get("application.process.id")
+                    .is_some_and(|value| value == &pid.to_string())
+            }));
+            eprintln!(
+                "live client attribution: PID {pid}, {} individually measured streams, peak {}; no samples saved",
+                indices.len(),
+                visual.peak
+            );
+            return;
+        }
+    }
+    panic!(
+        "PID {pid} had no window waveform; {} streams had measured PCM but no application identity",
+        pcm_without_identity.len()
+    );
+}
+
 fn source_outputs(engine: &mut Engine) -> Vec<(u32, u32, bool)> {
     struct Query {
         done: bool,

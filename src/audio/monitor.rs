@@ -22,6 +22,13 @@ const PUBLISH_INTERVAL: Duration = Duration::from_millis(40);
 const STALE_SAMPLES: Duration = Duration::from_millis(160);
 pub(crate) const STALE_AUDIO_UPDATE: Duration = Duration::from_millis(400);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const APPLICATION_IDENTITY_PROPERTIES: [&CStr; 5] = [
+    c"application.id",
+    c"application.name",
+    c"application.icon_name",
+    c"application.process.id",
+    c"application.process.binary",
+];
 
 #[derive(Default)]
 pub(crate) struct AudioInbox(Mutex<Option<AudioCacheUpdate>>);
@@ -152,9 +159,45 @@ struct Discovery {
     query_generation: u64,
     inputs_done: bool,
     outputs_done: bool,
+    clients_done: bool,
     failed: bool,
     inputs: BTreeMap<u32, Input>,
     outputs: HashMap<u32, Output>,
+    clients: HashMap<u32, HashMap<String, String>>,
+}
+
+impl Discovery {
+    fn complete(&self) -> bool {
+        self.inputs_done && self.outputs_done && self.clients_done
+    }
+
+    fn resolve_client_identity(&mut self) {
+        for input in self.inputs.values_mut() {
+            let Some(client) = self.clients.get(&input.client) else {
+                continue;
+            };
+            // Native PipeWire/OpenAL streams can put all application identity on
+            // the owning client. Inherit only missing identity, never media or
+            // window fields, and never overwrite stream-specific attribution.
+            for key in APPLICATION_IDENTITY_PROPERTIES {
+                let key = key.to_string_lossy();
+                if input
+                    .metadata
+                    .properties
+                    .get(key.as_ref())
+                    .is_none_or(|value| value.trim().is_empty())
+                    && let Some(value) = client
+                        .get(key.as_ref())
+                        .filter(|value| !value.trim().is_empty())
+                {
+                    input
+                        .metadata
+                        .properties
+                        .insert(key.into_owned(), value.clone());
+                }
+            }
+        }
+    }
 }
 
 struct Tap {
@@ -431,7 +474,9 @@ impl Engine {
                 );
                 check_operation(pa::pa_context_subscribe(
                     self.context.as_ptr(),
-                    pa::PA_SUBSCRIPTION_MASK_SINK_INPUT | pa::PA_SUBSCRIPTION_MASK_SINK,
+                    pa::PA_SUBSCRIPTION_MASK_SINK_INPUT
+                        | pa::PA_SUBSCRIPTION_MASK_SINK
+                        | pa::PA_SUBSCRIPTION_MASK_CLIENT,
                     Some(subscription_ready),
                     self.userdata(),
                 ))?;
@@ -462,11 +507,12 @@ impl Engine {
                 return Err("audio discovery timed out");
             }
             let mut discovery = self.discovery.borrow_mut();
-            if discovery.inputs_done && discovery.outputs_done {
+            if discovery.complete() {
                 if discovery.failed {
                     return Err("audio discovery failed or exceeded its bounds");
                 }
                 if discovery.query_generation == discovery.generation {
+                    discovery.resolve_client_identity();
                     self.inputs = std::mem::take(&mut discovery.inputs);
                     self.outputs = std::mem::take(&mut discovery.outputs);
                     discovery.invalidated.clear();
@@ -565,9 +611,11 @@ impl Engine {
             discovery.dirty = false;
             discovery.inputs_done = false;
             discovery.outputs_done = false;
+            discovery.clients_done = false;
             discovery.failed = false;
             discovery.inputs.clear();
             discovery.outputs.clear();
+            discovery.clients.clear();
         }
         self.query_started = Some(Instant::now());
         self.last_query = Instant::now();
@@ -580,6 +628,11 @@ impl Engine {
             check_operation(pa::pa_context_get_sink_info_list(
                 self.context.as_ptr(),
                 Some(output_info),
+                self.userdata(),
+            ))?;
+            check_operation(pa::pa_context_get_client_info_list(
+                self.context.as_ptr(),
+                Some(client_info),
                 self.userdata(),
             ))?;
         }
@@ -689,12 +742,7 @@ extern "C" fn input_info(
         return;
     }
     let mut properties = HashMap::new();
-    for key in [
-        c"application.id",
-        c"application.name",
-        c"application.icon_name",
-        c"application.process.id",
-        c"application.process.binary",
+    for key in APPLICATION_IDENTITY_PROPERTIES.into_iter().chain([
         c"media.name",
         c"media.category",
         c"media.class",
@@ -702,7 +750,7 @@ extern "C" fn input_info(
         c"window.name",
         c"object.id",
         c"object.serial",
-    ] {
+    ]) {
         let value = unsafe { pa::pa_proplist_gets(info.proplist, key.as_ptr()) };
         if let Some(value) = unsafe { bounded_string(value) } {
             properties.insert(key.to_string_lossy().into_owned(), value);
@@ -744,6 +792,36 @@ extern "C" fn input_info(
             },
         },
     );
+}
+
+extern "C" fn client_info(
+    _: *mut pa::pa_context,
+    info: *const pa::pa_client_info,
+    eol: i32,
+    data: *mut c_void,
+) {
+    let mut state = unsafe { &*data.cast::<RefCell<Discovery>>() }.borrow_mut();
+    if eol != 0 {
+        state.clients_done = true;
+        state.failed |= eol < 0;
+        return;
+    }
+    let Some(info) = (unsafe { info.as_ref() }) else {
+        state.failed = true;
+        return;
+    };
+    if state.clients.len() >= MAX_METADATA {
+        state.failed = true;
+        return;
+    }
+    let mut properties = HashMap::new();
+    for key in APPLICATION_IDENTITY_PROPERTIES {
+        let value = unsafe { pa::pa_proplist_gets(info.proplist, key.as_ptr()) };
+        if let Some(value) = unsafe { bounded_string(value) } {
+            properties.insert(key.to_string_lossy().into_owned(), value);
+        }
+    }
+    state.clients.insert(info.index, properties);
 }
 
 extern "C" fn output_info(
@@ -795,7 +873,218 @@ unsafe fn bounded_string(value: *const std::ffi::c_char) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::AudioVisualization;
+    use crate::models::{AppInfo, AudioVisualization};
+
+    fn native_telegram_input() -> Input {
+        Input {
+            sink: 23419,
+            client: 24354,
+            metadata: serde_json::from_value(serde_json::json!({
+                "index": 24355,
+                "properties": {
+                    "media.category": "Playback",
+                    "media.class": "Stream/Output/Audio",
+                    "media.name": "Playback Stream",
+                    "object.serial": "24355"
+                }
+            }))
+            .unwrap(),
+        }
+    }
+
+    fn telegram_client_identity() -> HashMap<String, String> {
+        [
+            ("application.name", "Telegram"),
+            ("application.process.binary", "Telegram"),
+            ("application.process.id", "131328"),
+        ]
+        .map(|(key, value)| (key.into(), value.into()))
+        .into()
+    }
+
+    #[test]
+    fn native_telegram_client_identity_routes_measured_audio_to_its_window_and_app() {
+        let input = native_telegram_input();
+        let mut unrelated = input.clone();
+        unrelated.client = 999;
+        unrelated.metadata.index = 999;
+        let mut discovery = Discovery {
+            inputs: BTreeMap::from([(24355, input), (999, unrelated)]),
+            clients: HashMap::from([(24354, telegram_client_identity())]),
+            ..Default::default()
+        };
+        let mut window = crate::audio::tests::firefox_window("telegram", 131328, "Music");
+        window.class = "org.telegram.desktop".into();
+        let app = AppInfo {
+            name: "Telegram Desktop".into(),
+            exec: "/usr/bin/Telegram -- %u".into(),
+            icon_path: None,
+            comment: None,
+            desktop_file_path: "/usr/share/applications/org.telegram.desktop.desktop".into(),
+            is_settings_module: false,
+        };
+        assert!(
+            crate::audio::find_sink_inputs_for_window(
+                &window,
+                &[discovery.inputs[&24355].metadata.clone()]
+            )
+            .is_empty()
+        );
+        discovery.resolve_client_identity();
+        assert!(
+            !discovery.inputs[&999]
+                .metadata
+                .properties
+                .contains_key("application.process.id")
+        );
+        let mut sinks = vec![discovery.inputs[&24355].metadata.clone()];
+        assert_eq!(crate::audio::app_audio_sink_indices(&app, &sinks), [24355]);
+        let cache = crate::audio::build_window_audio_cache(&[window.clone()], &sinks);
+        assert_eq!(cache.visualization_sinks[&window.id], [24355]);
+        let measured = HashMap::from([(
+            24355,
+            AudioVisualization {
+                peak: 70,
+                bands: [45; 8],
+            },
+        )]);
+        assert_eq!(
+            crate::audio::visualization_for_sinks(
+                &cache.visualization_sinks[&window.id],
+                &measured
+            )
+            .unwrap()
+            .peak,
+            70
+        );
+        assert!(
+            crate::audio::visualization_for_sinks(
+                &cache.visualization_sinks[&window.id],
+                &HashMap::new()
+            )
+            .is_none()
+        );
+        for (corked, mute) in [(true, false), (false, true)] {
+            sinks[0].corked = corked;
+            sinks[0].mute = mute;
+            assert!(
+                crate::audio::build_window_audio_cache(&[window.clone()], &sinks)
+                    .visualization_sinks
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn client_fallback_preserves_stream_identity_and_never_inherits_media_or_window_fields() {
+        let mut input = native_telegram_input();
+        input.metadata.properties.extend([
+            ("application.name".into(), "Firefox".into()),
+            ("application.process.id".into(), "123".into()),
+            ("application.process.binary".into(), " ".into()),
+        ]);
+        let mut client = telegram_client_identity();
+        client.extend([
+            ("window.id".into(), "not-a-window".into()),
+            ("media.name".into(), "wrong-track".into()),
+            ("object.serial".into(), "client-not-stream".into()),
+        ]);
+        let mut discovery = Discovery {
+            inputs: BTreeMap::from([(24355, input)]),
+            clients: HashMap::from([(24354, client)]),
+            ..Default::default()
+        };
+        discovery.resolve_client_identity();
+        let properties = &discovery.inputs[&24355].metadata.properties;
+        assert_eq!(properties["application.name"], "Firefox");
+        assert_eq!(properties["application.process.id"], "123");
+        assert_eq!(properties["application.process.binary"], "Telegram");
+        assert_eq!(properties["media.name"], "Playback Stream");
+        assert_eq!(properties["object.serial"], "24355");
+        assert!(!properties.contains_key("window.id"));
+    }
+
+    #[test]
+    fn discovery_waits_for_clients_as_well_as_streams_and_outputs() {
+        for mask in 0..8 {
+            let discovery = Discovery {
+                inputs_done: mask & 1 != 0,
+                outputs_done: mask & 2 != 0,
+                clients_done: mask & 4 != 0,
+                ..Default::default()
+            };
+            assert_eq!(discovery.complete(), mask == 7);
+        }
+    }
+
+    #[test]
+    fn client_metadata_callbacks_are_bounded_and_preserve_query_errors() {
+        let state = RefCell::new(Discovery::default());
+        let userdata = (&state as *const RefCell<Discovery>).cast_mut().cast();
+        let properties = NonNull::new(unsafe { pa::pa_proplist_new() }).unwrap();
+        unsafe {
+            assert_eq!(
+                pa::pa_proplist_sets(
+                    properties.as_ptr(),
+                    c"application.name".as_ptr(),
+                    c"Telegram".as_ptr()
+                ),
+                0
+            );
+        }
+        for index in 0..=MAX_METADATA as u32 {
+            client_info(
+                null_mut(),
+                &pa::pa_client_info {
+                    index,
+                    name: null(),
+                    owner_module: pa::PA_INVALID_INDEX,
+                    driver: null(),
+                    proplist: properties.as_ptr(),
+                },
+                0,
+                userdata,
+            );
+        }
+        unsafe {
+            pa::pa_proplist_free(properties.as_ptr());
+        }
+        assert_eq!(state.borrow().clients.len(), MAX_METADATA);
+        assert_eq!(state.borrow().clients[&0]["application.name"], "Telegram");
+        assert!(state.borrow().failed);
+        assert!(!state.borrow().clients_done);
+        client_info(null_mut(), null(), 1, userdata);
+        assert!(state.borrow().clients_done);
+        let failed = RefCell::new(Discovery::default());
+        client_info(
+            null_mut(),
+            null(),
+            -1,
+            (&failed as *const RefCell<Discovery>).cast_mut().cast(),
+        );
+        assert!(failed.borrow().clients_done && failed.borrow().failed);
+    }
+
+    #[test]
+    fn client_changes_refresh_identity_without_recreating_playback_monitors() {
+        let state = RefCell::new(Discovery::default());
+        let userdata = (&state as *const RefCell<Discovery>).cast_mut().cast();
+        for kind in [
+            pa::PA_SUBSCRIPTION_EVENT_NEW,
+            pa::PA_SUBSCRIPTION_EVENT_CHANGE,
+            pa::PA_SUBSCRIPTION_EVENT_REMOVE,
+        ] {
+            subscription_event(
+                null_mut(),
+                pa::PA_SUBSCRIPTION_EVENT_CLIENT | kind,
+                24354,
+                userdata,
+            );
+        }
+        assert!(state.borrow().dirty);
+        assert_eq!(state.borrow().generation, 3);
+        assert!(state.borrow().invalidated.is_empty());
+    }
 
     #[test]
     fn inbox_keeps_only_the_latest_sample_even_when_gui_is_suspended() {
