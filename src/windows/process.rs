@@ -30,19 +30,17 @@ pub(crate) fn parse_proc_stat(stat_content: &str) -> Option<ProcessStat> {
     let name_start = left.find('(')? + 1;
     let name = left[name_start..].to_string();
 
-    let tokens: Vec<&str> = right[1..].split_whitespace().collect();
-    if tokens.len() < 6 {
-        return None;
-    }
+    let mut tokens = right[1..].split_whitespace();
+    tokens.next()?;
 
     Some(ProcessStat {
         pid,
         name,
-        ppid: tokens[1].parse().ok()?,
-        process_group: tokens[2].parse().ok()?,
-        session: tokens[3].parse().ok()?,
-        tty: tokens[4].parse().ok()?,
-        foreground_process_group: tokens[5].parse().ok()?,
+        ppid: tokens.next()?.parse().ok()?,
+        process_group: tokens.next()?.parse().ok()?,
+        session: tokens.next()?.parse().ok()?,
+        tty: tokens.next()?.parse().ok()?,
+        foreground_process_group: tokens.next()?.parse().ok()?,
     })
 }
 

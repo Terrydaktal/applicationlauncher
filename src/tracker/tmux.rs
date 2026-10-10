@@ -38,33 +38,119 @@ pub struct LiveTmuxPane {
 /// Missing clients are returned as None; failed servers retain the last known
 /// value in the caller until its short expiry rather than flashing stale titles.
 pub fn capture_live_client_panes(client_pids: &[i32]) -> HashMap<i32, Option<LiveTmuxPane>> {
-    let deadline = Instant::now() + SNAPSHOT_REFRESH_BUDGET;
-    let mut sockets: HashMap<PathBuf, Vec<i32>> = HashMap::new();
-    let mut results = HashMap::new();
-    for &pid in client_pids.iter().take(MAX_CLIENTS) {
-        let Some(socket) = live_client_socket(pid) else {
-            results.insert(pid, None);
-            continue;
-        };
-        if sockets.len() < MAX_SERVERS || sockets.contains_key(&socket) {
-            sockets.entry(socket).or_default().push(pid);
+    LiveTmuxReader::default().capture(client_pids)
+}
+
+#[derive(Default)]
+pub struct LiveTmuxReader {
+    clients: HashMap<i32, (u64, u64, PathBuf, PathBuf)>,
+    poll: PanePoll,
+}
+
+impl LiveTmuxReader {
+    pub fn capture(&mut self, client_pids: &[i32]) -> HashMap<i32, Option<LiveTmuxPane>> {
+        self.clients
+            .retain(|pid, _| client_pids.iter().take(MAX_CLIENTS).any(|id| id == pid));
+        let deadline = Instant::now() + SNAPSHOT_REFRESH_BUDGET;
+        let mut sockets: HashMap<PathBuf, Vec<i32>> = HashMap::new();
+        let mut results = HashMap::new();
+        for &pid in client_pids.iter().take(MAX_CLIENTS) {
+            let Some(socket) = self.client_socket(pid) else {
+                results.insert(pid, None);
+                continue;
+            };
+            if sockets.len() < MAX_SERVERS || sockets.contains_key(&socket) {
+                sockets.entry(socket).or_default().push(pid);
+            }
         }
+        let poll = &mut self.poll;
+        poll.stats.clear();
+        poll.foreground.clear();
+        poll.directories.clear();
+        for (socket, pids) in sockets {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let Some(panes) = query(&socket, "list-clients", LIVE_CLIENT_FORMAT)
+                .ok()
+                .and_then(|text| parse_live_clients(&socket, &text))
+            else {
+                continue;
+            };
+            for pid in pids {
+                results.insert(
+                    pid,
+                    panes.get(&pid).and_then(|row| resolve_live_pane(row, poll)),
+                );
+            }
+        }
+        results
     }
-    for (socket, pids) in sockets {
-        if Instant::now() >= deadline {
-            break;
+
+    fn client_socket(&mut self, pid: i32) -> Option<PathBuf> {
+        let process = PathBuf::from(format!("/proc/{pid}"));
+        let identity = std::fs::metadata(&process).ok()?;
+        if pid <= 0 || identity.uid() != rustix::process::getuid().as_raw() {
+            self.clients.remove(&pid);
+            return None;
         }
-        let Some(panes) = query(&socket, "list-clients", LIVE_CLIENT_FORMAT)
-            .ok()
-            .and_then(|text| parse_live_clients(&socket, &text))
-        else {
-            continue;
-        };
-        for pid in pids {
-            results.insert(pid, panes.get(&pid).and_then(resolve_live_pane));
+        let stat = std::fs::read_to_string(process.join("stat")).ok()?;
+        let start = stat
+            .rsplit_once(") ")?
+            .1
+            .split_whitespace()
+            .nth(19)?
+            .parse()
+            .ok()?;
+        let executable = std::fs::read_link(process.join("exe")).ok()?;
+        if let Some((inode, started, exe, socket)) = self.clients.get(&pid)
+            && *inode == identity.ino()
+            && *started == start
+            && *exe == executable
+        {
+            return Some(socket.clone());
         }
+        self.clients.remove(&pid);
+        let socket = live_client_socket(pid)?;
+        self.clients
+            .insert(pid, (identity.ino(), start, executable, socket.clone()));
+        Some(socket)
     }
-    results
+}
+
+#[derive(Default)]
+struct PanePoll {
+    stats: HashMap<i32, Option<PaneProcessStat>>,
+    foreground: HashMap<i32, Option<i32>>,
+    directories: HashMap<i32, Option<PathBuf>>,
+    children: String,
+    stat_text: String,
+}
+
+impl PanePoll {
+    fn stat(&mut self, pid: i32) -> Option<PaneProcessStat> {
+        if let Some(stat) = self.stats.get(&pid) {
+            return stat.clone();
+        }
+        self.stat_text.clear();
+        let stat = (|| {
+            if std::fs::metadata(format!("/proc/{pid}")).ok()?.uid()
+                != rustix::process::getuid().as_raw()
+            {
+                return None;
+            }
+            std::fs::File::open(format!("/proc/{pid}/stat"))
+                .ok()?
+                .take(MAX_METADATA_BYTES as u64)
+                .read_to_string(&mut self.stat_text)
+                .ok()?;
+            parse_pane_process_stat(&self.stat_text)
+        })();
+        if self.stats.len() < MAX_PANE_PROCESSES * 8 {
+            self.stats.insert(pid, stat.clone());
+        }
+        stat
+    }
 }
 
 fn live_client_socket(pid: i32) -> Option<PathBuf> {
@@ -153,22 +239,34 @@ fn parse_live_clients(socket: &Path, text: &str) -> Option<HashMap<i32, LiveClie
     Some(clients)
 }
 
-fn resolve_live_pane(row: &LiveClientRow) -> Option<LiveTmuxPane> {
-    let client = pane_process_stat(row.pid)?;
-    let pane = pane_process_stat(row.pane_pid)?;
-    let server = pane_process_stat(row.session.server_pid)?;
+fn resolve_live_pane(row: &LiveClientRow, poll: &mut PanePoll) -> Option<LiveTmuxPane> {
+    let client = poll.stat(row.pid)?;
+    let pane = poll.stat(row.pane_pid)?;
+    let server = poll.stat(row.session.server_pid)?;
     // Do not associate an unrelated/reused pane PID with a terminal client.
     if !client.name.starts_with("tmux") || !server.name.starts_with("tmux") {
         return None;
     }
-    let process_pid = live_foreground_process(row.pane_pid)?;
-    let process = pane_process_stat(process_pid)?;
+    let process_pid = if let Some(cached) = poll.foreground.get(&row.pane_pid) {
+        *cached
+    } else {
+        let value = live_foreground_process(row.pane_pid, poll);
+        poll.foreground.insert(row.pane_pid, value);
+        value
+    }?;
+    let process = poll.stat(process_pid)?;
     if !in_pane_foreground_group(&process, &pane) {
         return None;
     }
-    let cwd = std::fs::read_link(format!("/proc/{process_pid}/cwd"))
-        .ok()
-        .filter(|path| path.is_absolute())
+    let cwd = poll
+        .directories
+        .entry(process_pid)
+        .or_insert_with(|| {
+            std::fs::read_link(format!("/proc/{process_pid}/cwd"))
+                .ok()
+                .filter(|path| path.is_absolute())
+        })
+        .clone()
         .unwrap_or_else(|| row.cwd.clone());
     Some(LiveTmuxPane {
         client_pid: row.pid,
@@ -182,8 +280,8 @@ fn resolve_live_pane(row: &LiveClientRow) -> Option<LiveTmuxPane> {
     })
 }
 
-fn live_foreground_process(pane_pid: i32) -> Option<i32> {
-    let root = pane_process_stat(pane_pid)?;
+fn live_foreground_process(pane_pid: i32, poll: &mut PanePoll) -> Option<i32> {
+    let root = poll.stat(pane_pid)?;
     let mut queue = VecDeque::from([(pane_pid, 0)]);
     let mut visited = HashSet::new();
     let mut best = None;
@@ -194,7 +292,7 @@ fn live_foreground_process(pane_pid: i32) -> Option<i32> {
         if visited.len() > MAX_PANE_PROCESSES {
             return None;
         }
-        let Some(stat) = pane_process_stat(pid) else {
+        let Some(stat) = poll.stat(pid) else {
             continue;
         };
         if stat.session != root.session || stat.tty != root.tty {
@@ -203,18 +301,18 @@ fn live_foreground_process(pane_pid: i32) -> Option<i32> {
         if in_pane_foreground_group(&stat, &root) && best.is_none_or(|old| (depth, pid) > old) {
             best = Some((depth, pid));
         }
-        let mut children = String::new();
+        poll.children.clear();
         if let Ok(file) = std::fs::File::open(format!("/proc/{pid}/task/{pid}/children"))
             && file
                 .take((MAX_PANE_PROCESSES * 16 + 1) as u64)
-                .read_to_string(&mut children)
+                .read_to_string(&mut poll.children)
                 .is_ok()
         {
-            if children.len() > MAX_PANE_PROCESSES * 16 {
+            if poll.children.len() > MAX_PANE_PROCESSES * 16 {
                 return None;
             }
             queue.extend(
-                children
+                poll.children
                     .split_whitespace()
                     .filter_map(|child| child.parse::<i32>().ok())
                     .take(MAX_PANE_PROCESSES.saturating_sub(visited.len() + queue.len()))
@@ -402,6 +500,7 @@ fn parse_pane(text: &str) -> Option<TmuxPaneRestore> {
     })
 }
 
+#[derive(Clone)]
 struct PaneProcessStat {
     name: String,
     process_group: i32,
@@ -421,13 +520,15 @@ fn pane_process_stat(pid: i32) -> Option<PaneProcessStat> {
 fn parse_pane_process_stat(text: &str) -> Option<PaneProcessStat> {
     let (prefix, suffix) = text.rsplit_once(") ")?;
     let name = prefix.split_once('(')?.1.to_owned();
-    let fields = suffix.split_whitespace().take(6).collect::<Vec<_>>();
+    let mut fields = suffix.split_whitespace();
+    fields.next()?;
+    fields.next()?;
     Some(PaneProcessStat {
         name,
-        process_group: fields.get(2)?.parse().ok()?,
-        session: fields.get(3)?.parse().ok()?,
-        tty: fields.get(4)?.parse().ok()?,
-        foreground_group: fields.get(5)?.parse().ok()?,
+        process_group: fields.next()?.parse().ok()?,
+        session: fields.next()?.parse().ok()?,
+        tty: fields.next()?.parse().ok()?,
+        foreground_group: fields.next()?.parse().ok()?,
     })
 }
 
@@ -1259,6 +1360,18 @@ mod tests {
         ]);
         let client = control_client(&server.program, &arguments);
         server.wait_for_client(client.0.id());
+        let second = control_client(
+            &server.program,
+            &args(&[
+                "-S",
+                server.socket.to_str().unwrap(),
+                "attach-session",
+                "-t",
+                "title-probe",
+            ]),
+        );
+        server.wait_for_client(second.0.id());
+        let mut reader = LiveTmuxReader::default();
         for (title, expected) in [
             ("\u{280b} Working | test", "\u{280b} Working | test"),
             ("\u{2819} Working | test", "\u{2819} Working | test"),
@@ -1282,7 +1395,17 @@ mod tests {
             let text = query(&server.socket, "list-clients", LIVE_CLIENT_FORMAT).unwrap();
             let rows = parse_live_clients(&server.socket, &text).unwrap();
             assert_eq!(rows[&(client.0.id() as i32)].title, expected);
-            let panes = capture_live_client_panes(&[client.0.id() as i32]);
+            let panes = reader.capture(&[client.0.id() as i32, second.0.id() as i32]);
+            assert_eq!(reader.clients.len(), 2);
+            assert_eq!(
+                reader.poll.foreground.len(),
+                1,
+                "shared panes are resolved once per poll"
+            );
+            assert_eq!(
+                panes[&(second.0.id() as i32)].as_ref().unwrap().title,
+                expected
+            );
             assert_eq!(
                 panes[&(client.0.id() as i32)].as_ref().unwrap().title,
                 expected

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use applicationlauncher::tracker::{LiveTmuxPane, capture_live_client_panes};
+use applicationlauncher::tracker::{LiveTmuxPane, LiveTmuxReader};
 use eframe::egui;
 
 use crate::models::{ProcessChainEntry, WindowInfo};
@@ -93,6 +93,7 @@ impl TmuxMonitor {
         applicationlauncher::observability::spawn_named("tmux-live-panes", move |worker| {
             let mut previous = HashMap::new();
             let mut successes = HashMap::new();
+            let mut reader = LiveTmuxReader::default();
             worker.set_state("waiting");
             loop {
                 let started = Instant::now();
@@ -110,10 +111,11 @@ impl TmuxMonitor {
                     state.targets.clone()
                 };
                 worker.set_state("checking-terminal-foreground");
+                let mut stats = HashMap::new();
                 let clients: HashMap<_, _> = targets
                     .iter()
                     .filter_map(|target| {
-                        let pid = client_for_target(target)?;
+                        let pid = client_for_target(target, &mut stats)?;
                         Some((target.id.as_str(), pid))
                     })
                     .collect();
@@ -124,7 +126,7 @@ impl TmuxMonitor {
                     .into_iter()
                     .collect();
                 worker.set_state("reading-tmux-panes");
-                let panes = capture_live_client_panes(&pids);
+                let panes = reader.capture(&pids);
                 let now = Instant::now();
                 let mut current = HashMap::new();
                 for target in &targets {
@@ -208,13 +210,18 @@ impl TmuxMonitor {
     }
 
     pub(crate) fn sync_windows(&mut self, windows: &[WindowInfo]) {
+        let previous_targets: HashMap<_, _> = self
+            .targets
+            .iter()
+            .map(|target| (target.id.as_str(), target))
+            .collect();
         let targets: Vec<_> = windows
             .iter()
             .filter_map(|window| {
-                let previous = self
-                    .targets
-                    .iter()
-                    .find(|target| target.id == window.id && target.owner_pid == window.pid);
+                let previous = previous_targets
+                    .get(window.id.as_str())
+                    .copied()
+                    .filter(|target| target.owner_pid == window.pid);
                 let mut target = target_for_window(window).or_else(|| {
                     is_terminal_class(&window.class.to_lowercase())
                         .then(|| previous.cloned())
@@ -300,9 +307,18 @@ fn target_for_window(window: &WindowInfo) -> Option<Target> {
     })
 }
 
-fn client_for_target(target: &Target) -> Option<i32> {
-    let root = read_process_stat(target.root_pid)?;
-    let foreground = read_process_stat(root.foreground_process_group)?;
+fn client_for_target(
+    target: &Target,
+    stats: &mut HashMap<i32, Option<crate::windows::process::ProcessStat>>,
+) -> Option<i32> {
+    let mut read = |pid| {
+        stats
+            .entry(pid)
+            .or_insert_with(|| read_process_stat(pid))
+            .clone()
+    };
+    let root = read(target.root_pid)?;
+    let foreground = read(root.foreground_process_group)?;
     if !foreground.name.starts_with("tmux")
         || !crate::windows::is_terminal_foreground_process(&foreground, &root)
     {
@@ -318,7 +334,7 @@ fn client_for_target(target: &Target) -> Option<i32> {
         if pid <= 0 || !visited.insert(pid) {
             break;
         }
-        pid = read_process_stat(pid)?.ppid;
+        pid = read(pid)?.ppid;
     }
     None
 }
@@ -730,7 +746,10 @@ mod tests {
                     assert_eq!(window.process_chain[0].pid, metadata.pane.process_pid);
                     assert_eq!(window.cwd_path.as_ref(), Some(&metadata.pane.cwd));
                     assert_eq!(
-                        client_for_target(&target_for_window(&window).unwrap()),
+                        client_for_target(
+                            &target_for_window(&window).unwrap(),
+                            &mut HashMap::new()
+                        ),
                         Some(metadata.pane.client_pid)
                     );
                     assert!(!window.title.contains("tmux new-session"));
