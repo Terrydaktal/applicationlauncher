@@ -104,6 +104,58 @@ mod tests {
     }
 
     #[test]
+    fn application_icon_tooltip_keeps_the_full_name_on_one_line_in_narrow_space() {
+        for name in ["Tixati", "Telegram Desktop", "Firefox Web Browser"] {
+            let ctx = egui::Context::default();
+            ctx.style_mut(|style| style.spacing.tooltip_width = 32.0);
+            let mut painted = None;
+            for frame in 0..4 {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(500.0, 760.0),
+                        )),
+                        time: Some(frame as f64 / 60.0),
+                        events: vec![egui::Event::PointerMoved(egui::pos2(449.0, 224.0))],
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let response = ui.interact(
+                                egui::Rect::from_min_size(
+                                    egui::pos2(425.0, 200.0),
+                                    egui::vec2(48.0, 48.0),
+                                ),
+                                ui.id().with("application_icon"),
+                                egui::Sense::hover(),
+                            );
+                            show_immediate_icon_tooltip(&response, name);
+                        });
+                    },
+                );
+                painted = output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == name => Some((
+                        text.galley.clone(),
+                        text.visual_bounding_rect(),
+                        shape.clip_rect,
+                    )),
+                    _ => None,
+                });
+            }
+            let (galley, bounds, clip_rect) =
+                painted.expect("hovering an application should paint its full name");
+            assert_eq!(galley.rows.len(), 1, "tooltip should not wrap {name:?}");
+            assert_eq!(galley.rows[0].glyphs.len(), name.chars().count());
+            assert!(
+                clip_rect.contains_rect(bounds),
+                "tooltip should not clip {name:?}"
+            );
+            assert!(bounds.min.x >= 0.0 && bounds.max.x <= 500.0);
+        }
+    }
+
+    #[test]
     fn periodic_snapshot_labels_identify_the_tier_and_capture_time() {
         let mut snapshot = applicationlauncher::tracker::SnapshotSummary {
             id: 1,

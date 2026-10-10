@@ -252,6 +252,6 @@ pub(crate) fn show_immediate_icon_tooltip(response: &egui::Response, text: &str)
     )
     .gap(8.0)
     .show(|ui| {
-        ui.label(text);
+        ui.add(egui::Label::new(text).extend());
     });
 }
