@@ -1,3 +1,4 @@
+use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -130,6 +131,112 @@ impl Gauge {
         (Self::AttentionPending, "attention_pending"),
         (Self::PendingFeedEvents, "pending_feed_events"),
     ];
+}
+
+const GUI_FRAME_INTERVAL_BOUNDS_US: [u64; 7] =
+    [2_500, 4_500, 7_000, 12_000, 20_000, 50_000, u64::MAX];
+
+#[derive(Default)]
+struct GuiFrameStatistics {
+    frames: AtomicU64,
+    last_time_us: AtomicU64,
+    interval_total_us: AtomicU64,
+    interval_counts: [AtomicU64; 7],
+    line_events: AtomicU64,
+    point_events: AtomicU64,
+    page_events: AtomicU64,
+    small_point_events: AtomicU64,
+    point_delta_total_micros: AtomicU64,
+}
+
+#[derive(Serialize)]
+struct GuiFrameStatisticsSnapshot {
+    frames: u64,
+    interval_total_us: u64,
+    interval_bounds_us: [u64; 7],
+    interval_counts: [u64; 7],
+    wheel_line_events: u64,
+    wheel_point_events: u64,
+    wheel_page_events: u64,
+    wheel_small_point_events: u64,
+    wheel_point_delta_total_micros: u64,
+}
+
+impl GuiFrameStatistics {
+    fn sample(&self, mode: RuntimeMode, input: &egui::RawInput) {
+        if mode != RuntimeMode::RuntimeActivated || input.viewport_id != egui::ViewportId::ROOT {
+            return;
+        }
+        self.frames.fetch_add(1, Ordering::Relaxed);
+        if let Some(time) = input.time.filter(|time| time.is_finite() && *time >= 0.0) {
+            let time_us = ((time * 1_000_000.0) as u64).max(1);
+            let previous = self.last_time_us.swap(time_us, Ordering::Relaxed);
+            if previous != 0 && time_us > previous {
+                let interval = time_us - previous;
+                let bucket = GUI_FRAME_INTERVAL_BOUNDS_US
+                    .iter()
+                    .position(|bound| interval <= *bound)
+                    .unwrap();
+                self.interval_counts[bucket].fetch_add(1, Ordering::Relaxed);
+                self.interval_total_us
+                    .fetch_add(interval, Ordering::Relaxed);
+            }
+        }
+        for event in &input.events {
+            if let egui::Event::MouseWheel { unit, delta, .. } = event {
+                match unit {
+                    egui::MouseWheelUnit::Line => {
+                        self.line_events.fetch_add(1, Ordering::Relaxed);
+                    }
+                    egui::MouseWheelUnit::Page => {
+                        self.page_events.fetch_add(1, Ordering::Relaxed);
+                    }
+                    egui::MouseWheelUnit::Point => {
+                        self.point_events.fetch_add(1, Ordering::Relaxed);
+                        if delta.length() < 8.0 {
+                            self.small_point_events.fetch_add(1, Ordering::Relaxed);
+                        }
+                        self.point_delta_total_micros
+                            .fetch_add((delta.length() * 1_000_000.0) as u64, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    fn reset(&self) {
+        for value in [
+            &self.frames,
+            &self.last_time_us,
+            &self.interval_total_us,
+            &self.line_events,
+            &self.point_events,
+            &self.page_events,
+            &self.small_point_events,
+            &self.point_delta_total_micros,
+        ]
+        .into_iter()
+        .chain(self.interval_counts.iter())
+        {
+            value.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> GuiFrameStatisticsSnapshot {
+        GuiFrameStatisticsSnapshot {
+            frames: self.frames.load(Ordering::Relaxed),
+            interval_total_us: self.interval_total_us.load(Ordering::Relaxed),
+            interval_bounds_us: GUI_FRAME_INTERVAL_BOUNDS_US,
+            interval_counts: std::array::from_fn(|index| {
+                self.interval_counts[index].load(Ordering::Relaxed)
+            }),
+            wheel_line_events: self.line_events.load(Ordering::Relaxed),
+            wheel_point_events: self.point_events.load(Ordering::Relaxed),
+            wheel_page_events: self.page_events.load(Ordering::Relaxed),
+            wheel_small_point_events: self.small_point_events.load(Ordering::Relaxed),
+            wheel_point_delta_total_micros: self.point_delta_total_micros.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -320,6 +427,7 @@ struct State {
     events: Mutex<BoundedFlightRecorder>,
     workers: Mutex<BTreeMap<u64, WorkerSnapshot>>,
     diagnostic_token: AtomicU64,
+    gui_frame_statistics: GuiFrameStatistics,
     persistent: OnceLock<PersistentRecorder>,
 }
 
@@ -340,6 +448,7 @@ impl State {
             events: Mutex::new(BoundedFlightRecorder::new(FLIGHT_RECORDER_CAPACITY)),
             workers: Mutex::new(BTreeMap::new()),
             diagnostic_token: AtomicU64::new(0),
+            gui_frame_statistics: GuiFrameStatistics::default(),
             persistent: OnceLock::new(),
         }
     }
@@ -413,6 +522,16 @@ pub fn enable_observable_for_doctor() {
 
 pub fn next_operation_id() -> u64 {
     state().operation_sequence.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Numeric-only measurements while an independent diagnostic capture is active.
+/// Ordinary rendering does not allocate, lock, sample the clock, or record events here.
+pub fn sample_gui_frame(input: &egui::RawInput) {
+    let state = state();
+    state.gui_frame_statistics.sample(
+        RuntimeMode::from_u8(state.mode.load(Ordering::Relaxed)),
+        input,
+    );
 }
 
 pub fn increment(counter: Counter) {
@@ -742,6 +861,7 @@ pub struct RuntimeSnapshot {
     uptime_ms: u64,
     counters: BTreeMap<&'static str, u64>,
     gauges: BTreeMap<&'static str, i64>,
+    gui_frame_statistics: GuiFrameStatisticsSnapshot,
     workers: Vec<WorkerSnapshot>,
     events: Vec<FlightEvent>,
     persistent_trace: Option<String>,
@@ -782,6 +902,7 @@ pub fn runtime_snapshot() -> RuntimeSnapshot {
             .iter()
             .map(|(gauge, name)| (*name, state.gauges[*gauge as usize].load(Ordering::Relaxed)))
             .collect(),
+        gui_frame_statistics: state.gui_frame_statistics.snapshot(),
         workers: state
             .workers
             .lock()
@@ -1023,6 +1144,7 @@ fn handle_diagnostic_connection(mut stream: std::os::unix::net::UnixStream) {
 fn authorize_debugger(pid: u32) -> Result<u64, String> {
     set_debugger(pid)?;
     let token = state().diagnostic_token.fetch_add(1, Ordering::AcqRel) + 1;
+    state().gui_frame_statistics.reset();
     state()
         .mode
         .store(RuntimeMode::RuntimeActivated as u8, Ordering::Release);
@@ -1455,6 +1577,75 @@ mod tests {
             boundary: None,
             decision: None,
         }
+    }
+
+    #[test]
+    fn gui_frame_measurements_are_inactive_outside_diagnostics_and_ignore_popups() {
+        let statistics = GuiFrameStatistics::default();
+        let mut input = egui::RawInput {
+            time: Some(1.0),
+            events: vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 2.0),
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        for mode in [RuntimeMode::Minimal, RuntimeMode::Observable] {
+            statistics.sample(mode, &input);
+        }
+        input.viewport_id = egui::ViewportId::from_hash_of("settings");
+        statistics.sample(RuntimeMode::RuntimeActivated, &input);
+        let snapshot = statistics.snapshot();
+        assert_eq!(snapshot.frames, 0);
+        assert_eq!(snapshot.wheel_point_events, 0);
+        assert_eq!(snapshot.interval_counts, [0; 7]);
+    }
+
+    #[test]
+    fn gui_frame_measurements_distinguish_high_refresh_intervals_and_wheel_units() {
+        let statistics = GuiFrameStatistics::default();
+        let mut input = egui::RawInput::default();
+        for time in [0.01, 0.015556, 0.021112, 0.037778, 0.071112] {
+            input.time = Some(time);
+            statistics.sample(RuntimeMode::RuntimeActivated, &input);
+        }
+        let snapshot = statistics.snapshot();
+        assert_eq!(snapshot.frames, 5);
+        assert_eq!(snapshot.interval_counts, [0, 0, 2, 0, 1, 1, 0]);
+        assert!(snapshot.interval_total_us.abs_diff(61_112) <= 2);
+
+        input.events = [
+            (egui::MouseWheelUnit::Point, 1.0),
+            (egui::MouseWheelUnit::Point, 15.0),
+            (egui::MouseWheelUnit::Line, 1.0),
+            (egui::MouseWheelUnit::Page, 1.0),
+        ]
+        .into_iter()
+        .map(|(unit, y)| egui::Event::MouseWheel {
+            unit,
+            delta: egui::vec2(0.0, y),
+            modifiers: egui::Modifiers::NONE,
+        })
+        .collect();
+        statistics.sample(RuntimeMode::RuntimeActivated, &input);
+        let snapshot = statistics.snapshot();
+        assert_eq!(snapshot.wheel_point_events, 2);
+        assert_eq!(snapshot.wheel_small_point_events, 1);
+        assert_eq!(snapshot.wheel_point_delta_total_micros, 16_000_000);
+        assert_eq!(snapshot.wheel_line_events, 1);
+        assert_eq!(snapshot.wheel_page_events, 1);
+        assert!(std::mem::size_of::<GuiFrameStatistics>() <= 256);
+        assert!(serde_json::to_string(&snapshot).unwrap().len() < 1024);
+
+        statistics.reset();
+        input.time = Some(10.0);
+        input.events.clear();
+        statistics.sample(RuntimeMode::RuntimeActivated, &input);
+        let snapshot = statistics.snapshot();
+        assert_eq!(snapshot.frames, 1);
+        assert_eq!(snapshot.interval_counts, [0; 7]);
+        assert_eq!(snapshot.wheel_point_events, 0);
     }
 
     #[test]

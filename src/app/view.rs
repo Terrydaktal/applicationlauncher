@@ -12,6 +12,7 @@ pub(super) fn open_window_count_label(ui: &egui::Ui, count: usize) -> (egui::Lab
 
 impl eframe::App for App {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+        applicationlauncher::observability::sample_gui_frame(input);
         let ignored = self.ime_input_filter.filter(input);
         if ignored != 0 {
             applicationlauncher::observability::add(
