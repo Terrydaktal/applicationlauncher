@@ -32,9 +32,36 @@ class InstallTests(unittest.TestCase):
 
     def test_fresh_install_has_private_bridge_loader_but_does_not_touch_profiles(self):
         path = INSTALLER.install(self.root, ROOT / "firefox/audio-bridge.js")
+        self.assertEqual(path.name, "firefox-autoconfig.cfg")
         self.assertTrue(path.read_text().startswith("//"))
         self.assertIn(INSTALLER.LOADER, path.read_text())
         self.assertFalse((self.root / "profiles.ini").exists())
+        preferences = (self.root / "defaults/pref" / INSTALLER.PREF_NAME).read_text()
+        self.assertIn('pref("general.config.filename", "firefox-autoconfig.cfg");', preferences)
+
+    def test_shared_modular_configuration_is_preserved_without_duplicate_audio_loader(self):
+        original = (
+            "// Shared Firefox AutoConfig.\n"
+            "const features = [\n"
+            '  ["autoconfig/british-dictionary.js", false],\n'
+            '  ["autoconfig/reverse-autoscroll.js", false],\n'
+            f"  {INSTALLER.BEGIN}\n"
+            f"  {INSTALLER.SHARED_LOADER_ENTRY}\n"
+            f"  {INSTALLER.END}\n"
+            "];\n"
+        )
+        config = self.root / "firefox-autoconfig.cfg"
+        config.write_text(original)
+        (self.root / "defaults/pref/99-firefox-autoconfig.js").write_text(
+            'pref("general.config.filename", "firefox-autoconfig.cfg");\n'
+        )
+        for _ in range(2):
+            self.assertEqual(INSTALLER.install(self.root, ROOT / "firefox/audio-bridge.js"), config)
+        self.assertEqual(config.read_text(), original)
+        self.assertNotIn(INSTALLER.LOADER, config.read_text())
+        self.assertEqual((self.root / INSTALLER.BRIDGE_NAME).read_bytes(), (ROOT / "firefox/audio-bridge.js").read_bytes())
+        preferences = (self.root / "defaults/pref" / INSTALLER.PREF_NAME).read_text()
+        self.assertIn('pref("general.config.filename", "firefox-autoconfig.cfg");', preferences)
 
     def test_conflicting_configuration_and_symlinks_are_rejected(self):
         prefs = self.root / "defaults/pref"

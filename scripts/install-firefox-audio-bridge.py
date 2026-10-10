@@ -11,6 +11,8 @@ BEGIN = "// BEGIN applicationlauncher audio bridge"
 END = "// END applicationlauncher audio bridge"
 BRIDGE_NAME = "applicationlauncher-audio-bridge.js"
 PREF_NAME = "zz-applicationlauncher-audio-bridge.js"
+AUTOCONFIG_NAME = "firefox-autoconfig.cfg"
+SHARED_LOADER_ENTRY = f'["{BRIDGE_NAME}", true],'
 LOADER = """// BEGIN applicationlauncher audio bridge
 try {
   const alDirectory = Components.classes["@mozilla.org/file/directory_service;1"]
@@ -75,7 +77,7 @@ def install(directory, source):
             r'\b(?:pref|defaultPref|lockPref)\(\s*[\'"]general\.config\.filename[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]\s*\)', text))
     if len(set(definitions)) > 1:
         raise ValueError("conflicting AutoConfig filenames; refusing to change them")
-    name = definitions[0] if definitions else "applicationlauncher-autoconfig.cfg"
+    name = definitions[0] if definitions else AUTOCONFIG_NAME
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or name in (".", ".."):
         raise ValueError("unsafe AutoConfig filename")
     config = directory / name
@@ -87,9 +89,15 @@ def install(directory, source):
     if not original.startswith("//"):
         raise ValueError("unsupported/obscured AutoConfig; refusing to replace it")
     content = without_loader(original)
-    if not content.endswith("\n"):
-        content += "\n"
-    content += LOADER
+    # The shared config already loads this optional script from its feature list.
+    # Keep that entry in place, rather than appending a second inline loader.
+    hook = original.split(BEGIN, 1)[1].split(END, 1)[0].strip() if BEGIN in original else None
+    if hook == SHARED_LOADER_ENTRY:
+        content = original
+    else:
+        if not content.endswith("\n"):
+            content += "\n"
+        content += LOADER
     # One permanent recovery copy, not an ever-growing set of backups.
     backup = config.with_name(config.name + ".before-applicationlauncher-audio")
     if config.exists() and BEGIN not in original and not backup.exists():
