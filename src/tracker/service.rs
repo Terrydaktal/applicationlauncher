@@ -45,6 +45,7 @@ const MASS_DISAPPEARANCE_CONFIRM_DELAY: Duration = Duration::from_secs(2);
 const MASS_DISAPPEARANCE_MAX_CONFIRM_ATTEMPTS: u8 = 5;
 const MASS_REMOVAL_WINDOW: Duration = Duration::from_secs(3);
 const PERIODIC_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_secs(30);
+const RESTORE_SPEC_CACHE_MAX_AGE: Duration = Duration::from_millis(500);
 
 fn reopen_shortcut_action_id() -> Vec<&'static str> {
     vec![
@@ -75,7 +76,13 @@ struct State {
     windows: HashMap<String, TrackedWindow>,
     snapshot_buffer: Option<HashMap<String, TrackedWindow>>,
     snapshot_deadline: Option<Instant>,
+    snapshot_durable_changed: bool,
     generation: u64,
+    window_changes: HashMap<String, u64>,
+    changes_floor: u64,
+    durable_generation: u64,
+    dirty_window_ids: HashMap<String, u64>,
+    full_persist_generation: Option<u64>,
     history_generation: u64,
     activation_sequence: i64,
     recovery_pending: bool,
@@ -97,6 +104,7 @@ struct State {
     auto_enter_enabled: bool,
     attention: HashMap<String, AttentionState>,
     restore_specs: HashMap<String, RestoreSpec>,
+    restore_spec_checked_at: HashMap<String, Instant>,
     restore_claims: HashSet<String>,
     history_restore_retry_after: HashMap<i64, Instant>,
     restore_sequence: u64,
@@ -105,6 +113,70 @@ struct State {
     recovery_restore_operations: HashSet<String>,
     terminal_upgrade_windows: HashSet<String>,
     terminal_upgrade_closed: HashSet<String>,
+}
+
+fn window_changes_since(state: &State, since: u64, run_id: &str) -> super::WindowChanges {
+    let reset = run_id != state.run_id || since < state.changes_floor || since > state.generation;
+    let mut changes = super::WindowChanges {
+        run_id: state.run_id.clone(),
+        generation: state.generation,
+        reset,
+        ..Default::default()
+    };
+    if reset {
+        changes.windows.extend(state.windows.values().cloned());
+    } else {
+        for (id, revision) in &state.window_changes {
+            if *revision <= since {
+                continue;
+            }
+            match state.windows.get(id) {
+                Some(window) => changes.windows.push(window.clone()),
+                None => changes.removed.push(id.clone()),
+            }
+        }
+    }
+    changes.windows.sort_by(|a, b| {
+        a.activation_sequence
+            .cmp(&b.activation_sequence)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    changes.removed.sort();
+    changes
+}
+
+fn reusable_restore_spec(
+    state: &State,
+    incoming: &TrackedWindow,
+    now: Instant,
+) -> Option<RestoreSpec> {
+    let checked_at = state.restore_spec_checked_at.get(&incoming.id)?;
+    if now.saturating_duration_since(*checked_at) >= RESTORE_SPEC_CACHE_MAX_AGE {
+        return None;
+    }
+    state
+        .snapshot_buffer
+        .as_ref()
+        .and_then(|windows| windows.get(&incoming.id))
+        .or_else(|| state.windows.get(&incoming.id))
+        .filter(|previous| {
+            previous.pid == incoming.pid
+                && previous.class == incoming.class
+                && previous.desktop_file_name == incoming.desktop_file_name
+                && previous.title != incoming.title
+                && previous
+                    .title
+                    .chars()
+                    .any(|ch| matches!(ch as u32, 0x2800..=0x28ff))
+                    == incoming
+                        .title
+                        .chars()
+                        .any(|ch| matches!(ch as u32, 0x2800..=0x28ff))
+                && super::database::stable_title(&previous.title)
+                    == super::database::stable_title(&incoming.title)
+        })
+        .and_then(|_| state.restore_specs.get(&incoming.id))
+        .cloned()
 }
 
 struct AttentionState {
@@ -400,6 +472,11 @@ impl Runtime {
         windows
     }
 
+    fn window_changes(&self, since: u64, run_id: &str) -> super::WindowChanges {
+        let state = self.0.state.lock().unwrap();
+        window_changes_since(&state, since, run_id)
+    }
+
     fn restorable_windows(&self) -> Vec<TrackedWindow> {
         self.windows()
             .into_iter()
@@ -407,32 +484,32 @@ impl Runtime {
             .collect()
     }
 
-    fn persist_current(&self) -> Result<(), String> {
-        let entries = {
-            let state = self.0.state.lock().unwrap();
+    fn publish_change(state: &mut State, id: Option<&str>) {
+        state.generation = state.generation.wrapping_add(1);
+        if let Some(id) = id {
             state
-                .windows
-                .values()
-                .cloned()
-                .map(|window| {
-                    let restore = state
-                        .restore_specs
-                        .get(&window.id)
-                        .cloned()
-                        .unwrap_or_else(|| super::infer_restore_spec(&window));
-                    (window, restore)
-                })
-                .collect::<Vec<_>>()
-        };
-        self.0
-            .database
-            .lock()
-            .unwrap()
-            .replace_current_with_restore(&entries)
+                .window_changes
+                .insert(id.to_string(), state.generation);
+        }
+        if id.is_none() || state.window_changes.len() > 4096 {
+            state.window_changes.clear();
+            state.changes_floor = state.generation;
+        }
     }
 
-    fn mark_changed(state: &mut State) {
-        state.generation = state.generation.wrapping_add(1);
+    fn mark_durable(state: &mut State, id: Option<&str>) {
+        state.durable_generation = state.durable_generation.wrapping_add(1);
+        if let Some(id) = id {
+            state
+                .dirty_window_ids
+                .insert(id.to_string(), state.durable_generation);
+        } else {
+            state.full_persist_generation = Some(state.durable_generation);
+        }
+        if state.dirty_window_ids.len() > 4096 {
+            state.dirty_window_ids.clear();
+            state.full_persist_generation = Some(state.durable_generation);
+        }
         state.recovery_dirty = true;
         state
             .recovery_due
@@ -702,7 +779,12 @@ impl Runtime {
             return;
         }
         let timestamp = now_ms();
-        let restore = super::infer_restore_spec(&incoming);
+        let cached_restore = {
+            let state = self.0.state.lock().unwrap();
+            reusable_restore_spec(&state, &incoming, Instant::now())
+        };
+        let restore_refreshed = cached_restore.is_none();
+        let restore = cached_restore.unwrap_or_else(|| super::infer_restore_spec(&incoming));
         let mut state = self.0.state.lock().unwrap();
         Self::expire_snapshot_if_needed(&mut state);
         if state.snapshot_buffer.is_none() && state.mass_disappearance.is_none() {
@@ -738,6 +820,16 @@ impl Runtime {
         let changed = previous
             .as_ref()
             .is_none_or(|previous| tracked_window_state_changed(previous, &incoming));
+        let durable_changed = previous
+            .as_ref()
+            .is_none_or(|previous| !super::database::persistence_equivalent(previous, &incoming))
+            || state.restore_specs.get(&incoming.id) != Some(&restore);
+        let changed_id = incoming.id.clone();
+        if restore_refreshed {
+            state
+                .restore_spec_checked_at
+                .insert(changed_id.clone(), Instant::now());
+        }
         state.restore_specs.insert(attention_id.clone(), restore);
         if let Some(target) = state.snapshot_buffer.as_mut() {
             target.insert(incoming.id.clone(), incoming);
@@ -767,7 +859,12 @@ impl Runtime {
             state.attention.remove(&attention_id);
         }
         if state.snapshot_buffer.is_none() && changed {
-            Self::mark_changed(&mut state);
+            Self::publish_change(&mut state, Some(&changed_id));
+        }
+        if state.snapshot_buffer.is_none() && durable_changed {
+            Self::mark_durable(&mut state, Some(&changed_id));
+        } else if state.snapshot_buffer.is_some() {
+            state.snapshot_durable_changed |= durable_changed;
         }
         crate::observability::set_gauge(
             crate::observability::Gauge::TrackedWindows,
@@ -802,10 +899,12 @@ impl Runtime {
         state.terminal_upgrade_closed.remove(id);
         state.attention.remove(id);
         let restore = state.restore_specs.remove(id);
+        state.restore_spec_checked_at.remove(id);
         let mut mass_trigger = None;
         if removed.is_some() {
             state.history_generation = state.history_generation.wrapping_add(1);
-            Self::mark_changed(&mut state);
+            Self::publish_change(&mut state, Some(id));
+            Self::mark_durable(&mut state, Some(id));
             if !intentional_restart
                 && is_mass_disappearance(removal_burst.baseline_entries.len(), state.windows.len())
             {
@@ -856,6 +955,22 @@ impl Runtime {
             return;
         };
         state.snapshot_deadline = None;
+        let display_changed = state.windows.len() != buffer.len()
+            || buffer.iter().any(|(id, window)| {
+                state
+                    .windows
+                    .get(id)
+                    .is_none_or(|old| tracked_window_state_changed(old, window))
+            });
+        let durable_changed = state.snapshot_durable_changed
+            || state.windows.len() != buffer.len()
+            || buffer.iter().any(|(id, window)| {
+                state
+                    .windows
+                    .get(id)
+                    .is_none_or(|old| !super::database::persistence_equivalent(old, window))
+            });
+        state.snapshot_durable_changed = false;
         let baseline_entries = state_snapshot_entries(&state);
         let expected_removals = baseline_entries
             .iter()
@@ -901,10 +1016,18 @@ impl Runtime {
             state.restore_specs.remove(&window.id);
         }
         state.restore_specs.retain(|id, _| live_ids.contains(id));
+        state
+            .restore_spec_checked_at
+            .retain(|id, _| live_ids.contains(id));
         if !closed.is_empty() {
             state.history_generation = state.history_generation.wrapping_add(1);
         }
-        Self::mark_changed(&mut state);
+        if display_changed {
+            Self::publish_change(&mut state, None);
+        }
+        if durable_changed {
+            Self::mark_durable(&mut state, None);
+        }
         crate::observability::set_gauge(
             crate::observability::Gauge::TrackedWindows,
             state.windows.len(),
@@ -988,7 +1111,7 @@ impl Runtime {
             (
                 state_snapshot_entries(&state),
                 state.boot_id.clone(),
-                state.generation,
+                state.durable_generation,
             )
         };
         super::tmux::refresh_snapshot_panes(&mut windows);
@@ -1003,7 +1126,7 @@ impl Runtime {
         match result {
             Ok(_) => {
                 crate::observability::increment(crate::observability::Counter::PersistenceWrites);
-                if state.generation == generation {
+                if state.durable_generation == generation {
                     state.recovery_dirty = false;
                     state.recovery_due = None;
                 }
@@ -1066,7 +1189,7 @@ impl Runtime {
     }
 
     fn persist_current_if_due(&self, force: bool) -> Result<(), String> {
-        let generation = {
+        let (generation, full, entries, removed) = {
             let mut state = self.0.state.lock().unwrap();
             if state.current_write_in_flight
                 || !state.current_dirty
@@ -1075,15 +1198,53 @@ impl Runtime {
                 return Ok(());
             }
             state.current_write_in_flight = true;
-            state.generation
+            let full = state.full_persist_generation.is_some();
+            let entries = state
+                .windows
+                .values()
+                .filter(|window| full || state.dirty_window_ids.contains_key(&window.id))
+                .map(|window| {
+                    (
+                        window.clone(),
+                        state
+                            .restore_specs
+                            .get(&window.id)
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let removed = state
+                .dirty_window_ids
+                .keys()
+                .filter(|id| !state.windows.contains_key(*id))
+                .cloned()
+                .collect::<Vec<_>>();
+            (state.durable_generation, full, entries, removed)
         };
-        let result = self.persist_current();
+        let result = {
+            let mut database = self.0.database.lock().unwrap();
+            if full {
+                database.replace_current_with_restore(&entries)
+            } else {
+                database.patch_current_with_restore(&entries, &removed)
+            }
+        };
         let mut state = self.0.state.lock().unwrap();
         state.current_write_in_flight = false;
         match result {
             Ok(()) => {
                 crate::observability::increment(crate::observability::Counter::PersistenceWrites);
-                if state.generation == generation {
+                state
+                    .dirty_window_ids
+                    .retain(|_, revision| *revision > generation);
+                if state
+                    .full_persist_generation
+                    .is_some_and(|revision| revision <= generation)
+                {
+                    state.full_persist_generation = None;
+                }
+                if state.durable_generation == generation {
                     state.current_dirty = false;
                     state.current_due = None;
                 }
@@ -1704,6 +1865,7 @@ impl WindowFeed {
     fn begin_snapshot(&self) {
         let mut state = self.0.0.state.lock().unwrap();
         state.snapshot_buffer = Some(HashMap::new());
+        state.snapshot_durable_changed = false;
         state.snapshot_deadline = Some(Instant::now() + SNAPSHOT_TRANSACTION_TIMEOUT);
     }
 
@@ -1930,6 +2092,11 @@ impl TrackerApi {
         serde_json::to_string(&self.0.windows()).unwrap()
     }
 
+    #[zbus(name = "GetWindowChanges")]
+    fn get_window_changes(&self, since: u64, run_id: &str) -> String {
+        serde_json::to_string(&self.0.window_changes(since, run_id)).unwrap()
+    }
+
     #[zbus(name = "GetHistory")]
     fn get_history(&self, limit: u32) -> String {
         let result = self
@@ -1963,12 +2130,21 @@ impl TrackerApi {
             &windows,
             now_ms(),
         );
+        if result.is_ok() {
+            let mut state = self.0.0.state.lock().unwrap();
+            state.history_generation = state.history_generation.wrapping_add(1);
+        }
         serde_json::to_string(&result).unwrap()
     }
 
     #[zbus(name = "DeleteSnapshot")]
     fn delete_snapshot(&self, id: i64) -> String {
-        serde_json::to_string(&self.0.0.database.lock().unwrap().delete_snapshot(id)).unwrap()
+        let result = self.0.0.database.lock().unwrap().delete_snapshot(id);
+        if result.is_ok() {
+            let mut state = self.0.0.state.lock().unwrap();
+            state.history_generation = state.history_generation.wrapping_add(1);
+        }
+        serde_json::to_string(&result).unwrap()
     }
 
     #[zbus(name = "GetSnapshot")]
@@ -2391,7 +2567,13 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             windows: persisted_windows,
             snapshot_buffer: None,
             snapshot_deadline: None,
+            snapshot_durable_changed: false,
             generation: 0,
+            window_changes: HashMap::new(),
+            changes_floor: 0,
+            durable_generation: 0,
+            dirty_window_ids: HashMap::new(),
+            full_persist_generation: None,
             history_generation: 0,
             activation_sequence,
             recovery_pending,
@@ -2413,6 +2595,7 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             auto_enter_enabled,
             attention: HashMap::new(),
             restore_specs,
+            restore_spec_checked_at: HashMap::new(),
             restore_claims: HashSet::new(),
             history_restore_retry_after: HashMap::new(),
             restore_sequence: 0,
@@ -2562,6 +2745,7 @@ pub fn run_tracker_daemon() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use super::{
@@ -2575,6 +2759,425 @@ mod tests {
     };
     use crate::tracker::restore::LaunchUnavailableCode;
     use crate::tracker::{HistoryEntry, RestoreReport, RestoreSpec, TrackedWindow};
+
+    #[test]
+    fn restore_spec_cache_expires_without_postponement_and_rechecks_identity() {
+        let now = Instant::now();
+        let window = TrackedWindow {
+            id: "terminal".into(),
+            pid: 100,
+            class: "xfce4-terminal".into(),
+            title: "codex - \u{280b} project - Terminal".into(),
+            ..Default::default()
+        };
+        let saved = RestoreSpec {
+            terminal_kind: Some("codex".into()),
+            cwd: Some("/project".into()),
+            ..Default::default()
+        };
+        let state = State {
+            windows: HashMap::from([(window.id.clone(), window.clone())]),
+            restore_specs: HashMap::from([(window.id.clone(), saved.clone())]),
+            restore_spec_checked_at: HashMap::from([(window.id.clone(), now)]),
+            ..Default::default()
+        };
+        let mut changed = window.clone();
+        changed.title = "codex - \u{2819} project - Terminal".into();
+        for millis in [1, 100, 499] {
+            assert_eq!(
+                super::reusable_restore_spec(&state, &changed, now + Duration::from_millis(millis)),
+                Some(saved.clone())
+            );
+        }
+        assert!(
+            super::reusable_restore_spec(&state, &changed, now + Duration::from_millis(500))
+                .is_none()
+        );
+        changed.pid += 1;
+        assert!(super::reusable_restore_spec(&state, &changed, now).is_none());
+        changed = window.clone();
+        changed.title = "codex - project - Terminal".into();
+        assert!(super::reusable_restore_spec(&state, &changed, now).is_none());
+        changed.title = "codex - \u{2819} other - Terminal".into();
+        assert!(super::reusable_restore_spec(&state, &changed, now).is_none());
+    }
+
+    #[test]
+    fn incremental_tracker_feed_coalesces_latest_state_and_removed_ids() {
+        let mut state = State {
+            run_id: "run-one".into(),
+            ..Default::default()
+        };
+        state.windows.insert(
+            "a".into(),
+            TrackedWindow {
+                id: "a".into(),
+                title: "old".into(),
+                ..Default::default()
+            },
+        );
+        state.windows.insert(
+            "b".into(),
+            TrackedWindow {
+                id: "b".into(),
+                ..Default::default()
+            },
+        );
+        assert!(super::window_changes_since(&state, u64::MAX, "").reset);
+        for title in ["middle", "latest"] {
+            state.windows.get_mut("a").unwrap().title = title.into();
+            Runtime::publish_change(&mut state, Some("a"));
+        }
+        state.windows.remove("b");
+        Runtime::publish_change(&mut state, Some("b"));
+        let delta = super::window_changes_since(&state, 0, "run-one");
+        assert!(!delta.reset);
+        assert_eq!(delta.generation, 3);
+        assert_eq!(delta.windows.len(), 1);
+        assert_eq!(delta.windows[0].title, "latest");
+        assert_eq!(delta.removed, ["b"]);
+        let idle = super::window_changes_since(&state, 3, "run-one");
+        assert!(idle.windows.is_empty());
+        assert!(idle.removed.is_empty());
+        assert!(!idle.reset);
+        assert!(super::window_changes_since(&state, 3, "previous-run").reset);
+        assert!(super::window_changes_since(&state, 4, "run-one").reset);
+    }
+
+    #[test]
+    fn bounded_tracker_journal_and_dirty_set_fall_back_to_full_resynchronization() {
+        let mut state = State {
+            run_id: "run".into(),
+            ..Default::default()
+        };
+        for index in 0..4097 {
+            let id = index.to_string();
+            Runtime::publish_change(&mut state, Some(&id));
+            Runtime::mark_durable(&mut state, Some(&id));
+        }
+        assert!(state.window_changes.len() <= 4096);
+        assert!(state.dirty_window_ids.len() <= 4096);
+        assert!(state.full_persist_generation.is_some());
+        let reset = super::window_changes_since(&state, 0, "run");
+        assert!(reset.reset);
+        assert!(reset.windows.is_empty());
+        let baseline = state.generation;
+        state.windows.insert(
+            "new".into(),
+            TrackedWindow {
+                id: "new".into(),
+                ..Default::default()
+            },
+        );
+        Runtime::publish_change(&mut state, Some("new"));
+        let delta = super::window_changes_since(&state, baseline, "run");
+        assert!(!delta.reset);
+        assert_eq!(delta.windows[0].id, "new");
+    }
+
+    #[test]
+    fn delayed_incremental_consumers_receive_exact_end_state() {
+        let mut state = State {
+            run_id: "run".into(),
+            ..Default::default()
+        };
+        let mut cursor = 0;
+        let mut visible = HashMap::new();
+        for sequence in 0..1000 {
+            let id = (sequence % 17).to_string();
+            if sequence % 3 == 0 {
+                state.windows.remove(&id);
+            } else {
+                state.windows.insert(
+                    id.clone(),
+                    TrackedWindow {
+                        id: id.clone(),
+                        title: sequence.to_string(),
+                        activation_sequence: sequence,
+                        ..Default::default()
+                    },
+                );
+            }
+            Runtime::publish_change(&mut state, Some(&id));
+            if sequence % 37 == 0 || sequence == 999 {
+                let changes = super::window_changes_since(&state, cursor, "run");
+                if changes.reset {
+                    visible.clear();
+                }
+                for window in changes.windows {
+                    visible.insert(window.id.clone(), window);
+                }
+                for id in changes.removed {
+                    visible.remove(&id);
+                }
+                cursor = changes.generation;
+                assert_eq!(visible, state.windows);
+            }
+        }
+    }
+
+    fn optimization_runtime() -> (Runtime, super::super::database::TestDatabaseDirectory) {
+        let (database, directory) = super::super::database::test_database();
+        (
+            Runtime(std::sync::Arc::new(RuntimeInner {
+                database: std::sync::Mutex::new(database),
+                terminal_upgrades: std::sync::Mutex::new(
+                    super::super::terminal_upgrade::UpgradeRegistry::default(),
+                ),
+                state: std::sync::Mutex::new(State {
+                    run_id: "optimization-test".into(),
+                    checkpoint_guarded: true,
+                    ..Default::default()
+                }),
+            })),
+            directory,
+        )
+    }
+
+    #[test]
+    fn transient_tracker_frames_publish_without_scheduling_database_writes() {
+        let (runtime, _directory) = optimization_runtime();
+        let mut window = TrackedWindow {
+            id: "spinner".into(),
+            pid: -1,
+            class: "xfce4-terminal".into(),
+            title: "codex - \u{280b} /project - Terminal".into(),
+            width: 800,
+            height: 600,
+            ..Default::default()
+        };
+        runtime.upsert(window.clone(), false);
+        runtime.persist_current_if_due(true).unwrap();
+        let before = {
+            let state = runtime.0.state.lock().unwrap();
+            assert!(!state.current_dirty);
+            (state.generation, state.durable_generation)
+        };
+        let stored_title = window.title.clone();
+        for frame in 0..100 {
+            window.title = format!(
+                "codex - {} /project - Terminal",
+                if frame % 2 == 0 {
+                    '\u{2819}'
+                } else {
+                    '\u{2807}'
+                }
+            );
+            runtime.upsert(window.clone(), false);
+        }
+        {
+            let state = runtime.0.state.lock().unwrap();
+            assert_eq!(state.generation, before.0 + 100);
+            assert_eq!(state.durable_generation, before.1);
+            assert!(!state.current_dirty);
+            assert!(state.current_due.is_none());
+            assert!(state.dirty_window_ids.is_empty());
+        }
+        runtime.persist_current_if_due(true).unwrap();
+        assert_eq!(runtime.windows()[0].title, window.title);
+        assert_eq!(
+            runtime
+                .0
+                .database
+                .lock()
+                .unwrap()
+                .current_window_entries()
+                .unwrap()[0]
+                .0
+                .title,
+            stored_title
+        );
+    }
+
+    struct LegacyTrackerFixture {
+        runtime: Runtime,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[zbus::interface(name = "com.terrydaktal.ApplicationLauncher.Tracker1")]
+    impl LegacyTrackerFixture {
+        fn get_status(&self) -> String {
+            serde_json::to_string(&self.runtime.status()).unwrap()
+        }
+
+        fn get_windows(&self) -> String {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            serde_json::to_string(&self.runtime.windows()).unwrap()
+        }
+    }
+
+    #[test]
+    #[ignore = "run only on a private dbus-run-session with APPLICATIONLAUNCHER_TEST_PRIVATE_BUS=1"]
+    fn private_bus_incremental_feed_and_legacy_fallback_preserve_end_state() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        assert_eq!(
+            std::env::var("APPLICATIONLAUNCHER_TEST_PRIVATE_BUS").as_deref(),
+            Ok("1")
+        );
+        let (runtime, _directory) = optimization_runtime();
+        {
+            let mut state = runtime.0.state.lock().unwrap();
+            for id in ["a", "b"] {
+                state.windows.insert(
+                    id.into(),
+                    TrackedWindow {
+                        id: id.into(),
+                        title: "initial".into(),
+                        ..Default::default()
+                    },
+                );
+                Runtime::publish_change(&mut state, Some(id));
+            }
+        }
+        let server = zbus::blocking::connection::Builder::session()
+            .unwrap()
+            .name(crate::tracker::SERVICE_NAME)
+            .unwrap()
+            .serve_at(
+                crate::tracker::TRACKER_PATH,
+                super::TrackerApi(runtime.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let client = crate::tracker::TrackerClient::connect().unwrap();
+        let initial = client.window_changes(u64::MAX, "").unwrap();
+        assert!(initial.reset);
+        assert_eq!(initial.windows.len(), 2);
+        {
+            let mut state = runtime.0.state.lock().unwrap();
+            state.windows.get_mut("a").unwrap().title = "latest".into();
+            Runtime::publish_change(&mut state, Some("a"));
+            state.windows.remove("b");
+            Runtime::publish_change(&mut state, Some("b"));
+        }
+        let delta = client
+            .window_changes(initial.generation, &initial.run_id)
+            .unwrap();
+        assert!(!delta.reset);
+        assert_eq!(delta.windows.len(), 1);
+        assert_eq!(delta.windows[0].title, "latest");
+        assert_eq!(delta.removed, ["b"]);
+        let idle = client
+            .window_changes(delta.generation, &delta.run_id)
+            .unwrap();
+        assert!(!idle.reset);
+        assert!(idle.windows.is_empty());
+        assert!(idle.removed.is_empty());
+        drop(client);
+        server.release_name(crate::tracker::SERVICE_NAME).unwrap();
+        drop(server);
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let _legacy_server = zbus::blocking::connection::Builder::session()
+            .unwrap()
+            .name(crate::tracker::SERVICE_NAME)
+            .unwrap()
+            .serve_at(
+                crate::tracker::TRACKER_PATH,
+                LegacyTrackerFixture {
+                    runtime: runtime.clone(),
+                    reads: Arc::clone(&reads),
+                },
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let client = crate::tracker::TrackerClient::connect().unwrap();
+        let full = client.window_changes(u64::MAX, "").unwrap();
+        assert!(full.reset);
+        assert_eq!(full.windows, runtime.windows());
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        let idle = client
+            .window_changes(full.generation, &full.run_id)
+            .unwrap();
+        assert!(!idle.reset);
+        assert!(idle.windows.is_empty());
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        {
+            let mut state = runtime.0.state.lock().unwrap();
+            state.windows.get_mut("a").unwrap().title = "legacy latest".into();
+            Runtime::publish_change(&mut state, Some("a"));
+        }
+        let full = client
+            .window_changes(idle.generation, &idle.run_id)
+            .unwrap();
+        assert!(full.reset);
+        assert_eq!(full.windows, runtime.windows());
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn persistence_in_flight_retains_newer_dirty_revisions() {
+        let (runtime, _directory) = optimization_runtime();
+        let window = TrackedWindow {
+            id: "window".into(),
+            title: "Editor".into(),
+            x: 10,
+            ..Default::default()
+        };
+        {
+            let mut state = runtime.0.state.lock().unwrap();
+            state.windows.insert(window.id.clone(), window);
+            Runtime::mark_durable(&mut state, Some("window"));
+        }
+        let database = runtime.0.database.lock().unwrap();
+        let worker_runtime = runtime.clone();
+        let worker =
+            std::thread::spawn(move || worker_runtime.persist_current_if_due(true).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if runtime.0.state.lock().unwrap().current_write_in_flight {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        {
+            let mut state = runtime.0.state.lock().unwrap();
+            let window = state.windows.get_mut("window").unwrap();
+            window.x = 500;
+            window.last_activated_at_ms = Some(123456);
+            Runtime::mark_durable(&mut state, Some("window"));
+        }
+        drop(database);
+        worker.join().unwrap();
+        assert!(
+            runtime
+                .0
+                .state
+                .lock()
+                .unwrap()
+                .dirty_window_ids
+                .contains_key("window")
+        );
+        runtime.persist_current_if_due(true).unwrap();
+        let saved = runtime
+            .0
+            .database
+            .lock()
+            .unwrap()
+            .current_window_entries()
+            .unwrap();
+        assert_eq!(saved[0].0.x, 500);
+        assert_eq!(saved[0].0.last_activated_at_ms, Some(123456));
+        assert!(!runtime.0.state.lock().unwrap().current_dirty);
+    }
+
+    #[test]
+    fn history_generation_tracks_manual_snapshot_creation_and_deletion() {
+        let (runtime, _directory) = optimization_runtime();
+        let api = super::TrackerApi(runtime.clone());
+        let before = runtime.history_generation();
+        let id: Result<i64, String> =
+            serde_json::from_str(&api.create_snapshot("Test snapshot")).unwrap();
+        let id = id.unwrap();
+        assert_eq!(runtime.history_generation(), before + 1);
+        let deleted: Result<(), String> = serde_json::from_str(&api.delete_snapshot(id)).unwrap();
+        deleted.unwrap();
+        assert_eq!(runtime.history_generation(), before + 2);
+    }
 
     #[test]
     fn terminal_maintenance_closures_do_not_pollute_history_or_leave_stale_specs() {

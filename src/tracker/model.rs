@@ -254,6 +254,15 @@ pub struct TrackerStatus {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WindowChanges {
+    pub run_id: String,
+    pub generation: u64,
+    pub reset: bool,
+    pub windows: Vec<TrackedWindow>,
+    pub removed: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RestoreReport {
     #[serde(default)]
     pub operation_id: Option<String>,

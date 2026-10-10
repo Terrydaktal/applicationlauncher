@@ -250,27 +250,16 @@ pub(crate) fn setup_kwin_window_feed(
                 }
             }
 
-            let result = client.as_ref().unwrap().status().and_then(|status| {
-                let tracker_restarted = last_run_id.as_deref() != Some(status.run_id.as_str());
-                if tracker_restarted {
-                    last_run_id = Some(status.run_id.clone());
-                    last_generation = u64::MAX;
-                    previous_payloads = None;
-                }
-
-                if status.generation == last_generation {
-                    return Ok(None);
-                }
-                client
-                    .as_ref()
-                    .unwrap()
-                    .windows()
-                    .map(|windows| Some((status.generation, windows)))
-            });
-
+            let result = client
+                .as_ref()
+                .unwrap()
+                .window_changes(last_generation, last_run_id.as_deref().unwrap_or(""));
             match result {
-                Ok(Some((generation, windows))) => {
-                    let payloads = windows
+                Ok(changes) => {
+                    let generation = changes.generation;
+                    last_run_id = Some(changes.run_id);
+                    let payloads = changes
+                        .windows
                         .into_iter()
                         .map(|window| KWinWindowPayload {
                             id: window.id,
@@ -290,15 +279,31 @@ pub(crate) fn setup_kwin_window_feed(
                             activation_sequence: window.activation_sequence,
                         })
                         .collect::<Vec<_>>();
-                    let (events, current_payloads) =
-                        window_feed_events_from_snapshot(previous_payloads.as_ref(), payloads);
+                    let (events, current_payloads) = if changes.reset {
+                        window_feed_events_from_snapshot(previous_payloads.as_ref(), payloads)
+                    } else {
+                        let mut current = previous_payloads.take().unwrap_or_default();
+                        let mut events = Vec::new();
+                        for payload in payloads {
+                            if current.get(&payload.id) != Some(&payload) {
+                                current.insert(payload.id.clone(), payload.clone());
+                                events.push(WindowFeedEvent::Upsert(payload));
+                            }
+                        }
+                        for id in changes.removed {
+                            if current.remove(&id).is_some() {
+                                events.push(WindowFeedEvent::Remove(id));
+                            }
+                        }
+                        (events, current)
+                    };
                     let has_events = !events.is_empty();
                     let should_repaint = if has_events {
                         let mut pending = match inbox.lock() {
                             Ok(pending) => pending,
                             Err(poisoned) => poisoned.into_inner(),
                         };
-                        queue_window_feed_update(&mut pending, events)
+                        queue_latest_window_feed_update(&mut pending, events, &current_payloads)
                     } else {
                         false
                     };
@@ -314,7 +319,6 @@ pub(crate) fn setup_kwin_window_feed(
                         }
                     }
                 }
-                Ok(None) => {}
                 Err(err) => {
                     eprintln!("Application Launcher tracker connection lost: {err}");
                     last_generation = u64::MAX;
@@ -378,6 +382,24 @@ pub(crate) fn queue_window_feed_update(
     combined.extend(events);
     *pending = Some(coalesce_window_feed_events(combined));
     should_repaint
+}
+
+fn queue_latest_window_feed_update(
+    pending: &mut Option<Vec<WindowFeedEvent>>,
+    events: Vec<WindowFeedEvent>,
+    latest: &HashMap<String, KWinWindowPayload>,
+) -> bool {
+    const MAX_PENDING_EVENTS: usize = 4096;
+    if pending.as_ref().map_or(0, Vec::len) + events.len() > MAX_PENDING_EVENTS {
+        let should_repaint = pending.is_none();
+        // Replace accumulated tombstones as well as frames with the complete end state.
+        *pending = Some(vec![WindowFeedEvent::Snapshot(
+            latest.values().cloned().collect(),
+        )]);
+        should_repaint
+    } else {
+        queue_window_feed_update(pending, events)
+    }
 }
 
 pub(crate) fn window_feed_events_from_snapshot(
@@ -865,6 +887,40 @@ pub(crate) fn get_snapshot_window_details(id: &str) -> SnapshotWindowDetails {
 #[cfg(test)]
 mod tests {
     use super::tracker_status_matches_build;
+
+    #[test]
+    fn inactive_ui_backlog_overflow_replaces_tombstones_with_authoritative_latest_state() {
+        use super::*;
+        let latest_window: KWinWindowPayload =
+            serde_json::from_str(r#"{"id":"alive","title":"latest","class":"editor"}"#).unwrap();
+        let latest = HashMap::from([("alive".into(), latest_window.clone())]);
+        let mut pending = Some(
+            (0..4096)
+                .map(|id| WindowFeedEvent::Remove(id.to_string()))
+                .collect(),
+        );
+        assert!(!queue_latest_window_feed_update(
+            &mut pending,
+            vec![WindowFeedEvent::Upsert(latest_window.clone())],
+            &latest,
+        ));
+        let [WindowFeedEvent::Snapshot(windows)] = pending.as_deref().unwrap() else {
+            panic!("overflow must become an authoritative snapshot");
+        };
+        assert_eq!(windows, &[latest_window]);
+        assert_eq!(pending.as_ref().unwrap().len(), 1);
+        let mut latest = latest;
+        latest.get_mut("alive").unwrap().title = "newest".into();
+        assert!(!queue_latest_window_feed_update(
+            &mut pending,
+            vec![WindowFeedEvent::Upsert(latest["alive"].clone())],
+            &latest,
+        ));
+        let applied = coalesce_window_feed_events(pending.take().unwrap());
+        assert!(matches!(applied.first(), Some(WindowFeedEvent::Reset)));
+        assert_eq!(applied.len(), 2);
+        assert!(matches!(&applied[1], WindowFeedEvent::Upsert(window) if window.title == "newest"));
+    }
 
     #[test]
     fn tracker_status_requires_the_current_launcher_build() {

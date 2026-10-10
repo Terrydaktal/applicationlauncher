@@ -8,6 +8,7 @@ use super::{
 
 pub struct TrackerClient {
     connection: Connection,
+    incremental_supported: std::sync::atomic::AtomicBool,
 }
 
 impl TrackerClient {
@@ -39,7 +40,10 @@ impl TrackerClient {
             // retry cannot duplicate an in-flight restore.
             .method_timeout(Duration::from_secs(30))
             .build()
-            .map(|connection| Self { connection })
+            .map(|connection| Self {
+                connection,
+                incremental_supported: true.into(),
+            })
             .map_err(|err| err.to_string())
     }
 
@@ -64,6 +68,27 @@ impl TrackerClient {
     }
     pub fn windows(&self) -> Result<Vec<TrackedWindow>, String> {
         serde_json::from_str(&self.call("GetWindows", &())?).map_err(|err| err.to_string())
+    }
+    pub fn window_changes(&self, since: u64, run_id: &str) -> Result<super::WindowChanges, String> {
+        use std::sync::atomic::Ordering;
+        if self.incremental_supported.load(Ordering::Relaxed) {
+            match self.call("GetWindowChanges", &(since, run_id)) {
+                Ok(json) => return serde_json::from_str(&json).map_err(|err| err.to_string()),
+                Err(err) if err.contains("UnknownMethod") => {
+                    self.incremental_supported.store(false, Ordering::Relaxed)
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        let status = self.status()?;
+        let reset = status.generation != since || status.run_id != run_id;
+        Ok(super::WindowChanges {
+            windows: if reset { self.windows()? } else { Vec::new() },
+            run_id: status.run_id,
+            generation: status.generation,
+            reset,
+            removed: Vec::new(),
+        })
     }
     pub fn history(&self, limit: u32) -> Result<Vec<HistoryEntry>, String> {
         decode_result(&self.call("GetHistory", &(limit,))?)

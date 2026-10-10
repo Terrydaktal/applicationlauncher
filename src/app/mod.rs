@@ -68,27 +68,54 @@ struct HistoryPopupState {
     loading: bool,
     action_pending: bool,
     refresh_in_flight: bool,
+    tracker_client: Option<applicationlauncher::tracker::TrackerClient>,
+    generation: Option<(String, u64)>,
     last_refresh_started: Option<Instant>,
     message: Option<String>,
 }
 
 fn refresh_history_popup(state: Arc<std::sync::Mutex<HistoryPopupState>>, ctx: egui::Context) {
-    if let Ok(mut state) = state.lock() {
+    let (client, generation) = if let Ok(mut state) = state.lock() {
+        if state.refresh_in_flight {
+            return;
+        }
         state.refresh_in_flight = true;
         state.last_refresh_started = Some(Instant::now());
-    }
+        (state.tracker_client.take(), state.generation.clone())
+    } else {
+        return;
+    };
     std::thread::spawn(move || {
-        let result = applicationlauncher::tracker::TrackerClient::connect()
-            .and_then(|client| Ok((client.history(500)?, client.snapshots()?)));
+        let mut client = client;
+        let result = (|| {
+            if client.is_none() {
+                client = Some(applicationlauncher::tracker::TrackerClient::connect()?);
+            }
+            let client = client.as_ref().unwrap();
+            let status = client.status()?;
+            let current = (status.run_id, status.history_generation);
+            if generation.as_ref() == Some(&current) {
+                return Ok(None);
+            }
+            Ok::<_, String>(Some((current, client.history(500)?, client.snapshots()?)))
+        })();
         if let Ok(mut state) = state.lock() {
             state.loading = false;
             state.refresh_in_flight = false;
             match result {
-                Ok((history, snapshots)) => {
+                Ok(Some((generation, history, snapshots))) => {
+                    state.generation = Some(generation);
+                    state.tracker_client = client;
                     state.history = history;
                     state.snapshots = snapshots;
                 }
-                Err(err) => state.message = Some(format!("Tracker unavailable: {err}")),
+                Ok(None) => {
+                    state.tracker_client = client;
+                }
+                Err(err) => {
+                    state.tracker_client = None;
+                    state.message = Some(format!("Tracker unavailable: {err}"));
+                }
             }
         }
         ctx.request_repaint();
@@ -491,8 +518,7 @@ impl App {
                 let refresh_due = shared_state
                     .lock()
                     .map(|state| {
-                        !state.show_sessions
-                            && !state.loading
+                        !state.loading
                             && !state.action_pending
                             && !state.refresh_in_flight
                             && state.last_refresh_started.is_none_or(|started| {

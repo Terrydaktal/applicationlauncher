@@ -217,6 +217,37 @@ impl TrackerDatabase {
         tx.commit().map_err(|err| err.to_string())
     }
 
+    pub fn patch_current_with_restore(
+        &mut self,
+        entries: &[(TrackedWindow, RestoreSpec)],
+        removed: &[String],
+    ) -> Result<(), String> {
+        let tx = self
+            .connection
+            .transaction()
+            .map_err(|err| err.to_string())?;
+        {
+            let mut delete = tx
+                .prepare_cached("DELETE FROM current_windows WHERE window_id=?1")
+                .map_err(|err| err.to_string())?;
+            for id in removed {
+                delete.execute([id]).map_err(|err| err.to_string())?;
+            }
+            let mut update = tx.prepare_cached("INSERT INTO current_windows(window_id,payload_json,restore_json,updated_at_ms) VALUES(?1,?2,?3,?4) ON CONFLICT(window_id) DO UPDATE SET payload_json=excluded.payload_json,restore_json=excluded.restore_json,updated_at_ms=excluded.updated_at_ms").map_err(|err| err.to_string())?;
+            for (window, restore) in entries {
+                update
+                    .execute(params![
+                        window.id,
+                        serde_json::to_string(window).map_err(|err| err.to_string())?,
+                        serde_json::to_string(restore).map_err(|err| err.to_string())?,
+                        window.updated_at_ms
+                    ])
+                    .map_err(|err| err.to_string())?;
+            }
+        }
+        tx.commit().map_err(|err| err.to_string())
+    }
+
     pub fn add_history_with_restore(
         &self,
         window: &TrackedWindow,
@@ -691,8 +722,9 @@ fn history_window_with_restore_title(
     window
 }
 
-fn stable_title(title: &str) -> String {
+pub(super) fn stable_title(title: &str) -> String {
     title
+        .replace("[ . ] Action Required", "[ ! ] Action Required")
         .chars()
         .filter(|character| !matches!(*character as u32, 0x2800..=0x28ff))
         .collect::<String>()
@@ -701,7 +733,7 @@ fn stable_title(title: &str) -> String {
         .join(" ")
 }
 
-fn persistence_equivalent(previous: &TrackedWindow, current: &TrackedWindow) -> bool {
+pub(super) fn persistence_equivalent(previous: &TrackedWindow, current: &TrackedWindow) -> bool {
     stable_title(&previous.title) == stable_title(&current.title)
         && previous.class == current.class
         && previous.pid == current.pid
@@ -762,6 +794,90 @@ pub(super) fn test_database() -> (TrackerDatabase, TestDatabaseDirectory) {
 mod tests {
     use super::*;
     use crate::tracker::{TrackedWindow, now_ms};
+
+    #[test]
+    fn current_window_delta_writes_only_changed_ids_and_preserves_other_records() {
+        let (mut database, _directory) = test_database();
+        let entries: Vec<_> = (0..50)
+            .map(|id| {
+                (
+                    TrackedWindow {
+                        id: id.to_string(),
+                        title: format!("Window {id}"),
+                        x: id,
+                        last_activated_at_ms: Some(123),
+                        activation_sequence: id as i64,
+                        ..Default::default()
+                    },
+                    RestoreSpec::default(),
+                )
+            })
+            .collect();
+        database.replace_current_with_restore(&entries).unwrap();
+        let original: String = database
+            .connection
+            .query_row(
+                "SELECT payload_json FROM current_windows WHERE window_id='49'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let before = database.connection.total_changes();
+        let mut changed = entries[0].clone();
+        changed.0.x = 400;
+        changed.0.last_activated_at_ms = Some(999);
+        database
+            .patch_current_with_restore(&[changed.clone()], &["1".into()])
+            .unwrap();
+        assert_eq!(database.connection.total_changes() - before, 2);
+        let after: String = database
+            .connection
+            .query_row(
+                "SELECT payload_json FROM current_windows WHERE window_id='49'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(original, after);
+        let saved: String = database
+            .connection
+            .query_row(
+                "SELECT payload_json FROM current_windows WHERE window_id='0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<TrackedWindow>(&saved).unwrap(),
+            changed.0
+        );
+    }
+
+    #[test]
+    fn persistence_ignores_spinner_and_attention_frames_but_preserves_real_changes() {
+        let old = TrackedWindow {
+            title: "codex - \u{280b} project - Terminal".into(),
+            ..Default::default()
+        };
+        let mut new = old.clone();
+        new.title = "codex - \u{2819} project - Terminal".into();
+        new.updated_at_ms = 99;
+        assert!(persistence_equivalent(&old, &new));
+        new.x = 1;
+        assert!(!persistence_equivalent(&old, &new));
+        let old = TrackedWindow {
+            title: "codex - [ . ] Action Required - project".into(),
+            ..Default::default()
+        };
+        let mut new = old.clone();
+        new.title = "codex - [ ! ] Action Required - project".into();
+        assert!(persistence_equivalent(&old, &new));
+        new.title = "codex - project".into();
+        assert!(!persistence_equivalent(&old, &new));
+        new = old.clone();
+        new.last_activated_at_ms = Some(123);
+        assert!(!persistence_equivalent(&old, &new));
+    }
 
     #[test]
     fn terminal_upgrade_backup_is_named_durable_and_preserves_every_tab_and_geometry() {
