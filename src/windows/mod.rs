@@ -10,4 +10,4 @@ pub(crate) use kwin::*;
 pub(crate) use process::*;
 pub(crate) use process_tree::{WindowProcessTreeLookup, WindowProcessTreeTarget};
 pub(crate) use terminal::*;
-pub(crate) use versions::{WindowVersionLookup, WindowVersionTarget};
+pub(crate) use versions::ProcessVersionCache;

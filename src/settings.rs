@@ -290,6 +290,23 @@ pub(crate) fn render_deferred_settings_panel(
             );
         });
 
+    ui.add_space(14.0);
+    ui.separator();
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new("Show Info").strong());
+    egui::Grid::new("deferred_info_settings_grid")
+        .num_columns(2)
+        .spacing([12.0, 10.0])
+        .show(ui, |ui| {
+            settings_changed |= settings_slider_row(
+                ui,
+                "Scroll Sensitivity:",
+                &mut state.settings.info_scroll_sensitivity,
+                0.1..=10.0,
+            );
+        });
+    ui.add_space(14.0);
+
     if settings_changed {
         state.save_changed_settings();
     }
@@ -316,10 +333,16 @@ pub(crate) fn render_deferred_settings_panel(
 }
 
 pub(crate) fn load_launcher_settings() -> LauncherSettings {
+    let path = std::env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(".config/applicationlauncher/settings.txt"));
+    load_launcher_settings_from_path(path)
+}
+
+fn load_launcher_settings_from_path(path: Option<PathBuf>) -> LauncherSettings {
     let mut settings = LauncherSettings::default();
 
-    if let Ok(home) = std::env::var("HOME") {
-        let path = PathBuf::from(format!("{}/.config/applicationlauncher/settings.txt", home));
+    if let Some(path) = path {
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(path) {
                 let mut saw_win_top_padding = false;
@@ -525,6 +548,11 @@ pub(crate) fn load_launcher_settings() -> LauncherSettings {
                                 .map(|v| v.clamp(0.1, 10.0))
                                 .unwrap_or(settings.win_scroll_sensitivity);
                         }
+                        "info_scroll_sensitivity" => {
+                            settings.info_scroll_sensitivity = value
+                                .parse::<f32>()
+                                .unwrap_or(settings.info_scroll_sensitivity);
+                        }
                         "ui_scale" => {
                             settings.ui_scale = value
                                 .parse::<f32>()
@@ -545,40 +573,44 @@ pub(crate) fn save_launcher_settings(settings: LauncherSettings) {
     if let Ok(home) = std::env::var("HOME") {
         let dir = PathBuf::from(format!("{}/.config/applicationlauncher", home));
         let path = dir.join("settings.txt");
-        let content = format!(
-            "show_system_settings_modules={}\napp_icon_mode={}\nwin_icon_size={:.1}\nwin_top_padding={:.1}\nwin_bottom_padding={:.1}\nwin_left_padding={:.1}\nwin_right_padding={:.1}\nwin_row_height={:.1}\nwin_text_spacing={:.1}\nwin_line_height={:.1}\nwin_show_path={}\nwin_show_last_activation={}\nshow_run_in_terminal={}\nshow_cd_in_terminal={}\nauto_send_enter_on_attention={}\nwin_title_size={:.1}\nwin_path_size={:.1}\napp_icon_size={:.1}\napp_icon_tile_size={:.1}\napp_top_padding={:.1}\napp_bottom_padding={:.1}\napp_left_padding={:.1}\napp_right_padding={:.1}\napp_icon_show_name={}\napp_icon_name_size={:.1}\ndisable_ibeam={}\napp_scroll_sensitivity={:.2}\nwin_scroll_sensitivity={:.2}\nui_scale={:.2}\n",
-            settings.show_system_settings_modules,
-            settings.app_icon_mode,
-            settings.win_icon_size,
-            settings.win_top_padding,
-            settings.win_bottom_padding,
-            settings.win_left_padding,
-            settings.win_right_padding,
-            settings.win_row_height,
-            settings.win_text_spacing,
-            settings.win_line_height,
-            settings.win_show_path,
-            settings.win_show_last_activation,
-            settings.show_run_in_terminal,
-            settings.show_cd_in_terminal,
-            settings.auto_send_enter_on_attention,
-            settings.win_title_size,
-            settings.win_path_size,
-            settings.app_icon_size,
-            settings.app_icon_tile_size,
-            settings.app_top_padding,
-            settings.app_bottom_padding,
-            settings.app_left_padding,
-            settings.app_right_padding,
-            settings.app_icon_show_name,
-            settings.app_icon_name_size,
-            settings.disable_ibeam,
-            settings.app_scroll_sensitivity,
-            settings.win_scroll_sensitivity,
-            settings.ui_scale
-        );
-        queue_write(path, content);
+        queue_write(path, format_launcher_settings(settings));
     }
+}
+
+fn format_launcher_settings(settings: LauncherSettings) -> String {
+    format!(
+        "show_system_settings_modules={}\napp_icon_mode={}\nwin_icon_size={:.1}\nwin_top_padding={:.1}\nwin_bottom_padding={:.1}\nwin_left_padding={:.1}\nwin_right_padding={:.1}\nwin_row_height={:.1}\nwin_text_spacing={:.1}\nwin_line_height={:.1}\nwin_show_path={}\nwin_show_last_activation={}\nshow_run_in_terminal={}\nshow_cd_in_terminal={}\nauto_send_enter_on_attention={}\nwin_title_size={:.1}\nwin_path_size={:.1}\napp_icon_size={:.1}\napp_icon_tile_size={:.1}\napp_top_padding={:.1}\napp_bottom_padding={:.1}\napp_left_padding={:.1}\napp_right_padding={:.1}\napp_icon_show_name={}\napp_icon_name_size={:.1}\ndisable_ibeam={}\napp_scroll_sensitivity={:.2}\nwin_scroll_sensitivity={:.2}\ninfo_scroll_sensitivity={:.2}\nui_scale={:.2}\n",
+        settings.show_system_settings_modules,
+        settings.app_icon_mode,
+        settings.win_icon_size,
+        settings.win_top_padding,
+        settings.win_bottom_padding,
+        settings.win_left_padding,
+        settings.win_right_padding,
+        settings.win_row_height,
+        settings.win_text_spacing,
+        settings.win_line_height,
+        settings.win_show_path,
+        settings.win_show_last_activation,
+        settings.show_run_in_terminal,
+        settings.show_cd_in_terminal,
+        settings.auto_send_enter_on_attention,
+        settings.win_title_size,
+        settings.win_path_size,
+        settings.app_icon_size,
+        settings.app_icon_tile_size,
+        settings.app_top_padding,
+        settings.app_bottom_padding,
+        settings.app_left_padding,
+        settings.app_right_padding,
+        settings.app_icon_show_name,
+        settings.app_icon_name_size,
+        settings.disable_ibeam,
+        settings.app_scroll_sensitivity,
+        settings.win_scroll_sensitivity,
+        settings.info_scroll_sensitivity,
+        settings.ui_scale
+    )
 }
 
 struct IdleCodexJob {
@@ -693,6 +725,66 @@ pub(crate) fn settings_slider_row(
         .changed();
     ui.end_row();
     changed
+}
+
+#[cfg(test)]
+mod info_settings_tests {
+    use super::*;
+
+    #[test]
+    fn info_scroll_sensitivity_persists_independently_and_loads_safe_legacy_defaults() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = Fixture(std::env::temp_dir().join(format!(
+            "launcher-info-scroll-settings-{}-{nonce}",
+            std::process::id()
+        )));
+        std::fs::create_dir(&fixture.0).unwrap();
+        let path = fixture.0.join("settings.txt");
+        let settings = LauncherSettings {
+            app_scroll_sensitivity: 1.75,
+            win_scroll_sensitivity: 3.25,
+            info_scroll_sensitivity: 4.25,
+            ..LauncherSettings::default()
+        };
+        let content = format_launcher_settings(settings);
+        assert!(
+            content
+                .lines()
+                .any(|line| line == "info_scroll_sensitivity=4.25")
+        );
+        std::fs::write(&path, content).unwrap();
+        let reloaded = load_launcher_settings_from_path(Some(path.clone()));
+        assert_eq!(reloaded.info_scroll_sensitivity, 4.25);
+        assert_eq!(reloaded.app_scroll_sensitivity, 1.75);
+        assert_eq!(reloaded.win_scroll_sensitivity, 3.25);
+
+        let default = LauncherSettings::default().info_scroll_sensitivity;
+        for (content, expected) in [
+            ("win_scroll_sensitivity=3.25\n", default),
+            ("info_scroll_sensitivity=not-a-number\n", default),
+            ("info_scroll_sensitivity=NaN\n", default),
+            ("info_scroll_sensitivity=inf\n", default),
+            ("info_scroll_sensitivity=-1\n", 0.1),
+            ("info_scroll_sensitivity=100\n", 10.0),
+        ] {
+            std::fs::write(&path, content).unwrap();
+            let reloaded = load_launcher_settings_from_path(Some(path.clone()));
+            assert_eq!(reloaded.info_scroll_sensitivity, expected, "{content}");
+        }
+        assert_eq!(
+            load_launcher_settings_from_path(None).info_scroll_sensitivity,
+            default
+        );
+    }
 }
 
 #[cfg(test)]

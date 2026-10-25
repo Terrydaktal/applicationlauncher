@@ -458,6 +458,29 @@ impl App {
                 ui.end_row();
             });
 
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new("Show Info").strong());
+        egui::Grid::new("info_settings_grid")
+            .num_columns(2)
+            .spacing([12.0, 10.0])
+            .show(ui, |ui| {
+                ui.label("Scroll Sensitivity:");
+                if ui
+                    .add(
+                        egui::Slider::new(&mut self.info_scroll_sensitivity, 0.1..=10.0)
+                            .show_value(true),
+                    )
+                    .changed()
+                {
+                    self.info_popups.request_repaint(ui.ctx());
+                    self.save_settings();
+                }
+                ui.end_row();
+            });
+        ui.add_space(14.0);
+
         ui.heading("Terminal Maintenance");
         terminal_maintenance::settings_button(ui, &self.terminal_maintenance);
         render_idle_codex_action(ui, &self.idle_codex_action);

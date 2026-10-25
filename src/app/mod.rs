@@ -374,9 +374,7 @@ pub(crate) struct App {
     app_icon_show_name: bool,
     app_icon_name_size: f32,
     disable_ibeam: bool,
-    process_chain_popup: Option<WindowInfo>,
-    window_version_lookup: Option<WindowVersionLookup>,
-    app_info_popup: Option<AppInfo>,
+    info_popups: popups::InfoPopups,
     settings_popup_state: Option<Arc<std::sync::Mutex<SettingsWindowState>>>,
     idle_codex_action: Arc<std::sync::Mutex<IdleCodexActionState>>,
     terminal_maintenance: Arc<std::sync::Mutex<TerminalMaintenanceState>>,
@@ -424,6 +422,7 @@ pub(crate) struct App {
     has_active_audio: bool,
     app_scroll_sensitivity: f32,
     win_scroll_sensitivity: f32,
+    info_scroll_sensitivity: f32,
     filtered_search_cache: Option<FilteredSearchCache>,
     pending_window_search_refresh_at: Option<Instant>,
     apps_generation: u64,
@@ -917,9 +916,7 @@ impl App {
             app_icon_show_name: settings.app_icon_show_name,
             app_icon_name_size: settings.app_icon_name_size,
             disable_ibeam: settings.disable_ibeam,
-            process_chain_popup: None,
-            window_version_lookup: None,
-            app_info_popup: None,
+            info_popups: popups::InfoPopups::default(),
             settings_popup_state: None,
             idle_codex_action: Arc::default(),
             terminal_maintenance: Arc::default(),
@@ -967,6 +964,7 @@ impl App {
             has_active_audio: false,
             app_scroll_sensitivity: settings.app_scroll_sensitivity,
             win_scroll_sensitivity: settings.win_scroll_sensitivity,
+            info_scroll_sensitivity: settings.info_scroll_sensitivity,
             filtered_search_cache: None,
             pending_window_search_refresh_at: None,
             apps_generation: 0,
@@ -1031,6 +1029,7 @@ impl App {
             disable_ibeam: self.disable_ibeam,
             app_scroll_sensitivity: self.app_scroll_sensitivity,
             win_scroll_sensitivity: self.win_scroll_sensitivity,
+            info_scroll_sensitivity: self.info_scroll_sensitivity,
             ui_scale: self.ui_scale,
         }
     }
@@ -1088,6 +1087,10 @@ impl App {
         self.disable_ibeam = settings.disable_ibeam;
         self.app_scroll_sensitivity = settings.app_scroll_sensitivity;
         self.win_scroll_sensitivity = settings.win_scroll_sensitivity;
+        if self.info_scroll_sensitivity != settings.info_scroll_sensitivity {
+            self.info_scroll_sensitivity = settings.info_scroll_sensitivity;
+            self.info_popups.request_repaint(ctx);
+        }
         if auto_enter_changed {
             let _ = self
                 .auto_enter_update_sender

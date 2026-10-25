@@ -261,6 +261,7 @@ pub struct LauncherSettings {
     pub disable_ibeam: bool,
     pub app_scroll_sensitivity: f32,
     pub win_scroll_sensitivity: f32,
+    pub info_scroll_sensitivity: f32,
     pub ui_scale: f32,
 }
 
@@ -295,6 +296,7 @@ impl Default for LauncherSettings {
             disable_ibeam: false,
             app_scroll_sensitivity: 1.0,
             win_scroll_sensitivity: 1.0,
+            info_scroll_sensitivity: 2.5,
             ui_scale: 1.0,
         }
     }
@@ -332,6 +334,7 @@ impl LauncherSettings {
         finite_clamped!(app_icon_name_size, 8.0, 20.0);
         finite_clamped!(app_scroll_sensitivity, 0.1, 10.0);
         finite_clamped!(win_scroll_sensitivity, 0.1, 10.0);
+        finite_clamped!(info_scroll_sensitivity, 0.1, 10.0);
         finite_clamped!(ui_scale, 0.5, 2.5);
         self
     }
@@ -340,8 +343,7 @@ impl LauncherSettings {
 #[derive(Clone, Debug)]
 pub enum PopupEvent {
     CloseSettings,
-    CloseWindowInfo,
-    CloseAppInfo,
+    CloseInfo(eframe::egui::ViewportId),
     CloseHistory,
 }
 
@@ -380,6 +382,31 @@ pub struct InfoPopupRow {
     pub value: String,
     pub searched: bool,
     pub separator_before: bool,
+    pub binary_is_current: Option<bool>,
+}
+
+#[derive(Clone)]
+pub struct InfoProcessSection {
+    pub id: eframe::egui::Id,
+    pub depth: usize,
+    pub header: Arc<str>,
+    pub default_open: bool,
+    pub rows: Vec<InfoPopupRow>,
+    pub metadata_sections: Vec<InfoMetadataSection>,
+}
+
+#[derive(Clone)]
+pub struct InfoMetadataSection {
+    pub id: eframe::egui::Id,
+    pub header: Arc<str>,
+    pub default_open: bool,
+    pub rows: Vec<InfoPopupRow>,
+}
+
+#[derive(Clone)]
+pub struct InfoProcessTree {
+    pub sections: Vec<InfoProcessSection>,
+    pub notice: Arc<str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -426,6 +453,7 @@ pub struct InfoPopupData {
     pub title: String,
     pub heading: String,
     pub subtitle: String,
+    pub scroll_sensitivity: f32,
     pub rows: Vec<InfoPopupRow>,
-    pub execution_chain: Vec<(String, String)>,
+    pub process_tree: Option<InfoProcessTree>,
 }

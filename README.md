@@ -70,8 +70,15 @@
 - `src/tracker/tmux.rs`: Bounded tmux client and active-pane discovery, exact-session reattachment, and named-session recreation. It saves the pane directory and a restricted program kind, not pane contents or arbitrary commands.
 - `src/bin/applicationlauncherd.rs`: Persistent background tracker entry point.
 - `src/windows/`: KWin snapshot consumption, process metadata, terminal integration, and icon resolution.
+- `src/windows/process_tree.rs`: On-demand background process-tree snapshots for Show Info, with real ancestry, application descendants, sibling helpers and detached tmux pane branches.
 - `src/windows/terminal/tmux.rs`: Background per-client active-pane monitoring and latest-state window metadata overlays, independent of tmux's desktop-title forwarding setting.
-- `src/windows/versions.rs`: On-demand, bounded running-executable version/build-ID probes and separately labelled installed-package metadata for Show Info.
+- `src/windows/versions.rs`: On-demand, bounded running/on-disk executable version and build-ID probes for Show Info. `versions/freshness.rs` checks local build status without compiling.
+- `src/windows/versions/lookup.rs`: Independent binary-version and package-version workers per information window for expanded process sections, with bounded/deduplicated requests, PID/executable identity guards and cancellation of stale popup work.
+- `src/windows/versions/node.rs`: Read-only installed Node application/package discovery, including symlinked CLI commands whose process title hides the script path; application metadata stays separate from Node runtime versions and ELF identities.
+- `src/windows/versions/script.rs`: Bounded, read-only Python and Java launch-target identification from process arguments. Resolves explicit script/JAR paths and labels modules/classes without importing or executing application code or guessing their files.
+- `src/windows/versions/pi.rs`: Bounded reader for Coherence Pi's installed build manifest and per-process startup receipt. Validates PID/start time, ownership, file safety, freshness and SDK/extension/patch identities without running Node or reading conversation contents.
+- `src/windows/versions/installation.rs`: Bounded, cached, read-only lookup of Progs' saved installation classifications for Show Info, including local fork launch wrappers.
+- `src/windows/versions/available.rs`: Read-only Pacman sync-database and Paru/AUR package-version queries, exact package matching, bounded caching and timeouts.
 - `kwin/applicationlauncher-window-feed/`: Transactional KWin script that sends compositor window events to the daemon.
 - `scripts/applicationlauncher`: Fast launch wrapper that activates compatible release binaries, repairs incompatible binary pairs in the background, and reports newer source without compiling it.
 - `scripts/lib/release-compatibility.sh`: Cached binary-build checks and bounded paired rebuilds for the wrapper.
@@ -88,7 +95,8 @@
 - Activates existing windows or launches new applications without closing the launcher.
 - Supports icon-grid mode for the application panel, including configurable icon size, tile size, label visibility, and label font size.
 - Keeps normal applications ahead of system settings modules on the default page when system modules are shown.
-- Provides context actions on windows, including closing the window and showing the execution chain popup.
+- Provides context actions on windows, including closing the window and opening Show Info with metadata and a process tree.
+- Opens independent Show Info windows for different window entries and application tiles, keeping each window's selection, geometry, dropdowns and background lookups separate. Selecting Show Info again for the same target brings its existing information window to the foreground. Closing one leaves the others intact; at most 32 information windows can be open at once.
 - Re-focuses the existing launcher instance instead of opening a second one.
 - Persists window size, pinned applications, and launcher settings under `$HOME/.config/applicationlauncher/`.
 - Renders strikethrough in open-window and Recently closed titles as native styling, without changing saved titles or restore metadata.
@@ -114,8 +122,19 @@ The project builds a native `eframe` / `egui` GUI and a separate user-session da
   Uses the KWin event feed for incremental updates, with bounded reconciliation through `kdotool`, then resolves metadata such as title, class, PID, icon, executable path, and terminal child processes.
 - Live tmux windows:
   A read-only background monitor maps each local tmux client to its active pane. Window entries use that pane's foreground program, working directory and actual title, preserving braille spinners and attention markers even when `set-titles` is off. Codex entries match the native tmux desktop title: `tmux: diet - codex: ~/tasks/diet - Check ChatGPT link access - Terminal`, with activity immediately before the directory when present. Both legacy `task | project` titles and newer Codex title selections are normalized using the pane's real directory rather than its abbreviated project label; task separators become ` - `. The session label, directory and task remain searchable. The window PID/executable still identify the terminal emulator; Show Info separately lists the tmux client, server socket, session and pane. Queries are batched per server at at most ten updates/second, publish only the latest state, briefly tolerate unavailable servers, and do not rerank searches for spinner-only changes. Idle shells are checked for entry into tmux every two seconds; no remote SSH pane inference or terminal input injection is used.
-- Window version information:
-  Show Info reports the window-owning executable's version and ELF build ID, and separately reports the active program for terminal windows (including programs inside tmux). Known noninteractive version switches are probed in a background worker against the pinned running executable, including deleted old binaries, rather than a possibly newer file on disk. Unknown executables are never launched for inspection. Installed Arch package versions are shown separately and are not claimed to be the running application's version. Unsupported or unavailable running versions are labelled unavailable; probes run only on opening Show Info and are cached by executable identity.
+- Window and process version information:
+  Each expanded Show Info process section reports that executable's running version, latest installed local version, local uncompiled-changes status, and both ELF build IDs. The running ELF build ID is coloured using build IDs (or the same executable inode), never just version strings: uncommitted rebuilds can print identical versions while containing different code. This applies independently to the terminal emulator, Fish, Bash, tmux, the active program and other inspected processes. Known noninteractive version switches are probed in a background worker against separately pinned running and on-disk ELF binaries, so deleted old executables retain their real running version after replacement. Unknown executables and shell scripts are never launched for inspection. "Latest" means the local installed binary, not a network/update check or an unbuilt source version. For local checkouts, Progs' published installation links can identify a newer build even while an older immutable release directory still exists (for example, tmux). The executable name and checkout must match, and up to 64 distinct aliases must agree on the same build; ambiguous targets are not guessed. Links and the pinned disk file are checked again after probing, so installation changes during inspection invalidate the comparison. Uncompiled changes use the selected installed build's path with a read-only Ninja target dry-run or a bounded Cargo dep-info/source/configuration timestamp check; the Cargo result is qualified because it is not Cargo's build planner. Ninja's always-run checks, such as Meson revision-header generators, do not prove uncompiled changes: without evidence of changed/missing inputs or commands the result is Unknown, not a false Yes. Missing/unsupported build metadata also reports Unknown, never a guessed No. Source status is checked again after reopening Show Info and expanding the section; no application is compiled or restarted. A disk binary replaced during inspection is reported as Unknown. Installed Arch package versions remain separate from executable versions. A single worker services at most 16 queued requests and 512 per-popup results; duplicate expansions reuse results. Closing/reopening cancels queued work and discards stale in-flight results. Both process start time and running executable identity are checked to reject PID reuse and exec changes.
+  Node-backed terminal applications are resolved separately from their runtime. A bounded, read-only lookup validates the script against a package.json bin entry and shows its installed package name/version, canonical entry point, and manifest. CLI programs such as Pi that overwrite their command line can be identified through their command symlink; this is explicitly labelled an inferred command lookup, and ambiguous matches are rejected. Installed package metadata is not claimed to be the exact version already loaded by an older process. Node's version, Arch package, ELF IDs and binary freshness are labelled as runtime information, never as Pi's version. No application JavaScript, npm commands, or application --version switches are executed to obtain package metadata.
+- Show Info process trees:
+  Settings -> Show Info -> Scroll Sensitivity controls wheel scrolling in all info windows, independently of either launcher panel. It applies immediately, is saved between launches, and supports 0.1x to 10x speed (default 2.5x). Scrollbar dragging and text selection are unchanged.
+  Process header text (including PIDs, executable paths and deleted-binary markers) is read-only and selectable for copying. Use the arrow beside a header to expand or collapse its details; selecting text does not toggle the section.
+  Window Info is a top-down process tree with independent dropdowns, branch connectors, PIDs, executable paths and window-owner/active-process markers. The window-owner dropdown starts expanded and contains titles, geometry, minimization, activation history, desktop entry and window application versions. Other dropdowns contain only their own PID, executable, working directory, command, desktop entry and lazily loaded versions. Tmux session/pane fields appear only under the corresponding tmux client/server, not under Pi or a shell. Pi's installed application metadata stays separate from Node's runtime metadata. Collapsing details leaves the hierarchy visible. Each section keeps continuous cross-row text selection; **Copy shown info** copies the headers and currently supplied details across sections.
+  The tree includes the owning process's descendants, so a Pi launcher shows Pi and its SSH tunnel as siblings rather than incorrectly presenting SSH as Pi's parent. Ancestors are included without unrelated application branches. Detached tmux panes retain their actual server ancestry; no false parent-child connection to the terminal client is drawn. Shared terminal/browser processes can cover more than one window. The snapshot is collected once per Show Info opening (or a change of target process) by a named background worker, not during startup, search, scrolling or each frame. Collection is capped at 32,768 scanned entries, 512 displayed processes, bounded ancestry/descendant depth, 16 KiB per command line and a 500 ms work budget; exited/reused processes and partial captures are reported rather than guessed. Threads are omitted. Reopen Show Info for a fresh snapshot; spinner/title changes do not refresh it or reset dropdowns/text selection. No process is started, signalled or modified to collect the tree; optional version probes use only the existing noninteractive allowlist.
+- Show Info installation classification:
+  Capabilities (including Progs' primary-role summary) and description are also read from the saved Progs inventory. They appear in application-tile info and in the relevant process-tree sections, with Node applications kept separate from their runtime. Missing or conflicting records show `Unavailable`, rather than borrowing another application's description or treating absent capabilities as a data-only package. These are informational fields, not additional search fields; lookups run only on background workers when Show Info is used.
+  Installation rows use Progs' badges and management names, such as `[FKM] Fork (User-managed)`, `[DVM] DEV (User-managed)`, `[PEP] Pacman Explicit (Package-managed)`, and `[NPT] npm (Toolchain-managed)`. They read `$XDG_CACHE_HOME/progs/scan-v1.json` (or `~/.cache/progs/scan-v1.json`) in the existing background info worker, never run Progs or trigger an inventory scan. Exact executable/alias targets take priority; a local source wrapper can identify a compiled binary only when its name and Git checkout both match. Conflicting, absent, unsupported or oversized inventory data reports UNC instead of guessing from the process name. The parser is capped at 16 MiB, 8,192 programs and 32,768 binaries; parsed data is reused until the inventory file changes. These classifications describe the last saved Progs inventory, not proof of the running binary's version. Refresh Progs, then close and reopen Show Info for updated classifications. Actual Pacman package versions are retained in the installation row, independently of executable versions and ELF IDs. Node application entry points and their Node runtime are classified separately.
+- Available package versions:
+  `Latest package version (Pacman/AUR)` is separate from the running version and latest binary on disk. Installed executable ownership identifies the package first; Progs can identify an exact package or a local source checkout's name. Local-build name matches are explicitly qualified, and unmanaged scripts and npm/uv/Cargo command names are not assumed to identify OS packages. Node application entry points and the Node runtime are checked independently. A dedicated background worker reads `pacman -Si` in configured repository priority order, then tries `paru -Si --aur` when no exact repository package is found. It never refreshes databases, installs, builds or upgrades packages, prompts for privileges, or runs discovered applications. Pacman values reflect the local sync databases and include `Last Pacman sync` with the date, time and UTC offset of the latest recorded synchronization request in `/var/log/pacman.log`; the record does not prove that every repository downloaded successfully. Only the last 1 MiB of the regular log file is read, off the GUI thread, and the parsed timestamp is cached until the file changes. Missing, unreadable or out-of-range records show `unknown`; database download/publication timestamps are not substituted. Paru may contact the AUR using only the package name, and its results do not inherit a Pacman sync date. Each tool has a three-second timeout and a 64 KiB accepted response bound. Up to 128 results are cached for five minutes (failures for 15 seconds), with default Pacman sync-directory changes invalidating cache keys. The per-popup package queue is capped at 16 requests and sleeps when empty. Ordinary binary metadata is published first and is not blocked by slow AUR queries. Closing or retargeting an info window clears queued work and rejects stale in-flight results; no lookup runs during startup, search, scrolling or unopened process sections.
 - Audio indicators:
   Rings respond to actual playback samples, not volume-slider values, MPRIS status or a synthetic animation. Each PulseAudio sink input is monitored individually on its output's monitor source, with no default-source or mixed-output fallback. The worker analyses 16 kHz stereo into eight frequency bands (60 Hz to 6.5 kHz) and peaks in 20 ms blocks, publishing at most 25 updates/second. Silence, corking, mute and stale samples clear the indicator. Audio is consumed in memory and discarded, never saved or sent to the GUI; the GUI receives only bounded, quantised levels and displays the latest result rather than replaying an update backlog. Monitoring is capped at 32 streams with requested 100 ms buffers and 256 metadata records, and reconnects with bounded retry delays after server loss. No analysis, audio-server I/O or process spawning occurs in the drawing path.
 
@@ -162,6 +181,63 @@ The project builds a native `eframe` / `egui` GUI and a separate user-session da
   Draws a frameless launcher window, a separate settings popup window, and a separate execution-chain popup window.
 - Single-instance behavior:
   Uses a Unix socket lock so a second launch request focuses the already-running instance.
+
+### Pi Application Build Details
+
+Show Info compares forks and Git clones with their upstream Pacman/AUR package
+version. Progs' explicit fork/clone classification controls these inferred package
+lookups; original local projects do not get a package-version row or a redundant
+update-source row. Package-managed applications retain their package-version
+comparison. The on-disk version and uncompiled-changes fields remain separate,
+and hosted applications are classified independently from their runtime.
+
+Expand the Pi process, then **Application: Pi**, in **Show Info** to see its loaded application version,
+code and extension fingerprints, installed patch verification, comparison age,
+coverage and source record paths. These identify Pi's JavaScript and extensions;
+the separate **Runtime: Node.js** dropdown identifies the native runtime and
+its ELF build ID.
+
+Show Info renders Unicode combining strikethrough marks as native styling in
+titles, process headers and metadata. Copying selected text or using **Copy shown
+info** preserves the original Unicode text, including the raw window title.
+
+Application and Runtime are independently expandable metadata sections under one
+PID, not extra process-tree nodes. Python scripts/modules and Java JARs, source
+files, modules and main classes use the same layout. Uncertain application
+identities and versions remain unknown rather than borrowing runtime metadata.
+Collapsing Pi's Application section stops its periodic build-receipt refreshes.
+Window Info defaults to 1200 points wide and fits its opening height to the
+visible content plus 8 extra points, within the monitor bounds. Initial
+process-tree/metadata loading gets one additional height fit; later updates and expanded sections scroll without
+continually resizing the window. Manual resizing remains available.
+Running and installed versions, entry points and fingerprints are paired in one
+continuous section without an internal divider. Matching values are retained so
+their distinct sources remain clear; installed paths are explicitly labelled.
+
+Coherence's installer writes `coherence-build.json` beside the selected Pi
+package's `package.json`. Pi's running-build extension writes
+`$XDG_RUNTIME_DIR/pi/processes/<PID>-<startticks>.json`, preserving its startup
+identity while updating the latest installed comparison. ApplicationLauncher
+reads both records and colours the running code fingerprint and latest extensions
+fingerprint green when verified current, red when a restart or installation update
+is required, and neutral when unknown. Missing fingerprints remain neutral;
+the comparison reason explains the result without a separate build-status row.
+A package version or matching Node ELF alone never proves that the running Pi
+has current patches.
+
+Records must belong to the current user, match the process PID and Linux start
+ticks, and reside in private runtime directories. Reads reject symlinks,
+non-regular or oversized files, malformed identities, unsafe permissions and
+comparisons more than 90 seconds old. Each JSON read is limited to 512 KiB.
+Missing or inconsistent evidence remains **Unknown**, including older Pi
+processes which have not loaded the receipt publisher yet.
+
+Only an expanded Pi process section requests a comparison refresh, at most once
+every two seconds. A background worker rereads the small records and selected
+Node package metadata; it does not rehash the SDK, invoke a package manager,
+reprobe Node, contact Pi or inspect chats. Closing or collapsing the section
+stops these refresh requests. Pi itself is responsible for keeping the
+comparison current and stating the fingerprint's finite coverage.
 
 ### Optional Firefox Audio Bridge
 

@@ -5,10 +5,7 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock, mpsc::Receiver};
-
-use crate::models::WindowInfo;
-use eframe::egui;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 mod available;
@@ -38,45 +35,6 @@ pub(crate) struct ProcessVersionTarget {
     program: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct WindowVersionTarget {
-    id: String,
-    owner: Option<ProcessVersionTarget>,
-    active: Option<ProcessVersionTarget>,
-}
-
-impl WindowVersionTarget {
-    pub(crate) fn for_window(window: &WindowInfo) -> Self {
-        let owner = window
-            .pid
-            .zip(window.exe_path.clone())
-            .map(|(pid, executable)| ProcessVersionTarget {
-                pid,
-                executable,
-                program: None,
-            });
-        let active = crate::windows::is_terminal_class(&window.class.to_lowercase())
-            .then(|| window.process_chain.first())
-            .flatten()
-            .filter(|_| window.active_process.is_some())
-            .and_then(|entry| {
-                entry
-                    .exe_path
-                    .clone()
-                    .map(|executable| ProcessVersionTarget {
-                        pid: entry.pid,
-                        executable,
-                        program: Some(entry.name.clone()),
-                    })
-            });
-        Self {
-            id: window.id.clone(),
-            owner,
-            active,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProcessVersion {
     pub(crate) running_unavailable: Option<&'static str>,
@@ -88,7 +46,6 @@ pub(crate) struct ProcessVersion {
     pub(crate) application_progs_metadata: ProgsMetadata,
     pub(crate) application_package_target: Option<PackageTarget>,
     pub(crate) application_latest_package_version: Option<String>,
-    pub(crate) source: Option<String>,
     pub(crate) version: Option<String>,
     pub(crate) latest_version: Option<String>,
     pub(crate) package_target: Option<PackageTarget>,
@@ -148,62 +105,6 @@ fn same_executable_build(
     }
     // Version strings and Git revisions can stay identical across dirty builds.
     Some(running.build_id.as_ref()? == latest.build_id.as_ref()?)
-}
-
-#[derive(Default)]
-pub(crate) struct WindowVersions {
-    pub(crate) owner: ProcessVersion,
-    pub(crate) active: ProcessVersion,
-}
-
-pub(crate) struct WindowVersionLookup {
-    pub(crate) target: WindowVersionTarget,
-    receiver: Receiver<WindowVersions>,
-    pub(crate) result: Option<WindowVersions>,
-}
-
-impl WindowVersionLookup {
-    pub(crate) fn start(target: WindowVersionTarget, ctx: egui::Context) -> Self {
-        let (tx, receiver) = std::sync::mpsc::sync_channel(1);
-        let request = target.clone();
-        applicationlauncher::observability::spawn_named("window-version-info", move |worker| {
-            worker.set_state("probing");
-            let result = WindowVersions {
-                owner: request
-                    .owner
-                    .as_ref()
-                    .map(probe_version)
-                    .unwrap_or_default(),
-                active: request
-                    .active
-                    .as_ref()
-                    .map(probe_version)
-                    .unwrap_or_default(),
-            };
-            let _ = tx.send(result);
-            ctx.request_repaint();
-            ctx.request_repaint_of(egui::ViewportId::from_hash_of(
-                "launcher_process_chain_popup",
-            ));
-        });
-        Self {
-            target,
-            receiver,
-            result: None,
-        }
-    }
-
-    pub(crate) fn poll(&mut self) {
-        if self.result.is_none() {
-            match self.receiver.try_recv() {
-                Ok(result) => self.result = Some(result),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.result = Some(WindowVersions::default())
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
-        }
-    }
 }
 
 fn clean_executable(path: &Path) -> PathBuf {
@@ -355,6 +256,7 @@ fn probe_executable(file: &File, name: &str) -> ExecutableVersion {
     result
 }
 
+#[cfg(test)]
 fn probe_version(target: &ProcessVersionTarget) -> ProcessVersion {
     probe_version_checked(target, || true)
 }
@@ -431,10 +333,6 @@ fn probe_version_checked(
         application_progs_metadata: ProgsMetadata::default(),
         application_package_target: None,
         application_latest_package_version: None,
-        source: running_info
-            .version
-            .as_ref()
-            .map(|_| "Running executable version switch (exact binary)".into()),
         version: running_info.version,
         latest_version: latest_info.as_ref().and_then(|info| info.version.clone()),
         package_target,
@@ -878,4 +776,10 @@ mod tests {
             );
         }
     }
+}
+
+pub(crate) fn progs_metadata(exec: &str) -> ProgsMetadata {
+    crate::search::executable_path_from_exec(exec)
+        .map(|path| installation::inspect(&path).1)
+        .unwrap_or_default()
 }

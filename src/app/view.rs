@@ -415,8 +415,7 @@ impl eframe::App for App {
             && !ctx.input(|i| i.focused)
             && !self.show_settings_menu
             && !self.show_history_popup
-            && self.process_chain_popup.is_none()
-            && self.app_info_popup.is_none()
+            && self.info_popups.is_empty()
             && !self.terminal_maintenance_is_open()
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -869,10 +868,8 @@ impl eframe::App for App {
                             self.close_history_popup();
                         } else if self.show_settings_menu {
                             self.close_settings_menu();
-                        } else if self.process_chain_popup.is_some() {
-                            self.process_chain_popup = None;
-                        } else if self.app_info_popup.is_some() {
-                            self.app_info_popup = None;
+                        } else if !self.info_popups.is_empty() {
+                            self.info_popups.close_last();
                         } else {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
@@ -1288,7 +1285,7 @@ impl eframe::App for App {
                                                 ui.close();
                                             }
                                             if ui.button("Show info").clicked() {
-                                                self.app_info_popup = Some(app.clone());
+                                                self.open_app_info_popup(ctx, app.clone());
                                                 ui.close();
                                             }
                                         });
@@ -2024,7 +2021,7 @@ impl eframe::App for App {
                                                         ui.close();
                                                     }
                                                     if ui.button("Show info").clicked() {
-                                                        self.app_info_popup = Some(app.clone());
+                                                        self.open_app_info_popup(ctx, app.clone());
                                                         ui.close();
                                                     }
                                                 }
@@ -2043,10 +2040,7 @@ impl eframe::App for App {
                                                         ui.close();
                                                     }
                                                     if ui.button("Show info").clicked() {
-                                                        if self.window_version_lookup.as_ref().is_some_and(|lookup| lookup.result.is_some()) {
-                                                            self.window_version_lookup = None;
-                                                        }
-                                                        self.process_chain_popup = Some(win.clone());
+                                                        self.open_window_info_popup(ctx, win.clone());
                                                         ui.close();
                                                     }
                                                     if ui.button("Open window").clicked() {
@@ -2312,7 +2306,7 @@ impl eframe::App for App {
 	                                                    ui.close();
 	                                                }
 	                                                if ui.button("Show info").clicked() {
-                                                                    self.app_info_popup = Some(app.clone());
+                                                                    self.open_app_info_popup(ctx, app.clone());
                                                                     ui.close();
                                                                 }
 		                                                    });
@@ -2482,7 +2476,7 @@ impl eframe::App for App {
 	                                                        ui.close();
 	                                                    }
 	                                                    if ui.button("Show info").clicked() {
-		                                                    self.app_info_popup = Some(app.clone());
+		                                                    self.open_app_info_popup(ctx, app.clone());
 		                                                    ui.close();
 		                                                }
 		                                                });
@@ -2701,12 +2695,7 @@ impl eframe::App for App {
                     if self.show_history_popup {
                         self.show_history_native_viewport(ctx);
                     }
-                    if self.process_chain_popup.is_some() {
-                        self.show_window_info_popup(ctx);
-                    }
-                    if self.app_info_popup.is_some() {
-                        self.show_app_info_popup(ctx);
-                    }
+                    self.show_info_popups(ctx);
                     self.show_terminal_maintenance(ctx);
                     self.show_deployment_warnings(ctx);
                     self.show_terminal_action_message(ctx);
