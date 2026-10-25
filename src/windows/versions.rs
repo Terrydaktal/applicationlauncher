@@ -14,9 +14,15 @@ use std::time::{Duration, Instant};
 mod available;
 mod freshness;
 mod installation;
+mod node;
+mod pi;
+mod script;
 
 pub(crate) use available::PackageTarget;
 pub(crate) use installation::ProgsMetadata;
+pub(crate) use node::NodeApplication;
+pub(crate) use pi::{BuildStatus as PiBuildStatus, PiBuildEvidence};
+pub(crate) use script::{ScriptApplication, runtime_name};
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 const CACHE_TTL: Duration = Duration::from_secs(300);
@@ -71,6 +77,14 @@ impl WindowVersionTarget {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProcessVersion {
     pub(crate) running_unavailable: Option<&'static str>,
+    pub(crate) runtime_name: Option<&'static str>,
+    pub(crate) application: Option<NodeApplication>,
+    pub(crate) script_application: Option<ScriptApplication>,
+    pub(crate) application_build: Option<PiBuildEvidence>,
+    pub(crate) application_installation: Option<String>,
+    pub(crate) application_progs_metadata: ProgsMetadata,
+    pub(crate) application_package_target: Option<PackageTarget>,
+    pub(crate) application_latest_package_version: Option<String>,
     pub(crate) source: Option<String>,
     pub(crate) version: Option<String>,
     pub(crate) latest_version: Option<String>,
@@ -91,6 +105,13 @@ impl ProcessVersion {
         self.version = None;
         self.build_id = None;
         self.running_latest_binary = None;
+        self.application = None;
+        self.script_application = None;
+        self.application_build = None;
+        self.application_installation = None;
+        self.application_progs_metadata = ProgsMetadata::default();
+        self.application_package_target = None;
+        self.application_latest_package_version = None;
     }
 }
 
@@ -197,16 +218,7 @@ fn version_argument(name: &str) -> Option<&'static str> {
         | "mousepad" | "copyq" | "konsole" | "alacritty" | "kitty" | "mpv" | "vim" | "nvim" => {
             Some("--version")
         }
-        name if name.strip_prefix("python3.").is_some_and(|suffix| {
-            !suffix.is_empty()
-                && suffix
-                    .trim_end_matches('t')
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit())
-        }) =>
-        {
-            Some("--version")
-        }
+        name if runtime_name(name) == Some("Python") => Some("--version"),
         _ => None,
     }
 }
@@ -408,6 +420,14 @@ fn probe_version_checked(
     let package_target = available::target(&clean_path, package.as_deref());
     let mut result = ProcessVersion {
         running_unavailable: running.as_ref().err().copied(),
+        runtime_name: runtime_name(name),
+        application: None,
+        script_application: None,
+        application_build: None,
+        application_installation: None,
+        application_progs_metadata: ProgsMetadata::default(),
+        application_package_target: None,
+        application_latest_package_version: None,
         source: running_info
             .version
             .as_ref()
@@ -424,6 +444,42 @@ fn probe_version_checked(
         progs_metadata,
         build_id: running_info.build_id,
     };
+    if running.is_ok()
+        && let Some(program) = target.program.as_deref()
+        && matches!(name, "node" | "nodejs")
+    {
+        result.application = node::probe(target.pid, program);
+        result.application_build = result
+            .application
+            .as_ref()
+            .filter(|application| application.package == pi::PACKAGE)
+            .map(|application| pi::probe(application, target.pid));
+        if let Some(application) = &result.application {
+            let (installation, metadata) = installation::inspect(&application.entry_point);
+            result.application_installation = Some(installation);
+            result.application_progs_metadata = metadata;
+        }
+        result.application_package_target = result.application.as_ref().and_then(|application| {
+            let owner = installed_package(&application.entry_point);
+            available::target(&application.entry_point, owner.as_deref())
+        });
+    }
+    if running.is_ok()
+        && let Some(runtime @ ("Python" | "Java")) = result.runtime_name
+    {
+        result.script_application = script::probe(runtime, target.pid);
+        if let Some(entry) = result
+            .script_application
+            .as_ref()
+            .and_then(|app| app.entry_point.as_ref())
+        {
+            let (installation, metadata) = installation::inspect(entry);
+            result.application_installation = Some(installation);
+            result.application_progs_metadata = metadata;
+            let package = installed_package(entry);
+            result.application_package_target = available::target(entry, package.as_deref());
+        }
+    }
     if let Some(disk) = latest_identity
         && !installed
             .as_ref()
@@ -815,7 +871,7 @@ mod tests {
             );
             eprintln!(
                 "runtime={:?} application={:?}",
-                version.installation, version.progs_metadata
+                version.runtime_name, version.application
             );
         }
     }
