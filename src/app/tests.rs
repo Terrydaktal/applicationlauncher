@@ -527,6 +527,61 @@ mod tests {
     }
 
     #[test]
+    fn application_panel_status_is_centered_inside_the_pane_after_resizing() {
+        for loading in [false, true] {
+            for scale in [1.0, 1.5, 2.0] {
+                let ctx = egui::Context::default();
+                ctx.set_pixels_per_point(scale);
+                for width in [978.0, 480.0, 160.0, 1400.0] {
+                    for _ in 0..3 {
+                        let mut measured = None;
+                        let _ = ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(width, 380.0),
+                                )),
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                egui::CentralPanel::default().show(ctx, |ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    ui.columns(2, |panes| {
+                                        panes[1].vertical(|ui| {
+                                            egui::ScrollArea::vertical()
+                                                .id_salt("apps_side_panel_scroll")
+                                                .max_height(300.0)
+                                                .show_viewport(ui, |ui, _| {
+                                                    let pane = ui.max_rect();
+                                                    let response =
+                                                        helpers::application_panel_status(
+                                                            ui, loading,
+                                                        );
+                                                    measured =
+                                                        Some((pane, response.rect, ui.clip_rect()));
+                                                });
+                                        });
+                                    });
+                                });
+                            },
+                        );
+                        let (pane, label, clip) = measured.unwrap();
+                        assert!(
+                            (label.center().x - pane.center().x).abs() <= 1.0,
+                            "status is not centered: pane={pane:?}, label={label:?}, loading={loading}, scale={scale}"
+                        );
+                        assert!(
+                            clip.contains_rect(label),
+                            "status text should not be clipped"
+                        );
+                        assert!(label.top() >= pane.top() + 20.0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn application_icon_tooltip_keeps_the_full_name_on_one_line_in_narrow_space() {
         for name in ["Tixati", "Telegram Desktop", "Firefox Web Browser"] {
             let ctx = egui::Context::default();

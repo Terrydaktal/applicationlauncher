@@ -2224,16 +2224,7 @@ impl eframe::App for App {
 		                                        if filtered_apps.is_empty() {
 		                                            self.rendered_side_panel_item_centers.clear();
 		                                            self.rendered_side_panel_grid_columns = 1;
-		                                            ui.add_space(20.0);
-	                                            ui.label(
-	                                                egui::RichText::new(if self.loading {
-	                                                    "Loading applications..."
-	                                                } else {
-	                                                    "No matching applications found"
-	                                                })
-	                                                .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 120))
-	                                                .size(13.0),
-	                                            );
+                                                    helpers::application_panel_status(ui, self.loading);
 		                                                } else if self.icon_only {
 		                                                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
                                                         let rendered_columns = helpers::grid_columns(ui.available_width(), self.app_icon_tile_size, 10.0);

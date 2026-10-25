@@ -1,5 +1,22 @@
 use super::*;
 
+pub(super) fn application_panel_status(ui: &mut egui::Ui, loading: bool) -> egui::Response {
+    ui.set_min_width(ui.available_width());
+    ui.vertical_centered(|ui| {
+        ui.add_space(20.0);
+        ui.label(
+            egui::RichText::new(if loading {
+                "Loading applications..."
+            } else {
+                "No matching applications found"
+            })
+            .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 120))
+            .size(13.0),
+        )
+    })
+    .inner
+}
+
 pub(super) fn virtual_items(
     ui: &mut egui::Ui,
     viewport: egui::Rect,
