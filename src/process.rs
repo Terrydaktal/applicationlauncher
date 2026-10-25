@@ -361,6 +361,8 @@ fn independent_scope_command(command: Command) -> (Command, String) {
         "--quiet",
         "--unit",
         &scope_name,
+        // argv is already separated; systemd must not expand literal tmux $IDs.
+        "--expand-environment=no",
         "--",
     ]);
     scoped.arg(program).args(arguments);
@@ -595,6 +597,31 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the user systemd manager; launches only a private printf scope"]
+    fn independent_scope_preserves_literal_tmux_ids_and_shell_arguments() {
+        let mut command = Command::new(executable_path("printf").unwrap());
+        let literals = [
+            "$6",
+            "${APPLICATIONLAUNCHER_SCOPE_TEST_VALUE}",
+            "$APPLICATIONLAUNCHER_SCOPE_TEST_VALUE",
+            "$argv",
+            "attach-session -E -t '$6'",
+            "/a directory/$6; not a command",
+        ];
+        command
+            .arg("<%s>\n")
+            .args(literals)
+            .env("APPLICATIONLAUNCHER_SCOPE_TEST_VALUE", "must not expand");
+        let (scoped, _) = independent_scope_command(command);
+        let output = output_with_timeout(scoped, Duration::from_secs(3)).unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            literals.map(|value| format!("<{value}>\n")).concat()
+        );
+    }
+
+    #[test]
     fn application_launches_are_wrapped_in_collectable_user_scopes() {
         let mut command = Command::new("example-program");
         command.arg("--example");
@@ -613,6 +640,11 @@ mod tests {
             "--unit".into(),
         ]));
         assert!(arguments.iter().any(|argument| argument == "--"));
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "--expand-environment=no")
+        );
         assert!(
             arguments
                 .iter()
