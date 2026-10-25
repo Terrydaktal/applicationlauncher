@@ -177,6 +177,7 @@ The project builds a native `eframe` / `egui` GUI and a separate user-session da
     5. **Window Title**: Alphabetically after transient braille and attention markers are ignored.
     The optional recent-first mode orders by last activation instead of these grouping rules.
   * **When a search query is typed:**
+    With recent-first ordering enabled, fuzzy matching still filters windows and provides highlights, but matching windows are shown by last activation, newest first. Unrecorded activation times come last; equal timestamps use activation sequence, normalized title and window ID as deterministic tie-breaks. Toggling ordering applies to the current search immediately. Activation-only changes reorder cached rows without rerunning fuzzy matching; spinner-only updates retain their existing fast path. The application panel keeps its normal search ranking. Otherwise, the normal search order is:
     1. **Fuzzy Match Score**: Best metadata match across title, app name, class, executable, desktop entry, and path-like context.
     2. **Application Key**: Alphabetically (case-insensitive) by application class/key.
     3. **Window Title**: Alphabetically (case-insensitive) by window title.

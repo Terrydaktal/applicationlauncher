@@ -357,6 +357,7 @@ pub(crate) fn filtered_search_cache_key(
     mode: LauncherMode,
     query: &str,
     show_system_settings_modules: bool,
+    order_windows_by_last_activation: bool,
     pinned_apps_generation: u64,
     apps_generation: u64,
     windows_generation: u64,
@@ -365,10 +366,51 @@ pub(crate) fn filtered_search_cache_key(
         mode,
         query: query.to_string(),
         show_system_settings_modules,
+        order_windows_by_last_activation,
         pinned_apps_generation,
         apps_generation,
         windows_generation,
     }
+}
+
+pub(super) fn sort_cached_windows_by_last_activation(results: &mut FilteredSearchResults) -> bool {
+    let count = results.windows.len();
+    if results.window_display_titles.len() != count
+        || results.window_highlight_segments.len() != count
+        || results.window_title_is_typos.len() != count
+    {
+        return false;
+    }
+    let mut order: Vec<_> = (0..count).collect();
+    order.sort_by_cached_key(|&index| window_last_activation_sort_key(&results.windows[index]));
+    if order
+        .iter()
+        .enumerate()
+        .all(|(index, &source)| index == source)
+    {
+        return true;
+    }
+
+    let mut destinations = vec![0; count];
+    for (destination, source) in order.into_iter().enumerate() {
+        destinations[source] = destination;
+    }
+    let windows = Arc::make_mut(&mut results.windows);
+    let titles = Arc::make_mut(&mut results.window_display_titles);
+    let highlights = Arc::make_mut(&mut results.window_highlight_segments);
+    let typos = Arc::make_mut(&mut results.window_title_is_typos);
+    // Keep row data aligned; each swap fixes one destination without fuzzy reranking.
+    for source in 0..count {
+        while destinations[source] != source {
+            let destination = destinations[source];
+            windows.swap(source, destination);
+            titles.swap(source, destination);
+            highlights.swap(source, destination);
+            typos.swap(source, destination);
+            destinations.swap(source, destination);
+        }
+    }
+    true
 }
 
 pub(crate) fn load_window_size() -> (f32, f32) {

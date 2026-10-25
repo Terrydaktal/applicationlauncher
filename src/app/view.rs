@@ -590,6 +590,7 @@ impl eframe::App for App {
                                 self.mode,
                                 &search_query,
                                 self.show_system_settings_modules,
+                                self.order_windows_by_last_activation,
                                 self.pinned_apps_generation,
                                 self.apps_generation,
                                 self.windows_generation,
@@ -669,6 +670,7 @@ impl eframe::App for App {
                                     &base_query,
                                     &typo_query,
                                     self.field_rank_model.as_ref(),
+                                    self.order_windows_by_last_activation,
                                 );
                                         filtered_window_title_is_typos = Arc::new(ranked_windows
                                             .iter()

@@ -2357,6 +2357,167 @@ mod tests {
     }
 
     #[test]
+    fn searched_windows_use_activation_order_only_when_enabled() {
+        let mut older = test_window_info("recentneedle");
+        older.id = "older".into();
+        older.last_activated_at_ms = Some(100);
+        let mut newer = test_window_info("recentneedle project");
+        newer.id = "newer".into();
+        newer.last_activated_at_ms = Some(200);
+        let mut unknown = older.clone();
+        unknown.id = "unknown".into();
+        unknown.last_activated_at_ms = None;
+        let mut unrelated = test_window_info("zzzzzzzzzzzz");
+        unrelated.id = "unrelated".into();
+        unrelated.last_activated_at_ms = Some(999);
+        let windows = vec![unknown, newer, unrelated, older];
+        let documents: Vec<_> = windows.iter().map(window_search_document).collect();
+        for query in ["recentneedle", "recentnedle"] {
+            let (base, typo) = search_queries(query).unwrap();
+            let fuzzy = ranked_window_matches(&windows, &documents, &base, &typo, None, false);
+            let recent = ranked_window_matches(&windows, &documents, &base, &typo, None, true);
+            assert_eq!(fuzzy[0].window.id, "older", "{query}");
+            assert_eq!(
+                recent
+                    .iter()
+                    .map(|item| item.window.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["newer", "older", "unknown"],
+                "{query}"
+            );
+            assert_eq!(fuzzy.len(), recent.len());
+            for item in &recent {
+                let original = fuzzy
+                    .iter()
+                    .find(|original| original.window.id == item.window.id)
+                    .unwrap();
+                assert_eq!(item.display_title, original.display_title);
+                assert_eq!(item.highlight_segments, original.highlight_segments);
+                assert_eq!(item.title_is_typo, original.title_is_typo);
+                assert!(
+                    !item.highlight_segments.is_empty(),
+                    "{query}: {}",
+                    item.window.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn search_cache_key_tracks_the_window_ordering_toggle() {
+        let key = |recent| {
+            filtered_search_cache_key(LauncherMode::Windows, "codex", true, recent, 1, 2, 3)
+        };
+        assert_eq!(key(false), key(false));
+        assert_ne!(key(false), key(true));
+        assert_ne!(key(true), key(false));
+    }
+
+    #[test]
+    fn cached_recent_search_reorders_all_row_data_without_reranking() {
+        let windows: Vec<_> = [
+            ("newest", Some(300)),
+            ("oldest", Some(100)),
+            ("unknown", None),
+            ("middle", Some(200)),
+        ]
+        .into_iter()
+        .map(|(id, timestamp)| {
+            let mut window = test_window_info(id);
+            window.id = id.into();
+            window.last_activated_at_ms = timestamp;
+            window
+        })
+        .collect();
+        let titles = windows
+            .iter()
+            .map(|window| format!("highlighted {}", window.id))
+            .collect();
+        let highlights = (0..windows.len())
+            .map(|index| vec![(index, index + 1, true)])
+            .collect();
+        let typos = (0..windows.len()).map(|index| index % 2 == 0).collect();
+        let mut results = FilteredSearchResults {
+            apps: Arc::new(Vec::new()),
+            windows: Arc::new(windows),
+            app_display_titles: Arc::new(Vec::new()),
+            window_display_titles: Arc::new(titles),
+            app_highlight_segments: Arc::new(Vec::new()),
+            app_name_highlight_segments: Arc::new(Vec::new()),
+            window_highlight_segments: Arc::new(highlights),
+            app_title_is_typos: Arc::new(Vec::new()),
+            window_title_is_typos: Arc::new(typos),
+        };
+        let previous = results.clone();
+        assert!(helpers::sort_cached_windows_by_last_activation(
+            &mut results
+        ));
+        assert_eq!(
+            results
+                .windows
+                .iter()
+                .map(|window| window.id.as_str())
+                .collect::<Vec<_>>(),
+            ["newest", "middle", "oldest", "unknown"]
+        );
+        Arc::make_mut(&mut results.windows)[2].last_activated_at_ms = Some(400);
+        assert!(helpers::sort_cached_windows_by_last_activation(
+            &mut results
+        ));
+        assert_eq!(
+            results
+                .windows
+                .iter()
+                .map(|window| window.id.as_str())
+                .collect::<Vec<_>>(),
+            ["oldest", "newest", "middle", "unknown"]
+        );
+        for (index, window) in results.windows.iter().enumerate() {
+            let old_index = previous
+                .windows
+                .iter()
+                .position(|old| old.id == window.id)
+                .unwrap();
+            assert_eq!(
+                results.window_display_titles[index],
+                previous.window_display_titles[old_index]
+            );
+            assert_eq!(
+                results.window_highlight_segments[index],
+                previous.window_highlight_segments[old_index]
+            );
+            assert_eq!(
+                results.window_title_is_typos[index],
+                previous.window_title_is_typos[old_index]
+            );
+        }
+        assert_eq!(previous.windows[1].last_activated_at_ms, Some(100));
+        assert!(Arc::ptr_eq(&results.apps, &previous.apps));
+        let ordered = results.clone();
+        assert!(helpers::sort_cached_windows_by_last_activation(
+            &mut results
+        ));
+        assert!(Arc::ptr_eq(&results.windows, &ordered.windows));
+        assert!(Arc::ptr_eq(
+            &results.window_display_titles,
+            &ordered.window_display_titles
+        ));
+        assert!(Arc::ptr_eq(
+            &results.window_highlight_segments,
+            &ordered.window_highlight_segments
+        ));
+        assert!(Arc::ptr_eq(
+            &results.window_title_is_typos,
+            &ordered.window_title_is_typos
+        ));
+        Arc::make_mut(&mut results.window_display_titles).pop();
+        assert!(!helpers::sort_cached_windows_by_last_activation(
+            &mut results
+        ));
+        assert!(Arc::ptr_eq(&results.windows, &ordered.windows));
+    }
+
+    #[test]
     fn last_activation_order_puts_newest_windows_first() {
         let mut older = test_window_info("older");
         older.last_activated_at_ms = Some(100);
@@ -2376,6 +2537,16 @@ mod tests {
             compare_windows_by_last_activation(&newer, &unknown),
             std::cmp::Ordering::Less
         );
+        let mut tied = newer.clone();
+        tied.activation_sequence += 1;
+        assert!(window_last_activation_sort_key(&tied) < window_last_activation_sort_key(&newer));
+        tied.activation_sequence = newer.activation_sequence;
+        tied.title = "alpha".into();
+        assert!(window_last_activation_sort_key(&tied) < window_last_activation_sort_key(&newer));
+        tied.title = newer.title.clone();
+        newer.id = "b".into();
+        tied.id = "a".into();
+        assert!(window_last_activation_sort_key(&tied) < window_last_activation_sort_key(&newer));
     }
 
     #[test]

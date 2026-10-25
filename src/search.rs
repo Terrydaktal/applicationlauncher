@@ -6,6 +6,7 @@ use fuzzy_rank::fields::fuzzy::{
 use fuzzy_rank::ranking::SearchRank;
 
 use eframe::egui;
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -305,29 +306,35 @@ pub(crate) fn ranked_window_matches(
     base_query: &MetadataQuery,
     typo_query: &MetadataQuery,
     field_rank_model: Option<&FieldRankModel>,
+    order_by_last_activation: bool,
 ) -> Vec<RankedWindowMatch> {
     let scores = vec![0.0; documents.len()];
-    rank_prepared_documents(documents, &scores, base_query, typo_query, field_rank_model)
-        .into_iter()
-        .filter_map(|(index, rank)| {
-            let window = windows.get(index)?;
-            let document = documents.get(index)?;
-            let (_, display_title, highlight_segments, title_is_typo) =
-                compute_display_title_and_highlights_for_rank(
-                    &full_search_visible_window_title(window),
-                    &document.values,
-                    typo_query,
-                    rank.clone(),
-                    70,
-                );
-            Some(RankedWindowMatch {
-                window: window.clone(),
-                title_is_typo,
-                display_title,
-                highlight_segments,
+    let mut matches: Vec<_> =
+        rank_prepared_documents(documents, &scores, base_query, typo_query, field_rank_model)
+            .into_iter()
+            .filter_map(|(index, rank)| {
+                let window = windows.get(index)?;
+                let document = documents.get(index)?;
+                let (_, display_title, highlight_segments, title_is_typo) =
+                    compute_display_title_and_highlights_for_rank(
+                        &full_search_visible_window_title(window),
+                        &document.values,
+                        typo_query,
+                        rank.clone(),
+                        70,
+                    );
+                Some(RankedWindowMatch {
+                    window: window.clone(),
+                    title_is_typo,
+                    display_title,
+                    highlight_segments,
+                })
             })
-        })
-        .collect()
+            .collect();
+    if order_by_last_activation {
+        matches.sort_by_cached_key(|item| window_last_activation_sort_key(&item.window));
+    }
+    matches
 }
 
 #[allow(dead_code)]
@@ -821,22 +828,23 @@ pub(crate) fn window_sort_title_key(win: &WindowInfo) -> String {
     )
 }
 
+pub(crate) fn window_last_activation_sort_key(
+    window: &WindowInfo,
+) -> (Reverse<Option<i64>>, Reverse<i64>, String, String) {
+    (
+        Reverse(window.last_activated_at_ms),
+        Reverse(window.activation_sequence),
+        window_sort_title_key(window),
+        window.id.clone(),
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn compare_windows_by_last_activation(
     left: &WindowInfo,
     right: &WindowInfo,
 ) -> std::cmp::Ordering {
-    let activation_time_order = match (left.last_activated_at_ms, right.last_activated_at_ms) {
-        (Some(left), Some(right)) => right.cmp(&left),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
-    };
-
-    activation_time_order
-        .then_with(|| right.activation_sequence.cmp(&left.activation_sequence))
-        .then_with(|| window_sort_title_key(left).cmp(&window_sort_title_key(right)))
-        .then_with(|| left.id.cmp(&right.id))
+    window_last_activation_sort_key(left).cmp(&window_last_activation_sort_key(right))
 }
 
 pub(crate) fn command_basename(exec: &str) -> Option<String> {

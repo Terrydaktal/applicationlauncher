@@ -254,6 +254,7 @@ impl App {
         };
         let cached_windows = Arc::make_mut(&mut cache.results.windows);
         let display_titles = Arc::make_mut(&mut cache.results.window_display_titles);
+        let mut activation_changed = false;
 
         for (old_window, new_window) in updates {
             let Some(index) = cached_windows
@@ -265,7 +266,16 @@ impl App {
             if let Some(display_title) = display_titles.get_mut(index) {
                 refresh_cached_transient_title(display_title, &old_window.title, &new_window.title);
             }
+            activation_changed |= old_window.last_activated_at_ms
+                != new_window.last_activated_at_ms
+                || old_window.activation_sequence != new_window.activation_sequence;
             cached_windows[index] = new_window.clone();
+        }
+        if cache.key.order_windows_by_last_activation
+            && activation_changed
+            && !helpers::sort_cached_windows_by_last_activation(&mut cache.results)
+        {
+            self.filtered_search_cache = None;
         }
     }
 

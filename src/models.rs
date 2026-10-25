@@ -226,6 +226,7 @@ pub struct FilteredSearchCacheKey {
     pub mode: LauncherMode,
     pub query: String,
     pub show_system_settings_modules: bool,
+    pub order_windows_by_last_activation: bool,
     pub pinned_apps_generation: u64,
     pub apps_generation: u64,
     pub windows_generation: u64,
