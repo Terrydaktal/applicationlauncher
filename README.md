@@ -91,6 +91,7 @@
 - Provides context actions on windows, including closing the window and showing the execution chain popup.
 - Re-focuses the existing launcher instance instead of opening a second one.
 - Persists window size, pinned applications, and launcher settings under `$HOME/.config/applicationlauncher/`.
+- Renders strikethrough in open-window and Recently closed titles as native styling, without changing saved titles or restore metadata.
 
 ## Runtime Architecture
 

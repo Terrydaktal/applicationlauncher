@@ -687,7 +687,7 @@ impl App {
                                 for entry in state.history.clone() {
                                     ui.horizontal(|ui| {
                                         ui.vertical(|ui| {
-                                            ui.label(&entry.window.title);
+                                            helpers::history_title_label(ui, &entry.window.title);
                                             ui.small(format!(
                                                 "{} | {}",
                                                 entry.restore.app_key,

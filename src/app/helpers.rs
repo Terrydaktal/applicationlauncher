@@ -545,6 +545,22 @@ pub(crate) fn paint_centered_title_job(
     ui.painter().galley(position, galley, fallback_color);
 }
 
+pub(super) fn history_title_label(ui: &mut egui::Ui, title: &str) -> egui::Response {
+    if !title.contains(['\u{0335}', '\u{0336}']) {
+        return ui.label(title);
+    }
+    let mut job = egui::text::LayoutJob::default();
+    egui::RichText::new(title)
+        .color(ui.visuals().text_color())
+        .append_to(
+            &mut job,
+            ui.style(),
+            egui::FontSelection::Default,
+            ui.text_valign(),
+        );
+    ui.label(crate::search::render_title_strikethrough(job))
+}
+
 pub(crate) fn grid_move_down(index: usize, len: usize, columns: usize) -> usize {
     if len == 0 {
         return 0;

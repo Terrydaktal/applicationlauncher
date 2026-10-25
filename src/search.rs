@@ -69,18 +69,27 @@ fn projected_search_values(values: &[(u8, String)]) -> Vec<(u8, String)> {
         .collect()
 }
 
-/// Keep one ASCII character per source character so fuzzy-rank byte ranges
-/// can be mapped back without Unicode case-folding changing offsets.
+pub(crate) fn is_title_strikethrough_mark(character: char) -> bool {
+    matches!(character, '\u{0335}' | '\u{0336}')
+}
+
+fn projected_search_character(character: char) -> Option<char> {
+    Some(match character {
+        character if is_title_strikethrough_mark(character) => return None,
+        '—' | '–' | '−' => '-',
+        '•' | '·' | '●' | '▪' | '◦' | '‣' => ' ',
+        character if character.is_ascii() => character.to_ascii_lowercase(),
+        character if character.is_whitespace() => ' ',
+        _ => ' ',
+    })
+}
+
+/// Project searchable characters to ASCII, ignoring visual strike overlays.
+/// Highlight offsets use the original-byte boundary map below.
 pub(crate) fn search_projection(value: &str) -> String {
     value
         .chars()
-        .map(|character| match character {
-            '—' | '–' | '−' => '-',
-            '•' | '·' | '●' | '▪' | '◦' | '‣' => ' ',
-            character if character.is_ascii() => character.to_ascii_lowercase(),
-            character if character.is_whitespace() => ' ',
-            _ => ' ',
-        })
+        .filter_map(projected_search_character)
         .collect()
 }
 
@@ -97,14 +106,13 @@ fn search_projection_with_map(value: &str) -> (String, Vec<usize>) {
     projection_to_original.push(0);
     for (start, character) in value.char_indices() {
         let end = start + character.len_utf8();
-        projection.push(match character {
-            '—' | '–' | '−' => '-',
-            '•' | '·' | '●' | '▪' | '◦' | '‣' => ' ',
-            character if character.is_ascii() => character.to_ascii_lowercase(),
-            character if character.is_whitespace() => ' ',
-            _ => ' ',
-        });
-        projection_to_original.push(end);
+        if let Some(projected) = projected_search_character(character) {
+            projection.push(projected);
+            projection_to_original.push(end);
+        } else {
+            // The overlay belongs to the preceding character's byte range.
+            *projection_to_original.last_mut().unwrap() = end;
+        }
     }
     (projection, projection_to_original)
 }
@@ -1348,10 +1356,16 @@ pub(crate) fn title_match_ranges(text: &str, query: &str) -> Vec<(usize, usize)>
     }
 
     let mut normalized = String::new();
-    let mut mapping = Vec::new();
+    let mut mapping: Vec<(usize, usize, usize, usize)> = Vec::new();
 
     for (start, ch) in text.char_indices() {
         let end = start + ch.len_utf8();
+        if is_title_strikethrough_mark(ch) {
+            if let Some((_, _, _, mapped_end)) = mapping.last_mut() {
+                *mapped_end = end;
+            }
+            continue;
+        }
         let lower = ch.to_lowercase().collect::<String>();
         let lower_start = normalized.len();
         normalized.push_str(&lower);
@@ -1799,7 +1813,7 @@ pub(crate) fn highlighted_title_job_from_segments(
 
     if valid_segments.is_empty() {
         job.append(text, 0.0, default_format);
-        return job;
+        return render_title_strikethrough(job);
     }
 
     let mut cursor = 0usize;
@@ -1825,6 +1839,50 @@ pub(crate) fn highlighted_title_job_from_segments(
         job.append(&text[cursor..], 0.0, default_format);
     }
 
+    render_title_strikethrough(job)
+}
+
+pub(crate) fn render_title_strikethrough(mut job: egui::text::LayoutJob) -> egui::text::LayoutJob {
+    if !job.text.contains(['\u{0335}', '\u{0336}']) {
+        return job;
+    }
+    // egui does not shape combining overlays. Preserve them as native styling
+    // after highlighting, so the search ranges still refer to the raw title.
+    let text = std::mem::take(&mut job.text);
+    let sections = std::mem::take(&mut job.sections);
+    job.text = String::with_capacity(text.len());
+    for section in sections {
+        let mut struck_format = section.format.clone();
+        struck_format.strikethrough = egui::Stroke::new(1.0, section.format.color);
+        for (offset, character) in text[section.byte_range.clone()].char_indices() {
+            if is_title_strikethrough_mark(character) {
+                continue;
+            }
+            let end = section.byte_range.start + offset + character.len_utf8();
+            let format = if text[end..]
+                .chars()
+                .next()
+                .is_some_and(is_title_strikethrough_mark)
+            {
+                &struck_format
+            } else {
+                &section.format
+            };
+            let start = job.text.len();
+            job.text.push(character);
+            if let Some(previous) = job.sections.last_mut()
+                && previous.format == *format
+            {
+                previous.byte_range.end = job.text.len();
+            } else {
+                job.sections.push(egui::text::LayoutSection {
+                    leading_space: 0.0,
+                    byte_range: start..job.text.len(),
+                    format: format.clone(),
+                });
+            }
+        }
+    }
     job
 }
 

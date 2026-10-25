@@ -1802,6 +1802,191 @@ mod tests {
     }
 
     #[test]
+    fn strikethrough_titles_match_plain_queries_and_keep_original_highlight_offsets() {
+        for mark in ['\u{0335}', '\u{0336}'] {
+            let struck: String = "codex".chars().flat_map(|ch| [ch, mark]).collect();
+            let title = format!(
+                "\u{2807} \u{3bb} {struck} ~/tasks/usbtree - Build USB speed diagnostic CLI - Terminal"
+            );
+            assert_eq!(search_projection(&struck), "codex");
+            let values = vec![(0, title.clone())];
+            let document =
+                crate::search::PreparedSearchDocument::new("fixture".into(), values.clone());
+            let (base, typo) = search_queries("codex").unwrap();
+            assert!(base.search_rank_prepared(document.candidate(0.0)).is_some());
+            assert_eq!(
+                title_match_ranges(&title, "codex")
+                    .iter()
+                    .map(|(start, end)| &title[*start..*end])
+                    .collect::<Vec<_>>(),
+                [struck.as_str()]
+            );
+            let (_, display, segments, is_typo) =
+                compute_display_title_and_highlights(&title, &values, &base, &typo, 512)
+                    .expect("a plain query must match the decorated title itself");
+            assert!(!is_typo);
+            assert!(
+                segments
+                    .iter()
+                    .any(|(start, end, exact)| *exact && display[*start..*end] == struck)
+            );
+            let job = highlighted_title_job_from_segments(&display, 14.0, &segments);
+            assert_eq!(job.text, title.replace(mark, ""));
+            assert!(
+                job.sections
+                    .iter()
+                    .any(|section| &job.text[section.byte_range.clone()] == "codex"
+                        && section.format.strikethrough.width > 0.0
+                        && section.format.color == egui::Color32::from_rgb(235, 90, 90))
+            );
+
+            let (base, typo) = search_queries("usbtree").unwrap();
+            let (_, display, segments, _) =
+                compute_display_title_and_highlights(&title, &values, &base, &typo, 512).unwrap();
+            assert!(
+                segments
+                    .iter()
+                    .any(|(start, end, exact)| *exact && &display[*start..*end] == "usbtree")
+            );
+        }
+    }
+
+    #[test]
+    fn strikethrough_title_typo_matches_remain_yellow() {
+        let title = "c\u{0336}o\u{0336}d\u{0336}e\u{0336}x\u{0336} - Terminal";
+        let values = vec![(0, title.into())];
+        let (base, typo) = search_queries("codxe").unwrap();
+        let (_, display, segments, is_typo) =
+            compute_display_title_and_highlights(title, &values, &base, &typo, 512)
+                .expect("typo fallback should see the undecorated program name");
+        assert!(is_typo);
+        let job = highlighted_title_job_from_segments(&display, 14.0, &segments);
+        assert!(
+            job.sections
+                .iter()
+                .any(|section| &job.text[section.byte_range.clone()] == "codex"
+                    && section.format.strikethrough.width > 0.0
+                    && section.format.color == egui::Color32::from_rgb(235, 196, 72))
+        );
+    }
+
+    #[test]
+    fn strikethrough_title_rendering_preserves_partial_colors_without_box_glyphs() {
+        let struck = "c\u{0336}o\u{0336}d\u{0336}e\u{0336}x\u{0336}";
+        let title = format!("\u{0336}prefix {struck} - \u{2807} ~/tasks/usbtree");
+        let start = title.find('c').unwrap();
+        let second = start + "c\u{0336}".len();
+        let fourth = second + "o\u{0336}d\u{0336}".len();
+        for segments in [
+            vec![],
+            vec![(start, start + 1, true), (second, fourth, false)],
+        ] {
+            let job = highlighted_title_job_from_segments(&title, 14.0, &segments);
+            assert_eq!(job.text, "prefix codex - \u{2807} ~/tasks/usbtree");
+            let strokes = job
+                .sections
+                .iter()
+                .filter(|section| section.format.strikethrough.width > 0.0)
+                .map(|section| (&job.text[section.byte_range.clone()], section.format.color))
+                .collect::<Vec<_>>();
+            if segments.is_empty() {
+                assert_eq!(strokes, [("codex", egui::Color32::WHITE)]);
+                assert_eq!(
+                    job.sections.len(),
+                    3,
+                    "equal formatting must coalesce, not create a section per letter"
+                );
+            } else {
+                assert_eq!(
+                    strokes,
+                    [
+                        ("c", egui::Color32::from_rgb(235, 90, 90)),
+                        ("od", egui::Color32::from_rgb(235, 196, 72)),
+                        ("ex", egui::Color32::WHITE),
+                    ]
+                );
+            }
+            let ctx = egui::Context::default();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label(job.clone());
+                });
+            });
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.job.text == job.text)));
+        }
+    }
+
+    #[test]
+    fn history_titles_render_strikethrough_without_boxes_and_keep_popup_styling() {
+        for mark in ['\u{0335}', '\u{0336}'] {
+            let decorated: String = "Terminal"
+                .chars()
+                .flat_map(|character| [character, mark])
+                .collect();
+            let title = format!("codex - \u{2807} ~/tasks/film - {decorated}");
+            let original = title.clone();
+            let ctx = egui::Context::default();
+            let font = egui::FontId::monospace(17.0);
+            let color = egui::Color32::from_rgb(200, 180, 150);
+            ctx.style_mut(|style| {
+                style.override_font_id = Some(font.clone());
+                style.visuals.override_text_color = Some(color);
+            });
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    helpers::history_title_label(ui, &title);
+                });
+            });
+            let job = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(&text.galley.job),
+                    _ => None,
+                })
+                .expect("the history title must be painted");
+            assert_eq!(job.text, "codex - \u{2807} ~/tasks/film - Terminal");
+            let struck = job
+                .sections
+                .iter()
+                .filter(|section| section.format.strikethrough.width > 0.0)
+                .map(|section| &job.text[section.byte_range.clone()])
+                .collect::<Vec<_>>();
+            assert_eq!(struck, ["Terminal"]);
+            assert!(
+                job.sections
+                    .iter()
+                    .all(|section| section.format.font_id == font && section.format.color == color)
+            );
+            assert_eq!(
+                title, original,
+                "rendering must not rewrite the stored title"
+            );
+        }
+    }
+
+    #[test]
+    fn history_titles_without_strikethrough_keep_their_original_text() {
+        for title in [
+            "~ - Terminal",
+            "\u{2807} codex - ~/tasks/film - Terminal",
+            "Caf\u{00e9} - e\u{0301} - Mousepad",
+        ] {
+            let ctx = egui::Context::default();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    helpers::history_title_label(ui, title);
+                });
+            });
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.job.text == title
+                    && text.galley.job.sections.iter().all(|section| section.format.strikethrough.width == 0.0)
+            )));
+        }
+    }
+
+    #[test]
     fn highlighted_title_job_ignores_invalid_ranges() {
         let title = "movie";
         let segments = [(0, title.len() + 10, false), (1, 3, false)];
