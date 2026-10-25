@@ -382,6 +382,45 @@ pub struct InfoPopupRow {
     pub separator_before: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ProcessIdentity {
+    pub pid: i32,
+    pub start_ticks: u64,
+}
+
+#[derive(Clone)]
+pub struct ProcessInfoNode {
+    pub identity: ProcessIdentity,
+    pub parent_pid: i32,
+    pub depth: usize,
+    pub name: String,
+    pub header: Arc<str>,
+    pub executable: Option<PathBuf>,
+    pub executable_identity: Option<(u64, u64)>,
+    pub cwd: Option<PathBuf>,
+    pub command_line: Option<String>,
+    pub command_summary: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct ProcessTreeSnapshot {
+    pub nodes: Arc<[ProcessInfoNode]>,
+    pub notice: Arc<str>,
+    #[cfg(test)]
+    pub text: Arc<str>,
+}
+
+impl ProcessTreeSnapshot {
+    pub fn unavailable(message: &str) -> Self {
+        Self {
+            nodes: Arc::from([]),
+            notice: message.into(),
+            #[cfg(test)]
+            text: message.into(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct InfoPopupData {
     pub title: String,

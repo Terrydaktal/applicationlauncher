@@ -14,12 +14,15 @@ use std::time::{Duration, Instant};
 mod available;
 mod freshness;
 mod installation;
+mod lookup;
 mod node;
 mod pi;
 mod script;
 
 pub(crate) use available::PackageTarget;
 pub(crate) use installation::ProgsMetadata;
+pub(crate) use lookup::PI_RECEIPT_REFRESH;
+pub(crate) use lookup::ProcessVersionCache;
 pub(crate) use node::NodeApplication;
 pub(crate) use pi::{BuildStatus as PiBuildStatus, PiBuildEvidence};
 pub(crate) use script::{ScriptApplication, runtime_name};
