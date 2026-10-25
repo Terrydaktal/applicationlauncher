@@ -11,9 +11,11 @@ use crate::models::WindowInfo;
 use eframe::egui;
 use std::time::{Duration, Instant};
 
+mod available;
 mod freshness;
 mod installation;
 
+pub(crate) use available::PackageTarget;
 pub(crate) use installation::ProgsMetadata;
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(750);
@@ -72,6 +74,8 @@ pub(crate) struct ProcessVersion {
     pub(crate) source: Option<String>,
     pub(crate) version: Option<String>,
     pub(crate) latest_version: Option<String>,
+    pub(crate) package_target: Option<PackageTarget>,
+    pub(crate) latest_package_version: Option<String>,
     pub(crate) latest_build_id: Option<String>,
     pub(crate) running_latest_binary: Option<bool>,
     pub(crate) uncompiled_changes: Option<String>,
@@ -401,6 +405,7 @@ fn probe_version_checked(
     };
     let package = installed_package(&clean_path);
     let (installation, progs_metadata) = installation::inspect(&clean_path);
+    let package_target = available::target(&clean_path, package.as_deref());
     let mut result = ProcessVersion {
         running_unavailable: running.as_ref().err().copied(),
         source: running_info
@@ -409,6 +414,8 @@ fn probe_version_checked(
             .map(|_| "Running executable version switch (exact binary)".into()),
         version: running_info.version,
         latest_version: latest_info.as_ref().and_then(|info| info.version.clone()),
+        package_target,
+        latest_package_version: None,
         latest_build_id: latest_info.and_then(|info| info.build_id),
         running_latest_binary,
         uncompiled_changes: Some(uncompiled_changes),
@@ -581,6 +588,64 @@ mod tests {
         assert!(result.version.is_none());
         assert!(result.build_id.is_none());
         assert!(result.running_latest_binary.is_none());
+    }
+
+    #[test]
+    #[ignore = "read-only installed bwrap and Progs inventory checks; requires this system's package metadata"]
+    fn installed_bwrap_metadata_survives_process_exit() {
+        let target = ProcessVersionTarget {
+            pid: i32::MAX,
+            executable: "/usr/bin/bwrap".into(),
+            program: Some("bwrap".into()),
+        };
+        let result = probe_version(&target);
+        assert!(
+            result
+                .installation
+                .as_deref()
+                .unwrap()
+                .contains("Pacman Dependency")
+        );
+        assert!(
+            result
+                .package
+                .as_deref()
+                .unwrap()
+                .starts_with("bubblewrap ")
+        );
+        assert_eq!(
+            result.progs_metadata.description.as_deref(),
+            Some("Unprivileged sandboxing tool")
+        );
+        assert!(
+            result
+                .progs_metadata
+                .capabilities
+                .as_deref()
+                .unwrap()
+                .starts_with("CLI")
+        );
+        assert!(
+            result
+                .latest_version
+                .as_deref()
+                .unwrap()
+                .starts_with("bubblewrap ")
+        );
+        assert!(result.latest_build_id.is_some());
+        assert!(result.version.is_none() && result.build_id.is_none());
+        let latest_package = available::query(result.package_target.as_ref().unwrap());
+        assert!(latest_package.contains("/bubblewrap "), "{latest_package}");
+        eprintln!(
+            "installation={:?}; package={:?}; description={:?}; capabilities={:?}; disk_version={:?}; disk_build_id={:?}; latest_package={latest_package}; running_unavailable={:?}",
+            result.installation,
+            result.package,
+            result.progs_metadata.description,
+            result.progs_metadata.capabilities,
+            result.latest_version,
+            result.latest_build_id,
+            result.running_unavailable
+        );
     }
 
     #[test]
