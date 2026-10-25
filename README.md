@@ -466,6 +466,21 @@ AUTHORS
 
 Browser windows are restored as application windows in the first release; exact tabs and URLs require browser-native session restore or a future browser extension. File-manager paths and terminal working directories are restored when reliable metadata is available. Failed or ambiguous items are reported rather than replaying unsafe commands.
 
+Restored applications run in independent user systemd scopes, with environment
+expansion disabled so literal arguments such as tmux session IDs (`$6`) arrive
+unchanged. Surviving tmux sessions are reattached with their saved server/session
+identity, without restarting their existing Codex program or detaching other
+clients. Plasma activity membership and skip-switcher state qualify an otherwise
+verified layout as `Adjusted` only when the actual state differs; merely recording
+these fields does not prevent an `Exact` result.
+
+The harmless argv regression uses only a short-lived `printf` scope, not a
+terminal or session restore:
+
+```bash
+cargo test --release --lib independent_scope_preserves_literal_tmux_ids_and_shell_arguments -- --ignored
+```
+
 ## Resource Optimizations
 
 The implemented [twelve-step optimization plan](docs/OPTIMIZATIONS.md) documents

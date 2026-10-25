@@ -461,8 +461,8 @@ fn parse_output_geometries(document: &serde_json::Value) -> Vec<OutputGeometry> 
     outputs.into_iter().map(|(_, output)| output).collect()
 }
 
-pub(crate) fn layout_target(wanted: &TrackedWindow, outputs: &[OutputGeometry]) -> LayoutTarget {
-    let saved_geometry = if wanted.maximized
+fn saved_layout_geometry(wanted: &TrackedWindow) -> WindowGeometry {
+    if wanted.maximized
         || wanted.maximized_horizontally
         || wanted.maximized_vertically
         || wanted.fullscreen
@@ -480,7 +480,11 @@ pub(crate) fn layout_target(wanted: &TrackedWindow, outputs: &[OutputGeometry]) 
             width: wanted.width,
             height: wanted.height,
         }
-    };
+    }
+}
+
+pub(crate) fn layout_target(wanted: &TrackedWindow, outputs: &[OutputGeometry]) -> LayoutTarget {
+    let saved_geometry = saved_layout_geometry(wanted);
     if !saved_geometry.is_valid() {
         return LayoutTarget {
             geometry: None,
@@ -654,6 +658,9 @@ fn layout_command_batches(
     }
 
     let mut clear_state = vec!["windowstate".into()];
+    if wanted.minimized {
+        clear_state.extend(["--add".into(), "minimized".into()]);
+    }
     for property in [
         "fullscreen",
         "maximized",
@@ -667,6 +674,9 @@ fn layout_command_batches(
         "skip_pager",
         "no_border",
     ] {
+        if property == "minimized" && wanted.minimized {
+            continue;
+        }
         clear_state.extend(["--remove".into(), property.into()]);
     }
     resize_args.extend(state_args_with_window(clear_state, id));
@@ -1338,7 +1348,7 @@ pub(super) fn valid_session_id(id: &str) -> bool {
         })
 }
 
-fn quote_argument(argument: &str) -> String {
+pub(super) fn quote_argument(argument: &str) -> String {
     format!("'{}'", argument.replace('\'', "'\\''"))
 }
 
@@ -1776,6 +1786,41 @@ mod tests {
         assert!(move_args.iter().any(|argument| argument == "windowmove"));
         assert!(add_index > 0);
         assert!(!resize_args.iter().any(|argument| argument == "windowmove"));
+    }
+
+    #[test]
+    fn minimized_layout_never_exposes_the_window_between_resize_and_move() {
+        let mut wanted = tracked_window("saved", "Terminal", "xfce4-terminal");
+        wanted.minimized = true;
+        let target = LayoutTarget {
+            geometry: Some(WindowGeometry {
+                x: 120,
+                y: 240,
+                width: 1000,
+                height: 700,
+            }),
+            output_name: None,
+            adjustment: None,
+        };
+        let batches = layout_command_batches("replacement", &wanted, &target);
+        assert!(
+            batches[0]
+                .windows(2)
+                .any(|pair| pair == ["--add", "minimized"])
+        );
+        assert!(batches.iter().all(|batch| {
+            !batch
+                .windows(2)
+                .any(|pair| pair == ["--remove", "minimized"])
+        }));
+        assert!(batches[0].iter().any(|arg| arg == "windowsize"));
+        assert!(batches[1].iter().any(|arg| arg == "windowmove"));
+        wanted.minimized = false;
+        assert!(
+            layout_command_batches("replacement", &wanted, &target)[0]
+                .windows(2)
+                .any(|pair| pair == ["--remove", "minimized"])
+        );
     }
 
     #[test]

@@ -1464,18 +1464,8 @@ impl Runtime {
                                     "multiple windows had equally strong identity metadata".into(),
                                 );
                             }
-                            if !item.wanted.activities.is_empty() {
-                                qualifications.push(
-                                    "Plasma activity membership was recorded but cannot be applied by kdotool"
-                                        .into(),
-                                );
-                            }
-                            if item.wanted.skip_switcher {
-                                qualifications.push(
-                                    "skip-switcher state was recorded but cannot be applied by kdotool"
-                                        .into(),
-                                );
-                            }
+                            qualifications
+                                .extend(unsupported_layout_adjustments(&item.wanted, actual));
                             let status = if qualifications.is_empty() {
                                 super::RestoreOutcomeStatus::Exact
                             } else {
@@ -1639,6 +1629,26 @@ fn layout_reconciliation_poll_interval(elapsed: Duration) -> Duration {
     } else {
         LAYOUT_RECONCILIATION_SLOW_POLL
     }
+}
+
+fn unsupported_layout_adjustments(wanted: &TrackedWindow, actual: &TrackedWindow) -> Vec<String> {
+    let mut adjustments = Vec::new();
+    if !wanted.activities.is_empty()
+        && wanted.activities.iter().collect::<HashSet<_>>()
+            != actual.activities.iter().collect::<HashSet<_>>()
+    {
+        adjustments.push(
+            "Plasma activity membership differs from the saved state and cannot be applied by kdotool"
+                .into(),
+        );
+    }
+    if wanted.skip_switcher != actual.skip_switcher {
+        adjustments.push(
+            "skip-switcher state differs from the saved state and cannot be applied by kdotool"
+                .into(),
+        );
+    }
+    adjustments
 }
 
 fn restore_report_succeeded(report: &RestoreReport) -> bool {
@@ -2692,6 +2702,48 @@ mod tests {
     };
     use crate::tracker::restore::LaunchUnavailableCode;
     use crate::tracker::{HistoryEntry, RestoreReport, RestoreSpec, TrackedWindow};
+
+    #[test]
+    fn matching_activity_membership_and_skip_switcher_do_not_make_restore_adjusted() {
+        let wanted = TrackedWindow {
+            activities: vec!["activity-a".into(), "activity-b".into()],
+            skip_switcher: true,
+            ..Default::default()
+        };
+        let mut actual = wanted.clone();
+        actual.activities.reverse();
+        assert!(super::unsupported_layout_adjustments(&wanted, &actual).is_empty());
+    }
+
+    #[test]
+    fn differing_unsupported_window_state_remains_a_reported_adjustment() {
+        let wanted = TrackedWindow {
+            activities: vec!["saved-activity".into()],
+            skip_switcher: true,
+            ..Default::default()
+        };
+        let actual = TrackedWindow {
+            activities: vec!["different-activity".into()],
+            ..Default::default()
+        };
+        let adjustments = super::unsupported_layout_adjustments(&wanted, &actual);
+        assert_eq!(adjustments.len(), 2);
+        assert!(adjustments[0].contains("activity"));
+        assert!(adjustments[1].contains("skip-switcher"));
+
+        // Older snapshots with no activity metadata must not invent a difference.
+        assert!(
+            super::unsupported_layout_adjustments(&TrackedWindow::default(), &actual).is_empty()
+        );
+        let actual = TrackedWindow {
+            skip_switcher: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::unsupported_layout_adjustments(&TrackedWindow::default(), &actual).len(),
+            1
+        );
+    }
 
     #[test]
     fn restore_spec_cache_expires_without_postponement_and_rechecks_identity() {
