@@ -501,6 +501,8 @@ mod tests {
             kind: "hourly".into(),
             created_at_ms: 1_672_531_200_000,
             window_count: 50,
+            daemon_version: None,
+            daemon_build_id: None,
         };
         assert_eq!(snapshot_label(&snapshot), "Hourly 2023-01-01 00:00 UTC");
         snapshot.created_at_ms += 3_600_000;
@@ -516,6 +518,42 @@ mod tests {
         assert!(
             format_activation_time(Some(1_672_531_200_123))
                 .starts_with("2023-01-01 00:00:00.123 UTC (")
+        );
+    }
+
+    #[test]
+    fn snapshot_daemon_labels_show_the_saved_producer_and_accept_legacy_responses() {
+        let mut snapshot: applicationlauncher::tracker::SnapshotSummary = serde_json::from_str(
+            r#"{"id":1,"name":null,"kind":"recent","created_at_ms":123,"window_count":50}"#,
+        )
+        .unwrap();
+        assert_eq!(snapshot.daemon_version, None);
+        assert_eq!(snapshot.daemon_build_id, None);
+        assert_eq!(
+            snapshot_daemon_label(&snapshot),
+            "Daemon version not recorded"
+        );
+
+        snapshot.daemon_version = Some("0.3.0".into());
+        snapshot.daemon_build_id =
+            Some("0.3.0-release-x86_64-unknown-linux-gnu-0123456789abcdef".into());
+        assert_eq!(
+            snapshot_daemon_label(&snapshot),
+            "Daemon 0.3.0 - build 0123456789abcdef"
+        );
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        let decoded =
+            serde_json::from_str::<applicationlauncher::tracker::SnapshotSummary>(&encoded)
+                .unwrap();
+        assert_eq!(decoded, snapshot);
+
+        snapshot.daemon_build_id = None;
+        assert_eq!(snapshot_daemon_label(&snapshot), "Daemon 0.3.0");
+        snapshot.daemon_version = Some(" ".into());
+        snapshot.daemon_build_id = Some(String::new());
+        assert_eq!(
+            snapshot_daemon_label(&snapshot),
+            "Daemon version not recorded"
         );
     }
 

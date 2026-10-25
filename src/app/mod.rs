@@ -188,6 +188,30 @@ fn snapshot_label(snapshot: &applicationlauncher::tracker::SnapshotSummary) -> S
     }
 }
 
+fn snapshot_daemon_label(snapshot: &applicationlauncher::tracker::SnapshotSummary) -> String {
+    let version = snapshot
+        .daemon_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map(|version| format!("Daemon {version}"))
+        .unwrap_or_else(|| "Daemon version not recorded".into());
+    let Some(build) = snapshot
+        .daemon_build_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|build| !build.is_empty())
+    else {
+        return version;
+    };
+    let short_build = build
+        .rsplit('-')
+        .next()
+        .filter(|suffix| suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .unwrap_or(build);
+    format!("{version} - build {short_build}")
+}
+
 fn format_last_activation_age(timestamp_ms: Option<i64>) -> String {
     let Some(timestamp_ms) = timestamp_ms.filter(|timestamp| *timestamp > 0) else {
         return "-".to_string();
@@ -639,6 +663,10 @@ impl App {
                                                 }));
                                             }
                                         });
+                                        ui.weak(egui::RichText::new(snapshot_daemon_label(snapshot)).small())
+                                            .on_hover_text(snapshot.daemon_build_id.as_deref().unwrap_or(
+                                                "The saving daemon's build identity was not recorded for this snapshot.",
+                                            ));
                                     });
                                     ui.separator();
                                 }

@@ -269,6 +269,10 @@ The launcher writes its runtime data to:
   Stores pinned application desktop file paths in display order.
 - `$XDG_STATE_HOME/applicationlauncher/history.sqlite3`
   Private SQLite WAL database containing current windows, closed-window history, recovery state, up to 120 five-minute snapshots plus 120 older hourly snapshots, and named snapshots. Named snapshots remain until manually deleted; automatic snapshot retention does not prune closed-window history.
+  Each new snapshot records the saving daemon's version and source-build identity.
+  Saved sessions displays both, with the full build identity available on hover.
+  Older snapshots without this metadata show `Daemon version not recorded`;
+  upgrading or promoting a snapshot to the hourly tier does not rewrite its producer.
 - `$HOME/.config/systemd/user/applicationlauncherd.service`
   Auto-installed tracker service with restart-on-failure behavior.
 - `$HOME/.local/bin/applicationlauncherd`

@@ -234,6 +234,10 @@ pub struct SnapshotSummary {
     pub kind: String,
     pub created_at_ms: i64,
     pub window_count: usize,
+    #[serde(default)]
+    pub daemon_version: Option<String>,
+    #[serde(default)]
+    pub daemon_build_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

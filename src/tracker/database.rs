@@ -33,7 +33,7 @@ impl TrackerDatabase {
             .mode(0o600)
             .open(path)
             .map_err(|err| err.to_string())?;
-        let connection = Connection::open(path).map_err(|err| err.to_string())?;
+        let mut connection = Connection::open(path).map_err(|err| err.to_string())?;
         connection
             .busy_timeout(Duration::from_secs(2))
             .map_err(|err| err.to_string())?;
@@ -55,7 +55,8 @@ impl TrackerDatabase {
                  CREATE INDEX IF NOT EXISTS history_closed_idx ON history(closed_at_ms DESC);
                  CREATE TABLE IF NOT EXISTS snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, kind TEXT NOT NULL,
-                    created_at_ms INTEGER NOT NULL, boot_id TEXT NOT NULL
+                    created_at_ms INTEGER NOT NULL, boot_id TEXT NOT NULL,
+                    daemon_version TEXT, daemon_build_id TEXT
                  );
                  CREATE INDEX IF NOT EXISTS snapshots_kind_id_idx ON snapshots(kind, id DESC);
                  CREATE TABLE IF NOT EXISTS snapshot_windows (
@@ -82,6 +83,7 @@ impl TrackerDatabase {
                 schema_version, SCHEMA_VERSION
             ));
         }
+        migrate_snapshot_provenance(&mut connection)?;
         connection
             .execute(
                 "INSERT INTO meta(key,value) VALUES('schema_version',?1) ON CONFLICT(key) DO NOTHING",
@@ -525,7 +527,7 @@ impl TrackerDatabase {
     }
 
     pub fn snapshots(&self) -> Result<Vec<SnapshotSummary>, String> {
-        let mut statement = self.connection.prepare("SELECT s.id,s.name,s.kind,s.created_at_ms,COUNT(w.ordinal) FROM snapshots s LEFT JOIN snapshot_windows w ON w.snapshot_id=s.id GROUP BY s.id ORDER BY s.created_at_ms DESC,s.id DESC").map_err(|err| err.to_string())?;
+        let mut statement = self.connection.prepare("SELECT s.id,s.name,s.kind,s.created_at_ms,COUNT(w.ordinal),s.daemon_version,s.daemon_build_id FROM snapshots s LEFT JOIN snapshot_windows w ON w.snapshot_id=s.id GROUP BY s.id ORDER BY s.created_at_ms DESC,s.id DESC").map_err(|err| err.to_string())?;
         let rows = statement
             .query_map([], |row| {
                 Ok(SnapshotSummary {
@@ -534,6 +536,8 @@ impl TrackerDatabase {
                     kind: row.get(2)?,
                     created_at_ms: row.get(3)?,
                     window_count: row.get::<_, i64>(4)? as usize,
+                    daemon_version: row.get(5)?,
+                    daemon_build_id: row.get(6)?,
                 })
             })
             .map_err(|err| err.to_string())?;
@@ -642,6 +646,33 @@ fn hourly_promotion_phase(connection: &Connection) -> Result<u8, String> {
     Ok(phase)
 }
 
+fn migrate_snapshot_provenance(connection: &mut Connection) -> Result<(), String> {
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|err| err.to_string())?;
+    let columns = {
+        let mut statement = tx
+            .prepare("PRAGMA table_info(snapshots)")
+            .map_err(|err| err.to_string())?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|err| err.to_string())?
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(|err| err.to_string())?
+    };
+    // Nullable additive columns preserve old records and compatibility with old writers.
+    for column in ["daemon_version", "daemon_build_id"] {
+        if !columns.contains(column) {
+            tx.execute(
+                &format!("ALTER TABLE snapshots ADD COLUMN {column} TEXT"),
+                [],
+            )
+            .map_err(|err| err.to_string())?;
+        }
+    }
+    tx.commit().map_err(|err| err.to_string())
+}
+
 fn insert_snapshot(
     tx: &Transaction<'_>,
     name: Option<&str>,
@@ -651,8 +682,8 @@ fn insert_snapshot(
     created_at_ms: i64,
 ) -> Result<i64, String> {
     tx.execute(
-        "INSERT INTO snapshots(name,kind,created_at_ms,boot_id) VALUES(?1,?2,?3,?4)",
-        params![name, kind, created_at_ms, boot_id],
+        "INSERT INTO snapshots(name,kind,created_at_ms,boot_id,daemon_version,daemon_build_id) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![name, kind, created_at_ms, boot_id, env!("CARGO_PKG_VERSION"), crate::BUILD_ID],
     )
     .map_err(|err| err.to_string())?;
     let id = tx.last_insert_rowid();
@@ -764,6 +795,146 @@ pub(super) fn test_database() -> (TrackerDatabase, TestDatabaseDirectory) {
 mod tests {
     use super::*;
     use crate::tracker::{TrackedWindow, now_ms};
+
+    #[test]
+    fn snapshots_record_the_saving_daemon_version_and_build_for_all_capture_paths() {
+        let (mut database, _directory) = test_database();
+        let entries = periodic_entries();
+        let named = database
+            .create_snapshot_with_entries(Some("Manual"), "named", "boot", &entries, 1)
+            .unwrap();
+        let recovery = database
+            .create_snapshot_with_entries(None, "recovery", "boot", &entries, 2)
+            .unwrap();
+        let recent = database
+            .create_periodic_snapshot_if_due("boot", &entries, 3)
+            .unwrap()
+            .unwrap();
+        for id in [named, recovery, recent] {
+            let producer: (String, String) = database
+                .connection
+                .query_row(
+                    "SELECT daemon_version,daemon_build_id FROM snapshots WHERE id=?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(producer.0, env!("CARGO_PKG_VERSION"));
+            assert_eq!(producer.1, crate::BUILD_ID);
+            let summary = database.snapshot(id).unwrap().unwrap().summary;
+            assert_eq!(summary.daemon_version.as_deref(), Some(producer.0.as_str()));
+            assert_eq!(
+                summary.daemon_build_id.as_deref(),
+                Some(producer.1.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_snapshot_migration_preserves_windows_without_inventing_daemon_versions() {
+        let (_database, directory) = test_database();
+        let path = directory.0.join("legacy.sqlite3");
+        let legacy = Connection::open(&path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, kind TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL, boot_id TEXT NOT NULL
+                 );
+                 CREATE TABLE snapshot_windows (
+                    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+                    ordinal INTEGER NOT NULL, payload_json TEXT NOT NULL,
+                    restore_json TEXT NOT NULL, PRIMARY KEY(snapshot_id, ordinal)
+                 );
+                 INSERT INTO snapshots(name,kind,created_at_ms,boot_id)
+                    VALUES('Original session','named',123,'old-boot');",
+            )
+            .unwrap();
+        let entries = periodic_entries();
+        legacy
+            .execute(
+                "INSERT INTO snapshot_windows VALUES(1,0,?1,?2)",
+                params![
+                    serde_json::to_string(&entries[0].0).unwrap(),
+                    serde_json::to_string(&entries[0].1).unwrap(),
+                ],
+            )
+            .unwrap();
+        drop(legacy);
+
+        let mut database = TrackerDatabase::open(&path).unwrap();
+        let original = database.snapshot(1).unwrap().unwrap();
+        assert_eq!(original.windows, entries);
+        assert_eq!(original.summary.name.as_deref(), Some("Original session"));
+        assert_eq!(original.summary.daemon_version, None);
+        assert_eq!(original.summary.daemon_build_id, None);
+        let new = database
+            .create_snapshot_with_entries(Some("New"), "named", "new-boot", &entries, 456)
+            .unwrap();
+        // Old writers remain compatible and leave producer metadata explicitly unknown.
+        database
+            .connection
+            .execute(
+                "INSERT INTO snapshots(name,kind,created_at_ms,boot_id)
+                    VALUES('Old writer','named',789,'old-boot')",
+                [],
+            )
+            .unwrap();
+        let old_writer = database.connection.last_insert_rowid();
+        drop(database);
+
+        for _ in 0..2 {
+            let database = TrackerDatabase::open(&path).unwrap();
+            assert_eq!(database.snapshot(1).unwrap().unwrap(), original);
+            let summary = database.snapshot(new).unwrap().unwrap().summary;
+            assert_eq!(
+                summary.daemon_version.as_deref(),
+                Some(env!("CARGO_PKG_VERSION"))
+            );
+            assert_eq!(summary.daemon_build_id.as_deref(), Some(crate::BUILD_ID));
+            let summary = database.snapshot(old_writer).unwrap().unwrap().summary;
+            assert_eq!(summary.daemon_version, None);
+            assert_eq!(summary.daemon_build_id, None);
+        }
+    }
+
+    #[test]
+    fn hourly_promotion_and_reopening_preserve_the_original_snapshot_daemon_build() {
+        let (mut database, _directory) = test_database();
+        let path = database.path().to_path_buf();
+        let entries = periodic_entries();
+        let original = database
+            .create_periodic_snapshot_if_due("boot", &entries, PERIODIC_SNAPSHOT_INTERVAL_MS)
+            .unwrap()
+            .unwrap();
+        database
+            .connection
+            .execute(
+                "UPDATE snapshots SET daemon_version='0.3.0',daemon_build_id='original-daemon-build' WHERE id=?1",
+                [original],
+            )
+            .unwrap();
+        for capture in 2..=MAX_RECENT_SNAPSHOTS + 1 {
+            database
+                .create_periodic_snapshot_if_due(
+                    "boot",
+                    &entries,
+                    capture * PERIODIC_SNAPSHOT_INTERVAL_MS,
+                )
+                .unwrap()
+                .unwrap();
+        }
+        drop(database);
+        let database = TrackerDatabase::open(&path).unwrap();
+        let snapshot = database.snapshot(original).unwrap().unwrap();
+        assert_eq!(snapshot.summary.kind, "hourly");
+        assert_eq!(snapshot.summary.daemon_version.as_deref(), Some("0.3.0"));
+        assert_eq!(
+            snapshot.summary.daemon_build_id.as_deref(),
+            Some("original-daemon-build")
+        );
+        assert_eq!(snapshot.windows, entries);
+    }
 
     #[test]
     fn current_window_delta_writes_only_changed_ids_and_preserves_other_records() {
