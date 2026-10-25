@@ -1952,73 +1952,6 @@ impl Drop for TerminalUpgradeProtection {
     }
 }
 
-impl super::terminal_upgrade::UpgradeBackend for Runtime {
-    fn windows(&self) -> Vec<TrackedWindow> {
-        self.windows()
-    }
-
-    fn backup(
-        &self,
-        all_windows: &[TrackedWindow],
-        targets: &[super::terminal_upgrade::UpgradeTarget],
-    ) -> Result<i64, String> {
-        let (boot, stored) = {
-            let state = self.0.state.lock().unwrap();
-            (state.boot_id.clone(), state.restore_specs.clone())
-        };
-        let mut entries = all_windows
-            .iter()
-            .map(|window| {
-                let mut restore = stored
-                    .get(&window.id)
-                    .cloned()
-                    .unwrap_or_else(|| super::infer_restore_spec(window));
-                if let Some(target) = targets.iter().find(|target| target.window.id == window.id) {
-                    restore.terminal_tabs = target.restore_tabs();
-                }
-                (window.clone(), restore)
-            })
-            .collect::<Vec<_>>();
-        entries.sort_by_key(|(window, _)| window.stacking_order);
-        self.0
-            .database
-            .lock()
-            .unwrap()
-            .create_terminal_upgrade_backup(&boot, &entries)
-    }
-
-    fn preflight(&self, target: &super::terminal_upgrade::UpgradeTarget) -> Result<(), String> {
-        super::terminal_upgrade::preflight_target(target, &self.windows())
-    }
-
-    fn launch_and_verify(
-        &self,
-        target: &super::terminal_upgrade::UpgradeTarget,
-    ) -> Result<String, String> {
-        super::terminal_upgrade::launch_replacement(target, || self.windows())
-    }
-
-    fn close_and_wait(
-        &self,
-        target: &super::terminal_upgrade::UpgradeTarget,
-    ) -> Result<(), String> {
-        let result = super::terminal_upgrade::close_original(target, || self.windows());
-        if result.is_ok() {
-            self.0
-                .state
-                .lock()
-                .unwrap()
-                .terminal_upgrade_closed
-                .insert(target.window.id.clone());
-        }
-        result
-    }
-
-    fn finish_layout(&self, windows: &[(TrackedWindow, String)]) -> Result<(), String> {
-        super::restore::restore_stacking(windows)
-    }
-}
-
 #[interface(name = "com.terrydaktal.ApplicationLauncher.Tracker1", spawn = false)]
 impl TrackerApi {
     #[zbus(name = "BeginTerminalUpgradePreview")]
@@ -2072,8 +2005,8 @@ impl TrackerApi {
                     .spawn(move || {
                         let _protection = protection;
                         let worker = crate::observability::register_worker("terminal-upgrade");
-                        worker.set_state("backing-up-and-restarting-terminals");
-                        work.run(&runtime);
+                        worker.set_state("requesting-terminal-owned-updates");
+                        work.run();
                     })
                     .map_err(|err| err.to_string())?;
             }

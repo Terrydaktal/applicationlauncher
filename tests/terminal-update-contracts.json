@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "profile": "release",
+  "scope": "Optional delegation to terminal-owned updates; no launcher-owned replacement backend",
+  "behaviors": [
+    {
+      "id": "TERMUPDATE-CLIENT-01",
+      "contract": "Updater service names are restricted to the terminal-owned private namespace",
+      "tests": [
+        "delegated_update_service_is_bounded_and_cannot_target_an_arbitrary_bus_name"
+      ]
+    },
+    {
+      "id": "TERMUPDATE-CLIENT-02",
+      "contract": "Previews are bounded, confirmed, single-use and superseded safely",
+      "tests": [
+        "delegated_previews_are_bounded_single_use_and_require_confirmation"
+      ]
+    },
+    {
+      "id": "TERMUPDATE-CLIENT-03",
+      "contract": "Private-bus requests delegate once, do not use a launch/close backend, tolerate changing captions for single-window processes and refuse ambiguous shared windows",
+      "tests": [
+        "private_bus_update_requests_are_delegated_once_and_ambiguous_windows_are_refused"
+      ]
+    }
+  ],
+  "terminal_transaction_contracts": "xfce4-terminal:tests/update-in-place-contracts.json"
+}

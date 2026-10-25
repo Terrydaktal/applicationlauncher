@@ -10,13 +10,13 @@ use crate::models::TerminalMaintenanceState;
 const POPUP_ID: &str = "terminal_maintenance_popup";
 
 pub(crate) fn settings_button(ui: &mut egui::Ui, shared: &Arc<Mutex<TerminalMaintenanceState>>) {
-    if ui.button("Restart terminal windows...").clicked() {
+    if ui.button("Update outdated terminal windows...").clicked() {
         if let Ok(mut state) = shared.lock() {
             state.open = true;
         }
         ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
     }
-    ui.small("Preview, back up and restart verified XFCE4 Terminal windows using their latest built binary.");
+    ui.small("Preview, back up and restart only outdated XFCE4 Terminal windows. Windows already running their latest built binary are left untouched.");
 }
 
 impl App {
@@ -56,7 +56,7 @@ impl App {
         ctx.show_viewport_deferred(
             egui::ViewportId::from_hash_of(POPUP_ID),
             egui::ViewportBuilder::default()
-                .with_title("Restart Terminal Windows")
+                .with_title("Update Terminal Windows")
                 .with_inner_size([820.0, 620.0])
                 .with_min_inner_size([560.0, 380.0])
                 .with_resizable(true)
@@ -105,8 +105,9 @@ enum Action {
 
 fn panel(ui: &mut egui::Ui, state: &mut TerminalMaintenanceState) -> Option<Action> {
     let mut action = None;
-    ui.heading("Restart Terminal Windows");
-    ui.label("The daemon saves a permanent backup before changing any window, then restarts each selected terminal individually and verifies its binary, tabs, position and size.");
+    ui.heading("Update Terminal Windows");
+    ui.label("Each selected terminal manages its own update, confirmation, recovery commands and KWin placement. Application Launcher only requests the update and observes its result.");
+    ui.small("Only outdated builds can be selected. Up-to-date windows are not restarted.");
     ui.colored_label(egui::Color32::from_rgb(240, 196, 92), "Non-tmux programs are interrupted. Scrollback, unsaved shell state and in-flight work cannot be preserved. Unsupported or changed windows are skipped; there is no force-kill.");
     ui.small("tmux tabs reattach to their exact surviving sessions before their old window closes. Activity is not always visible in inactive tabs; review the complete tab list.");
     ui.separator();
@@ -122,6 +123,12 @@ fn panel(ui: &mut egui::Ui, state: &mut TerminalMaintenanceState) -> Option<Acti
         .is_some_and(|report| report.phase == TerminalUpgradePhase::Ready)
         && !state.worker_running;
     if let Some(report) = &state.report {
+        state.selected.retain(|id| {
+            report
+                .windows
+                .iter()
+                .any(|window| window.window_id == *id && window.eligible)
+        });
         ui.label(&report.message);
         if let Some(id) = report.backup_snapshot_id {
             ui.label(format!(
@@ -180,7 +187,7 @@ fn panel(ui: &mut egui::Ui, state: &mut TerminalMaintenanceState) -> Option<Acti
         if ui
             .add_enabled(
                 ready && state.confirmed && !state.selected.is_empty(),
-                egui::Button::new("Back up and restart selected terminals"),
+                egui::Button::new("Request updates in selected terminals"),
             )
             .clicked()
         {
@@ -211,6 +218,8 @@ mod tests {
                 phase: TerminalUpgradePhase::Ready,
                 windows: vec![TerminalUpgradeWindow {
                     window_id: "supported".into(),
+                    terminal_window_uuid: "fixture-window-uuid".into(),
+                    owner_pid: 123,
                     title: "codex - fixture - Terminal".into(),
                     tabs: vec!["codex - /fixture (active)".into()],
                     eligible: true,
@@ -291,12 +300,12 @@ mod tests {
             assert!(render(&ctx, &mut state, vec![]).1.is_none());
         }
         let (output, _) = render(&ctx, &mut state, vec![]);
-        let position = button_center(&output, "Back up and restart selected terminals");
+        let position = button_center(&output, "Request updates in selected terminals");
         assert!(render(&ctx, &mut state, click(position)).1.is_none());
         assert!(!state.confirmed);
         state.confirmed = true;
         let (output, _) = render(&ctx, &mut state, vec![]);
-        let position = button_center(&output, "Back up and restart selected terminals");
+        let position = button_center(&output, "Request updates in selected terminals");
         match render(&ctx, &mut state, click(position)).1 {
             Some(Action::Start { id, selected }) => {
                 assert_eq!(id, "fixture-only-no-live-IPC");
@@ -320,9 +329,31 @@ mod tests {
                 state.selected.clear();
             }
             let (output, _) = render(&ctx, &mut state, vec![]);
-            let position = button_center(&output, "Back up and restart selected terminals");
+            let position = button_center(&output, "Request updates in selected terminals");
             assert!(render(&ctx, &mut state, click(position)).1.is_none());
         }
+    }
+
+    #[test]
+    fn up_to_date_terminal_cannot_be_selected_or_restarted_even_with_stale_selection() {
+        let ctx = egui::Context::default();
+        let mut state = state();
+        state.confirmed = true;
+        let window = &mut state.report.as_mut().unwrap().windows[0];
+        window.eligible = false;
+        window.recommended = false;
+        window.status = "up_to_date".into();
+        window.message = "Already running the latest built binary; left untouched".into();
+        let title = window.title.clone();
+        let (output, action) = render(&ctx, &mut state, vec![]);
+        assert!(action.is_none());
+        assert!(state.selected.is_empty());
+        let checkbox = button_center(&output, &title);
+        assert!(render(&ctx, &mut state, click(checkbox)).1.is_none());
+        assert!(state.selected.is_empty());
+        let (output, _) = render(&ctx, &mut state, vec![]);
+        let restart = button_center(&output, "Request updates in selected terminals");
+        assert!(render(&ctx, &mut state, click(restart)).1.is_none());
     }
 }
 

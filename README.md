@@ -50,7 +50,7 @@
 - `src/main.rs`: GUI CLI parsing, single-instance startup, and native window creation.
 - `src/app/`: Launcher state, feeds, commands, search-row rendering, settings, popups, and the `eframe` update loop.
 - `src/app/terminal_maintenance.rs`: Separate terminal-restart confirmation/progress popup. Uses background D-Bus requests and never closes or launches terminals itself.
-- `src/tracker/terminal_upgrade.rs`: On-demand daemon-owned terminal inspection, bounded restart plans, explicit confirmation, pinned replacement binaries and per-window restart/verification. Receives the current tracked windows and selected plan IDs; produces a preview, named backup and progress/failure report.
+- `src/tracker/terminal_upgrade.rs`: Optional bulk-request adapter for terminal-owned updates. Maps tracked windows conservatively to terminal UUIDs, requests updates through their D-Bus APIs and observes results; never launches replacements or closes terminals.
 - `src/launch/`: Desktop-entry parsing and application/window launch actions.
 - `src/audio.rs`: Stream-to-app/window attribution, volume controls and measured icon-ring rendering.
 - `src/audio/monitor.rs`: Named background worker using native PulseAudio per-playback-stream monitors. Publishes a single replaceable latest-result slot; never records a microphone or the mixed desktop output.
@@ -305,56 +305,31 @@ Current settings cover:
 
 ## Terminal Maintenance
 
-Open `F10` -> `Terminal Maintenance` -> `Restart terminal windows...`.
-Opening the separate popup only inspects terminals. Review every tab, select
-windows, acknowledge the possible loss of unsaved state, then press
-`Back up and restart selected terminals`. Busy windows are not selected by
-default. Windows already running their current on-disk executable need no
-restart and are excluded.
+Open `F10` -> `Terminal Maintenance` -> `Update outdated terminal windows...`.
+The popup is an optional client of XFCE Terminal's own update API. It queries
+`GetUpdateStatus(window_uuid)` on each terminal's unique D-Bus owner and sends
+`UpdateInPlace(window_uuid)` for selected outdated windows. The terminal owns
+confirmation, executable pinning, application resume, private recovery commands,
+startup gates and KWin placement; Application Launcher does not launch replacements
+or close terminal windows. Non-tmux confirmation still appears in the terminal.
 
-The daemon first commits a FULL-synchronous named backup, retained until manually
-deleted in `F9` -> `Saved sessions` as `Before terminal restart ...`. It records
-window geometry, desktop, minimized/maximized state, stacking and all verified
-tabs with their directories, active-tab selection and allowlisted restore data.
-Replacement executables are pinned from the real running terminal's original
-filesystem path; this uses the currently built binary at that path, not a source
-scan or automatic compilation. The preview displays its path, build ID when
-available and SHA256. A replaced binary or changed window/tab identity invalidates
-the preview instead of guessing.
+The popup observes the returned terminal-owned helper service and reports its
+result. Closing or restarting Application Launcher does not cancel that helper.
+Duplicate starts do not repeat requests. An ambiguous shared-process window or a
+terminal without the new API is ineligible rather than using a daemon-owned
+fallback. Old running terminals need one manual restart to acquire the new API.
+The old `BeginTerminalUpdatePreview` endpoint and tracker-owned replacement worker
+have been removed. Existing saved sessions, automatic snapshots, terminal session
+restoration and old named backups remain supported and are not deleted.
 
-Restarts run one window at a time in the daemon, off the GUI/event loop. New
-windows use `--disable-server` and independent systemd scopes, so they cannot
-accidentally reuse the old terminal server or be killed when the launcher or
-daemon stops. The worker verifies the replacement executable, every tab and
-placement before reporting success, then restores stacking and focus. Closing
-the popup or launcher does not cancel an already confirmed daemon job. Reopening
-the popup resumes progress reporting; refresh the preview for a new operation.
+XFCE Terminal's right-click **Update in Place** works without Application Launcher
+or its tracking daemon. New recovery metadata belongs to the terminal under
+`~/.local/state/xfce4-terminal/updates/`, not to the tracker snapshot database.
+Window identity mapping uses the terminal owner PID and lifetime UUID; identical
+captions in one shared process are refused rather than guessed. There is no
+terminal-maintenance scanning during ordinary launcher use.
 
-All-tmux windows attach to their exact surviving server/session identities and
-are verified before the original window is asked to close. Ordinary terminals
-close before their programs restart, and the worker verifies the original
-non-tmux process has exited to avoid simultaneous writers to a Codex session.
-Supported replay is fish/bash/zsh login shells, `htop`, `nvtop`, `agy -c`
-and Codex by its **exact** session ID, read from its open rollout metadata or
-explicit resume arguments. This action never guesses with `codex resume --last`.
-Multi-tab upgrade backups require their saved tmux sessions to remain available
-when restored; they do not pretend to recover tmux pane memory after a server
-exit or reboot.
-
-SSH, arbitrary programs, missing metadata, ambiguous shared-server windows,
-background jobs and invalid placement are skipped. Scrollback, shell variables
-and in-flight non-tmux work are not recoverable. Activity in inactive tabs cannot
-always be determined: review all tabs before confirming. XFCE may require its own
-close confirmation; a close that does not complete within 30 seconds is reported
-without force-killing or repeating the request. Failed items are reported
-individually and the backup remains available. Confirmation plans expire after
-five minutes, detailed previews and reports are bounded, and duplicate starts do
-not repeat a restart. No terminal-maintenance polling or scanning runs during
-ordinary launcher use.
-
-Automated verification uses fake backends, temporary databases, argument
-inspection and headless egui rendering. These tests do not restart live terminals
-or attach to the user's desktop:
+Isolated adapter and popup checks:
 
 ```bash
 cargo test --lib terminal_upgrade
