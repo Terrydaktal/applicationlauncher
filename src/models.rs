@@ -26,6 +26,8 @@ pub struct PactlSinkInput {
     pub volume: HashMap<String, PactlVolumeChannel>,
     #[serde(default)]
     pub properties: HashMap<String, String>,
+    #[serde(skip)]
+    pub process_ancestors: Vec<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

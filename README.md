@@ -140,6 +140,14 @@ The project builds a native `eframe` / `egui` GUI and a separate user-session da
 
   Playback-stream change notifications refresh metadata without recreating healthy monitors. PipeWire emits these notifications when a monitor is attached, so treating every change as a disconnection would create a feedback loop and overload the shared audio services. Removal/replacement still invalidates immediately; refreshed identity, device, mute and cork state determine whether a monitor actually needs replacing.
 
+  Audio helpers such as Chrome's separate audio process are matched to their
+  owning browser process using verified same-executable ancestry. This runs only
+  during background metadata discovery, is capped at 16 parents, and stops before
+  unrelated shells or terminals. Distinct browser instances can therefore show
+  playback on the correct window even when their stream only says `Playback`.
+  Multiple windows sharing the same browser process remain ambiguous without a
+  browser-side bridge; the launcher does not guess from the current tab title.
+
   Window waveforms still require an unambiguous stream owner. A shared browser PID or application name alone does not identify which window contains a playing background tab. When window-specific metadata is unavailable or ambiguous, audio remains indicated on the application tile instead of marking every window as playing. Volume controls remain application/process-wide. Matching uses the full window list, not just the currently searched results, and is cached separately from sample updates.
 
   With the optional Firefox AutoConfig bridge installed, the launcher uses Firefox's own audible-tab ownership, including background tabs. A single audible browser window owns that process's measured sound; simultaneous audible windows require exact stream/tab title matches. Window binding requires an exact unique raw title and PID. Duplicate window/track titles or an out-of-date title cannot assign sound to the wrong window: they withhold the window waveform rather than guess. Firefox's delayed speaker-icon removal is explicitly excluded so pause/mute clears ownership promptly. Private runtime files expire after 12 seconds and include the process start identity, preventing PID reuse or browser crashes from retaining old ownership. A stopped reader also expires on the GUI side. No browser I/O is performed during rendering.

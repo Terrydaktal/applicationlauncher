@@ -517,11 +517,12 @@ impl Engine {
                     self.outputs = std::mem::take(&mut discovery.outputs);
                     discovery.invalidated.clear();
                     discovery.invalidate_all = false;
-                    let metadata: Vec<_> = self
+                    let mut metadata: Vec<_> = self
                         .inputs
                         .values()
                         .map(|input| input.metadata.clone())
                         .collect();
+                    super::ownership::resolve(&mut metadata);
                     if *self.metadata != metadata {
                         self.metadata = Arc::new(metadata);
                     }
@@ -789,6 +790,7 @@ extern "C" fn input_info(
                 mute: info.mute != 0,
                 volume,
                 properties,
+                process_ancestors: Vec::new(),
             },
         },
     );

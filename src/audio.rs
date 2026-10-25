@@ -9,6 +9,7 @@ use crate::models::{AppInfo, AudioVisualization, PactlSinkInput, WindowAudioCach
 mod analysis;
 mod firefox;
 mod monitor;
+mod ownership;
 pub(crate) use firefox::{
     FIREFOX_WORKER_TIMEOUT, FirefoxAudioInbox, FirefoxAudioProcess, apply_firefox_attribution,
     start_firefox_audio_bridge,
@@ -103,7 +104,7 @@ pub(crate) fn sink_match_signature(cache: &WindowAudioCache) -> HashMap<String, 
 
 #[derive(Default)]
 struct SinkWindowAttribution<'a> {
-    strength: u8,
+    strength: (u8, std::cmp::Reverse<usize>),
     candidates: usize,
     window_id: Option<&'a str>,
 }
@@ -123,13 +124,19 @@ pub(crate) fn build_window_audio_cache(
                 .and_then(|pid| pid.parse::<i32>().ok())
                 .filter(|pid| *pid > 0);
             let strength = if pid.is_some() && window.pid == pid {
-                3
+                (3, std::cmp::Reverse(0))
             } else if pid
                 .is_some_and(|pid| window.process_chain.iter().any(|entry| entry.pid == pid))
             {
-                2
+                (2, std::cmp::Reverse(0))
+            } else if let Some(distance) = window.pid.and_then(|pid| {
+                sink.process_ancestors
+                    .iter()
+                    .position(|ancestor| *ancestor == pid)
+            }) {
+                (2, std::cmp::Reverse(distance + 1))
             } else {
-                1
+                (1, std::cmp::Reverse(0))
             };
             let owner = owners.entry(sink.index).or_default();
             if strength < owner.strength {
@@ -306,16 +313,19 @@ pub(crate) fn find_sink_inputs_for_window(
         }
     }
 
-    // 2. Try to match by process chain PIDs
+    // 2. Try verified audio-helper parents or the window's own process chain.
     if matches.is_empty() {
-        for entry in &window.process_chain {
-            let pid_str = entry.pid.to_string();
-            for sink in sink_inputs {
-                if let Some(pid_val) = sink.properties.get("application.process.id") {
-                    if pid_val == &pid_str {
-                        matches.push(sink.clone());
-                    }
-                }
+        for sink in sink_inputs {
+            let sink_pid = sink.properties.get("application.process.id");
+            if window
+                .pid
+                .is_some_and(|pid| sink.process_ancestors.contains(&pid))
+                || window
+                    .process_chain
+                    .iter()
+                    .any(|entry| sink_pid.is_some_and(|pid| pid == &entry.pid.to_string()))
+            {
+                matches.push(sink.clone());
             }
         }
     }
@@ -366,6 +376,7 @@ pub(crate) fn find_sink_inputs_for_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn painted_bars(size: f32, level: u8) -> Vec<([egui::Pos2; 2], egui::Stroke)> {
         let ctx = egui::Context::default();
@@ -456,6 +467,24 @@ mod tests {
         .unwrap()
     }
 
+    fn chrome_window(id: &str, pid: i32, title: &str) -> WindowInfo {
+        let mut window = firefox_window(id, pid, title);
+        window.class = "Google-chrome".into();
+        window.desktop_file_name = Some("google-chrome".into());
+        window
+    }
+
+    fn chrome_sink(index: u32, pid: i32) -> PactlSinkInput {
+        let mut sink = firefox_sink(index, pid);
+        sink.properties
+            .insert("application.name".into(), "Google Chrome".into());
+        sink.properties
+            .insert("application.process.binary".into(), "chrome".into());
+        sink.properties
+            .insert("media.name".into(), "Playback".into());
+        sink
+    }
+
     struct MeasuredCache {
         level_buckets: HashMap<String, u8>,
         sink_matches: HashMap<String, Vec<PactlSinkInput>>,
@@ -543,6 +572,129 @@ mod tests {
         ];
         let cache = playing_cache(&windows, &[firefox_sink(1, 100)]);
         assert_eq!(cache.level_buckets, HashMap::from([("first".into(), 75)]));
+    }
+
+    #[test]
+    fn verified_audio_descendant_belongs_to_its_browser_window() {
+        let windows = [
+            chrome_window("first", 100, "First window"),
+            chrome_window("second", 200, "Unrelated selected tab"),
+            chrome_window("third", 300, "Third window"),
+        ];
+        let mut sink = chrome_sink(1, 250);
+        sink.process_ancestors = vec![200];
+        assert_eq!(
+            playing_cache(&windows, &[sink]).level_buckets,
+            HashMap::from([("second".into(), 75)])
+        );
+    }
+
+    #[test]
+    fn shared_browser_process_is_still_ambiguous_with_verified_audio_helpers() {
+        let windows = [
+            chrome_window("first", 200, "First window"),
+            chrome_window("second", 200, "Second window"),
+            chrome_window("unrelated", 300, "Other browser instance"),
+        ];
+        let mut sink = chrome_sink(1, 250);
+        sink.process_ancestors = vec![200];
+        assert!(playing_cache(&windows, &[sink]).level_buckets.is_empty());
+    }
+
+    #[test]
+    fn closest_verified_parent_wins_but_not_over_the_exact_stream_process() {
+        let mut windows = vec![
+            chrome_window("distant", 100, "Distant parent"),
+            chrome_window("nearest", 200, "Nearest parent"),
+        ];
+        let mut sink = chrome_sink(1, 250);
+        sink.process_ancestors = vec![200, 100];
+        assert_eq!(
+            playing_cache(&windows, &[sink.clone()]).level_buckets,
+            HashMap::from([("nearest".into(), 75)])
+        );
+        windows.push(chrome_window("direct", 250, "Exact stream process"));
+        assert_eq!(
+            playing_cache(&windows, &[sink]).level_buckets,
+            HashMap::from([("direct".into(), 75)])
+        );
+    }
+
+    #[test]
+    fn untrusted_stream_json_cannot_claim_verified_process_ancestry() {
+        let sink: PactlSinkInput = serde_json::from_value(serde_json::json!({
+            "index": 1,
+            "process_ancestors": [200],
+            "properties": {"application.process.id": "250"}
+        }))
+        .unwrap();
+        assert!(sink.process_ancestors.is_empty());
+    }
+
+    #[test]
+    #[ignore = "read-only live metadata; requires APPLICATIONLAUNCHER_TEST_AUDIO_PID and APPLICATIONLAUNCHER_TEST_AUDIO_OWNER_PID"]
+    fn live_audio_helper_attribution() {
+        let pid = std::env::var("APPLICATIONLAUNCHER_TEST_AUDIO_PID")
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let owner = std::env::var("APPLICATIONLAUNCHER_TEST_AUDIO_OWNER_PID")
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let tracked = applicationlauncher::tracker::TrackerClient::connect()
+            .unwrap()
+            .windows()
+            .unwrap();
+        let windows: Vec<_> = tracked
+            .into_iter()
+            .filter(|win| win.class.to_ascii_lowercase().contains("chrom"))
+            .map(|win| {
+                let mut window = chrome_window(&win.id, win.pid, &win.title);
+                window.class = win.class;
+                window
+            })
+            .collect();
+        assert_eq!(
+            windows.iter().filter(|win| win.pid == Some(owner)).count(),
+            1
+        );
+        let mut command = Command::new("pactl");
+        command.args(["--format=json", "list", "sink-inputs"]);
+        let result =
+            applicationlauncher::process::output_with_timeout(command, Duration::from_secs(3))
+                .unwrap();
+        assert!(result.status.success());
+        let mut sinks: Vec<PactlSinkInput> = serde_json::from_slice(&result.stdout).unwrap();
+        let started = Instant::now();
+        ownership::resolve(&mut sinks);
+        let resolution_us = started.elapsed().as_micros();
+        let sink = sinks
+            .iter()
+            .find(|sink| {
+                sink.properties
+                    .get("application.process.id")
+                    .and_then(|pid| pid.parse::<i32>().ok())
+                    == Some(pid)
+            })
+            .expect("the reported Chrome stream must still exist");
+        assert!(sink.process_ancestors.contains(&owner));
+        let cache = build_window_audio_cache(&windows, &sinks);
+        let owners: Vec<_> = windows
+            .iter()
+            .filter(|win| {
+                cache
+                    .visualization_sinks
+                    .get(&win.id)
+                    .is_some_and(|indices| indices.contains(&sink.index))
+            })
+            .collect();
+        assert_eq!(owners.len(), 1, "stream must route to exactly one window");
+        assert_eq!(owners[0].pid, Some(owner));
+        eprintln!(
+            "{}",
+            serde_json::json!({"stream": sink.index, "audio_pid": pid, "verified_ancestors": sink.process_ancestors, "owning_window": owners[0].id, "browser_pid": owner, "metadata_resolution_us": resolution_us})
+        );
     }
 
     #[test]
