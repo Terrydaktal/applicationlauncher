@@ -1124,6 +1124,47 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "read-only foreground probe; requires APPLICATIONLAUNCHER_TEST_TERMINAL_PID and APPLICATIONLAUNCHER_TEST_TERMINAL_PROGRAM"]
+    fn live_terminal_dbus_foreground_program_and_title() {
+        let pid = std::env::var("APPLICATIONLAUNCHER_TEST_TERMINAL_PID")
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let expected = std::env::var("APPLICATIONLAUNCHER_TEST_TERMINAL_PROGRAM").unwrap();
+        let records = fetch_terminal_dbus_records().unwrap();
+        let record = records
+            .iter()
+            .find(|record| record.active && record.terminal_pid == pid as u32)
+            .expect("the selected terminal must have active D-Bus metadata");
+        let (children, names, parents) = get_process_tree();
+        let window = build_window_info(
+            "read-only-terminal-probe".into(),
+            record.window_title.clone(),
+            "xfce4-terminal".into(),
+            Some("xfce4-terminal.desktop".into()),
+            Some(pid),
+            None,
+            None,
+            "breeze-dark",
+            &mut HashMap::new(),
+            &children,
+            &names,
+            &parents,
+            &records,
+        )
+        .unwrap();
+        eprintln!(
+            "active={:?} process_pid={:?} title={}",
+            window.active_process,
+            window.process_chain.first().map(|process| process.pid),
+            window.title
+        );
+        assert_eq!(window.active_process.as_deref(), Some(expected.as_str()));
+        assert_eq!(window.process_chain.first().unwrap().name, expected);
+        assert!(window.title.starts_with(&format!("{expected} - ")));
+    }
+
+    #[test]
     fn reconciliation_adds_missing_windows_without_dropping_feed_state() {
         let mut existing = test_window_info("old title");
         existing.id = "existing".to_string();

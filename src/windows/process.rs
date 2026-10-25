@@ -129,12 +129,21 @@ pub(crate) fn find_terminal_leaf_with_stat_reader(
     pid_to_name: &HashMap<i32, String>,
     mut stat_for_pid: impl FnMut(i32) -> Option<ProcessStat>,
 ) -> Option<(i32, String)> {
-    let children = ppid_to_children.get(&terminal_pid)?;
-    let root_pid = children
-        .iter()
-        .filter_map(|pid| pid_to_name.get(pid).map(|name| (*pid, name)))
-        .min_by_key(|(pid, name)| (!is_shell(name), *pid))
-        .map(|(pid, _)| pid)?;
+    // D-Bus can supply the foreground shell itself, not its terminal parent.
+    // Keep that shell as the root so every sibling command is considered.
+    let root_pid = if pid_to_name
+        .get(&terminal_pid)
+        .is_some_and(|name| is_shell(name))
+    {
+        terminal_pid
+    } else {
+        ppid_to_children
+            .get(&terminal_pid)?
+            .iter()
+            .filter_map(|pid| pid_to_name.get(pid).map(|name| (*pid, name)))
+            .min_by_key(|(pid, name)| (!is_shell(name), *pid))
+            .map(|(pid, _)| pid)?
+    };
     let root_name = pid_to_name.get(&root_pid)?.clone();
     let Some(terminal_stat) = stat_for_pid(root_pid) else {
         return Some((root_pid, root_name));
@@ -305,4 +314,60 @@ pub(crate) fn summarize_command_line(args: &[String]) -> Option<String> {
 }
 pub(crate) fn process_exists(pid: i32) -> bool {
     Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_foreground_scan_compares_all_sibling_programs() {
+        let stats = [
+            "20 (fish) S 10 20 20 34840 30",
+            "30 (bash) S 20 30 20 34840 30",
+            "40 (ssh) S 30 30 20 34840 30",
+            "50 (pi) S 30 30 20 34840 30",
+            "60 (electron) S 50 60 60 34841 60",
+            "70 (background) S 30 70 20 34840 30",
+        ]
+        .map(|line| parse_proc_stat(line).unwrap())
+        .into_iter()
+        .map(|stat| (stat.pid, stat))
+        .collect::<HashMap<_, _>>();
+        let names = stats
+            .iter()
+            .map(|(&pid, stat)| (pid, stat.name.clone()))
+            .collect();
+        for siblings in [vec![40, 50, 70], vec![70, 50, 40]] {
+            let children = HashMap::from([
+                (10, vec![20]),
+                (20, vec![30]),
+                (30, siblings),
+                (50, vec![60]),
+            ]);
+            for start in [30, 20, 10] {
+                assert_eq!(
+                    find_terminal_leaf_with_stat_reader(start, &children, &names, |pid| stats
+                        .get(&pid)
+                        .cloned()),
+                    Some((50, "pi".into())),
+                    "root={start}: the SSH sibling must not hide Pi; background/detached children must stay excluded"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_idle_shell_is_its_own_foreground_fallback() {
+        let shell = parse_proc_stat("20 (fish) S 10 20 20 34840 20").unwrap();
+        assert_eq!(
+            find_terminal_leaf_with_stat_reader(
+                20,
+                &HashMap::new(),
+                &HashMap::from([(20, "fish".into())]),
+                |pid| (pid == 20).then(|| shell.clone())
+            ),
+            Some((20, "fish".into()))
+        );
+    }
 }
