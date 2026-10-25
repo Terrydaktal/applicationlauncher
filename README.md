@@ -172,7 +172,10 @@ The project builds a native `eframe` / `egui` GUI and a separate user-session da
   * **When the search box is empty:**
     1. **Application window count**: Applications with fewer open windows appear first.
     2. **Application Key**: Terminal/application groups remain together and are ordered alphabetically.
-    3. **Window Title**: Alphabetically after transient braille and attention markers are ignored.
+    3. **Console application**: Within a terminal group, console applications with fewer windows come first, then their application key alphabetically.
+    4. **Tmux priority**: Within each console application, tmux sessions appear before regular terminal windows.
+    5. **Window Title**: Alphabetically after transient braille and attention markers are ignored.
+    The optional recent-first mode orders by last activation instead of these grouping rules.
   * **When a search query is typed:**
     1. **Fuzzy Match Score**: Best metadata match across title, app name, class, executable, desktop entry, and path-like context.
     2. **Application Key**: Alphabetically (case-insensitive) by application class/key.

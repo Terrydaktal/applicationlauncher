@@ -92,6 +92,91 @@ mod tests {
         assert_eq!(cache.get(&changed, true)[0].id, "c2");
     }
 
+    fn console_window(id: &str, program: &str, session: Option<&str>) -> WindowInfo {
+        let mut window = test_window_info(&format!("{program} - {id} - Terminal"));
+        window.id = id.into();
+        window.active_process = Some(program.into());
+        window.command_summary = Some(program.into());
+        if let Some(session) = session {
+            window.title = format!("tmux: {session} - {program}: /project - Terminal");
+            window.tmux_pane = Some(applicationlauncher::tracker::LiveTmuxPane {
+                client_pid: 123,
+                session: applicationlauncher::tracker::TmuxSession {
+                    socket_path: "/tmp/test-tmux.sock".into(),
+                    session_name: session.into(),
+                    ..Default::default()
+                },
+                pane_id: "%0".into(),
+                pane_pid: 4320,
+                process_pid: 4321,
+                process_name: program.into(),
+                cwd: "/project".into(),
+                title: program.into(),
+            });
+        }
+        window
+    }
+
+    #[test]
+    fn console_application_groups_put_tmux_windows_before_regular_windows() {
+        let windows = vec![
+            console_window("codex-regular-z", "codex", None),
+            console_window("htop-regular", "htop", None),
+            console_window("codex-tmux-z", "codex", Some("z")),
+            console_window("fish", "fish", None),
+            console_window("codex-regular-a", "codex", None),
+            console_window("codex-tmux-a", "codex", Some("a")),
+            console_window("htop-tmux", "htop", Some("monitor")),
+        ];
+        let mut cache = helpers::DefaultWindowsCache::default();
+        let rows = cache.get(&windows, false);
+        assert_eq!(
+            rows.iter()
+                .map(|window| window.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "fish",
+                "htop-tmux",
+                "htop-regular",
+                "codex-tmux-a",
+                "codex-tmux-z",
+                "codex-regular-a",
+                "codex-regular-z"
+            ]
+        );
+        assert!(Arc::ptr_eq(&rows, &cache.get(&windows, false)));
+    }
+
+    #[test]
+    fn console_tmux_attachment_changes_invalidate_cached_window_order() {
+        let mut windows = vec![
+            console_window("a", "codex", None),
+            console_window("z", "codex", None),
+        ];
+        let mut cache = helpers::DefaultWindowsCache::default();
+        assert_eq!(cache.get(&windows, false)[0].id, "a");
+        let old = windows[1].clone();
+        windows[1].tmux_pane = console_window("z", "codex", Some("work")).tmux_pane;
+        cache.update(&[(old, windows[1].clone())]);
+        assert_eq!(cache.get(&windows, false)[0].id, "z");
+        let old = windows[1].clone();
+        windows[1].tmux_pane = None;
+        cache.update(&[(old, windows[1].clone())]);
+        assert_eq!(cache.get(&windows, false)[0].id, "a");
+    }
+
+    #[test]
+    fn console_tmux_priority_does_not_override_recent_first_ordering() {
+        let mut regular = console_window("regular", "codex", None);
+        regular.last_activated_at_ms = Some(200);
+        let mut tmux = console_window("tmux", "codex", Some("work"));
+        tmux.last_activated_at_ms = Some(100);
+        let windows = vec![tmux, regular];
+        let mut cache = helpers::DefaultWindowsCache::default();
+        assert_eq!(cache.get(&windows, true)[0].id, "regular");
+        assert_eq!(cache.get(&windows, false)[0].id, "tmux");
+    }
+
     #[test]
     fn incremental_documents_prepare_only_changed_entries_and_drop_removed_entries() {
         let mut windows = vec![test_window_info("first"), test_window_info("second")];

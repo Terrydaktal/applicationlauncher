@@ -70,6 +70,7 @@ impl DefaultWindowsCache {
         if updates.iter().any(|(old, new)| {
             old.last_activated_at_ms != new.last_activated_at_ms
                 || old.activation_sequence != new.activation_sequence
+                || old.tmux_pane.is_some() != new.tmux_pane.is_some()
         }) {
             self.invalidate();
             return;
@@ -159,6 +160,12 @@ impl DefaultWindowsCache {
                             subgroup_count_a
                                 .cmp(&subgroup_count_b)
                                 .then_with(|| subgroup_key_a.cmp(&subgroup_key_b))
+                                .then_with(|| {
+                                    b.window
+                                        .tmux_pane
+                                        .is_some()
+                                        .cmp(&a.window.tmux_pane.is_some())
+                                })
                         }
                         _ => std::cmp::Ordering::Equal,
                     },
