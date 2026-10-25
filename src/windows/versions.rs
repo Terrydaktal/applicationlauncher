@@ -8,6 +8,7 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+mod application;
 mod available;
 mod freshness;
 mod installation;
@@ -16,6 +17,7 @@ mod node;
 mod pi;
 mod script;
 
+pub(crate) use application::{ApplicationInfo, ApplicationInfoUpdate, inspect_application};
 pub(crate) use available::PackageTarget;
 pub(crate) use installation::ProgsMetadata;
 pub(crate) use lookup::PI_RECEIPT_REFRESH;
@@ -117,6 +119,7 @@ fn version_argument(name: &str) -> Option<&'static str> {
     match name {
         "tmux" => Some("-V"),
         "java" => Some("-version"),
+        "chrome" | "chromium" | "chromium-browser" => Some("--product-version"),
         "xfce4-terminal" | "fish" | "bash" | "zsh" | "bwrap" | "codex" | "codex-code-mode"
         | "htop" | "nvtop" | "python" | "python3" | "node" | "firefox" | "dolphin" | "pcmanfm"
         | "mousepad" | "copyq" | "konsole" | "alacritty" | "kitty" | "mpv" | "vim" | "nvim" => {
@@ -438,6 +441,7 @@ mod tests {
         assert_eq!(version_argument("tmux"), Some("-V"));
         assert_eq!(version_argument("bwrap"), Some("--version"));
         assert_eq!(version_argument("java"), Some("-version"));
+        assert_eq!(version_argument("chrome"), Some("--product-version"));
         assert_eq!(version_argument("python3.14t"), Some("--version"));
         assert_eq!(version_argument("python3.14"), Some("--version"));
     }
@@ -776,10 +780,4 @@ mod tests {
             );
         }
     }
-}
-
-pub(crate) fn progs_metadata(exec: &str) -> ProgsMetadata {
-    crate::search::executable_path_from_exec(exec)
-        .map(|path| installation::inspect(&path).1)
-        .unwrap_or_default()
 }

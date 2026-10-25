@@ -48,8 +48,8 @@ enum InfoTarget {
 
 struct AppInfoPopup {
     app: AppInfo,
-    metadata: Option<crate::windows::versions::ProgsMetadata>,
-    receiver: Option<std::sync::mpsc::Receiver<crate::windows::versions::ProgsMetadata>>,
+    metadata: Option<crate::windows::versions::ApplicationInfo>,
+    receiver: Option<std::sync::mpsc::Receiver<crate::windows::versions::ApplicationInfoUpdate>>,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -64,36 +64,75 @@ impl AppInfoPopup {
     }
 
     fn poll_metadata(&mut self, ctx: &egui::Context, viewport_id: egui::ViewportId) {
-        if self.metadata.is_some() {
+        if self.metadata.is_some() && self.receiver.is_none() {
             return;
         }
         let receiver = self.receiver.get_or_insert_with(|| {
             let exec = self.app.exec.clone();
+            let desktop_file = self.app.desktop_file_path.clone();
             let cancelled = self.cancelled.clone();
             let ctx = ctx.clone();
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let (tx, rx) = std::sync::mpsc::sync_channel(2);
+            // Exactly two bounded updates; never make local details wait for an AUR query.
             applicationlauncher::observability::spawn_named("app-info", move |worker| {
+                use crate::windows::versions::ApplicationInfoUpdate;
                 if cancelled.load(Ordering::Acquire) {
                     return;
                 }
-                worker.set_state("reading-progs-metadata");
-                let metadata = crate::windows::versions::progs_metadata(&exec);
-                if !cancelled.load(Ordering::Acquire) {
-                    let _ = tx.try_send(metadata);
-                    ctx.request_repaint_of(egui::ViewportId::ROOT);
-                    ctx.request_repaint_of(viewport_id);
+                worker.set_state("resolving-installed-application");
+                let metadata = crate::windows::versions::inspect_application(&exec, &desktop_file);
+                if cancelled.load(Ordering::Acquire)
+                    || tx
+                        .try_send(ApplicationInfoUpdate::Details(metadata.clone()))
+                        .is_err()
+                {
+                    return;
                 }
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+                ctx.request_repaint_of(viewport_id);
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                worker.set_state("checking-available-package-version");
+                if let Some(version) = metadata.query_package_version()
+                    && !cancelled.load(Ordering::Acquire)
+                {
+                    let _ = tx.try_send(ApplicationInfoUpdate::PackageVersion(version));
+                }
+                // Publish completion before waking the UI, including when no package applies.
+                drop(tx);
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+                ctx.request_repaint_of(viewport_id);
             });
             rx
         });
-        match receiver.try_recv() {
-            Ok(metadata) => self.metadata = Some(metadata),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.metadata = Some(Default::default());
+        let mut finished = false;
+        for _ in 0..2 {
+            match receiver.try_recv() {
+                Ok(crate::windows::versions::ApplicationInfoUpdate::Details(metadata)) => {
+                    self.metadata = Some(metadata);
+                }
+                Ok(crate::windows::versions::ApplicationInfoUpdate::PackageVersion(version)) => {
+                    if let Some(metadata) = self.metadata.as_mut() {
+                        metadata.latest_package_version = Some(version);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.metadata.get_or_insert_with(Default::default);
+                    finished = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
-        if self.metadata.is_some() {
+        if finished {
+            if let Some(metadata) = self.metadata.as_mut()
+                && metadata.package_target.is_some()
+                && metadata.latest_package_version.is_none()
+            {
+                metadata.latest_package_version =
+                    Some("Unavailable (package lookup ended without a result)".into());
+            }
             self.receiver = None;
         }
     }
@@ -107,75 +146,159 @@ impl Drop for AppInfoPopup {
 
 fn application_info_rows(state: &AppInfoPopup, is_pinned: bool) -> Vec<InfoPopupRow> {
     let app = &state.app;
-    let path = executable_path_from_exec(&app.exec);
-    let unavailable = || {
-        if state.metadata.is_some() {
-            "Unavailable"
-        } else {
-            "Loading..."
-        }
-        .to_owned()
+    let details = state.metadata.as_ref();
+    let value = |value: Option<String>| {
+        value.unwrap_or_else(|| {
+            if details.is_none() {
+                "Loading..."
+            } else {
+                "Unavailable"
+            }
+            .to_owned()
+        })
     };
+    let path = |path: Option<&PathBuf>| value(path.map(|path| path.to_string_lossy().into_owned()));
     let row = |label: &str, value: String, searched: bool| InfoPopupRow {
         label: label.into(),
         value,
         searched,
-        separator_before: false,
+        separator_before: matches!(label, "Launcher executable basename" | "Desktop file stem"),
         binary_is_current: None,
     };
-    vec![
+    let mut rows = vec![
         row("Name", app.name.clone(), true),
-        row(
-            "Executable basename",
-            command_basename(&app.exec).unwrap_or_else(|| "Unavailable".into()),
-            true,
-        ),
-        row(
-            "Desktop file stem",
-            app.desktop_file_path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or("Unavailable")
-                .into(),
-            true,
-        ),
         row(
             "Comment",
             app.comment.clone().unwrap_or_else(|| "Unavailable".into()),
             true,
         ),
         row(
-            "Capabilities",
-            state
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.capabilities.clone())
-                .unwrap_or_else(unavailable),
+            "Application capabilities",
+            value(details.and_then(|info| info.metadata.capabilities.clone())),
             false,
         ),
         row(
-            "Description",
-            state
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.description.clone())
-                .unwrap_or_else(unavailable),
+            "Application description",
+            value(details.and_then(|info| info.metadata.description.clone())),
             false,
+        ),
+        row(
+            "Application executable path",
+            path(details.and_then(|info| info.executable.as_ref())),
+            false,
+        ),
+        row(
+            "Application version (on disk)",
+            value(details.and_then(|info| info.version.clone())),
+            false,
+        ),
+        row(
+            "Application installation",
+            value(details.and_then(|info| info.installation.clone())),
+            false,
+        ),
+        row(
+            "Application installed package",
+            value(details.and_then(|info| info.package.clone())),
+            false,
+        ),
+    ];
+    if let Some((label, version)) = latest_package_version_field(
+        details.and_then(|info| info.latest_package_version.as_deref()),
+        details.is_some_and(|info| info.package_target.is_some()),
+    ) {
+        rows.push(row(&format!("Application {label}"), version, false));
+    }
+    rows.extend([
+        row(
+            "Application ELF build ID (on disk)",
+            value(details.and_then(|info| {
+                if info.native == Some(false) {
+                    Some("Not applicable (interpreted application entry point)".into())
+                } else {
+                    info.build_id.clone()
+                }
+            })),
+            false,
+        ),
+        row(
+            "Application uncompiled changes",
+            value(details.and_then(|info| info.uncompiled_changes.clone())),
+            false,
+        ),
+        row(
+            "Application identification",
+            value(
+                details
+                    .map(|info| info.resolution.clone())
+                    .filter(|reason| !reason.is_empty()),
+            ),
+            false,
+        ),
+        row(
+            "Launcher executable basename",
+            command_basename(&app.exec).unwrap_or_else(|| "Unavailable".into()),
+            true,
         ),
         row("Cleaned command", clean_exec_cmd(&app.exec), true),
-        row(
-            "Executable path",
-            path.as_ref()
-                .map(|path| path.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Unavailable".into()),
-            false,
-        ),
-        row(
-            "Executable exists",
-            path.as_ref().is_some_and(|path| path.is_file()).to_string(),
-            false,
-        ),
         row("Raw Exec", app.exec.clone(), false),
+        row(
+            "Launcher executable path",
+            path(details.and_then(|info| info.launcher.as_ref())),
+            false,
+        ),
+        row(
+            "Launcher executable exists",
+            value(details.map(|info| info.launcher_exists.to_string())),
+            false,
+        ),
+        row(
+            "Launcher resolved path",
+            path(details.and_then(|info| info.launcher_resolved.as_ref())),
+            false,
+        ),
+        row(
+            "Launch chain",
+            value(
+                details
+                    .map(|info| {
+                        info.chain
+                            .iter()
+                            .map(|path| path.to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join(" -> ")
+                    })
+                    .filter(|chain| !chain.is_empty()),
+            ),
+            false,
+        ),
+    ]);
+    if details
+        .is_some_and(|info| info.executable.is_none() || info.launcher_resolved != info.executable)
+    {
+        rows.extend([
+            row(
+                "Launcher installation",
+                value(details.and_then(|info| info.launcher_installation.clone())),
+                false,
+            ),
+            row(
+                "Launcher description",
+                value(details.and_then(|info| info.launcher_metadata.description.clone())),
+                false,
+            ),
+        ]);
+    }
+    rows.extend([
+        row(
+            "Desktop file stem",
+            app.desktop_file_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("Unavailable")
+                .to_owned(),
+            true,
+        ),
         row(
             "Desktop file",
             app.desktop_file_path.to_string_lossy().into_owned(),
@@ -183,7 +306,7 @@ fn application_info_rows(state: &AppInfoPopup, is_pinned: bool) -> Vec<InfoPopup
         ),
         row(
             "Desktop file exists",
-            app.desktop_file_path.exists().to_string(),
+            value(details.map(|info| info.desktop_exists.to_string())),
             false,
         ),
         row(
@@ -200,7 +323,8 @@ fn application_info_rows(state: &AppInfoPopup, is_pinned: bool) -> Vec<InfoPopup
             app.is_settings_module.to_string(),
             false,
         ),
-    ]
+    ]);
+    rows
 }
 
 struct WindowInfoPopup {
@@ -1306,6 +1430,243 @@ mod tests {
             comment: None,
             is_settings_module: false,
         }))
+    }
+
+    #[test]
+    fn app_progs_lookup_publishes_once_without_restarting_on_later_frames() {
+        let InfoTarget::App(mut popup) = app("/test/progs.desktop") else {
+            unreachable!();
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        popup.receiver = Some(rx);
+        let ctx = egui::Context::default();
+        popup.poll_metadata(&ctx, egui::ViewportId::ROOT);
+        assert!(popup.metadata.is_none() && popup.receiver.is_some());
+        let metadata = crate::windows::versions::ApplicationInfo {
+            metadata: crate::windows::versions::ProgsMetadata {
+                capabilities: Some(
+                    "GUI \u{00b7} CLI  \u{2022}  Primary role: GUI application".into(),
+                ),
+                description: Some("Terminal emulator".into()),
+            },
+            ..Default::default()
+        };
+        tx.send(crate::windows::versions::ApplicationInfoUpdate::Details(
+            metadata.clone(),
+        ))
+        .unwrap();
+        drop(tx);
+        popup.poll_metadata(&ctx, egui::ViewportId::ROOT);
+        assert_eq!(popup.metadata.as_ref(), Some(&metadata));
+        assert!(popup.receiver.is_none());
+        popup.poll_metadata(&ctx, egui::ViewportId::ROOT);
+        assert_eq!(popup.metadata.as_ref(), Some(&metadata));
+        assert!(popup.receiver.is_none());
+    }
+
+    #[test]
+    fn disconnected_app_progs_lookup_stops_loading_instead_of_retrying() {
+        let InfoTarget::App(mut popup) = app("/test/progs.desktop") else {
+            unreachable!();
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        popup.receiver = Some(rx);
+        drop(tx);
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            popup.poll_metadata(&ctx, egui::ViewportId::ROOT);
+            assert_eq!(popup.metadata, Some(Default::default()));
+            assert!(popup.receiver.is_none());
+        }
+    }
+
+    #[test]
+    fn application_details_are_published_before_the_available_package_query_finishes() {
+        use crate::windows::versions::{ApplicationInfo, ApplicationInfoUpdate, PackageTarget};
+        let InfoTarget::App(mut popup) = app("/test/browser.desktop") else {
+            unreachable!();
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        popup.receiver = Some(rx);
+        tx.send(ApplicationInfoUpdate::Details(ApplicationInfo {
+            version: Some("Browser 1.0".into()),
+            package_target: Some(PackageTarget {
+                name: "browser".into(),
+                inferred: false,
+            }),
+            ..Default::default()
+        }))
+        .unwrap();
+        let ctx = egui::Context::default();
+        popup.poll_metadata(&ctx, egui::ViewportId::ROOT);
+        assert_eq!(
+            popup.metadata.as_ref().unwrap().version.as_deref(),
+            Some("Browser 1.0")
+        );
+        assert!(popup.receiver.is_some());
+        let rows = application_info_rows(&popup, false);
+        assert!(rows.iter().any(|row| row.label
+            == "Application latest package version (Pacman/AUR)"
+            && row.value == "Checking Pacman/AUR..."));
+        tx.send(ApplicationInfoUpdate::PackageVersion(
+            "extra/browser 2.0; Last Pacman sync: date".into(),
+        ))
+        .unwrap();
+        drop(tx);
+        popup.poll_metadata(&ctx, egui::ViewportId::ROOT);
+        assert!(popup.receiver.is_none());
+        let rows = application_info_rows(&popup, false);
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "Application version (on disk)"
+                    && row.value == "Browser 1.0")
+        );
+        assert!(rows.iter().any(|row| row.label
+            == "Application latest package version (Pacman/AUR)"
+            && row.value == "extra/browser 2.0; Last Pacman sync: date"));
+    }
+
+    #[test]
+    fn application_info_keeps_wrapper_metadata_separate_and_only_draws_captured_file_state() {
+        use crate::windows::versions::{ApplicationInfo, ProgsMetadata};
+        let InfoTarget::App(mut popup) = app("/not-a-real-directory/browser.desktop") else {
+            unreachable!();
+        };
+        popup.metadata = Some(ApplicationInfo {
+            launcher: Some("/not-a-real-directory/browser-fast".into()),
+            launcher_resolved: Some("/config/browser-fast".into()),
+            launcher_exists: true,
+            desktop_exists: true,
+            executable: Some("/opt/browser/browser".into()),
+            installation: Some("[AEP] AUR Explicit (Package-managed)".into()),
+            package: Some("browser 1.0-1".into()),
+            version: Some("Browser 1.0".into()),
+            build_id: Some("abcd1234".into()),
+            uncompiled_changes: Some("Not applicable (package-managed installation)".into()),
+            metadata: ProgsMetadata {
+                capabilities: Some("GUI".into()),
+                description: Some("Actual browser description".into()),
+            },
+            launcher_installation: Some("[DVM] DEV (User-managed)".into()),
+            launcher_metadata: ProgsMetadata {
+                capabilities: Some("GUI".into()),
+                description: Some("Custom launch wrapper".into()),
+            },
+            ..Default::default()
+        });
+        for _ in 0..3 {
+            let rows = application_info_rows(&popup, false);
+            let value = |label: &str| {
+                rows.iter()
+                    .find(|row| row.label == label)
+                    .unwrap()
+                    .value
+                    .as_str()
+            };
+            assert_eq!(
+                value("Application description"),
+                "Actual browser description"
+            );
+            assert_eq!(value("Launcher description"), "Custom launch wrapper");
+            assert_eq!(value("Application executable path"), "/opt/browser/browser");
+            assert_eq!(
+                value("Launcher executable path"),
+                "/not-a-real-directory/browser-fast"
+            );
+            assert_eq!(value("Application version (on disk)"), "Browser 1.0");
+            assert_eq!(value("Application installed package"), "browser 1.0-1");
+            assert_eq!(value("Application ELF build ID (on disk)"), "abcd1234");
+            assert_eq!(value("Launcher executable exists"), "true");
+            assert_eq!(value("Desktop file exists"), "true");
+            assert!(
+                !rows
+                    .iter()
+                    .any(|row| row.label.contains("PID") || row.label.contains("running version"))
+            );
+            assert!(
+                rows.iter()
+                    .filter(|row| row.label.starts_with("Application "))
+                    .all(|row| !row.searched)
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_application_info_does_not_substitute_the_wrapper_description() {
+        let InfoTarget::App(mut popup) = app("/test/browser.desktop") else {
+            unreachable!();
+        };
+        popup.metadata = Some(crate::windows::versions::ApplicationInfo {
+            resolution: "Unknown (dynamic wrapper target)".into(),
+            launcher_metadata: crate::windows::versions::ProgsMetadata {
+                description: Some("Local custom wrapper".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let rows = application_info_rows(&popup, false);
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "Application description" && row.value == "Unavailable")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "Launcher description"
+                    && row.value == "Local custom wrapper")
+        );
+        assert!(rows.iter().any(
+            |row| row.label == "Application identification" && row.value.starts_with("Unknown")
+        ));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.label.contains("latest package version"))
+        );
+    }
+
+    #[test]
+    fn closing_application_info_cancels_its_worker_and_disconnects_the_bounded_channel() {
+        let InfoTarget::App(mut popup) = app("/test/browser.desktop") else {
+            unreachable!();
+        };
+        let cancelled = popup.cancelled.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        popup.receiver = Some(rx);
+        drop(popup);
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(
+            tx.try_send(
+                crate::windows::versions::ApplicationInfoUpdate::PackageVersion("stale".into())
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_package_worker_does_not_leave_the_application_info_checking_forever() {
+        use crate::windows::versions::{ApplicationInfo, PackageTarget};
+        let InfoTarget::App(mut popup) = app("/test/browser.desktop") else {
+            unreachable!();
+        };
+        popup.metadata = Some(ApplicationInfo {
+            version: Some("Browser 1.0".into()),
+            package_target: Some(PackageTarget {
+                name: "browser".into(),
+                inferred: false,
+            }),
+            ..Default::default()
+        });
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        popup.receiver = Some(rx);
+        drop(tx);
+        popup.poll_metadata(&egui::Context::default(), egui::ViewportId::ROOT);
+        let metadata = popup.metadata.as_ref().unwrap();
+        assert_eq!(metadata.version.as_deref(), Some("Browser 1.0"));
+        assert_eq!(
+            metadata.latest_package_version.as_deref(),
+            Some("Unavailable (package lookup ended without a result)")
+        );
+        assert!(popup.receiver.is_none());
     }
 
     fn window(id: &str) -> InfoTarget {
