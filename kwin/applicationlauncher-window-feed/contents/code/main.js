@@ -148,7 +148,15 @@ function serializeWindow(window) {
     };
 }
 
+function isTrackedWindow(window) {
+    return !!(window && window.internalId && trackedWindows[String(window.internalId)]);
+}
+
 function sendUpsert(window) {
+    // Teardown can emit more title/geometry signals after either removal signal.
+    if (!isTrackedWindow(window)) {
+        return;
+    }
     var payload = serializeWindow(window);
     if (!payload) {
         return;
@@ -330,7 +338,7 @@ if (workspace.screensChanged) {
 
 workspace.windowActivated.connect(function (window) {
     updateReopenShortcutState();
-    if (window) {
+    if (isTrackedWindow(window)) {
         var payload = serializeWindow(window);
         if (payload) {
             callDBus(

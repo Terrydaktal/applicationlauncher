@@ -283,7 +283,7 @@ For explicit live verification while Firefox is playing, enable `APPLICATIONLAUN
 - Immediate icon tooltips in application icon mode.
 - Pinning and reordering of applications.
 - Middle-click on a window entry to launch another instance of the underlying application.
-- Right-click on a window entry to open, clone, show metadata, close the application, or inspect its execution chain.
+- Right-click on a window entry to open, clone, show metadata and the process tree, or close the application.
 - Optional close-on-blur behavior.
 - Settings includes **Stop idle Codex sessions...**, an explicit, confirmed action that sends one `SIGINT` to each verified local idle Codex process. It checks fresh terminal-tab metadata and window titles for spinners/attention, then rechecks process identity and foreground ownership before signalling through a PID handle. It requires a shell underneath Codex and never signals terminal windows, shells or whole process groups, never force-kills or retries, and does not run automatically. Unsupported/inactive tabs and ambiguous or changed sessions are skipped. This is a signal interrupt, not a literal TUI Ctrl+C keypress; Codex versions can handle the two differently. Title-based idle detection is conservative but cannot make the final title-read/signal boundary atomic with Codex starting a new turn.
 - Temporary border overlay support for highlighting a target window.
