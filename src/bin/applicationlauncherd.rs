@@ -1,14 +1,14 @@
 fn main() {
+    if std::env::args().any(|argument| argument == "--build-id") {
+        println!("{}", applicationlauncher::BUILD_ID);
+        return;
+    }
     applicationlauncher::observability::initialize(
         applicationlauncher::observability::Component::Daemon,
     );
     applicationlauncher::observability::install_panic_hook(
         applicationlauncher::observability::Component::Daemon,
     );
-    if std::env::args().any(|argument| argument == "--build-id") {
-        println!("{}", applicationlauncher::BUILD_ID);
-        return;
-    }
     if std::env::args().any(|argument| argument == "--install") {
         if let Err(err) = applicationlauncher::tracker::ensure_tracker_installed() {
             eprintln!("applicationlauncherd: {err}");

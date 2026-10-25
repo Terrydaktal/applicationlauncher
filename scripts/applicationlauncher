@@ -16,6 +16,10 @@ runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 build_lock="$runtime_dir/applicationlauncher-build-v2.lock"
 socket_path="$runtime_dir/applicationlauncher-windows.sock"
 
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=lib/release-compatibility.sh
+source "$repo_dir/scripts/lib/release-compatibility.sh"
+
 source_inputs_are_newer() {
 	local input
 
@@ -217,12 +221,66 @@ report_deployment_failure() {
 	fi
 }
 
+queue_release_repair() {
+	# Transfer the same lock description to the worker, then close our copy.
+	# Unlocking it here would also unlock the worker and allow duplicate builds.
+	exec 9>"$build_lock"
+	if flock -n 9; then
+		if repair_retry_is_due; then
+			nohup "$script_path" --repair-incompatible-release "$@" \
+				</dev/null >>"$build_log" 2>&1 9>&9 &
+		fi
+	fi
+	exec 9>&-
+}
+
 mkdir -p -- "$state_dir" "$runtime_dir"
+
+if [[ "${1:-}" == --repair-incompatible-release ]]; then
+	shift
+	# Normally inherited from queue_release_repair; also support direct retries.
+	if [[ "$(readlink -- "/proc/$$/fd/9" 2>/dev/null || true)" != "$build_lock" ]]; then
+		exec 9>"$build_lock"
+	fi
+	flock -n 9 || exit 0
+	if ! repair_release_pair; then
+		report_deployment_failure 'Application Launcher build repair failed; running processes were preserved'
+		exit 1
+	fi
+	flock -u 9
+	exec 9>&-
+	# The normal deployment path now activates the verified pair, preserving args.
+	exec "$script_path" "$@"
+fi
+
+# Diagnostic/control requests must preserve the incident, not trigger updates.
+for argument in "$@"; do
+	case "$argument" in
+	--diagnose | debug-doctor | replay | --build-id | --shutdown | --help | -h)
+		exec "$binary" "$@"
+		;;
+	esac
+done
 
 if [[ ! -x "$binary" || ! -x "$daemon_binary" ]]; then
 	report_deployment_failure 'Application Launcher release binaries are missing; run cargo build --release --bins'
 	exit 1
 fi
+
+pair_status=0
+release_pair_is_compatible || pair_status=$?
+if [[ "$pair_status" != 0 ]]; then
+	if [[ "$pair_status" == 1 ]]; then
+		queue_release_repair "$@"
+	else
+		printf '%s\n' 'Could not verify launcher/daemon build identities; leaving running processes unchanged.' >&2
+	fi
+	# Do not stop a working daemon or keep restarting incompatible on-disk files.
+	# Show the existing GUI immediately while the detached repair worker builds.
+	export APPLICATIONLAUNCHER_BUILD_REPAIR_PENDING=1
+	exec "$binary" "$@"
+fi
+unset APPLICATIONLAUNCHER_BUILD_REPAIR_PENDING
 
 source_changes_pending=false
 if source_inputs_are_newer; then

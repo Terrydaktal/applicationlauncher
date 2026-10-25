@@ -73,7 +73,8 @@
 - `src/windows/terminal/tmux.rs`: Background per-client active-pane monitoring and latest-state window metadata overlays, independent of tmux's desktop-title forwarding setting.
 - `src/windows/versions.rs`: On-demand, bounded running-executable version/build-ID probes and separately labelled installed-package metadata for Show Info.
 - `kwin/applicationlauncher-window-feed/`: Transactional KWin script that sends compositor window events to the daemon.
-- `scripts/applicationlauncher`: Fast launch wrapper that activates current release binaries and reports newer source without compiling it.
+- `scripts/applicationlauncher`: Fast launch wrapper that activates compatible release binaries, repairs incompatible binary pairs in the background, and reports newer source without compiling it.
+- `scripts/lib/release-compatibility.sh`: Cached binary-build checks and bounded paired rebuilds for the wrapper.
 - `scripts/build-debuggable-release`: Produces build-ID-indexed exact binaries, split symbols, hashes, and `build-info.json`.
 - `docs/DEBUGGABILITY.md`: Runtime modes, budgets, capture guarantees, privacy rules, and progress invariants.
 - `Cargo.toml`: Package metadata and Rust dependencies.
@@ -240,7 +241,9 @@ The integration test starts only its own private PulseAudio server with null out
 ./scripts/applicationlauncher
 ```
 
-The wrapper never invokes Cargo during launcher activation. It compares any running launcher and daemon processes with the already-built `target/release` executables and restarts both components only when those executable files have been replaced. Source, Cargo metadata, embedded KWin files, and the local `../fuzzy-rank` dependency are checked separately; newer source produces a warning in the launcher while the existing release continues running. Run `cargo build --release --bins` explicitly to build those changes.
+The wrapper checks that the built launcher and daemon have the same source-build fingerprint, even when their version numbers are identical. It caches these checks by file identity, size and timestamps. A confirmed incompatible pair queues one background `cargo build --release --locked --bins`; Cargo rebuilds whichever targets are stale. The existing GUI can appear immediately, and running processes are replaced only after both rebuilt binaries are verified compatible. Only the launcher and daemon are restarted, never user application windows. A failed repair preserves the running processes, keeps a bounded build log at `$XDG_STATE_HOME/applicationlauncher/launcher-build.log`, and waits five minutes before automatically retrying the same failed pair. Replaced files allow an immediate retry. Diagnostic and control commands never trigger repair or restart.
+
+For compatible binaries, the wrapper compares running processes with the already-built `target/release` executables and restarts both components only when those executable files have been replaced. Source, Cargo metadata, embedded KWin files, and the local `../fuzzy-rank` dependency are checked separately; newer source alone produces a warning, not an automatic build. Run `cargo build --release --bins` explicitly to build those changes. Focused, isolated deployment regressions can be run with `uv run --no-project python -m unittest discover -s tests -p test_launcher_deployment.py`; their fake services and binaries do not touch the desktop session.
 
 Install the command as a symbolic link so the wrapper remains updated with the repository:
 

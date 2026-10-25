@@ -67,6 +67,24 @@ pub fn ensure_tracker_installed() -> Result<(), String> {
             binary.display()
         ));
     }
+    let output = crate::process::output_with_timeout(
+        {
+            let mut command = Command::new(&binary);
+            command.arg("--build-id");
+            command
+        },
+        Duration::from_secs(2),
+    )
+    .map_err(|err| format!("Could not check tracker binary build: {err}"))?;
+    if !output.status.success() {
+        return Err(
+            "Could not check tracker binary build; existing service was left unchanged".into(),
+        );
+    }
+    validate_tracker_binary_build(
+        crate::BUILD_ID,
+        String::from_utf8_lossy(&output.stdout).trim(),
+    )?;
     let bin_dir = home.join(".local/bin");
     std::fs::create_dir_all(&bin_dir).map_err(|err| err.to_string())?;
     let link = bin_dir.join("applicationlauncherd");
@@ -181,6 +199,16 @@ pub fn ensure_tracker_installed() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn validate_tracker_binary_build(launcher_build: &str, daemon_build: &str) -> Result<(), String> {
+    if launcher_build == daemon_build {
+        Ok(())
+    } else {
+        Err(format!(
+            "Incompatible launcher/daemon binaries on disk (launcher={launcher_build}, daemon={daemon_build}). Launch through scripts/applicationlauncher to rebuild both in the background; the existing tracker service was left unchanged"
+        ))
+    }
 }
 
 pub fn restart_tracker_service() -> Result<(), String> {
@@ -390,7 +418,21 @@ pub(crate) fn start_kwin_feed_watchdog() {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{KWIN_FEED_MISSING_GRACE, KWIN_MAIN_JS, KwinFeedWatchdogState};
+    use super::{
+        KWIN_FEED_MISSING_GRACE, KWIN_MAIN_JS, KwinFeedWatchdogState, validate_tracker_binary_build,
+    };
+
+    #[test]
+    fn incompatible_disk_builds_are_rejected_before_service_installation() {
+        let launcher_build = "0.4.1-release-x86_64-unknown-linux-gnu-5c0a3fa50d3dac3b";
+        let daemon_build = "0.4.1-release-x86_64-unknown-linux-gnu-278a84b4f9258ec0";
+        assert!(validate_tracker_binary_build(launcher_build, launcher_build).is_ok());
+        let error = validate_tracker_binary_build(launcher_build, daemon_build).unwrap_err();
+        assert!(error.contains("rebuild both in the background"));
+        assert!(error.contains("service was left unchanged"));
+        assert!(validate_tracker_binary_build(daemon_build, launcher_build).is_err());
+        assert!(validate_tracker_binary_build(launcher_build, "").is_err());
+    }
 
     #[test]
     fn kwin_feed_avoids_unsupported_browser_timers() {

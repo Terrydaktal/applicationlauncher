@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "profile": "release",
+  "scope": "Installed wrapper and paired launcher/daemon deployment",
+  "behaviors": [
+    {
+      "id": "DEPLOY-01",
+      "contract": "Compare source-build fingerprints, not version numbers or timestamp order; a confirmed mismatch rebuilds both targets and validates the result before activation.",
+      "tests": ["test_same_version_different_builds_are_repaired_together", "test_successful_cargo_with_a_still_incompatible_pair_does_not_activate", "incompatible_disk_builds_are_rejected_before_service_installation", "release_pair_probes_share_identity_without_starting_runtime_services"]
+    },
+    {
+      "id": "DEPLOY-02",
+      "contract": "Compatible binaries and newer source alone do not invoke Cargo. Cached identity probes are invalidated when a binary changes.",
+      "tests": ["test_healthy_pair_does_not_build_and_reuses_identity_cache", "test_newer_source_is_a_warning_not_a_build", "test_replacing_one_binary_invalidates_the_cache", "test_stale_running_daemon_with_a_compatible_disk_pair_only_restarts"]
+    },
+    {
+      "id": "DEPLOY-03",
+      "contract": "A background repair has one deployment lock, a 15-minute build deadline and a 256-KiB build-output bound. Repeated shortcuts still open the existing GUI without stopping a working daemon.",
+      "tests": ["test_repair_is_background_single_flight_and_does_not_stop_a_working_daemon", "test_failed_build_output_is_bounded_and_private", "test_timed_out_build_cannot_activate_a_replacement"]
+    },
+    {
+      "id": "DEPLOY-04",
+      "contract": "Unknown identities and failed or incomplete builds cannot activate a replacement. Failed identical pairs have a five-minute retry cooldown; user application windows are never recovery targets.",
+      "tests": ["test_unreadable_build_identity_is_not_treated_as_a_confirmed_mismatch", "test_compiler_failure_preserves_processes_and_does_not_retry_every_shortcut", "test_successful_cargo_with_a_still_incompatible_pair_does_not_activate", "test_identical_failed_pair_can_retry_after_the_cooldown", "test_new_binary_allows_an_immediate_retry_after_failure"]
+    },
+    {
+      "id": "DEPLOY-05",
+      "contract": "Diagnostic and control invocations cannot repair or restart the deployment, and build-ID probes do not initialize runtime diagnostics.",
+      "tests": ["test_diagnostic_and_control_commands_do_not_repair_or_restart", "release_pair_probes_share_identity_without_starting_runtime_services"]
+    }
+  ]
+}

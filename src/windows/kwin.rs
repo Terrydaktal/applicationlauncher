@@ -336,6 +336,14 @@ pub(crate) fn setup_kwin_window_feed(
 }
 
 fn ensure_tracker_ready() -> Result<(), String> {
+    if std::env::var_os("APPLICATIONLAUNCHER_BUILD_REPAIR_PENDING")
+        .is_some_and(|value| value == "1")
+    {
+        return Err(
+            "Launcher/daemon binaries are incompatible or unverified. The launch wrapper repairs confirmed mismatches in the background and reloads the compatible pair; the current tracker was left running. Build failures are recorded in launcher-build.log"
+                .into(),
+        );
+    }
     applicationlauncher::tracker::ensure_tracker_installed()?;
     let mut restart_attempts = 0;
     let mut last_error = "tracker did not report a status".to_string();
