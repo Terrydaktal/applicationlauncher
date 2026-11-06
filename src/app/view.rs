@@ -1182,11 +1182,12 @@ impl eframe::App for App {
                             self.win_text_spacing,
                             self.win_show_path,
                         );
-	                    let row_height = match self.mode {
-                            LauncherMode::Apps => app_row_height,
-                            LauncherMode::Windows => window_row_height,
-                        };
+                    let row_height = match self.mode {
+                        LauncherMode::Apps => app_row_height,
+                        LauncherMode::Windows => window_row_height,
+                    };
 
+                    let mut pending_pin_move = None;
                     if render_side_panel {
                         let previous_spacing = ui.spacing().item_spacing;
                         ui.spacing_mut().item_spacing.x = 0.0;
@@ -1240,6 +1241,7 @@ impl eframe::App for App {
                                                 helpers::virtual_item(ui, index, egui::vec2(self.app_icon_tile_size, self.app_icon_tile_size), |ui| {
 		                                        let is_selected = index == self.selected_index;
 			                                        let app = &filtered_apps[index].0;
+                                                let is_pinned = self.pinned_app_positions.contains_key(&app.desktop_file_path);
 			                                        let tile_size = self.app_icon_tile_size;
                                                 let audio_level = self
                                                     .app_audio_sinks
@@ -1248,7 +1250,7 @@ impl eframe::App for App {
 
                                         let (rect, response) = ui.allocate_exact_size(
                                             egui::vec2(tile_size, tile_size),
-	                                            egui::Sense::click(),
+	                                            helpers::application_item_sense(is_pinned),
 	                                        );
 
 
@@ -1272,20 +1274,6 @@ impl eframe::App for App {
 
                                             if is_pinned {
                                                 if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
-                                                    if pos >= columns {
-                                                        if ui.button("⬆ Move up").clicked() {
-                                                            self.pinned_apps.swap(pos, pos - columns);
-                                                            self.save_pinned_apps();
-                                                            ui.close();
-                                                        }
-                                                    }
-                                                    if pos + columns < self.pinned_apps.len() {
-                                                        if ui.button("⬇ Move down").clicked() {
-                                                            self.pinned_apps.swap(pos, pos + columns);
-                                                            self.save_pinned_apps();
-                                                            ui.close();
-                                                        }
-                                                    }
                                                     if pos > 0 {
                                                         if ui.button("⬅ Move left").clicked() {
                                                             self.pinned_apps.swap(pos, pos - 1);
@@ -1425,6 +1413,9 @@ impl eframe::App for App {
                                                 ),
                                             );
                                         }
+                                        if let Some(movement) = helpers::pinned_app_drag_drop(ui, &response, app, is_pinned) {
+                                            pending_pin_move = Some(movement);
+                                        }
                                                 });
 	                                    }
 	                                });
@@ -1443,7 +1434,7 @@ impl eframe::App for App {
                                 LauncherMode::Apps => "apps_main_list_scroll",
                                 LauncherMode::Windows => "windows_main_list_scroll",
 	                            })
-	                            .max_height(list_height)
+                            .max_height(list_height)
                             .show_viewport(ui, |ui, viewport| {
                                     if self.mode == LauncherMode::Apps {
                                         helpers::application_scroll_content(ui, viewport);
@@ -1998,10 +1989,12 @@ impl eframe::App for App {
                                         }
                                     }
 
+                                    let row_is_pinned = self.mode == LauncherMode::Apps
+                                        && self.pinned_app_positions.contains_key(&filtered_apps[index].0.desktop_file_path);
                                     let overlay_response = ui.interact(
                                         rect,
                                         ui.id().with(("main_row_overlay", index)),
-                                        egui::Sense::click(),
+                                        helpers::application_item_sense(row_is_pinned),
                                     );
 
                                     if terminal_action_label.is_none() {
@@ -2024,24 +2017,6 @@ impl eframe::App for App {
                                                         ui.close();
                                                     }
 
-                                                    if is_pinned {
-                                                        if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
-                                                            if pos > 0 {
-                                                                if ui.button("⬆ Move up").clicked() {
-                                                                    self.pinned_apps.swap(pos, pos - 1);
-                                                                    self.save_pinned_apps();
-                                                                    ui.close();
-                                                                }
-                                                            }
-                                                            if pos + 1 < self.pinned_apps.len() {
-                                                                if ui.button("⬇ Move down").clicked() {
-                                                                    self.pinned_apps.swap(pos, pos + 1);
-                                                                    self.save_pinned_apps();
-                                                                    ui.close();
-                                                                }
-                                                            }
-                                                        }
-                                                    }
                                                     ui.separator();
                                                     let has_open_window = self.windows.iter().any(|window| {
                                                         self.desktop_file_path_for_window(window).as_ref()
@@ -2181,6 +2156,11 @@ impl eframe::App for App {
                                         });
                                     }
 
+                                        if row_is_pinned
+                                            && let Some(movement) = helpers::pinned_app_drag_drop(ui, &overlay_response, &filtered_apps[index].0, true)
+                                        {
+                                            pending_pin_move = Some(movement);
+                                        }
 	                                    if overlay_response.hovered() {
 	                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
 	                                    }
@@ -2273,7 +2253,8 @@ impl eframe::App for App {
                                                                 for index in visible {
                                                                     let item = &filtered_apps[index];
                                                                     helpers::virtual_item(ui, index, egui::vec2(self.app_icon_tile_size, self.app_icon_tile_size), |ui| {
-			                                                            let app = &item.0;
+				                                                            let app = &item.0;
+                                                                    let is_pinned = self.pinned_app_positions.contains_key(&app.desktop_file_path);
 			                                                            let tile_size = self.app_icon_tile_size;
                                                                     let audio_level = self
                                                                         .app_audio_sinks
@@ -2283,7 +2264,7 @@ impl eframe::App for App {
 	                                                                && index == self.side_panel_selected_index;
                                                             let (rect, response) = ui.allocate_exact_size(
                                                                 egui::vec2(tile_size, tile_size),
-	                                                                egui::Sense::click(),
+		                                                                helpers::application_item_sense(is_pinned),
 	                                                            );
 	                                                            show_immediate_icon_tooltip(&response, &app.name);
                                                             if is_selected && scroll_to_side_selected {
@@ -2304,24 +2285,6 @@ impl eframe::App for App {
 	                                                            self.save_pinned_apps();
 		                                                            ui.close();
 		                                                        }
-                                                                if is_pinned {
-                                                                    if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
-                                                                        if pos > 0 {
-                                                                            if ui.button("⬆ Move up").clicked() {
-                                                                                self.pinned_apps.swap(pos, pos - 1);
-                                                                                self.save_pinned_apps();
-                                                                                ui.close();
-                                                                            }
-                                                                        }
-                                                                        if pos + 1 < self.pinned_apps.len() {
-                                                                            if ui.button("⬇ Move down").clicked() {
-                                                                                self.pinned_apps.swap(pos, pos + 1);
-                                                                                self.save_pinned_apps();
-                                                                                ui.close();
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
 	                                                ui.separator();
 	                                                let has_open_window = self.windows.iter().any(|window| {
 	                                                    self.desktop_file_path_for_window(window).as_ref()
@@ -2434,7 +2397,9 @@ impl eframe::App for App {
                                                                     ),
                                                                 );
                                                             }
-		                                                    let _ = index;
+                                                                if let Some(movement) = helpers::pinned_app_drag_drop(ui, &response, app, is_pinned) {
+                                                                    pending_pin_move = Some(movement);
+                                                                }
                                                                     });
 		                                                        }
 	                                                    });
@@ -2450,14 +2415,15 @@ impl eframe::App for App {
                                                         for index in visible {
                                                             let item = &filtered_apps[index];
                                                             helpers::virtual_item(ui, index, egui::vec2(ui.available_width(), app_row_height), |ui| {
-	                                                        let app = &item.0;
+		                                                        let app = &item.0;
+                                                            let is_pinned = self.pinned_app_positions.contains_key(&app.desktop_file_path);
                                                             let audio_level = self
                                                                 .app_audio_sinks
                                                                 .get(&app.desktop_file_path)
                                                                 .and_then(|indices| visualization_for_sinks(indices, &self.audio_visualizations));
-	                                                        let (rect, response) = ui.allocate_exact_size(
+		                                                        let (rect, response) = ui.allocate_exact_size(
                                                             egui::vec2(ui.available_width(), app_row_height),
-                                                            egui::Sense::click(),
+                                                            helpers::application_item_sense(is_pinned),
                                                         );
 	                                                response.clone().context_menu(|ui| {
 	                                                    let path = app.desktop_file_path.clone();
@@ -2474,24 +2440,6 @@ impl eframe::App for App {
 	                                                        self.save_pinned_apps();
 	                                                        ui.close();
 	                                                    }
-                                                        if is_pinned {
-                                                            if let Some(pos) = self.pinned_apps.iter().position(|x| x == &path) {
-                                                                if pos > 0 {
-                                                                    if ui.button("⬆ Move up").clicked() {
-                                                                        self.pinned_apps.swap(pos, pos - 1);
-                                                                        self.save_pinned_apps();
-                                                                        ui.close();
-                                                                    }
-                                                                }
-                                                                if pos + 1 < self.pinned_apps.len() {
-                                                                    if ui.button("⬇ Move down").clicked() {
-                                                                        self.pinned_apps.swap(pos, pos + 1);
-                                                                        self.save_pinned_apps();
-                                                                        ui.close();
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
 	                                                    ui.separator();
 	                                                    let has_open_window = self.windows.iter().any(|window| {
 	                                                        self.desktop_file_path_for_window(window).as_ref()
@@ -2564,7 +2512,6 @@ impl eframe::App for App {
 	                                                            .unwrap_or(&app.name);
 		                                                        let show_search_metadata =
 		                                                            !search_query.trim().is_empty();
-		                                                        let mut label_clicked = false;
 	                                                        if self.win_show_path {
                                                             let text_min_x =
                                                                 content_rect.min.x + app_icon_size.x + 10.0;
@@ -2603,12 +2550,10 @@ impl eframe::App for App {
                                                                                     .unwrap_or(&[]),
                                                                             ),
                                                                         )
-	                                                                .sense(egui::Sense::click())
+                                                                        .selectable(false)
+		                                                                .sense(egui::Sense::hover())
 	                                                                .truncate(),
 	                                                            );
-                                                            if title_response.clicked() {
-                                                                label_clicked = true;
-                                                            }
                                                             if self.disable_ibeam && title_response.hovered() {
                                                                 text_ui
                                                                     .ctx()
@@ -2638,15 +2583,13 @@ impl eframe::App for App {
 	                                                                        ))
 	                                                                        .size(self.win_path_size)
 	                                                                        .line_height(Some(
-	                                                                            self.win_line_height * 0.8,
-	                                                                        )),
-	                                                                )
-	                                                                .sense(egui::Sense::click())
+                                                                            self.win_line_height * 0.8,
+		                                                                        )),
+		                                                                )
+                                                                    .selectable(false)
+		                                                                .sense(egui::Sense::hover())
 	                                                                .truncate(),
 	                                                            );
-	                                                            if path_response.clicked() {
-	                                                                label_clicked = true;
-	                                                            }
 	                                                            if self.disable_ibeam && path_response.hovered() {
 	                                                                text_ui
 	                                                                    .ctx()
@@ -2665,20 +2608,18 @@ impl eframe::App for App {
                                                                                     .unwrap_or(&[]),
                                                                             ),
                                                                         )
-	                                                                .sense(egui::Sense::click())
+                                                                        .selectable(false)
+		                                                                .sense(egui::Sense::hover())
 	                                                                .truncate(),
 	                                                            );
-                                                            if title_response.clicked() {
-                                                                label_clicked = true;
-                                                            }
                                                             if self.disable_ibeam && title_response.hovered() {
                                                                 child_ui
                                                                     .ctx()
                                                                     .set_cursor_icon(egui::CursorIcon::Default);
                                                             }
                                                         }
-                                                        if label_clicked {
-                                                            self.open_or_launch_app_and_exit(app, ctx);
+                                                        if let Some(movement) = helpers::pinned_app_drag_drop(ui, &response, app, is_pinned) {
+                                                            pending_pin_move = Some(movement);
                                                         }
                                                             });
                                                     }
@@ -2688,6 +2629,24 @@ impl eframe::App for App {
 	                        });
 	                        ui.spacing_mut().item_spacing = previous_spacing;
 	                    }
+
+                    if let Some(movement) = pending_pin_move
+                        && helpers::move_pinned_app(&mut self.pinned_apps, &movement)
+                    {
+                        self.save_pinned_apps();
+                        if search_query.trim().is_empty()
+                            && let Some(index) = self.default_apps().iter().position(|(app, _)| app.desktop_file_path == movement.from)
+                        {
+                            if self.mode == LauncherMode::Apps {
+                                self.selected_index = index;
+                            } else {
+                                self.active_pane = ActivePane::Apps;
+                                self.side_panel_selected_index = index;
+                            }
+                        }
+                        ctx.request_repaint();
+                    }
+                    helpers::show_pinned_app_drag(ctx);
 
                     // Custom drag-resize handle at the bottom-right corner
                     let resize_handle_size = egui::vec2(16.0, 16.0);

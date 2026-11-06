@@ -6,17 +6,6 @@ pub(super) fn compact_panel_scrollbars(ui: &mut egui::Ui) {
     scroll.floating_width = 2.0;
 }
 
-pub(super) fn application_scroll_content(ui: &mut egui::Ui, viewport: egui::Rect) {
-    let scroll = ui.spacing().scroll;
-    if scroll.floating {
-        // Reserve the fully expanded bar even while it is hidden, so grid columns stay stable.
-        let gutter = (scroll.bar_width + scroll.bar_outer_margin + 2.0
-            - scroll.floating_allocated_width)
-            .max(0.0);
-        ui.set_width((ui.available_width() - gutter).max(0.0));
-    }
-}
-
 pub(super) fn application_panel_status(ui: &mut egui::Ui, loading: bool) -> egui::Response {
     ui.set_min_width(ui.available_width());
     ui.vertical_centered(|ui| {
@@ -32,6 +21,137 @@ pub(super) fn application_panel_status(ui: &mut egui::Ui, loading: bool) -> egui
         )
     })
     .inner
+}
+
+pub(super) fn application_scroll_content(ui: &mut egui::Ui, viewport: egui::Rect) {
+    let scroll = ui.spacing().scroll;
+    if scroll.floating {
+        // Reserve the fully expanded bar even while it is hidden, so grid columns stay stable.
+        let gutter = (scroll.bar_width + scroll.bar_outer_margin + 2.0
+            - scroll.floating_allocated_width)
+            .max(0.0);
+        ui.set_width((ui.available_width() - gutter).max(0.0));
+    }
+    if egui::DragAndDrop::has_payload_of_type::<PinnedAppDrag>(ui.ctx()) {
+        let screen_viewport = viewport.translate(ui.max_rect().min.to_vec2());
+        let delta = ui.input(|input| {
+            let pos = input.pointer.interact_pos()?;
+            if !input.pointer.primary_down() || !screen_viewport.contains(pos) {
+                return None;
+            }
+            let edge = 28.0_f32.min(screen_viewport.height() / 2.0);
+            if edge <= 0.0 {
+                return None;
+            }
+            let up = ((screen_viewport.top() + edge - pos.y) / edge).clamp(0.0, 1.0);
+            let down = ((pos.y - screen_viewport.bottom() + edge) / edge).clamp(0.0, 1.0);
+            Some((up - down) * 320.0 * input.stable_dt.min(0.05))
+        });
+        if let Some(delta) = delta.filter(|delta| *delta != 0.0) {
+            ui.scroll_with_delta_animation(
+                egui::vec2(0.0, delta),
+                egui::style::ScrollAnimation::none(),
+            );
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+struct PinnedAppDrag {
+    path: PathBuf,
+    name: String,
+    icon: Option<PathBuf>,
+}
+
+pub(super) struct PinnedAppMove {
+    pub from: PathBuf,
+    pub to: PathBuf,
+}
+
+pub(super) fn application_item_sense(pinned: bool) -> egui::Sense {
+    if pinned {
+        egui::Sense::click_and_drag()
+    } else {
+        egui::Sense::click()
+    }
+}
+
+pub(super) fn pinned_app_drag_drop(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    app: &AppInfo,
+    pinned: bool,
+) -> Option<PinnedAppMove> {
+    if !pinned {
+        return None;
+    }
+    if response.drag_started_by(egui::PointerButton::Primary) {
+        egui::DragAndDrop::set_payload(
+            ui.ctx(),
+            PinnedAppDrag {
+                path: app.desktop_file_path.clone(),
+                name: app.name.clone(),
+                icon: app.icon_path.clone(),
+            },
+        );
+    }
+    let dragged = response.dnd_hover_payload::<PinnedAppDrag>()?;
+    if dragged.path == app.desktop_file_path {
+        return None;
+    }
+    ui.painter().rect_stroke(
+        response.rect.shrink(1.0),
+        egui::CornerRadius::same(8),
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(61, 174, 233)),
+        egui::StrokeKind::Inside,
+    );
+    if ui.input(|input| input.pointer.button_released(egui::PointerButton::Primary)) {
+        response.dnd_release_payload::<PinnedAppDrag>()?;
+        return Some(PinnedAppMove {
+            from: dragged.path.clone(),
+            to: app.desktop_file_path.clone(),
+        });
+    }
+    None
+}
+
+pub(super) fn show_pinned_app_drag(ctx: &egui::Context) {
+    let Some(dragged) = egui::DragAndDrop::payload::<PinnedAppDrag>(ctx) else {
+        return;
+    };
+    let Some(pos) = ctx.pointer_interact_pos() else {
+        return;
+    };
+    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+    egui::Area::new(egui::Id::new("pinned_app_drag_preview"))
+        .order(egui::Order::Tooltip)
+        .interactable(false)
+        .fixed_pos(pos + egui::vec2(14.0, 14.0))
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let size = egui::vec2(24.0, 24.0);
+                    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                    paint_icon_in_rect(ui, dragged.icon.as_ref(), rect, size);
+                    ui.label(&dragged.name);
+                });
+            });
+        });
+}
+
+pub(super) fn move_pinned_app(pins: &mut Vec<PathBuf>, movement: &PinnedAppMove) -> bool {
+    let Some(from) = pins.iter().position(|path| *path == movement.from) else {
+        return false;
+    };
+    let Some(to) = pins.iter().position(|path| *path == movement.to) else {
+        return false;
+    };
+    if from == to {
+        return false;
+    }
+    let path = pins.remove(from);
+    pins.insert(to, path);
+    true
 }
 
 pub(super) fn virtual_items(
@@ -385,6 +505,317 @@ mod default_apps_tests {
         assert_eq!(positions.len(), 1);
         assert_eq!(positions.get(Path::new("/apps/a.desktop")), Some(&0));
     }
+
+    #[test]
+    fn pinned_moves_preserve_every_other_apps_relative_order() {
+        for len in 1..12 {
+            let original: Vec<_> = (0..len).map(|i| PathBuf::from(i.to_string())).collect();
+            for from in 0..len {
+                for to in 0..len {
+                    let mut pins = original.clone();
+                    assert_eq!(
+                        move_pinned_app(
+                            &mut pins,
+                            &PinnedAppMove {
+                                from: original[from].clone(),
+                                to: original[to].clone(),
+                            },
+                        ),
+                        from != to
+                    );
+                    assert_eq!(pins[to], original[from]);
+                    assert_eq!(pins.len(), original.len());
+                    let remaining: Vec<_> = pins.iter().filter(|p| **p != original[from]).collect();
+                    assert_eq!(
+                        remaining,
+                        original
+                            .iter()
+                            .filter(|p| **p != original[from])
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+            for (from, to) in [
+                (PathBuf::from("missing"), original[0].clone()),
+                (original[0].clone(), PathBuf::from("missing")),
+            ] {
+                let mut pins = original.clone();
+                assert!(!move_pinned_app(&mut pins, &PinnedAppMove { from, to }));
+                assert_eq!(pins, original);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct DragFrame {
+        rects: Vec<egui::Rect>,
+        moves: Vec<PinnedAppMove>,
+        clicked: bool,
+        middle_clicked: bool,
+    }
+
+    fn drag_frame(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        grid: bool,
+        overlay: bool,
+    ) -> DragFrame {
+        let mut result = DragFrame::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(280.0, 300.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_width(if grid { 164.0 } else { 220.0 });
+                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
+                    result.rects.clear();
+                    ui.horizontal_wrapped(|ui| {
+                        for index in 0..5 {
+                            let app = app(&index.to_string(), false);
+                            let pinned = index < 4;
+                            let sense = application_item_sense(pinned);
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(if grid { 48.0 } else { 220.0 }, 48.0),
+                                if overlay { egui::Sense::click() } else { sense },
+                            );
+                            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                            child.add(
+                                egui::Label::new(&app.name)
+                                    .selectable(false)
+                                    .sense(egui::Sense::hover()),
+                            );
+                            let response = if overlay {
+                                ui.interact(rect, ui.id().with(("overlay", index)), sense)
+                            } else {
+                                response
+                            };
+                            result.clicked |= response.clicked();
+                            result.middle_clicked |= response.middle_clicked();
+                            if let Some(movement) =
+                                pinned_app_drag_drop(ui, &response, &app, pinned)
+                            {
+                                result.moves.push(movement);
+                            }
+                            result.rects.push(rect);
+                        }
+                    });
+                });
+                show_pinned_app_drag(ctx);
+            },
+        );
+        result
+    }
+
+    fn pointer_button(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn pinned_drag_only_reorders_once_on_a_valid_drop_and_never_launches() {
+        for grid in [false, true] {
+            for overlay in [false, true] {
+                for (from, to) in [(0, 3), (3, 0), (1, 1), (0, 4), (4, 0)] {
+                    let ctx = egui::Context::default();
+                    let initial = drag_frame(&ctx, Vec::new(), grid, overlay);
+                    let start = initial.rects[from].left_top() + egui::vec2(6.0, 6.0);
+                    let target = initial.rects[to].center();
+                    for events in [
+                        vec![
+                            egui::Event::PointerMoved(start),
+                            pointer_button(start, egui::PointerButton::Primary, true),
+                        ],
+                        vec![egui::Event::PointerMoved(start + egui::vec2(10.0, 10.0))],
+                        vec![egui::Event::PointerMoved(target)],
+                        Vec::new(),
+                    ] {
+                        let frame = drag_frame(&ctx, events, grid, overlay);
+                        assert!(frame.moves.is_empty(), "must not reorder while hovering");
+                        assert!(!frame.clicked, "dragging must not launch an application");
+                    }
+                    let frame = drag_frame(
+                        &ctx,
+                        vec![pointer_button(target, egui::PointerButton::Primary, false)],
+                        grid,
+                        overlay,
+                    );
+                    assert!(!frame.clicked, "dropping must not launch an application");
+                    let valid = from != to && from < 4 && to < 4;
+                    assert_eq!(
+                        frame.moves.len(),
+                        usize::from(valid),
+                        "drop {from}->{to}, grid={grid}, overlay={overlay}"
+                    );
+                    if valid {
+                        assert_eq!(
+                            frame.moves[0].from,
+                            app(&from.to_string(), false).desktop_file_path
+                        );
+                        assert_eq!(
+                            frame.moves[0].to,
+                            app(&to.to_string(), false).desktop_file_path
+                        );
+                    }
+                    assert!(drag_frame(&ctx, Vec::new(), grid, overlay).moves.is_empty());
+                    assert!(!egui::DragAndDrop::has_payload_of_type::<PinnedAppDrag>(
+                        &ctx
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_drag_escape_cancels_without_reordering_or_launching() {
+        let ctx = egui::Context::default();
+        let initial = drag_frame(&ctx, Vec::new(), true, false);
+        let start = initial.rects[0].center();
+        let target = initial.rects[3].center();
+        drag_frame(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(start),
+                pointer_button(start, egui::PointerButton::Primary, true),
+            ],
+            true,
+            false,
+        );
+        drag_frame(&ctx, vec![egui::Event::PointerMoved(target)], true, false);
+        assert!(egui::DragAndDrop::has_payload_of_type::<PinnedAppDrag>(
+            &ctx
+        ));
+        let cancelled = drag_frame(
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+            false,
+        );
+        assert!(cancelled.moves.is_empty());
+        assert!(!ctx.input(|input| input.key_pressed(egui::Key::Escape)));
+        assert!(!egui::DragAndDrop::has_payload_of_type::<PinnedAppDrag>(
+            &ctx
+        ));
+        let released = drag_frame(
+            &ctx,
+            vec![pointer_button(target, egui::PointerButton::Primary, false)],
+            true,
+            false,
+        );
+        assert!(released.moves.is_empty());
+        assert!(!released.clicked);
+    }
+
+    #[test]
+    fn pinned_drag_edge_scrolling_stays_in_its_panel_and_stops_on_release() {
+        let ctx = egui::Context::default();
+        egui::DragAndDrop::set_payload(
+            &ctx,
+            PinnedAppDrag {
+                path: PathBuf::from("/apps/test.desktop"),
+                name: "test".into(),
+                icon: None,
+            },
+        );
+        let render = |events| {
+            let mut offsets = [0.0; 2];
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 240.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.columns(2, |panes| {
+                            for (index, ui) in panes.iter_mut().enumerate() {
+                                let area = egui::ScrollArea::vertical()
+                                    .id_salt(index)
+                                    .auto_shrink([false, true])
+                                    .max_height(180.0)
+                                    .show_viewport(ui, |ui, viewport| {
+                                        application_scroll_content(ui, viewport);
+                                        ui.set_height(1000.0);
+                                    });
+                                offsets[index] = area.state.offset.y;
+                            }
+                        });
+                    });
+                },
+            );
+            offsets
+        };
+        let pos = egui::pos2(450.0, 186.0);
+        let mut offsets = render(vec![
+            egui::Event::PointerMoved(pos),
+            pointer_button(pos, egui::PointerButton::Primary, true),
+        ]);
+        for _ in 0..10 {
+            offsets = render(Vec::new());
+            assert_eq!(offsets[0], 0.0);
+        }
+        assert!(offsets[1] > 0.0 && offsets[1] < 200.0);
+        let released = render(vec![pointer_button(
+            pos,
+            egui::PointerButton::Primary,
+            false,
+        )]);
+        // egui applies the preceding frame's queued scroll target at the next frame start.
+        assert_eq!(released[0], 0.0);
+        assert!(released[1] >= offsets[1] && released[1] - offsets[1] <= 16.0);
+        assert!(!egui::DragAndDrop::has_payload_of_type::<PinnedAppDrag>(
+            &ctx
+        ));
+        for _ in 0..5 {
+            assert_eq!(render(Vec::new()), released);
+        }
+    }
+
+    #[test]
+    fn pinned_items_keep_normal_click_and_middle_click_actions() {
+        for button in [egui::PointerButton::Primary, egui::PointerButton::Middle] {
+            let ctx = egui::Context::default();
+            let initial = drag_frame(&ctx, Vec::new(), false, false);
+            let pos = initial.rects[0].left_top() + egui::vec2(6.0, 6.0);
+            drag_frame(
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    pointer_button(pos, button, true),
+                ],
+                false,
+                false,
+            );
+            let released = drag_frame(&ctx, vec![pointer_button(pos, button, false)], false, false);
+            assert_eq!(released.clicked, button == egui::PointerButton::Primary);
+            assert_eq!(
+                released.middle_clicked,
+                button == egui::PointerButton::Middle
+            );
+            assert!(released.moves.is_empty());
+            assert!(!egui::DragAndDrop::has_payload_of_type::<PinnedAppDrag>(
+                &ctx
+            ));
+        }
+    }
 }
 
 pub(crate) fn filtered_search_cache_key(
@@ -685,7 +1116,8 @@ pub(crate) fn nearest_center_index(centers: &[f32], target_y: f32) -> Option<usi
 }
 
 pub(crate) fn show_immediate_icon_tooltip(response: &egui::Response, text: &str) {
-    if !response.hovered() {
+    if !response.hovered() || egui::DragAndDrop::has_payload_of_type::<PinnedAppDrag>(&response.ctx)
+    {
         return;
     }
 
