@@ -2498,4 +2498,128 @@ mod tests {
         assert!(popups.close(first));
         assert!(popups.open(app("over-limit.desktop")).is_ok());
     }
+    #[test]
+    fn native_process_info_matches_the_requested_order_with_package_updates_and_roots() {
+        use crate::windows::versions::{
+            ApplicationLaunch, NpmTarget, PackageTarget, ProcessVersion, ProgsMetadata,
+        };
+        let InfoTarget::Window(state) = window("bash") else {
+            unreachable!()
+        };
+        let node = ProcessInfoNode {
+            identity: crate::models::ProcessIdentity {
+                pid: 42,
+                start_ticks: 100,
+            },
+            parent_pid: 41,
+            depth: 1,
+            name: "bash".into(),
+            script_name: None,
+            header: "bash (pid 42) - /usr/bin/bash".into(),
+            executable: Some("/usr/bin/bash".into()),
+            executable_identity: None,
+            cwd: Some("/work/cmake".into()),
+            command_line: Some("bash".into()),
+        };
+        let mut version = ProcessVersion {
+            version: Some("GNU bash, version 5.3.15(1)-release".into()),
+            latest_version: Some("GNU bash, version 5.3.15(1)-release".into()),
+            build_id: Some("running-build-id".into()),
+            latest_build_id: Some("installed-build-id".into()),
+            running_latest_binary: Some(false),
+            uncompiled_changes: Some("Unknown (no supported local build metadata)".into()),
+            installation: Some("[PDT] Pacman Dependency Tool (Package-managed)".into()),
+            package: Some("bash 5.3.15-2".into()),
+            package_target: Some(PackageTarget {
+                name: "bash".into(),
+                inferred: false,
+            }),
+            latest_package_version: Some(
+                "extra/bash 5.3.20-2 (Last Pacman sync: 2026-10-07)".into(),
+            ),
+            progs_metadata: ProgsMetadata {
+                description: Some("The GNU Bourne Again shell".into()),
+                capabilities: Some("CLI".into()),
+                package_type: Some("[PDP] Pacman Dependency (Package-managed)".into()),
+                root_packages: Some("base 3-3 [PEP]".into()),
+            },
+            launch: Some(ApplicationLaunch {
+                executable: Some("/usr/bin/bash".into()),
+                chain: vec!["/usr/bin/rbash".into(), "/usr/bin/bash".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for role in ["Application", "Runtime"] {
+            let mut versions = process_version_rows(role, Some(&version), false);
+            append_desktop_entry_rows(
+                &mut versions,
+                desktop_entry_rows(None, Some(false), false, None),
+            );
+            let rows = process_info_rows(&state.window, &node, versions);
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.label.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "Process name",
+                    "PID",
+                    "Parent PID",
+                    "Executable path",
+                    "Working directory",
+                    "Command line",
+                    "Process start (ticks since boot)",
+                    "Version",
+                    "ELF build ID",
+                    "Latest version (on disk)",
+                    "Latest ELF build ID (on disk)",
+                    "Uncompiled changes",
+                    "Type",
+                    "Package",
+                    "Latest package version (Pacman/AUR)",
+                    "Root package",
+                    "Launch chain",
+                    "Desktop file",
+                    "Icon path",
+                    "Name",
+                    "Comment",
+                    "Description",
+                    "Capabilities",
+                ]
+            );
+            assert_eq!(rows[8].binary_is_current, Some(false));
+            assert_eq!(rows[12].value, "PDT");
+            assert_eq!(rows[13].value, "bash 5.3.15-2 [PDP]");
+            assert_eq!(rows[15].value, "base 3-3 [PEP]");
+            assert!(
+                rows[..9]
+                    .iter()
+                    .all(|row| row.scope == InfoFieldScope::RunningInstance)
+            );
+            assert!(
+                rows[9..]
+                    .iter()
+                    .all(|row| row.scope == InfoFieldScope::Installation)
+            );
+        }
+        version.npm_target = Some(NpmTarget {
+            name: "@example/tool".into(),
+            upstream: true,
+        });
+        let rows = process_version_rows("Application", Some(&version), false);
+        let position = |label: &str| rows.iter().position(|row| row.label == label).unwrap();
+        assert_eq!(
+            position("Latest package version (npm)"),
+            position("Latest package version (Pacman/AUR)") + 1
+        );
+        assert_eq!(
+            position("Root package"),
+            position("Latest package version (npm)") + 1
+        );
+        assert!(
+            rows[position("Latest package version (npm)")]
+                .value
+                .starts_with("Checking")
+        );
+    }
 }

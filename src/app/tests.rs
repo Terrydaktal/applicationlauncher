@@ -3488,4 +3488,61 @@ mod tests {
         assert_eq!(projected, "gimp -  mage");
         assert!(search_queries("mpv").is_some());
     }
+    #[test]
+    fn package_rows_distinguish_tools_owning_packages_and_explicit_dependency_roots() {
+        let mut version = crate::windows::versions::ProcessVersion {
+            installation: Some("[PDT] Pacman Dependency Tool (Package-managed)".into()),
+            package: Some("bash 5.3.15-2".into()),
+            progs_metadata: crate::windows::versions::ProgsMetadata {
+                package_type: Some("[PDP] Pacman Dependency (Package-managed)".into()),
+                root_packages: Some("base 3-3 [PEP] (132 other dependent packages; inferred from first recorded transaction)".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for role in ["Application", "Runtime"] {
+            let rows = super::super::popups::process_version_rows(role, Some(&version), false);
+            let owning = rows.iter().position(|row| row.label == "Package").unwrap();
+            assert_eq!(rows[owning].value, "bash 5.3.15-2 [PDP]");
+            assert_eq!(rows[owning + 1].label, "Root package");
+            assert!(rows[owning + 1].value.starts_with("base 3-3 [PEP]"));
+            assert!(
+                rows[owning + 1]
+                    .value
+                    .contains("132 other dependent packages")
+            );
+            assert_eq!(
+                rows.iter().find(|row| row.label == "Type").unwrap().value,
+                "PDT"
+            );
+            assert!(rows[owning..=owning + 1].iter().all(|row| {
+                row.scope == InfoFieldScope::Installation
+                    && !row.searched
+                    && !row.separator_before
+                    && row.binary_is_current.is_none()
+            }));
+        }
+        version.progs_metadata = Default::default();
+        let rows = super::super::popups::process_version_rows("Application", Some(&version), false);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.label == "Package")
+                .unwrap()
+                .value,
+            "bash 5.3.15-2"
+        );
+        assert!(
+            rows.iter()
+                .find(|row| row.label == "Root package")
+                .unwrap()
+                .value
+                .starts_with("Unknown")
+        );
+        version.package = None;
+        assert!(
+            !super::super::popups::process_version_rows("Application", Some(&version), false)
+                .iter()
+                .any(|row| row.label == "Root package")
+        );
+    }
 }

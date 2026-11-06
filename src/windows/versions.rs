@@ -15,6 +15,7 @@ mod installation;
 mod lookup;
 mod node;
 mod npm;
+mod package_history;
 mod pi;
 mod script;
 

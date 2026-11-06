@@ -14,6 +14,58 @@ const MAX_RESULTS: usize = 128;
 const MAX_OUTPUT: usize = 64 * 1024;
 const MAX_SYNC_LOG: u64 = 1024 * 1024;
 
+pub(super) fn parse_sync_timestamp(timestamp: &str) -> Option<i64> {
+    let bytes = timestamp.as_bytes();
+    if bytes.len() != 24
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || !matches!(bytes[19], b'+' | b'-')
+        || !bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || byte.is_ascii_digit()
+        })
+    {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| timestamp[range].parse::<i32>().ok();
+    let year = number(0..4)? - 1900;
+    let month = number(5..7)? - 1;
+    let day = number(8..10)?;
+    let hour = number(11..13)?;
+    let minute = number(14..16)?;
+    let second = number(17..19)?;
+    let offset_hour = number(20..22)?;
+    let offset_minute = number(22..24)?;
+    if offset_hour > 23 || offset_minute > 59 {
+        return None;
+    }
+    // timegm ignores the host timezone; reject dates it had to normalize.
+    let mut time: libc::tm = unsafe { std::mem::zeroed() };
+    time.tm_year = year;
+    time.tm_mon = month;
+    time.tm_mday = day;
+    time.tm_hour = hour;
+    time.tm_min = minute;
+    time.tm_sec = second;
+    let seconds = unsafe { libc::timegm(&mut time) };
+    if (
+        time.tm_year,
+        time.tm_mon,
+        time.tm_mday,
+        time.tm_hour,
+        time.tm_min,
+        time.tm_sec,
+    ) != (year, month, day, hour, minute, second)
+    {
+        return None;
+    }
+    let offset =
+        i64::from(offset_hour * 3600 + offset_minute * 60) * if bytes[19] == b'-' { -1 } else { 1 };
+    seconds.checked_sub(offset)
+}
+
 fn parse_last_pacman_sync(bytes: &[u8]) -> Option<String> {
     // Ignore an incomplete final line while Pacman may still be writing it.
     let complete = &bytes[..bytes.iter().rposition(|byte| *byte == b'\n')?];
