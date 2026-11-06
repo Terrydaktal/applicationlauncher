@@ -26,6 +26,29 @@ pub(crate) fn process_info_section_is_open(
         .is_open()
 }
 
+pub(crate) fn installation_badge(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let badge = match value.strip_prefix('[') {
+        Some(value) => value.split_once(']')?.0,
+        None => value,
+    };
+    if badge.len() != 3 || !badge.bytes().all(|byte| byte.is_ascii_uppercase()) {
+        return None;
+    }
+    Some(match badge {
+        "FKM" => "FRK",
+        "DVM" => "DEV",
+        "CLX" => "CLO",
+        "OPX" => "OPT",
+        "SCU" => "USC",
+        "BIU" => "UBI",
+        "NPT" => "NUT",
+        "UVT" => "UUT",
+        "CAT" => "CUT",
+        _ => badge,
+    })
+}
+
 fn info_popup_layout(
     heading: &str,
     subtitle: &str,

@@ -1547,7 +1547,7 @@ mod tests {
                 capabilities: Some("GUI".into()),
                 description: Some("Actual browser description".into()),
             },
-            launcher_installation: Some("[DVM] DEV (User-managed)".into()),
+            launcher_installation: Some("[DEV] DEV (User-managed)".into()),
             launcher_metadata: ProgsMetadata {
                 capabilities: Some("GUI".into()),
                 description: Some("Custom launch wrapper".into()),

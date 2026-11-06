@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::Deserialize;
 
+const INVENTORY_SCHEMA_VERSION: u32 = 4;
 const MAX_INVENTORY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PROGRAMS: usize = 8192;
 const MAX_BINARIES: usize = 32768;
@@ -153,7 +154,43 @@ impl Program {
         ProgsMetadata {
             capabilities: self.capabilities.as_ref().map(Capabilities::summary),
             description: (!self.desc.trim().is_empty()).then(|| self.desc.trim().to_owned()),
+            ..Default::default()
         }
+    }
+
+    fn package_name(&self) -> &str {
+        if self.owning_package.is_empty() {
+            &self.name
+        } else {
+            &self.owning_package
+        }
+    }
+
+    fn tool_label(&self) -> Option<String> {
+        // Match Progs' provided_tool_identity, keeping local build classifications intact.
+        let (badge, summary) = match (self.origin.as_str(), self.install_role.as_str()) {
+            ("Pacman", "Explicit") => ("PET", "Pacman Explicit Tool"),
+            ("Pacman", "Dependency") => ("PDT", "Pacman Dependency Tool"),
+            ("Pacman", _) => ("PPT", "Pacman Provided Tool"),
+            ("Aur", "Explicit") => ("AET", "AUR Explicit Tool"),
+            ("Aur", "Dependency") => ("ADT", "AUR Dependency Tool"),
+            ("Aur", _) => ("APT", "AUR Provided Tool"),
+            ("Cargo", "Explicit") => ("CET", "Cargo Explicit Tool"),
+            ("Cargo", _) => ("CUT", "Cargo Unknown Tool"),
+            ("Npm", "Explicit") => ("NET", "npm Explicit Tool"),
+            ("Npm", "Dependency") => ("NDT", "npm Dependency Tool"),
+            ("Npm", _) => ("NUT", "npm Unknown Tool"),
+            ("Uv", "Explicit") => ("UET", "uv Explicit Tool"),
+            ("Uv", "Dependency") => ("UDT", "uv Dependency Tool"),
+            ("Uv", _) => ("UUT", "uv Unknown Tool"),
+            _ => return self.label(),
+        };
+        let management = if matches!(self.origin.as_str(), "Pacman" | "Aur") {
+            "Package-managed"
+        } else {
+            "Toolchain-managed"
+        };
+        Some(format!("[{badge}] {summary} ({management})"))
     }
 
     fn label(&self) -> Option<String> {
@@ -169,41 +206,44 @@ impl Program {
             ("Aur", "Standalone") => ("Standalone", "ASP"),
             ("Aur", "ToolchainManaged") => ("Toolchain-managed", "ASP"),
             (_, _) if package_managed => return None,
+            ("Uv", "Explicit") => ("Explicit", "UEP"),
+            ("Uv", "Dependency") => ("Dependency", "UDP"),
+            ("Uv", _) => ("Unknown install reason", "UUP"),
+            ("Npm", "Explicit") => ("Explicit", "NEP"),
+            ("Npm", "Dependency") => ("Dependency", "NDP"),
+            ("Npm", _) => ("Unknown install reason", "NUP"),
+            ("Cargo", "Explicit") => ("Explicit", "CEP"),
+            ("Cargo", _) => ("Unknown install reason", "CUP"),
+            ("Rustup", _) => ("", "RUT"),
             _ => ("", "UNC"),
         };
         let (source, management, local_badge) = if self.state.broken {
             ("BRK", "Broken", "BRK")
         } else if self.state.dev {
-            ("DEV", "User-managed", "DVM")
+            ("DEV", "User-managed", "DEV")
         } else if self.state.fork {
-            ("Fork", "User-managed", "FKM")
+            ("Fork", "User-managed", "FRK")
         } else if self.state.cloned {
-            ("Git Clone", "External source", "CLX")
+            ("Git Clone", "External source", "CLO")
         } else if self.state.unclassified {
             ("UNC", "Unclassified", "UNC")
         } else if self.state.opt {
-            ("opt", "External/manual", "OPX")
+            ("opt", "External/manual", "OPT")
         } else if self.state.script {
-            ("SCU", "Unmanaged", "SCU")
+            ("USC", "Unmanaged", "USC")
         } else if self.state.binary {
-            ("BIU", "Unmanaged", "BIU")
+            ("UBI", "Unmanaged", "UBI")
         } else {
             ("UNC", "Unclassified", "UNC")
         };
-        let toolchain_badge = match self.origin.as_str() {
-            "Uv" => Some("UVT"),
-            "Npm" => Some("NPT"),
-            "Cargo" => Some("CAT"),
-            _ => None,
-        };
         let badge = if package_managed && self.state.orphan {
-            "POP"
+            if self.origin == "Aur" { "AOP" } else { "POP" }
         } else if self.origin == "Aur" {
             package_badge
         } else if self.state.broken {
             "BRK"
-        } else if let Some(badge) = toolchain_badge {
-            badge
+        } else if matches!(self.origin.as_str(), "Uv" | "Npm" | "Cargo" | "Rustup") {
+            package_badge
         } else if local_badge != "UNC" || self.state.unclassified {
             local_badge
         } else {
@@ -212,9 +252,10 @@ impl Program {
         let summary = match self.origin.as_str() {
             "Pacman" => format!("Pacman {role} (Package-managed)"),
             "Aur" => format!("AUR {role} (Package-managed)"),
-            "Uv" => "uv (Toolchain-managed)".into(),
-            "Npm" => "npm (Toolchain-managed)".into(),
-            "Cargo" => "Cargo (Toolchain-managed)".into(),
+            "Uv" => format!("uv {role} (Toolchain-managed)"),
+            "Npm" => format!("npm {role} (Toolchain-managed)"),
+            "Cargo" => format!("Cargo {role} (Toolchain-managed)"),
+            "Rustup" => "rustup (Toolchain-managed)".into(),
             "Local" => format!("{source} ({management})"),
             _ => return None,
         };
@@ -258,10 +299,13 @@ fn checkout_root(executable: &Path) -> Option<&Path> {
         .find(|directory| directory.join(".git").exists())
 }
 
-fn unique_label<'a>(programs: impl Iterator<Item = &'a Program>) -> Result<Option<String>, ()> {
+fn unique_label<'a>(
+    programs: impl Iterator<Item = &'a Program>,
+    classify: fn(&Program) -> Option<String>,
+) -> Result<Option<String>, ()> {
     let mut label = None;
     for candidate in programs {
-        let current = candidate.label().ok_or(())?;
+        let current = classify(candidate).ok_or(())?;
         if label.as_ref().is_some_and(|previous| previous != &current) {
             return Err(());
         }
@@ -276,7 +320,7 @@ impl Inventory {
             return None;
         }
         let inventory: Self = serde_json::from_slice(bytes).ok()?;
-        (inventory.schema_version == 3
+        (inventory.schema_version == INVENTORY_SCHEMA_VERSION
             && inventory.scan.apps.len() <= MAX_PROGRAMS
             && inventory
                 .scan
@@ -328,7 +372,9 @@ impl Inventory {
         let Some(programs) = self.matching_programs(executable) else {
             return (None, ProgsMetadata::default());
         };
-        let label = unique_label(programs.iter().copied()).ok().flatten();
+        let label = unique_label(programs.iter().copied(), Program::tool_label)
+            .ok()
+            .flatten();
         let metadata = programs
             .first()
             .map(|program| program.metadata())
@@ -351,7 +397,9 @@ impl Inventory {
                     program.owning_package == package
                 }
         });
-        let label = unique_label(programs.clone()).ok().flatten();
+        let label = unique_label(programs.clone(), Program::tool_label)
+            .ok()
+            .flatten();
         let mut metadata = programs.map(Program::metadata);
         let first = metadata.next().unwrap_or_default();
         let metadata = if metadata.all(|value| value == first) {
@@ -552,7 +600,7 @@ mod tests {
     }
 
     fn inventory(apps: Vec<serde_json::Value>) -> Vec<u8> {
-        serde_json::to_vec(&json!({"schema_version": 3, "scan": {"apps": apps}})).unwrap()
+        serde_json::to_vec(&json!({"schema_version": 4, "scan": {"apps": apps}})).unwrap()
     }
 
     struct Fixture(PathBuf);
@@ -787,37 +835,37 @@ mod tests {
                 "Uv",
                 "Standalone",
                 json!({}),
-                "[UVT] uv (Toolchain-managed)",
+                "[UUP] uv Unknown install reason (Toolchain-managed)",
             ),
             (
                 "Npm",
                 "ToolchainManaged",
                 json!({}),
-                "[NPT] npm (Toolchain-managed)",
+                "[NUP] npm Unknown install reason (Toolchain-managed)",
             ),
             (
                 "Cargo",
                 "ToolchainManaged",
                 json!({}),
-                "[CAT] Cargo (Toolchain-managed)",
+                "[CUP] Cargo Unknown install reason (Toolchain-managed)",
             ),
             (
                 "Local",
                 "Standalone",
                 json!({"dev": true}),
-                "[DVM] DEV (User-managed)",
+                "[DEV] DEV (User-managed)",
             ),
             (
                 "Local",
                 "Standalone",
                 json!({"fork": true}),
-                "[FKM] Fork (User-managed)",
+                "[FRK] Fork (User-managed)",
             ),
             (
                 "Local",
                 "Standalone",
                 json!({"cloned": true}),
-                "[CLX] Git Clone (External source)",
+                "[CLO] Git Clone (External source)",
             ),
             (
                 "Local",
@@ -829,19 +877,19 @@ mod tests {
                 "Local",
                 "Standalone",
                 json!({"opt": true}),
-                "[OPX] opt (External/manual)",
+                "[OPT] opt (External/manual)",
             ),
             (
                 "Local",
                 "Standalone",
                 json!({"script": true}),
-                "[SCU] SCU (Unmanaged)",
+                "[USC] USC (Unmanaged)",
             ),
             (
                 "Local",
                 "Standalone",
                 json!({"binary": true}),
-                "[BIU] BIU (Unmanaged)",
+                "[UBI] UBI (Unmanaged)",
             ),
             ("Local", "Standalone", json!({}), "[UNC] UNC (Unclassified)"),
         ] {
@@ -864,7 +912,7 @@ mod tests {
         ] {
             assert_eq!(
                 inventory.lookup(Path::new(path)).as_deref(),
-                Some("[CAT] Cargo (Toolchain-managed)")
+                Some("[CUT] Cargo Unknown Tool (Toolchain-managed)")
             );
         }
         assert!(inventory.lookup(Path::new("/unrelated/tool")).is_none());
@@ -1027,7 +1075,7 @@ mod tests {
             inventory
                 .lookup(&checkout.join("build/terminal/xfce4-terminal"))
                 .as_deref(),
-            Some("[FKM] Fork (User-managed)")
+            Some("[FRK] Fork (User-managed)")
         );
         let metadata = inventory
             .inspect(&checkout.join("build/terminal/xfce4-terminal"))
@@ -1109,7 +1157,7 @@ mod tests {
                 .lookup(Path::new("/bin/tool"))
                 .is_none()
         );
-        assert!(Inventory::parse(br#"{"schema_version":4,"scan":{"apps":[]}}"#).is_none());
+        assert!(Inventory::parse(br#"{"schema_version":5,"scan":{"apps":[]}}"#).is_none());
         assert!(Inventory::parse(b"invalid JSON").is_none());
         let root = Fixture::new();
         let path = root.0.join("oversized.json");
@@ -1146,11 +1194,11 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &updated));
         assert_eq!(
             updated.lookup(Path::new("/bin/tool")).as_deref(),
-            Some("[DVM] DEV (User-managed)")
+            Some("[DEV] DEV (User-managed)")
         );
         assert_eq!(
             first.lookup(Path::new("/bin/tool")).as_deref(),
-            Some("[FKM] Fork (User-managed)")
+            Some("[FRK] Fork (User-managed)")
         );
     }
 
@@ -1173,6 +1221,142 @@ mod tests {
             if let Ok(expected) = std::env::var(key) {
                 assert_eq!(actual.as_deref(), Some(expected.as_str()));
             }
+        }
+    }
+    #[test]
+    fn schema_four_preserves_progs_development_classification_and_metadata() {
+        let bytes = serde_json::to_vec(&json!({
+            "schema_version": 4,
+            "uv_dependency_revision": 1,
+            "scan": {
+                "apps": [{
+                    "name": "progs",
+                    "origin": "Local",
+                    "install_role": "Standalone",
+                    "state": {"dev": true},
+                    "desc": "System programs manager",
+                    "capabilities": {"has_gui": true, "has_cli": true},
+                    "binaries": [{
+                        "name": "progs",
+                        "path": "/home/example/.local/bin/progs",
+                        "target": "/home/example/Dev/progs/target/release/progs"
+                    }]
+                }],
+                "provides_map": {},
+                "_stats": [1, 0, 0, 0, 0]
+            }
+        }))
+        .unwrap();
+        let inventory = Inventory::parse(&bytes).expect("current Progs inventory must be accepted");
+        for executable in [
+            "/home/example/.local/bin/progs",
+            "/home/example/Dev/progs/target/release/progs",
+        ] {
+            let (label, metadata) = inventory.inspect(Path::new(executable));
+            assert_eq!(label.as_deref(), Some("[DEV] DEV (User-managed)"));
+            assert_eq!(
+                metadata.description.as_deref(),
+                Some("System programs manager")
+            );
+            assert_eq!(
+                metadata.capabilities.as_deref(),
+                Some("GUI \u{00b7} CLI  \u{2022}  Primary role: GUI application")
+            );
+        }
+    }
+
+    #[test]
+    fn current_progs_badges_preserve_package_and_tool_install_roles() {
+        for (origin, role, package_badge, tool_badge) in [
+            ("Pacman", "Explicit", "PEP", "PET"),
+            ("Pacman", "Dependency", "PDP", "PDT"),
+            ("Pacman", "Standalone", "PSP", "PPT"),
+            ("Pacman", "ToolchainManaged", "PSP", "PPT"),
+            ("Aur", "Explicit", "AEP", "AET"),
+            ("Aur", "Dependency", "ADP", "ADT"),
+            ("Aur", "Standalone", "ASP", "APT"),
+            ("Aur", "ToolchainManaged", "ASP", "APT"),
+            ("Uv", "Explicit", "UEP", "UET"),
+            ("Uv", "Dependency", "UDP", "UDT"),
+            ("Uv", "Standalone", "UUP", "UUT"),
+            ("Uv", "ToolchainManaged", "UUP", "UUT"),
+            ("Npm", "Explicit", "NEP", "NET"),
+            ("Npm", "Dependency", "NDP", "NDT"),
+            ("Npm", "Standalone", "NUP", "NUT"),
+            ("Npm", "ToolchainManaged", "NUP", "NUT"),
+            ("Cargo", "Explicit", "CEP", "CET"),
+            ("Cargo", "Dependency", "CUP", "CUT"),
+            ("Cargo", "Standalone", "CUP", "CUT"),
+            ("Cargo", "ToolchainManaged", "CUP", "CUT"),
+            ("Rustup", "ToolchainManaged", "RUT", "RUT"),
+        ] {
+            let record: Program = serde_json::from_value(program(origin, role, json!({}))).unwrap();
+            assert!(
+                record
+                    .label()
+                    .unwrap()
+                    .starts_with(&format!("[{package_badge}]")),
+                "{origin}/{role}: package"
+            );
+            assert!(
+                record
+                    .tool_label()
+                    .unwrap()
+                    .starts_with(&format!("[{tool_badge}]")),
+                "{origin}/{role}: tool"
+            );
+        }
+    }
+
+    #[test]
+    fn current_progs_special_state_badges_and_precedence_are_preserved() {
+        for (origin, role, state, package_badge, tool_badge) in [
+            ("Local", "Standalone", json!({"fork": true}), "FRK", "FRK"),
+            (
+                "Local",
+                "Standalone",
+                json!({"dev": true, "fork": true}),
+                "DEV",
+                "DEV",
+            ),
+            ("Local", "Standalone", json!({"cloned": true}), "CLO", "CLO"),
+            ("Local", "Standalone", json!({"opt": true}), "OPT", "OPT"),
+            ("Local", "Standalone", json!({"script": true}), "USC", "USC"),
+            ("Local", "Standalone", json!({"binary": true}), "UBI", "UBI"),
+            (
+                "Local",
+                "Standalone",
+                json!({"broken": true, "fork": true}),
+                "BRK",
+                "BRK",
+            ),
+            ("Npm", "Explicit", json!({"fork": true}), "NEP", "NET"),
+            ("Npm", "Explicit", json!({"broken": true}), "BRK", "NET"),
+            (
+                "Pacman",
+                "Dependency",
+                json!({"orphan": true}),
+                "POP",
+                "PDT",
+            ),
+            ("Aur", "Dependency", json!({"orphan": true}), "AOP", "ADT"),
+            ("Aur", "Dependency", json!({"broken": true}), "ADP", "ADT"),
+        ] {
+            let record: Program = serde_json::from_value(program(origin, role, state)).unwrap();
+            assert!(
+                record
+                    .label()
+                    .unwrap()
+                    .starts_with(&format!("[{package_badge}]")),
+                "{origin}/{role}: package"
+            );
+            assert!(
+                record
+                    .tool_label()
+                    .unwrap()
+                    .starts_with(&format!("[{tool_badge}]")),
+                "{origin}/{role}: tool"
+            );
         }
     }
 }
