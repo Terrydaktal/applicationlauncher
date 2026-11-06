@@ -5,7 +5,7 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 const CACHE_TTL: Duration = Duration::from_secs(300);
@@ -66,7 +66,7 @@ pub(super) fn parse_sync_timestamp(timestamp: &str) -> Option<i64> {
     seconds.checked_sub(offset)
 }
 
-fn parse_last_pacman_sync(bytes: &[u8]) -> Option<String> {
+fn parse_last_pacman_sync(bytes: &[u8]) -> Option<i64> {
     // Ignore an incomplete final line while Pacman may still be writing it.
     let complete = &bytes[..bytes.iter().rposition(|byte| *byte == b'\n')?];
     complete
@@ -77,32 +77,12 @@ fn parse_last_pacman_sync(bytes: &[u8]) -> Option<String> {
             let timestamp = line
                 .strip_prefix('[')?
                 .strip_suffix("] [PACMAN] synchronizing package lists")?;
-            let bytes = timestamp.as_bytes();
-            if bytes.len() != 24
-                || bytes[4] != b'-'
-                || bytes[7] != b'-'
-                || bytes[10] != b'T'
-                || bytes[13] != b':'
-                || bytes[16] != b':'
-                || !matches!(bytes[19], b'+' | b'-')
-                || !bytes.iter().enumerate().all(|(index, byte)| {
-                    matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || byte.is_ascii_digit()
-                })
-            {
-                return None;
-            }
-            Some(format!(
-                "{} {} {}:{}",
-                &timestamp[..10],
-                &timestamp[11..19],
-                &timestamp[19..22],
-                &timestamp[22..]
-            ))
+            parse_sync_timestamp(timestamp)
         })
 }
 
-fn last_pacman_sync(path: &Path) -> Option<String> {
-    type Cache = Option<(super::ExecutableIdentity, Option<String>)>;
+fn last_pacman_sync(path: &Path) -> Option<i64> {
+    type Cache = Option<(super::ExecutableIdentity, Option<i64>)>;
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     let file = File::options()
@@ -134,7 +114,7 @@ fn last_pacman_sync(path: &Path) -> Option<String> {
         return None;
     }
     if let Ok(mut cache) = cache.lock() {
-        *cache = Some((identity, timestamp.clone()));
+        *cache = Some((identity, timestamp));
     }
     timestamp
 }
@@ -215,13 +195,22 @@ struct QueryResult {
 }
 
 impl QueryResult {
-    fn display(&self, last_sync: Option<&str>) -> String {
+    fn display(&self, last_sync: Option<i64>, now: i64) -> String {
         if self.pacman {
-            format!(
-                "{}; Last Pacman sync: {}",
-                self.text,
-                last_sync.unwrap_or("unknown")
-            )
+            let age = last_sync
+                .and_then(|timestamp| now.checked_sub(timestamp))
+                .filter(|seconds| *seconds >= 0)
+                .map(|seconds| match seconds / 3600 {
+                    0 => "less than 1 hour ago".into(),
+                    1 => "1 hour ago".into(),
+                    hours @ 2..=23 => format!("{hours} hours ago"),
+                    hours => match hours / 24 {
+                        1 => "1 day ago".into(),
+                        days => format!("{days} days ago"),
+                    },
+                })
+                .unwrap_or_else(|| "unknown".into());
+            format!("{} (Last Pacman sync: {})", self.text, age)
         } else {
             self.text.clone()
         }
@@ -249,14 +238,11 @@ fn query_with(
                     && (!aur || repository.eq_ignore_ascii_case("aur"))
                 {
                     return QueryResult {
-                        text: format!(
-                            "{repository}/{package} {version} ({})",
-                            if aur {
-                                "Paru/AUR"
-                            } else {
-                                "Pacman sync database"
-                            }
-                        ),
+                        text: if aur {
+                            format!("{repository}/{package} {version} (Paru/AUR)")
+                        } else {
+                            format!("{repository}/{package} {version}")
+                        },
                         found: true,
                         pacman: !aur,
                     };
@@ -349,11 +335,12 @@ pub(super) fn query(target: &PackageTarget) -> String {
         .pacman
         .then(|| last_pacman_sync(Path::new("/var/log/pacman.log")))
         .flatten();
-    let mut text = result.display(last_sync.as_deref());
-    if target.inferred {
-        text.push_str("; package-name match for local build");
-    }
-    text
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+        .unwrap_or(i64::MIN);
+    result.display(last_sync, now)
 }
 
 #[cfg(test)]
@@ -397,6 +384,41 @@ mod tests {
         }
     }
 
+    fn timestamp(value: &str) -> i64 {
+        parse_sync_timestamp(value).unwrap()
+    }
+
+    #[test]
+    fn sync_timestamps_validate_calendar_dates_and_account_for_timezone_offsets() {
+        for value in [
+            "1970-01-01T00:00:00+0000",
+            "1970-01-01T01:30:00+0130",
+            "1969-12-31T19:30:00-0430",
+        ] {
+            assert_eq!(parse_sync_timestamp(value), Some(0), "{value}");
+        }
+        assert!(parse_sync_timestamp("2000-02-29T23:59:59+0000").is_some());
+        assert!(parse_sync_timestamp("2024-02-29T00:00:00+0000").is_some());
+        for invalid in [
+            "1900-02-29T00:00:00+0000",
+            "2026-02-29T00:00:00+0000",
+            "2026-04-31T00:00:00+0000",
+            "2026-00-01T00:00:00+0000",
+            "2026-13-01T00:00:00+0000",
+            "2026-01-00T00:00:00+0000",
+            "2026-01-01T24:00:00+0000",
+            "2026-01-01T00:60:00+0000",
+            "2026-01-01T00:00:60+0000",
+            "2026-01-01T00:00:00+2400",
+            "2026-01-01T00:00:00+0060",
+            "2026-10-07",
+            "",
+            " ",
+        ] {
+            assert!(parse_sync_timestamp(invalid).is_none(), "{invalid}");
+        }
+    }
+
     #[test]
     fn last_pacman_sync_uses_the_latest_complete_sync_record_and_preserves_its_offset() {
         let log = b"[2026-10-07T20:48:01+0100] [PACMAN] synchronizing package lists\n\
@@ -405,8 +427,8 @@ mod tests {
             [2026-10-25T02:22:05+0000] [ALPM] synchronizing package lists\n\
             [2026-10-25T02:23:06+0000] [PACMAN] synchronizing package lists";
         assert_eq!(
-            parse_last_pacman_sync(log).as_deref(),
-            Some("2026-10-25 02:21:04 -04:30")
+            parse_last_pacman_sync(log),
+            Some(timestamp("2026-10-25T02:21:04-0430"))
         );
         assert!(parse_last_pacman_sync(b"").is_none());
     }
@@ -424,9 +446,10 @@ mod tests {
             b"[2026-10-25T02:23:06+00\xff0] [PACMAN] synchronizing package lists\n",
         );
         log.extend_from_slice(b"[invalid] [PACMAN] synchronizing package lists\n");
+        log.extend_from_slice(b"[2026-02-30T00:00:00+0000] [PACMAN] synchronizing package lists\n");
         assert_eq!(
-            parse_last_pacman_sync(&log).as_deref(),
-            Some("2026-10-07 20:48:01 +01:00")
+            parse_last_pacman_sync(&log),
+            Some(timestamp("2026-10-07T20:48:01+0100"))
         );
     }
 
@@ -443,8 +466,8 @@ mod tests {
         .unwrap();
         for _ in 0..2 {
             assert_eq!(
-                last_pacman_sync(&path).as_deref(),
-                Some("2026-10-07 20:48:01 +01:00")
+                last_pacman_sync(&path),
+                Some(timestamp("2026-10-07T20:48:01+0100"))
             );
         }
         writeln!(
@@ -453,8 +476,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            last_pacman_sync(&path).as_deref(),
-            Some("2026-10-25 02:21:04 +00:00")
+            last_pacman_sync(&path),
+            Some(timestamp("2026-10-25T02:21:04+0000"))
         );
         std::fs::write(
             &path,
@@ -469,8 +492,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            last_pacman_sync(&path).as_deref(),
-            Some("2026-10-26 02:21:04 +00:00")
+            last_pacman_sync(&path),
+            Some(timestamp("2026-10-26T02:21:04+0000"))
         );
     }
 
@@ -490,13 +513,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            last_pacman_sync(&path).as_deref(),
-            Some("2026-10-25 02:21:04 +00:00")
+            last_pacman_sync(&path),
+            Some(timestamp("2026-10-25T02:21:04+0000"))
         );
     }
 
     #[test]
-    fn sync_date_is_displayed_next_to_cached_pacman_versions_but_not_aur_or_errors() {
+    fn sync_age_uses_hours_then_days_and_is_recomputed_for_cached_package_results() {
         let result = query_with("tool", Some(Path::new("pacman")), None, |_| {
             Ok(output(
                 true,
@@ -504,17 +527,31 @@ mod tests {
                 "",
             ))
         });
-        assert_eq!(
-            result.display(Some("2026-10-07 20:48:01 +01:00")),
-            "extra/tool 2.0-1 (Pacman sync database); Last Pacman sync: 2026-10-07 20:48:01 +01:00"
-        );
-        assert!(result.display(None).ends_with("Last Pacman sync: unknown"));
-        assert!(
-            result
-                .clone()
-                .display(Some("2026-10-25 02:21:04 +00:00"))
-                .ends_with("Last Pacman sync: 2026-10-25 02:21:04 +00:00")
-        );
+        let sync = timestamp("2026-10-07T20:48:01+0100");
+        for (seconds, expected) in [
+            (0, "less than 1 hour ago"),
+            (3599, "less than 1 hour ago"),
+            (3600, "1 hour ago"),
+            (7199, "1 hour ago"),
+            (7200, "2 hours ago"),
+            (86399, "23 hours ago"),
+            (86400, "1 day ago"),
+            (86401, "1 day ago"),
+            (172799, "1 day ago"),
+            (172800, "2 days ago"),
+            (30 * 86400, "30 days ago"),
+        ] {
+            assert_eq!(
+                result.display(Some(sync), sync + seconds),
+                format!("extra/tool 2.0-1 (Last Pacman sync: {expected})")
+            );
+        }
+        for missing in [None, Some(sync + 1), Some(i64::MIN)] {
+            assert_eq!(
+                result.display(missing, sync),
+                "extra/tool 2.0-1 (Last Pacman sync: unknown)"
+            );
+        }
         let aur = query_with("tool", None, Some(Path::new("paru")), |_| {
             Ok(output(
                 true,
@@ -522,9 +559,9 @@ mod tests {
                 "",
             ))
         });
-        assert_eq!(aur.display(Some("date")), "aur/tool 3.0-1 (Paru/AUR)");
+        assert_eq!(aur.display(Some(sync), sync), "aur/tool 3.0-1 (Paru/AUR)");
         let missing = query_with("tool", None, None, |_| panic!("must not execute"));
-        assert_eq!(missing.display(Some("date")), missing.text);
+        assert_eq!(missing.display(Some(sync), sync), missing.text);
     }
 
     #[test]
@@ -610,7 +647,7 @@ mod tests {
             },
         );
         assert_eq!(calls.len(), 1);
-        assert_eq!(found.text, "extra/tool 2.0-1 (Pacman sync database)");
+        assert_eq!(found.text, "extra/tool 2.0-1");
         assert!(found.found);
         calls.clear();
         let found = query_with(

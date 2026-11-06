@@ -63,7 +63,7 @@ fn classify_ninja_status(output: &str) -> &'static str {
     } else if pending {
         // Restat generators (e.g. Meson's vcs_tag) are always scheduled, but may
         // leave identical output. A dry-run cannot prove that sources changed.
-        "Unknown (pending checks may be always-run generators, not source changes)"
+        "Unknown"
     } else if output.lines().any(|line| line == "ninja: no work to do.") {
         "No (Ninja target is up to date)"
     } else {
@@ -278,7 +278,7 @@ mod tests {
         fixture.write("revision.h", "already current revision", now);
         let executable = fixture.write("app", "already built", now + Duration::from_secs(60));
         let status = ninja_status(&fixture.0, &executable);
-        assert!(status.starts_with("Unknown"), "{status}");
+        assert_eq!(status, "Unknown");
         assert!(!fixture.0.join("MUST_NOT_RUN").exists());
     }
 
