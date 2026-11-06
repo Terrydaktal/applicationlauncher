@@ -125,23 +125,22 @@ pub(crate) fn is_terminal_title_marker(value: &str) -> bool {
         || key.ends_with("terminal")
 }
 
+fn is_pi_title_marker(value: &str) -> bool {
+    unstyled_title_characters(value).eq("pi".chars())
+        || unstyled_title_characters(value).eq("\u{03c0}".chars())
+}
+
 pub(crate) fn terminal_title_segments(
     dynamic_title: &str,
     proc_name: &str,
     command_summary: Option<&str>,
     cwd: Option<&str>,
     parent_program: Option<&str>,
+    terminal_marker: &str,
 ) -> Vec<String> {
     let dynamic_title = dynamic_title.trim();
     let mut segments = Vec::new();
     let primary_title = terminal_primary_title(proc_name, command_summary);
-    if let Some(parent_program) = parent_program {
-        push_unique_terminal_segment(&mut segments, parent_program);
-        push_unique_terminal_segment(&mut segments, terminal_process_display_name(proc_name));
-    } else {
-        push_unique_terminal_segment(&mut segments, primary_title.clone());
-    }
-
     let primary_key = normalize_app_match_key(&primary_title);
     let proc_key = normalize_app_match_key(proc_name);
     let parent_key = parent_program.map(normalize_app_match_key);
@@ -167,17 +166,50 @@ pub(crate) fn terminal_title_segments(
             }
         });
 
+    let has_separate_title_parts = title_parts.len() > 1;
+    let pi_marker = if primary_key == "pi" {
+        title_parts
+            .iter()
+            .copied()
+            .find(|part| {
+                !part.is_empty() && crate::search::attention_required_frame(part) != Some(*part)
+            })
+            .filter(|part| is_pi_title_marker(part))
+    } else {
+        None
+    };
+    // Pi's one-character glyph carries the style of the complete program name.
+    let primary_title = pi_marker
+        .and_then(|marker| {
+            marker
+                .chars()
+                .find(|ch| crate::search::is_title_strikethrough_mark(*ch))
+        })
+        .map(|mark| format!("p{mark}i{mark}"))
+        .unwrap_or(primary_title);
+    if let Some(parent_program) = parent_program {
+        push_unique_terminal_segment(&mut segments, parent_program);
+        if proc_key == "pi" {
+            push_unique_terminal_segment(&mut segments, primary_title);
+        } else {
+            push_unique_terminal_segment(&mut segments, terminal_process_display_name(proc_name));
+        }
+    } else {
+        push_unique_terminal_segment(&mut segments, primary_title);
+    }
+
     for part in title_parts {
         let part = part.trim();
         if part.is_empty() || is_terminal_title_marker(part) {
             continue;
         }
 
-        if prefer_cwd_over_dynamic_path && terminal_context_looks_path_like(part) {
-            continue;
-        }
-
-        if let Some(cwd) = cwd.filter(|cwd| terminal_segment_matches_cwd_basename(part, cwd)) {
+        // Resolve separate directory fields before the legacy whole-caption fallback
+        // can reinsert a program marker or task that has already been handled.
+        if let Some(cwd) = cwd.filter(|cwd| {
+            terminal_segment_matches_cwd_basename(part, cwd)
+                || (has_separate_title_parts && terminal_context_looks_path_like(part))
+        }) {
             let spinner = terminal_segment_leading_spinner(part).filter(|_| {
                 !segments
                     .iter()
@@ -188,6 +220,10 @@ pub(crate) fn terminal_title_segments(
                 .unwrap_or_else(|| cwd.to_string());
             push_unique_terminal_segment(&mut segments, cwd_segment);
             has_cwd_segment = true;
+            continue;
+        }
+
+        if prefer_cwd_over_dynamic_path && terminal_context_looks_path_like(part) {
             continue;
         }
 
@@ -221,7 +257,7 @@ pub(crate) fn terminal_title_segments(
         }
     }
 
-    segments.push("Terminal".to_string());
+    segments.push(terminal_marker.to_string());
     segments
 }
 
@@ -238,12 +274,12 @@ pub(crate) fn terminal_display_title(
         .strip_prefix("- ")
         .unwrap_or(raw_title.trim());
 
-    let dynamic_title = strip_terminal_title_marker(raw_title);
+    let (dynamic_title, terminal_marker, _) = split_terminal_title_marker(raw_title);
     // These titles already contain their program/context in the user's selected order.
     if dynamic_title.starts_with("tmux: ")
         || (is_codex_process(proc_name) && is_configured_codex_title(dynamic_title))
     {
-        return format!("{dynamic_title} - Terminal");
+        return format!("{dynamic_title} - {terminal_marker}");
     }
 
     if normalize_app_match_key(proc_name) == "ssh"
@@ -269,6 +305,7 @@ pub(crate) fn terminal_display_title(
                 command_summary,
                 cwd,
                 parent_program,
+                terminal_marker,
             )
             .join(sep);
         }
@@ -284,21 +321,33 @@ pub(crate) fn terminal_display_title(
                 command_summary,
                 cwd,
                 parent_program,
+                terminal_marker,
             )
             .join(sep);
         }
     }
 
-    terminal_title_segments(raw_title, proc_name, command_summary, cwd, parent_program).join(" - ")
+    terminal_title_segments(
+        raw_title,
+        proc_name,
+        command_summary,
+        cwd,
+        parent_program,
+        terminal_marker,
+    )
+    .join(" - ")
 }
 
 pub(crate) fn is_configured_codex_title(title: &str) -> bool {
     [" | ", " - "].into_iter().any(|separator| {
         title.split(separator).any(|part| {
-            (part == "codex" && title.contains(separator))
-                || part
-                    .strip_prefix("codex ")
-                    .is_some_and(|rest| rest.chars().next().is_some_and(is_braille_spinner_char))
+            let mut characters = unstyled_title_characters(part);
+            characters.by_ref().take(5).eq("codex".chars())
+                && match characters.next() {
+                    None => title.contains(separator),
+                    Some(' ') => characters.next().is_some_and(is_braille_spinner_char),
+                    _ => false,
+                }
         })
     })
 }
@@ -359,7 +408,7 @@ pub(crate) fn tmux_codex_display_title(pane_title: &str, cwd: &str) -> String {
 }
 
 fn ssh_terminal_display_title(raw_title: &str, parent_program: Option<&str>) -> Option<String> {
-    let dynamic_title = strip_terminal_title_marker(raw_title);
+    let (dynamic_title, terminal_marker, _) = split_terminal_title_marker(raw_title);
     let closing_bracket = dynamic_title.find(']')?;
     if !dynamic_title.starts_with('[') {
         return None;
@@ -379,27 +428,32 @@ fn ssh_terminal_display_title(raw_title: &str, parent_program: Option<&str>) -> 
         .unwrap_or_else(|| remote_user.to_string());
 
     Some(format!(
-        "ssh - {remote_identity} - {remote_context} - Terminal"
+        "ssh - {remote_identity} - {remote_context} - {terminal_marker}"
     ))
 }
 
-fn strip_terminal_title_marker(raw_title: &str) -> &str {
+fn unstyled_title_characters(value: &str) -> impl Iterator<Item = char> + '_ {
+    value
+        .chars()
+        .filter(|character| !crate::search::is_title_strikethrough_mark(*character))
+}
+
+fn split_terminal_title_marker(raw_title: &str) -> (&str, &str, &str) {
     for separator in [" - ", " — ", " – ", " : ", " | "] {
-        if let Some(dynamic_title) = raw_title
-            .strip_suffix("Terminal")
-            .and_then(|title| title.strip_suffix(separator))
+        // Match undecorated text, but retain the original marker for rendering.
+        if let Some((dynamic_title, marker)) = raw_title.rsplit_once(separator)
+            && unstyled_title_characters(marker).eq("Terminal".chars())
         {
-            return dynamic_title.trim();
+            return (dynamic_title.trim(), marker, separator);
         }
-        if let Some(dynamic_title) = raw_title
-            .strip_prefix("Terminal")
-            .and_then(|title| title.strip_prefix(separator))
+        if let Some((marker, dynamic_title)) = raw_title.split_once(separator)
+            && unstyled_title_characters(marker).eq("Terminal".chars())
         {
-            return dynamic_title.trim();
+            return (dynamic_title.trim(), marker, separator);
         }
     }
 
-    raw_title.trim()
+    (raw_title.trim(), "Terminal", " - ")
 }
 
 pub(crate) fn replace_terminal_suffix_path(original_suffix: &str, cwd: &str) -> String {

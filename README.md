@@ -256,6 +256,9 @@ Show Info renders Unicode combining strikethrough marks as native styling in
 titles, process headers and metadata. Copying selected text or using **Copy shown
 info** preserves the original Unicode text, including the raw window title.
 
+Pi's Unicode program marker is normalized to `pi` in launcher titles, carrying
+any strikethrough onto both letters. Raw window and tmux pane titles are unchanged.
+
 Application and Runtime are independently expandable metadata sections under one
 PID, not extra process-tree nodes. Python scripts/modules and Java JARs, source
 files, modules and main classes use the same layout. Uncertain application

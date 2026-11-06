@@ -451,6 +451,32 @@ mod tests {
     }
 
     #[test]
+    fn pi_panes_normalize_the_program_glyph_without_losing_strikethrough_or_spinner() {
+        for mark in ['\u{0335}', '\u{0336}'] {
+            let mut window = window();
+            let raw_title = window.raw_title.clone();
+            let mut metadata = metadata();
+            metadata.pane.process_name = "pi".into();
+            metadata.chain.clear();
+            metadata.command_line = Some("pi".into());
+            metadata.command_summary = Some("pi".into());
+            for path in ["diet", "/tasks/diet"] {
+                metadata.pane.title = format!("\u{03c0}{mark} - \u{280b} {path}");
+                metadata.apply(&mut window);
+                assert_eq!(
+                    window.title,
+                    format!("tmux: diet - p{mark}i{mark} - \u{280b} /tasks/diet - Terminal")
+                );
+                assert_eq!(window.raw_title, raw_title);
+                assert_eq!(
+                    window.tmux_pane.as_ref().unwrap().title,
+                    metadata.pane.title
+                );
+            }
+        }
+    }
+
+    #[test]
     fn pane_overlays_only_inner_metadata_and_keeps_outer_client_mapping() {
         let mut window = window();
         metadata().apply(&mut window);

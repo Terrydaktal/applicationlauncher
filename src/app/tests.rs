@@ -3545,4 +3545,242 @@ mod tests {
                 .any(|row| row.label == "Root package")
         );
     }
+    #[test]
+    fn configured_terminal_titles_preserve_strikethrough_without_duplicate_markers() {
+        for mark in ['\u{0335}', '\u{0336}'] {
+            let strike = |text: &str| {
+                text.chars()
+                    .flat_map(|character| [character, mark])
+                    .collect::<String>()
+            };
+            let marker = strike("Terminal");
+            for program in ["codex".to_string(), strike("codex")] {
+                for separator in [" - ", " | "] {
+                    for dynamic_title in [
+                        format!(
+                            "{program}{separator}~/tasks/computersimulation{separator}Visualize Linux app startup"
+                        ),
+                        format!(
+                            "{program} \u{280b} ~/tasks/computersimulation{separator}Visualize Linux app startup"
+                        ),
+                        format!(
+                            "[ ! ] Action Required{separator}{program}{separator}~/tasks/computersimulation{separator}Visualize Linux app startup"
+                        ),
+                    ] {
+                        let expected = format!("{dynamic_title} - {marker}");
+                        for raw_title in [
+                            format!("{dynamic_title}{separator}{marker}"),
+                            format!("{marker}{separator}{dynamic_title}"),
+                        ] {
+                            assert_eq!(
+                                terminal_display_title(
+                                    &raw_title,
+                                    "codex",
+                                    Some("codex resume --last"),
+                                    Some("~/tasks/computersimulation"),
+                                    None,
+                                ),
+                                expected,
+                                "raw title: {raw_title:?}"
+                            );
+                        }
+                        let tmux_title = format!("tmux: simulation - {expected}");
+                        assert_eq!(
+                            terminal_display_title(
+                                &tmux_title,
+                                "tmux: client",
+                                None,
+                                Some("~"),
+                                None,
+                            ),
+                            tmux_title
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pi_title_alias_preserves_strikethrough_on_the_ascii_program_name() {
+        for mark in ['\u{0335}', '\u{0336}'] {
+            let strike = |text: &str| text.chars().flat_map(|ch| [ch, mark]).collect::<String>();
+            let program = strike("pi");
+            let terminal = strike("Terminal");
+            for alias in [strike("\u{03c0}"), program.clone()] {
+                for separator in [" - ", " — ", " – ", " : ", " | "] {
+                    for raw in [
+                        format!("{alias}{separator}alex{separator}{terminal}"),
+                        format!("{terminal}{separator}{alias}{separator}alex"),
+                    ] {
+                        for process in ["pi", "node"] {
+                            let title = terminal_display_title(
+                                &raw,
+                                process,
+                                Some("pi"),
+                                Some("~/tasks/alex"),
+                                None,
+                            );
+                            assert_eq!(
+                                title,
+                                format!("{program}{separator}~/tasks/alex{separator}{terminal}")
+                            );
+                            assert!(!title.contains('\u{03c0}'));
+                            let job = highlighted_title_job_from_segments(&title, 14.0, &[]);
+                            assert!(job.text.starts_with("pi"));
+                            assert!(
+                                job.sections
+                                    .iter()
+                                    .filter(|section| section.byte_range.start < 2)
+                                    .all(|section| section.format.strikethrough.width > 0.0)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pi_titles_with_full_paths_do_not_reinsert_the_original_program_marker() {
+        for mark in ['\u{0335}', '\u{0336}'] {
+            let strike = |text: &str| text.chars().flat_map(|ch| [ch, mark]).collect::<String>();
+            let program = strike("pi");
+            for directory in ["alex", "emma"] {
+                let cwd = format!("~/tasks/{directory}");
+                for terminal in ["Terminal".to_string(), strike("Terminal")] {
+                    for path in [cwd.clone(), format!("/home/lewis/tasks/{directory}")] {
+                        for spinner in ["", "\u{280b} "] {
+                            for alias in [strike("\u{03c0}"), program.clone()] {
+                                for separator in [" - ", " — ", " – ", " : ", " | "] {
+                                    let raw = format!(
+                                        "{alias}{separator}{spinner}{path}{separator}{terminal}"
+                                    );
+                                    for process in ["pi", "node"] {
+                                        let title = terminal_display_title(
+                                            &raw,
+                                            process,
+                                            Some("pi"),
+                                            Some(&cwd),
+                                            None,
+                                        );
+                                        assert_eq!(
+                                            title,
+                                            format!(
+                                                "{program}{separator}{spinner}{cwd}{separator}{terminal}"
+                                            ),
+                                            "raw title: {raw:?}"
+                                        );
+                                        assert!(!title.contains('\u{03c0}'));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn segmented_terminal_paths_preserve_tasks_and_spinners_without_duplication() {
+        for process in ["fish", "htop", "nvtop", "pi"] {
+            for path in ["~/old", "/old", "~/tasks/current"] {
+                let raw = format!("{process} - \u{280b} {path} - current task - Terminal");
+                assert_eq!(
+                    terminal_display_title(
+                        &raw,
+                        process,
+                        Some(process),
+                        Some("~/tasks/current"),
+                        None,
+                    ),
+                    format!("{process} - \u{280b} ~/tasks/current - current task - Terminal")
+                );
+            }
+        }
+        assert_eq!(
+            terminal_display_title(
+                "[lewis] /old - Terminal",
+                "fish",
+                Some("fish"),
+                Some("~/tasks/current"),
+                None,
+            ),
+            "fish - [lewis] ~/tasks/current - Terminal"
+        );
+    }
+
+    #[test]
+    fn pi_title_alias_keeps_spinner_attention_and_unstyled_program_names() {
+        for alias in ["\u{03c0}", "pi"] {
+            assert_eq!(
+                terminal_display_title(
+                    &format!("{alias} - alex - Terminal"),
+                    "pi",
+                    Some("pi"),
+                    Some("~/tasks/alex"),
+                    None
+                ),
+                "pi - ~/tasks/alex - Terminal",
+            );
+        }
+        let program = "p\u{0336}i\u{0336}";
+        assert_eq!(
+            terminal_display_title(
+                "\u{03c0}\u{0336} - \u{280b} alex - Terminal",
+                "pi",
+                Some("pi"),
+                Some("~/tasks/alex"),
+                None
+            ),
+            format!("{program} - \u{280b} ~/tasks/alex - Terminal"),
+        );
+        assert_eq!(
+            terminal_display_title(
+                "\u{03c0}\u{0336} - [ ! ] Action Required - alex - Terminal",
+                "pi",
+                Some("pi"),
+                Some("~/tasks/alex"),
+                None
+            ),
+            format!("{program} - [ ! ] Action Required - ~/tasks/alex - Terminal"),
+        );
+        assert_eq!(
+            terminal_display_title(
+                "[ ! ] Action Required - \u{03c0}\u{0336} - alex - Terminal",
+                "pi",
+                Some("pi"),
+                Some("~/tasks/alex"),
+                None,
+            ),
+            format!("{program} - [ ! ] Action Required - ~/tasks/alex - Terminal"),
+        );
+    }
+
+    #[test]
+    fn shell_and_ssh_terminal_titles_preserve_struck_terminal_markers() {
+        let marker = "T\u{0336}e\u{0336}r\u{0336}m\u{0336}i\u{0336}n\u{0336}a\u{0336}l\u{0336}";
+        for separator in [" - ", " — ", " – ", " : ", " | "] {
+            for raw_title in [
+                format!("~{separator}{marker}"),
+                format!("{marker}{separator}~"),
+            ] {
+                assert_eq!(
+                    terminal_display_title(&raw_title, "fish", Some("fish"), Some("~"), None),
+                    format!("fish{separator}~{separator}{marker}")
+                );
+            }
+            assert_eq!(
+                terminal_display_title(
+                    &format!("[lewis] /remote/path{separator}{marker}"),
+                    "ssh",
+                    None,
+                    Some("~"),
+                    Some("fish"),
+                ),
+                format!("ssh - [lewis] fish - /remote/path - {marker}")
+            );
+        }
+    }
 }
