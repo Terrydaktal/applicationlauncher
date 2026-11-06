@@ -49,6 +49,95 @@ pub(crate) fn installation_badge(value: &str) -> Option<&str> {
     })
 }
 
+fn installation_type_color(value: &str) -> Option<egui::Color32> {
+    let badge = installation_badge(value)?;
+    Some(installation_palette_color(badge).unwrap_or(egui::Color32::from_rgb(180, 180, 180)))
+}
+
+fn installation_palette_color(badge: &str) -> Option<egui::Color32> {
+    let muted = |red, green, blue| {
+        let channel = |value: u8| ((2 * u16::from(value) + 3 * 144) / 5) as u8;
+        egui::Color32::from_rgb(channel(red), channel(green), channel(blue))
+    };
+    // Mirror progs/src/labels.rs::badge_color after normalizing legacy aliases.
+    Some(match badge {
+        "PEP" | "PET" | "PEL" => egui::Color32::from_rgb(34, 224, 94),
+        "PSP" | "PPT" => egui::Color32::from_rgb(16, 185, 129),
+        "PDP" | "PDT" | "PDL" => muted(16, 185, 129),
+        "AEP" | "ASP" | "AET" | "AEL" | "APT" => egui::Color32::from_rgb(217, 70, 239),
+        "ADP" | "ADT" | "ADL" => muted(217, 70, 239),
+        "CEP" | "CET" | "CEL" | "RUT" => egui::Color32::from_rgb(198, 91, 50),
+        "CUP" | "CUT" | "CUL" => muted(198, 91, 50),
+        "NEP" | "NET" | "NEL" => egui::Color32::from_rgb(100, 155, 255),
+        "NDP" | "NDT" | "NDL" | "NUP" | "NUT" | "NUL" => muted(59, 130, 246),
+        "UEP" | "UET" | "UEL" => egui::Color32::from_rgb(168, 85, 247),
+        "UDP" | "UDT" | "UDL" | "UUP" | "UUT" | "UUL" => muted(168, 85, 247),
+        "POP" | "AOP" => egui::Color32::from_rgb(120, 120, 128),
+        "DEV" => egui::Color32::from_rgb(255, 158, 170),
+        "FRK" => egui::Color32::from_rgb(34, 211, 238),
+        "CLO" => egui::Color32::from_rgb(199, 210, 254),
+        "UNC" => egui::Color32::from_rgb(113, 113, 122),
+        "BRK" => egui::Color32::from_rgb(82, 82, 91),
+        "UBI" => egui::Color32::from_rgb(217, 249, 157),
+        "USC" => egui::Color32::from_rgb(255, 239, 208),
+        "OPT" => egui::Color32::from_rgb(253, 224, 71),
+        _ => return None,
+    })
+}
+
+fn append_info_text(job: &mut egui::text::LayoutJob, text: &str, mut format: egui::TextFormat) {
+    let trimmed = text.trim();
+    if trimmed.len() == 3
+        && let Some(color) = installation_badge(trimmed).and_then(installation_palette_color)
+    {
+        format.color = color;
+        job.append(text, 0.0, format);
+        return;
+    }
+
+    let mut cursor = 0;
+    for (start, _) in text.match_indices('[') {
+        let Some(badge) = text
+            .get(start..start + 5)
+            .filter(|badge| badge.ends_with(']'))
+        else {
+            continue;
+        };
+        let Some(color) = installation_badge(badge).and_then(installation_palette_color) else {
+            continue;
+        };
+        if cursor < start {
+            job.append(&text[cursor..start], 0.0, format.clone());
+        }
+        let mut badge_format = format.clone();
+        badge_format.color = color;
+        job.append(badge, 0.0, badge_format);
+        cursor = start + badge.len();
+    }
+    if cursor < text.len() {
+        job.append(&text[cursor..], 0.0, format);
+    }
+}
+
+fn info_text_layout(
+    text: &str,
+    font_id: egui::FontId,
+    color: egui::Color32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    append_info_text(&mut job, text, egui::TextFormat::simple(font_id, color));
+    job
+}
+
+fn info_field_label_color(scope: InfoFieldScope) -> egui::Color32 {
+    match scope {
+        InfoFieldScope::Neutral => egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170),
+        InfoFieldScope::Window => egui::Color32::from_rgb(144, 166, 188),
+        InfoFieldScope::RunningInstance => egui::Color32::from_rgb(146, 180, 160),
+        InfoFieldScope::Installation => egui::Color32::from_rgb(184, 167, 143),
+    }
+}
+
 fn info_popup_layout(
     heading: &str,
     subtitle: &str,
@@ -56,9 +145,7 @@ fn info_popup_layout(
     body_font: egui::FontId,
     heading_font: egui::FontId,
 ) -> (egui::text::LayoutJob, Vec<usize>) {
-    let searchable_label_color = egui::Color32::from_rgb(214, 184, 86);
     let searchable_value_color = egui::Color32::from_rgb(255, 236, 170);
-    let neutral_label_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170);
     let mut layout_job = egui::text::LayoutJob::default();
     let mut divider_cursors = Vec::new();
     let format = |font_id: egui::FontId, color: egui::Color32| egui::TextFormat {
@@ -72,13 +159,17 @@ fn info_popup_layout(
     };
 
     if !heading.is_empty() {
-        layout_job.append(heading, 0.0, format(heading_font, egui::Color32::WHITE));
+        append_info_text(
+            &mut layout_job,
+            heading,
+            format(heading_font, egui::Color32::WHITE),
+        );
         layout_job.append("\n", 0.0, format(body_font.clone(), egui::Color32::WHITE));
     }
     if !subtitle.is_empty() {
-        layout_job.append(
+        append_info_text(
+            &mut layout_job,
             subtitle,
-            0.0,
             format(
                 body_font.clone(),
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170),
@@ -97,21 +188,24 @@ fn info_popup_layout(
             divider(&mut layout_job);
         }
         let label = format!("{:<label_width$}  ", row.label);
-        let label_color = if row.searched {
-            searchable_label_color
-        } else {
-            neutral_label_color
-        };
+        let label_color = info_field_label_color(row.scope);
         let value_color = match row.binary_is_current {
             Some(true) => egui::Color32::from_rgb(130, 225, 145),
             Some(false) => egui::Color32::from_rgb(255, 110, 110),
+            None if row.label == "Type" => {
+                installation_type_color(&row.value).unwrap_or(egui::Color32::WHITE)
+            }
             None if row.searched => searchable_value_color,
             None => egui::Color32::WHITE,
         };
-        layout_job.append(&label, 0.0, format(body_font.clone(), label_color));
-        layout_job.append(
+        append_info_text(
+            &mut layout_job,
+            &label,
+            format(body_font.clone(), label_color),
+        );
+        append_info_text(
+            &mut layout_job,
             &format!("{}\n", row.value),
-            0.0,
             format(body_font.clone(), value_color),
         );
     }
@@ -340,15 +434,10 @@ fn render_collapsible_info(
         default_open,
     );
     let header = state.show_header(ui, |ui| {
-        let mut job = egui::text::LayoutJob::default();
-        job.append(
+        let job = info_text_layout(
             header,
-            0.0,
-            egui::TextFormat {
-                font_id: egui::TextStyle::Monospace.resolve(ui.style()),
-                color: ui.visuals().text_color(),
-                ..Default::default()
-            },
+            egui::TextStyle::Monospace.resolve(ui.style()),
+            ui.visuals().text_color(),
         );
         let text = InfoText::new(job);
         let mut display = text.job.text.as_str();
@@ -388,18 +477,17 @@ pub(crate) fn render_info_popup_panel(
             &data.rows,
         )];
     };
-    let mut heading = egui::text::LayoutJob::default();
-    heading.append(
+    let heading = info_text_layout(
         &data.heading,
-        0.0,
-        egui::TextFormat {
-            font_id: egui::TextStyle::Heading.resolve(ui.style()),
-            color: ui.visuals().text_color(),
-            ..Default::default()
-        },
+        egui::TextStyle::Heading.resolve(ui.style()),
+        ui.visuals().text_color(),
     );
     ui.label(crate::search::render_title_strikethrough(heading));
-    ui.label(egui::RichText::new(&data.subtitle).weak());
+    ui.label(info_text_layout(
+        &data.subtitle,
+        egui::TextStyle::Body.resolve(ui.style()),
+        ui.visuals().weak_text_color(),
+    ));
     if ui.button("Copy shown info").clicked() {
         ui.ctx().copy_text(copy_shown_info(data));
     }
@@ -447,7 +535,11 @@ pub(crate) fn render_info_popup_panel(
         );
     }
     ui.add_space(8.0);
-    ui.label(egui::RichText::new(tree.notice.as_ref()).small().weak());
+    ui.label(info_text_layout(
+        tree.notice.as_ref(),
+        egui::TextStyle::Small.resolve(ui.style()),
+        ui.visuals().weak_text_color(),
+    ));
     editors
 }
 
@@ -610,8 +702,8 @@ mod tests {
         let mut data = tree_info();
         data.process_tree.as_mut().unwrap().sections[0].rows = (0..80)
             .map(|index| InfoPopupRow {
-                scope: InfoFieldScope::Neutral,
                 label: format!("Metadata {index}"),
+                scope: InfoFieldScope::Neutral,
                 value: "A long metadata value ".repeat(30),
                 searched: false,
                 separator_before: false,
@@ -687,8 +779,8 @@ mod tests {
             let mut data = if tree { tree_info() } else { window_info() };
             let rows = (0..120)
                 .map(|index| InfoPopupRow {
-                    scope: InfoFieldScope::Neutral,
                     label: format!("Metadata {index}"),
+                    scope: InfoFieldScope::Neutral,
                     value: "A long metadata value ".repeat(30),
                     searched: false,
                     separator_before: false,
@@ -863,40 +955,40 @@ mod tests {
             scroll_sensitivity: 1.0,
             rows: vec![
                 InfoPopupRow {
-                    scope: InfoFieldScope::Neutral,
                     label: "Window PID".into(),
+                    scope: InfoFieldScope::Window,
                     value: "1234".into(),
                     searched: false,
                     separator_before: false,
                     binary_is_current: None,
                 },
                 InfoPopupRow {
-                    scope: InfoFieldScope::Neutral,
-                    label: "Application version".into(),
+                    label: "Version".into(),
+                    scope: InfoFieldScope::RunningInstance,
                     value: "1.2.0".into(),
                     searched: false,
                     separator_before: false,
                     binary_is_current: None,
                 },
                 InfoPopupRow {
-                    scope: InfoFieldScope::Neutral,
                     label: "Active process".into(),
+                    scope: InfoFieldScope::RunningInstance,
                     value: "codex".into(),
                     searched: true,
                     separator_before: true,
                     binary_is_current: None,
                 },
                 InfoPopupRow {
-                    scope: InfoFieldScope::Neutral,
                     label: "Working directory".into(),
+                    scope: InfoFieldScope::RunningInstance,
                     value: "~/project".into(),
                     searched: true,
                     separator_before: false,
                     binary_is_current: None,
                 },
                 InfoPopupRow {
-                    scope: InfoFieldScope::Neutral,
                     label: "Executable path".into(),
+                    scope: InfoFieldScope::RunningInstance,
                     value: "/usr/bin/codex".into(),
                     searched: false,
                     separator_before: true,
@@ -943,8 +1035,8 @@ mod tests {
                 data.rows.insert(
                     1,
                     InfoPopupRow {
-                        scope: InfoFieldScope::Neutral,
                         label: "Raw window title".into(),
+                        scope: InfoFieldScope::Window,
                         value: raw_title.clone(),
                         searched: false,
                         separator_before: false,
@@ -1000,13 +1092,24 @@ mod tests {
         let ctx = egui::Context::default();
         let mut data = window_info();
         data.rows.insert(0, InfoPopupRow {
-            scope: InfoFieldScope::Neutral,
             label: "Raw window title".into(),
-            value: "\u{3bb} - T\u{0336}e\u{0336}r\u{0336}m\u{0336}i\u{0336}n\u{0336}a\u{0336}l\u{0336}".into(),
+            scope: InfoFieldScope::Window,
+            value: "\u{3bb} - T\u{0336}e\u{0336}r\u{0336}m\u{0336}i\u{0336}n\u{0336}a\u{0336}l\u{0336} [FRK]".into(),
             searched: true,
             separator_before: false,
             binary_is_current: None,
         });
+        data.rows.insert(
+            1,
+            InfoPopupRow {
+                label: "Package".into(),
+                scope: InfoFieldScope::Installation,
+                value: "bash 5.3 [PDP]".into(),
+                searched: false,
+                separator_before: false,
+                binary_is_current: None,
+            },
+        );
         let (output, editor) = frame(&ctx, &data, Vec::new());
         let (raw_job, dividers) = info_popup_layout(
             &data.heading,
@@ -1068,15 +1171,346 @@ mod tests {
                         && section.format.color == egui::Color32::from_rgb(255, 236, 170)
                 )
         );
+        for badge in ["[FRK]", "[PDP]"] {
+            assert!(projection.job.sections.iter().any(|section| {
+                &projection.job.text[section.byte_range.clone()] == badge
+                    && Some(section.format.color) == installation_type_color(badge)
+            }));
+        }
+    }
+
+    #[test]
+    fn info_scope_colours_apply_only_to_labels_independently_of_search_and_status() {
+        let cases = [
+            ("Ordinary", "value", false, None, egui::Color32::WHITE),
+            (
+                "Searchable",
+                "match",
+                true,
+                None,
+                egui::Color32::from_rgb(255, 236, 170),
+            ),
+            (
+                "Current",
+                "current",
+                false,
+                Some(true),
+                egui::Color32::from_rgb(130, 225, 145),
+            ),
+            (
+                "Outdated",
+                "outdated",
+                true,
+                Some(false),
+                egui::Color32::from_rgb(255, 110, 110),
+            ),
+            (
+                "Type",
+                "FRK",
+                false,
+                None,
+                egui::Color32::from_rgb(34, 211, 238),
+            ),
+        ];
+        for (scope, label_colour) in [
+            (
+                InfoFieldScope::Neutral,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170),
+            ),
+            (
+                InfoFieldScope::Window,
+                egui::Color32::from_rgb(144, 166, 188),
+            ),
+            (
+                InfoFieldScope::RunningInstance,
+                egui::Color32::from_rgb(146, 180, 160),
+            ),
+            (
+                InfoFieldScope::Installation,
+                egui::Color32::from_rgb(184, 167, 143),
+            ),
+        ] {
+            let rows: Vec<_> = cases
+                .iter()
+                .map(|(label, value, searched, status, _)| InfoPopupRow {
+                    label: (*label).into(),
+                    scope,
+                    value: (*value).into(),
+                    searched: *searched,
+                    separator_before: false,
+                    binary_is_current: *status,
+                })
+                .collect();
+            let (layout, _) = info_popup_layout(
+                "",
+                "",
+                &rows,
+                egui::FontId::monospace(12.0),
+                egui::FontId::proportional(20.0),
+            );
+            assert_eq!(layout.sections.len(), cases.len() * 2);
+            for (sections, (label, value, _, _, value_colour)) in
+                layout.sections.chunks_exact(2).zip(cases)
+            {
+                assert_eq!(
+                    layout.text[sections[0].byte_range.clone()].trim_end(),
+                    label
+                );
+                assert_eq!(sections[0].format.color, label_colour);
+                assert_eq!(
+                    &layout.text[sections[1].byte_range.clone()],
+                    format!("{value}\n")
+                );
+                assert_eq!(sections[1].format.color, value_colour);
+            }
+            let renamed = vec![InfoPopupRow {
+                label: "Renamed field".into(),
+                ..rows[0].clone()
+            }];
+            let (layout, _) = info_popup_layout(
+                "",
+                "",
+                &renamed,
+                egui::FontId::monospace(12.0),
+                egui::FontId::proportional(20.0),
+            );
+            assert_eq!(layout.sections[0].format.color, label_colour);
+        }
+    }
+
+    #[test]
+    fn classification_values_use_the_progs_palette_in_every_field() {
+        let colours = [
+            ("PEP PET PEL", [34, 224, 94]),
+            ("PSP PPT", [16, 185, 129]),
+            ("PDP PDT PDL", [92, 160, 138]),
+            ("AEP ASP AET AEL APT", [217, 70, 239]),
+            ("ADP ADT ADL", [173, 114, 182]),
+            ("CEP CET CEL RUT", [198, 91, 50]),
+            ("CUP CUT CUL CAT", [165, 122, 106]),
+            ("NEP NET NEL", [100, 155, 255]),
+            ("NDP NDT NDL NUP NUT NUL NPT", [110, 138, 184]),
+            ("UEP UET UEL", [168, 85, 247]),
+            ("UDP UDT UDL UUP UUT UUL UVT", [153, 120, 185]),
+            ("POP AOP", [120, 120, 128]),
+            ("DEV DVM", [255, 158, 170]),
+            ("FRK FKM", [34, 211, 238]),
+            ("CLO CLX", [199, 210, 254]),
+            ("UNC", [113, 113, 122]),
+            ("BRK", [82, 82, 91]),
+            ("UBI BIU", [217, 249, 157]),
+            ("USC SCU", [255, 239, 208]),
+            ("OPT OPX", [253, 224, 71]),
+        ];
+        for (codes, [red, green, blue]) in colours {
+            for code in codes.split_whitespace() {
+                let mut data = window_info();
+                let value = code.to_owned();
+                assert_eq!(
+                    installation_type_color(&format!("[{code}] Installation classification")),
+                    installation_type_color(code)
+                );
+                for label in ["Type", "Description"] {
+                    data.rows.push(InfoPopupRow {
+                        label: label.into(),
+                        scope: InfoFieldScope::Installation,
+                        value: value.clone(),
+                        searched: false,
+                        separator_before: false,
+                        binary_is_current: None,
+                    });
+                }
+                for label in ["Package", "Root package", "Other field"] {
+                    data.rows.push(InfoPopupRow {
+                        label: label.into(),
+                        scope: InfoFieldScope::Installation,
+                        value: format!("package 1.0 [{code}]"),
+                        searched: false,
+                        separator_before: false,
+                        binary_is_current: None,
+                    });
+                }
+                let (layout, _) = info_popup_layout(
+                    "",
+                    "",
+                    &data.rows,
+                    egui::FontId::monospace(12.0),
+                    egui::FontId::proportional(20.0),
+                );
+                let values: Vec<_> = layout
+                    .sections
+                    .iter()
+                    .filter(|section| {
+                        layout.text[section.byte_range.clone()] == format!("{value}\n")
+                    })
+                    .collect();
+                assert_eq!(values.len(), 2);
+                assert_eq!(
+                    values[0].format.color,
+                    egui::Color32::from_rgb(red, green, blue),
+                    "installation badge: {code}"
+                );
+                assert_eq!(
+                    values[1].format.color,
+                    egui::Color32::from_rgb(red, green, blue)
+                );
+                let embedded: Vec<_> = layout
+                    .sections
+                    .iter()
+                    .filter(|section| {
+                        layout.text[section.byte_range.clone()] == format!("[{code}]")
+                    })
+                    .collect();
+                assert_eq!(embedded.len(), 3);
+                assert!(embedded.iter().all(
+                    |section| section.format.color == egui::Color32::from_rgb(red, green, blue)
+                ));
+                assert!(
+                    layout
+                        .sections
+                        .iter()
+                        .filter(|section| {
+                            &layout.text[section.byte_range.clone()] == "package 1.0 "
+                        })
+                        .all(|section| section.format.color == egui::Color32::WHITE)
+                );
+                let label = layout
+                    .sections
+                    .iter()
+                    .find(|section| layout.text[section.byte_range.clone()].starts_with("Type "))
+                    .unwrap();
+                assert_eq!(
+                    label.format.color,
+                    info_field_label_color(InfoFieldScope::Installation)
+                );
+                assert!(copy_shown_info(&data).contains("Type"));
+                assert!(copy_shown_info(&data).contains(&value));
+            }
+        }
+    }
+
+    #[test]
+    fn inline_badges_preserve_unicode_surroundings_and_ignore_malformed_or_unrelated_brackets() {
+        let text = "\u{3bb} [PEP] [PDP][FRK] [NEW] [PE] [peP] [P\u{00c9}P] [PDP [CLO]\n";
+        let base = egui::Color32::from_rgb(255, 236, 170);
+        let job = info_text_layout(text, egui::FontId::monospace(12.0), base);
+        assert_eq!(job.text, text);
+        let mut cursor = 0;
+        let mut badges = Vec::new();
+        for section in &job.sections {
+            assert_eq!(section.byte_range.start, cursor);
+            cursor = section.byte_range.end;
+            let token = &job.text[section.byte_range.clone()];
+            if ["[PEP]", "[PDP]", "[FRK]", "[CLO]"].contains(&token) {
+                assert_eq!(Some(section.format.color), installation_type_color(token));
+                badges.push(token);
+            } else {
+                assert_eq!(section.format.color, base, "{token}");
+            }
+        }
+        assert_eq!(cursor, text.len());
+        assert_eq!(badges, ["[PEP]", "[PDP]", "[FRK]", "[CLO]"]);
+        for text in ["[".repeat(8192), "[PEP".repeat(2048)] {
+            let job = info_text_layout(&text, egui::FontId::monospace(12.0), base);
+            assert_eq!(job.text, text);
+            assert_eq!(job.sections.len(), 1);
+            assert_eq!(job.sections[0].format.color, base);
+        }
+    }
+
+    #[test]
+    fn badges_are_coloured_in_tree_headings_process_headers_metadata_and_notices() {
+        use crate::models::InfoMetadataSection;
+        let ctx = egui::Context::default();
+        let mut data = tree_info();
+        data.heading = "Heading [PEP]".into();
+        data.subtitle = "Subtitle [FRK]".into();
+        let tree = data.process_tree.as_mut().unwrap();
+        tree.notice = "Snapshot [CLO]".into();
+        let owner = &mut tree.sections[0];
+        owner.header = "xfce4-terminal [PDP]".into();
+        owner.metadata_sections.push(InfoMetadataSection {
+            id: owner.id.with("metadata"),
+            header: "Application [NET]".into(),
+            default_open: true,
+            rows: vec![InfoPopupRow {
+                label: "Root package".into(),
+                scope: InfoFieldScope::Installation,
+                value: "root 1.0 [AEP]".into(),
+                searched: false,
+                separator_before: false,
+                binary_is_current: None,
+            }],
+        });
+        let (output, _) = frame(&ctx, &data, Vec::new());
+        for badge in ["[PEP]", "[FRK]", "[CLO]", "[PDP]", "[NET]", "[AEP]"] {
+            assert!(
+                output.shapes.iter().any(|shape| matches!(&shape.shape,
+                    egui::Shape::Text(text) if text.galley.job.sections.iter().any(|section| {
+                        &text.galley.job.text[section.byte_range.clone()] == badge
+                            && Some(section.format.color) == installation_type_color(badge)
+                    })
+                )),
+                "{badge}"
+            );
+            assert!(copy_shown_info(&data).contains(badge));
+        }
+    }
+
+    #[test]
+    fn legacy_installation_codes_display_current_progs_names_without_guessing_unknown_roles() {
+        for (legacy, current) in [
+            ("FKM", "FRK"),
+            ("DVM", "DEV"),
+            ("CLX", "CLO"),
+            ("OPX", "OPT"),
+            ("SCU", "USC"),
+            ("BIU", "UBI"),
+            ("NPT", "NUT"),
+            ("UVT", "UUT"),
+            ("CAT", "CUT"),
+        ] {
+            assert_eq!(installation_badge(legacy), Some(current));
+            assert_eq!(
+                installation_badge(&format!("[{legacy}] Legacy classification")),
+                Some(current)
+            );
+            assert_eq!(
+                installation_type_color(legacy),
+                installation_type_color(current)
+            );
+        }
+    }
+
+    #[test]
+    fn installation_type_placeholders_stay_neutral_and_unknown_badges_use_progs_fallback() {
+        for value in [
+            "",
+            "Loading...",
+            "Unavailable",
+            "Unknown",
+            "pdp",
+            "[PDP",
+            "[pd]",
+            "PDT tool",
+        ] {
+            assert_eq!(installation_type_color(value), None);
+        }
+        for value in ["NEW", "[NEW] Future classification"] {
+            assert_eq!(
+                installation_type_color(value),
+                Some(egui::Color32::from_rgb(180, 180, 180))
+            );
+        }
     }
 
     #[test]
     fn identity_values_are_red_or_green_without_colouring_labels_or_other_values() {
         let hash = "6e689278f21a31797320afd5269395c09d75e390";
         let labels = [
-            "Application ELF build ID",
-            "Application running code fingerprint",
-            "Application latest extensions fingerprint",
+            "ELF build ID",
+            "Running code fingerprint",
+            "Latest extensions fingerprint",
         ];
         for scale in [1.0, 2.0] {
             for (status, colour) in [
@@ -1089,8 +1523,12 @@ mod tests {
                     data.rows.insert(
                         1 + index,
                         InfoPopupRow {
-                            scope: InfoFieldScope::Neutral,
                             label: (*label).into(),
+                            scope: if *label == "Latest extensions fingerprint" {
+                                InfoFieldScope::Installation
+                            } else {
+                                InfoFieldScope::RunningInstance
+                            },
                             value: hash.into(),
                             searched: false,
                             separator_before: false,
@@ -1121,7 +1559,11 @@ mod tests {
                         .unwrap();
                     assert_eq!(
                         label_section.format.color,
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170)
+                        info_field_label_color(if label == "Latest extensions fingerprint" {
+                            InfoFieldScope::Installation
+                        } else {
+                            InfoFieldScope::RunningInstance
+                        })
                     );
                 }
                 let other = layout
@@ -1288,8 +1730,8 @@ mod tests {
                         default_open: true,
                         metadata_sections: Vec::new(),
                         rows: vec![InfoPopupRow {
-                            scope: InfoFieldScope::Neutral,
                             label: "Window PID".into(),
+                            scope: InfoFieldScope::Window,
                             value: "1".into(),
                             searched: false,
                             separator_before: false,
@@ -1303,8 +1745,8 @@ mod tests {
                         default_open: false,
                         metadata_sections: Vec::new(),
                         rows: vec![InfoPopupRow {
-                            scope: InfoFieldScope::Neutral,
                             label: "Process name".into(),
+                            scope: InfoFieldScope::RunningInstance,
                             value: "fish".into(),
                             searched: true,
                             separator_before: false,
@@ -1392,8 +1834,8 @@ mod tests {
             let tree = data.process_tree.as_mut().unwrap();
             tree.sections[0].rows = (0..28)
                 .map(|index| InfoPopupRow {
-                    scope: InfoFieldScope::Neutral,
                     label: format!("Metadata {index}"),
+                    scope: InfoFieldScope::Neutral,
                     value: "Value".into(),
                     searched: false,
                     separator_before: false,
@@ -1577,8 +2019,8 @@ mod tests {
                 data.process_tree.as_mut().unwrap().sections[0]
                     .rows
                     .push(InfoPopupRow {
-                        scope: InfoFieldScope::Neutral,
                         label: "Version".into(),
+                        scope: InfoFieldScope::RunningInstance,
                         value: "Background probe finished".into(),
                         searched: false,
                         separator_before: false,
@@ -1726,8 +2168,8 @@ mod tests {
         data.process_tree.as_mut().unwrap().sections[0]
             .rows
             .push(InfoPopupRow {
-                scope: InfoFieldScope::Neutral,
                 label: "Raw window title".into(),
+                scope: InfoFieldScope::Window,
                 value: "Original title - Terminal".into(),
                 searched: false,
                 separator_before: false,
@@ -1801,10 +2243,10 @@ mod tests {
             (
                 "hosted-application",
                 "Application: Pi",
-                "Application package",
+                "Package",
                 "@earendil-works/pi-coding-agent",
             ),
-            ("runtime", "Runtime: Node.js", "Runtime version", "v26.4.0"),
+            ("runtime", "Runtime: Node.js", "Version", "v26.4.0"),
         ]
         .into_iter()
         .map(|(key, header, label, value)| InfoMetadataSection {
@@ -1812,8 +2254,8 @@ mod tests {
             header: header.into(),
             default_open: true,
             rows: vec![InfoPopupRow {
-                scope: InfoFieldScope::Neutral,
                 label: label.into(),
+                scope: InfoFieldScope::RunningInstance,
                 value: value.into(),
                 searched: false,
                 separator_before: false,
@@ -1852,7 +2294,7 @@ mod tests {
         tree_frame(&ctx, &data, vec![pointer(end, false)]);
         let (copied, _) = tree_frame(&ctx, &data, vec![egui::Event::Copy]);
         assert!(copied.platform_output.commands.iter().any(|command| matches!(command,
-            egui::OutputCommand::CopyText(text) if text.contains("Runtime version") && text.contains("v26.4.0"))));
+            egui::OutputCommand::CopyText(text) if text.contains("Version") && text.contains("v26.4.0"))));
         let document = copy_shown_info(&data);
         assert!(document.contains("Application: Pi") && document.contains("Runtime: Node.js"));
         assert!(
