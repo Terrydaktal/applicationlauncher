@@ -126,7 +126,7 @@ fn manifest_text(value: &Value, key: &str, limit: usize) -> Option<String> {
         .then(|| text.to_owned())
 }
 
-fn package_for_entry(
+pub(super) fn package_for_entry(
     entry: &Path,
     command: Option<&str>,
     identification: &'static str,
@@ -225,6 +225,20 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn npm_registry_identity_follows_declared_bin_entries_without_running_them() {
+        let fixture = Fixture::new();
+        let entry = fixture.install("application", "0.84.2");
+        let link = fixture.0.join("pi");
+        symlink(&entry, &link).unwrap();
+        let target = super::super::npm::target(&link, None).unwrap();
+        assert_eq!(target.name, "@earendil-works/pi-coding-agent");
+        assert!(!target.upstream);
+        let unrelated = entry.with_file_name("unrelated.js");
+        std::fs::write(&unrelated, "DO_NOT_RUN").unwrap();
+        assert!(super::super::npm::target(&unrelated, None).is_none());
     }
 
     #[test]

@@ -19,10 +19,30 @@ struct Request {
     target: ProcessVersionTarget,
 }
 
+enum PackageLookup {
+    System(super::PackageTarget),
+    Npm(super::NpmTarget),
+}
+
+impl PackageLookup {
+    fn result<'a>(
+        &self,
+        version: &'a mut ProcessVersion,
+        application: bool,
+    ) -> &'a mut Option<String> {
+        match (self, application) {
+            (Self::System(_), false) => &mut version.latest_package_version,
+            (Self::System(_), true) => &mut version.application_latest_package_version,
+            (Self::Npm(_), false) => &mut version.latest_npm_version,
+            (Self::Npm(_), true) => &mut version.application_latest_npm_version,
+        }
+    }
+}
+
 struct PackageRequest {
     generation: u64,
     identity: ProcessIdentity,
-    target: super::PackageTarget,
+    target: PackageLookup,
     application: bool,
 }
 
@@ -67,7 +87,10 @@ impl ProcessVersionCache {
     ) -> Self {
         Self::start_with_packages(ctx, viewport_id, probe, |request| {
             // A repository version belongs to a package, not the lifetime of its process.
-            Some(super::available::query(&request.target))
+            Some(match &request.target {
+                PackageLookup::System(target) => super::available::query(target),
+                PackageLookup::Npm(target) => super::npm::query(target),
+            })
         })
     }
 
@@ -199,7 +222,10 @@ impl ProcessVersionCache {
                         }
                         state.packages.pop_front().unwrap()
                     };
-                    worker.set_state("querying-pacman-or-aur");
+                    worker.set_state(match &request.target {
+                        PackageLookup::System(_) => "querying-pacman-or-aur",
+                        PackageLookup::Npm(_) => "querying-npm-registry",
+                    });
                     let result = package_probe(&request)
                         .unwrap_or_else(|| "Unavailable (package lookup failed)".into());
                     let publish = {
@@ -215,11 +241,7 @@ impl ProcessVersionCache {
                         }
                         if let Some(Some(version)) = state.results.get_mut(&request.identity) {
                             let version = Arc::make_mut(version);
-                            if request.application {
-                                version.application_latest_package_version = Some(result);
-                            } else {
-                                version.latest_package_version = Some(result);
-                            }
+                            *request.target.result(version, request.application) = Some(result);
                             true
                         } else {
                             false
@@ -268,8 +290,25 @@ impl ProcessVersionCache {
                                 .insert(request.identity, Instant::now());
                         }
                         for (target, application) in [
-                            (version.package_target.clone(), false),
-                            (version.application_package_target.clone(), true),
+                            (
+                                version.package_target.clone().map(PackageLookup::System),
+                                false,
+                            ),
+                            (
+                                version
+                                    .application_package_target
+                                    .clone()
+                                    .map(PackageLookup::System),
+                                true,
+                            ),
+                            (version.npm_target.clone().map(PackageLookup::Npm), false),
+                            (
+                                version
+                                    .application_npm_target
+                                    .clone()
+                                    .map(PackageLookup::Npm),
+                                true,
+                            ),
                         ] {
                             if let Some(target) = target {
                                 if state.packages.len() < MAX_PENDING {
@@ -281,11 +320,7 @@ impl ProcessVersionCache {
                                     });
                                 } else {
                                     let result = Some("Unavailable (package lookup queue full; close and reopen Show Info to retry)".into());
-                                    if application {
-                                        version.application_latest_package_version = result;
-                                    } else {
-                                        version.latest_package_version = result;
-                                    }
+                                    *target.result(&mut version, application) = result;
                                 }
                             }
                         }
@@ -671,6 +706,131 @@ mod tests {
     }
 
     #[test]
+    fn cached_process_metadata_does_not_resolve_desktop_candidates_again_each_frame() {
+        let cache =
+            ProcessVersionCache::start(egui::Context::default(), egui::ViewportId::ROOT, |_| {
+                ProcessVersion::default()
+            });
+        let resolutions = std::cell::Cell::new(0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let result = cache.request_for_application(&node(1), false, || {
+                resolutions.set(resolutions.get() + 1);
+                None
+            });
+            if result.is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for _ in 0..100 {
+            assert!(
+                cache
+                    .request_for_application(&node(1), false, || panic!(
+                        "cached metadata must not rescan desktop entries"
+                    ))
+                    .is_some()
+            );
+        }
+        assert_eq!(resolutions.get(), 1);
+    }
+
+    #[test]
+    fn npm_and_system_queries_publish_to_separate_application_and_runtime_fields() {
+        let cache = ProcessVersionCache::start_with_packages(
+            egui::Context::default(),
+            egui::ViewportId::ROOT,
+            |_| ProcessVersion {
+                version: Some("node running".into()),
+                package_target: Some(super::super::PackageTarget {
+                    name: "nodejs".into(),
+                    inferred: false,
+                }),
+                application_package_target: Some(super::super::PackageTarget {
+                    name: "packaged-script".into(),
+                    inferred: false,
+                }),
+                npm_target: super::super::NpmTarget::package("runtime-fixture"),
+                application_npm_target: super::super::NpmTarget::package("@example/app"),
+                ..Default::default()
+            },
+            |request| {
+                Some(match &request.target {
+                    PackageLookup::System(target) => format!("system {}", target.name),
+                    PackageLookup::Npm(target) => format!("npm {}", target.name),
+                })
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(version) = cache.request(&node(1))
+                && version.application_latest_npm_version.is_some()
+            {
+                assert_eq!(version.version.as_deref(), Some("node running"));
+                assert_eq!(
+                    version.latest_package_version.as_deref(),
+                    Some("system nodejs")
+                );
+                assert_eq!(
+                    version.application_latest_package_version.as_deref(),
+                    Some("system packaged-script")
+                );
+                assert_eq!(
+                    version.latest_npm_version.as_deref(),
+                    Some("npm runtime-fixture")
+                );
+                assert_eq!(
+                    version.application_latest_npm_version.as_deref(),
+                    Some("npm @example/app")
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "npm results did not complete");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn npm_query_does_not_block_native_details_or_survive_popup_reset() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let cache = ProcessVersionCache::start_with_packages(
+            egui::Context::default(),
+            egui::ViewportId::ROOT,
+            |_| ProcessVersion {
+                version: Some("running binary".into()),
+                npm_target: super::super::NpmTarget::package("tool"),
+                ..Default::default()
+            },
+            move |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Some("obsolete registry result".into())
+            },
+        );
+        cache.request(&node(1));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let version = cache.request(&node(1)).unwrap();
+        assert_eq!(version.version.as_deref(), Some("running binary"));
+        assert!(version.latest_npm_version.is_none());
+        let shared = cache.shared.clone();
+        cache.reset();
+        drop(cache);
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&shared) > 1 {
+            assert!(
+                Instant::now() < deadline,
+                "workers did not finish after closing"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(shared.0.lock().unwrap().results.is_empty());
+        assert!(version.latest_npm_version.is_none());
+    }
+
+    #[test]
     fn slow_package_lookups_do_not_block_binary_metadata_and_discard_reset_results() {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -800,35 +960,5 @@ mod tests {
                 .latest_package_version
                 .is_none()
         );
-    }
-    #[test]
-    fn cached_process_metadata_does_not_resolve_desktop_candidates_again_each_frame() {
-        let cache =
-            ProcessVersionCache::start(egui::Context::default(), egui::ViewportId::ROOT, |_| {
-                ProcessVersion::default()
-            });
-        let resolutions = std::cell::Cell::new(0);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let result = cache.request_for_application(&node(1), false, || {
-                resolutions.set(resolutions.get() + 1);
-                None
-            });
-            if result.is_some() {
-                break;
-            }
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        for _ in 0..100 {
-            assert!(
-                cache
-                    .request_for_application(&node(1), false, || panic!(
-                        "cached metadata must not rescan desktop entries"
-                    ))
-                    .is_some()
-            );
-        }
-        assert_eq!(resolutions.get(), 1);
     }
 }

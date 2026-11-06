@@ -72,8 +72,8 @@ impl AppInfoPopup {
             let desktop_file = self.app.desktop_file_path.clone();
             let cancelled = self.cancelled.clone();
             let ctx = ctx.clone();
-            let (tx, rx) = std::sync::mpsc::sync_channel(2);
-            // Exactly two bounded updates; never make local details wait for an AUR query.
+            let (tx, rx) = std::sync::mpsc::sync_channel(3);
+            // At most three updates; local details never wait for a package registry.
             applicationlauncher::observability::spawn_named("app-info", move |worker| {
                 use crate::windows::versions::ApplicationInfoUpdate;
                 if cancelled.load(Ordering::Acquire) {
@@ -98,6 +98,17 @@ impl AppInfoPopup {
                     && !cancelled.load(Ordering::Acquire)
                 {
                     let _ = tx.try_send(ApplicationInfoUpdate::PackageVersion(version));
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    ctx.request_repaint_of(viewport_id);
+                }
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                worker.set_state("checking-available-npm-version");
+                if let Some(version) = metadata.query_npm_version()
+                    && !cancelled.load(Ordering::Acquire)
+                {
+                    let _ = tx.try_send(ApplicationInfoUpdate::NpmVersion(version));
                 }
                 // Publish completion before waking the UI, including when no package applies.
                 drop(tx);
@@ -107,7 +118,7 @@ impl AppInfoPopup {
             rx
         });
         let mut finished = false;
-        for _ in 0..2 {
+        for _ in 0..4 {
             match receiver.try_recv() {
                 Ok(crate::windows::versions::ApplicationInfoUpdate::Details(metadata)) => {
                     self.metadata = Some(metadata);
@@ -115,6 +126,11 @@ impl AppInfoPopup {
                 Ok(crate::windows::versions::ApplicationInfoUpdate::PackageVersion(version)) => {
                     if let Some(metadata) = self.metadata.as_mut() {
                         metadata.latest_package_version = Some(version);
+                    }
+                }
+                Ok(crate::windows::versions::ApplicationInfoUpdate::NpmVersion(version)) => {
+                    if let Some(metadata) = self.metadata.as_mut() {
+                        metadata.latest_npm_version = Some(version);
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -132,6 +148,13 @@ impl AppInfoPopup {
             {
                 metadata.latest_package_version =
                     Some("Unavailable (package lookup ended without a result)".into());
+            }
+            if let Some(metadata) = self.metadata.as_mut()
+                && metadata.npm_target.is_some()
+                && metadata.latest_npm_version.is_none()
+            {
+                metadata.latest_npm_version =
+                    Some("Unavailable (npm lookup ended without a result)".into());
             }
             self.receiver = None;
         }
@@ -153,6 +176,8 @@ struct InstalledApplicationFields<'a> {
     native: Option<bool>,
     package_target: bool,
     latest_package_version: Option<&'a str>,
+    npm_target: Option<&'a crate::windows::versions::NpmTarget>,
+    latest_npm_version: Option<&'a str>,
     uncompiled_changes: Option<&'a str>,
     installation: Option<&'a str>,
     package: Option<&'a str>,
@@ -200,6 +225,7 @@ fn installed_application_rows(
     });
     let package =
         latest_package_version_field(fields.latest_package_version, fields.package_target);
+    let npm = latest_npm_version_field(fields.latest_npm_version, fields.npm_target);
     let owning_package = fields.package.map(|package| {
         match fields
             .metadata
@@ -248,6 +274,7 @@ fn installed_application_rows(
     ]
     .into_iter()
     .chain(package.map(|(label, value)| (label, Some(value))))
+    .chain(npm.map(|(label, value)| (label, Some(value))))
     .chain(root_package)
     .chain([
         ("Launch chain", chain),
@@ -373,6 +400,8 @@ fn application_info_rows(state: &AppInfoPopup) -> Vec<InfoPopupRow> {
             native: details.and_then(|info| info.native),
             package_target: details.is_some_and(|info| info.package_target.is_some()),
             latest_package_version: details.and_then(|info| info.latest_package_version.as_deref()),
+            npm_target: details.and_then(|info| info.npm_target.as_ref()),
+            latest_npm_version: details.and_then(|info| info.latest_npm_version.as_deref()),
             uncompiled_changes: details.and_then(|info| info.uncompiled_changes.as_deref()),
             installation: details.and_then(|info| info.installation.as_deref()),
             package: details.and_then(|info| info.package.as_deref()),
@@ -462,6 +491,20 @@ impl InfoPopups {
     }
 }
 
+fn latest_npm_version_field(
+    latest_version: Option<&str>,
+    target: Option<&crate::windows::versions::NpmTarget>,
+) -> Option<(&'static str, String)> {
+    target.map(|target| {
+        (
+            "latest package version (npm)",
+            latest_version
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Checking npm registry for {}...", target.name)),
+        )
+    })
+}
+
 fn latest_package_version_field(
     latest_package_version: Option<&str>,
     has_package_target: bool,
@@ -524,6 +567,8 @@ pub(super) fn process_version_rows(
             package_target: version.is_some_and(|version| version.package_target.is_some()),
             latest_package_version: version
                 .and_then(|version| version.latest_package_version.as_deref()),
+            npm_target: version.and_then(|version| version.npm_target.as_ref()),
+            latest_npm_version: version.and_then(|version| version.latest_npm_version.as_deref()),
             uncompiled_changes: version.and_then(|version| version.uncompiled_changes.as_deref()),
             installation: version.and_then(|version| version.installation.as_deref()),
             package: version.and_then(|version| version.package.as_deref()),
@@ -599,6 +644,12 @@ pub(super) fn application_version_rows(
         ));
         package_rows.push(row("package", application.package.clone()));
         if let Some((label, value)) = package_field {
+            package_rows.push(row(label, value));
+        }
+        if let Some((label, value)) = latest_npm_version_field(
+            version.and_then(|version| version.application_latest_npm_version.as_deref()),
+            version.and_then(|version| version.application_npm_target.as_ref()),
+        ) {
             package_rows.push(row(label, value));
         }
         if application.package == "@earendil-works/pi-coding-agent" {
@@ -1588,6 +1639,124 @@ mod tests {
             popup.poll_metadata(&ctx, egui::ViewportId::ROOT);
             assert_eq!(popup.metadata, Some(Default::default()));
             assert!(popup.receiver.is_none());
+        }
+    }
+
+    #[test]
+    fn npm_version_rows_keep_upstream_and_node_registry_versions_out_of_running_identity() {
+        use crate::windows::versions::{NodeApplication, NpmTarget, ProcessVersion};
+        let mut native = ProcessVersion {
+            version: Some("codex-cli 0.159.1".into()),
+            latest_version: Some("codex-cli 0.159.1".into()),
+            npm_target: Some(NpmTarget {
+                name: "@openai/codex".into(),
+                upstream: true,
+            }),
+            ..Default::default()
+        };
+        let rows = process_version_rows("Application", Some(&native), false);
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "Latest package version (npm)"
+                    && row.value.contains("Checking npm registry"))
+        );
+        native.latest_npm_version =
+            Some("@openai/codex 0.160.0 (npm latest; upstream reference)".into());
+        let rows = process_version_rows("Application", Some(&native), false);
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "Version" && row.value == "codex-cli 0.159.1")
+        );
+        let npm_row = rows
+            .iter()
+            .find(|row| row.label == "Latest package version (npm)")
+            .unwrap();
+        assert!(npm_row.value.contains("upstream reference"));
+        assert!(npm_row.binary_is_current.is_none());
+
+        let hosted = ProcessVersion {
+            runtime_name: Some("Node.js"),
+            version: Some("v26.4.0".into()),
+            application: Some(NodeApplication {
+                package: "@example/tool".into(),
+                installed_version: "1.0.0".into(),
+                entry_point: "/tool/cli.js".into(),
+                manifest: "/tool/package.json".into(),
+                identification: "test metadata",
+            }),
+            application_npm_target: NpmTarget::package("@example/tool"),
+            application_latest_npm_version: Some("@example/tool 2.0.0 (npm latest)".into()),
+            ..Default::default()
+        };
+        let rows = application_version_rows("Application", Some(&hosted), false);
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "Latest package version (npm)"
+                    && row.value == "@example/tool 2.0.0 (npm latest)")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "Installed version" && row.value == "1.0.0")
+        );
+        assert!(!rows.iter().any(|row| row.value == "v26.4.0"));
+        let runtime = process_version_rows("Runtime", Some(&hosted), false);
+        assert!(!runtime.iter().any(|row| row.label.ends_with("(npm)")));
+        assert!(
+            runtime
+                .iter()
+                .any(|row| row.label == "Version" && row.value == "v26.4.0")
+        );
+    }
+
+    #[test]
+    fn application_npm_updates_and_worker_failure_do_not_leave_checking_forever() {
+        use crate::windows::versions::{ApplicationInfo, ApplicationInfoUpdate, NpmTarget};
+        for success in [false, true] {
+            let InfoTarget::App(mut popup) = app("/test/tool.desktop") else {
+                unreachable!()
+            };
+            let (tx, rx) = std::sync::mpsc::sync_channel(3);
+            popup.receiver = Some(rx);
+            tx.send(ApplicationInfoUpdate::Details(ApplicationInfo {
+                version: Some("local version".into()),
+                npm_target: NpmTarget::package("@example/tool"),
+                ..Default::default()
+            }))
+            .unwrap();
+            let ctx = egui::Context::default();
+            popup.poll_metadata(&ctx, egui::ViewportId::ROOT);
+            assert!(
+                application_info_rows(&popup)
+                    .iter()
+                    .any(|row| row.label == "Latest package version (npm)"
+                        && row.value.contains("Checking npm registry"))
+            );
+            if success {
+                tx.send(ApplicationInfoUpdate::NpmVersion(
+                    "@example/tool 2.0.0 (npm latest)".into(),
+                ))
+                .unwrap();
+            }
+            drop(tx);
+            popup.poll_metadata(&ctx, egui::ViewportId::ROOT);
+            assert!(popup.receiver.is_none());
+            let rows = application_info_rows(&popup);
+            let row = rows
+                .iter()
+                .find(|row| row.label == "Latest package version (npm)")
+                .unwrap();
+            assert_eq!(
+                row.value,
+                if success {
+                    "@example/tool 2.0.0 (npm latest)"
+                } else {
+                    "Unavailable (npm lookup ended without a result)"
+                }
+            );
+            assert_eq!(
+                popup.metadata.as_ref().unwrap().version.as_deref(),
+                Some("local version")
+            );
         }
     }
 

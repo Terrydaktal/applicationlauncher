@@ -493,6 +493,20 @@ impl Inventory {
             })
     }
 
+    fn npm_package(&self, executable: &Path) -> Option<String> {
+        let mut result = None;
+        for program in self.matching_programs(executable)? {
+            if program.origin != "Npm"
+                || program.name.is_empty()
+                || result.as_ref().is_some_and(|name| name != &program.name)
+            {
+                return None;
+            }
+            result = Some(program.name.clone());
+        }
+        result
+    }
+
     fn package_name(&self, executable: &Path) -> Option<(String, bool)> {
         let mut result = None;
         for program in self.matching_programs(executable)? {
@@ -569,6 +583,10 @@ fn inventory() -> Option<Arc<Inventory>> {
 
 pub(super) fn package_name(executable: &Path) -> Option<(String, bool)> {
     inventory()?.package_name(executable)
+}
+
+pub(super) fn npm_package(executable: &Path) -> Option<String> {
+    inventory()?.npm_package(executable)
 }
 
 pub(super) fn launch_alias(executable: &Path) -> Option<PathBuf> {
@@ -1421,5 +1439,24 @@ mod tests {
         std::fs::remove_file(&alias).unwrap();
         std::os::unix::fs::symlink(&other, &alias).unwrap();
         assert!(inventory.launch_alias(&entry).is_none());
+    }
+    #[test]
+    fn npm_registry_mapping_requires_exact_unambiguous_npm_ownership() {
+        let mut record = program("Npm", "ToolchainManaged", json!({}));
+        record["name"] = json!("@example/tool");
+        let matches = Inventory::parse(&inventory(vec![record.clone()])).unwrap();
+        assert_eq!(
+            matches.npm_package(Path::new("/bin/tool")).as_deref(),
+            Some("@example/tool")
+        );
+        assert!(matches.npm_package(Path::new("/elsewhere/tool")).is_none());
+        assert!(matches.package_name(Path::new("/bin/tool")).is_none());
+        let mut conflict = record.clone();
+        conflict["name"] = json!("other-tool");
+        let ambiguous = Inventory::parse(&inventory(vec![record.clone(), conflict])).unwrap();
+        assert!(ambiguous.npm_package(Path::new("/bin/tool")).is_none());
+        record["origin"] = json!("Local");
+        let local = Inventory::parse(&inventory(vec![record])).unwrap();
+        assert!(local.npm_package(Path::new("/bin/tool")).is_none());
     }
 }

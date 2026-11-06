@@ -14,6 +14,7 @@ mod freshness;
 mod installation;
 mod lookup;
 mod node;
+mod npm;
 mod pi;
 mod script;
 
@@ -25,6 +26,7 @@ pub(crate) use installation::ProgsMetadata;
 pub(crate) use lookup::PI_RECEIPT_REFRESH;
 pub(crate) use lookup::ProcessVersionCache;
 pub(crate) use node::NodeApplication;
+pub(crate) use npm::NpmTarget;
 pub(crate) use pi::{BuildStatus as PiBuildStatus, PiBuildEvidence};
 pub(crate) use script::{ScriptApplication, runtime_name};
 
@@ -52,10 +54,14 @@ pub(crate) struct ProcessVersion {
     pub(crate) application_progs_metadata: ProgsMetadata,
     pub(crate) application_package_target: Option<PackageTarget>,
     pub(crate) application_latest_package_version: Option<String>,
+    pub(crate) application_npm_target: Option<NpmTarget>,
+    pub(crate) application_latest_npm_version: Option<String>,
     pub(crate) version: Option<String>,
     pub(crate) latest_version: Option<String>,
     pub(crate) package_target: Option<PackageTarget>,
     pub(crate) latest_package_version: Option<String>,
+    pub(crate) npm_target: Option<NpmTarget>,
+    pub(crate) latest_npm_version: Option<String>,
     pub(crate) latest_build_id: Option<String>,
     pub(crate) running_latest_binary: Option<bool>,
     pub(crate) uncompiled_changes: Option<String>,
@@ -80,6 +86,8 @@ impl ProcessVersion {
         self.application_progs_metadata = ProgsMetadata::default();
         self.application_package_target = None;
         self.application_latest_package_version = None;
+        self.application_npm_target = None;
+        self.application_latest_npm_version = None;
         self.application_launch = None;
     }
 }
@@ -334,6 +342,14 @@ fn probe_version_checked(
     let (installation, progs_metadata) =
         installation::inspect_with_owner(&clean_path, package.as_deref());
     let package_target = available::target(&clean_path, package.as_deref());
+    let npm_target = npm::target(
+        &clean_path,
+        running_info.version.as_deref().or_else(|| {
+            latest_info
+                .as_ref()
+                .and_then(|info| info.version.as_deref())
+        }),
+    );
     let launch = application::process_launch(
         &clean_path,
         installed.as_ref(),
@@ -353,10 +369,14 @@ fn probe_version_checked(
         application_progs_metadata: ProgsMetadata::default(),
         application_package_target: None,
         application_latest_package_version: None,
+        application_npm_target: None,
+        application_latest_npm_version: None,
         version: running_info.version,
         latest_version: latest_info.as_ref().and_then(|info| info.version.clone()),
         package_target,
         latest_package_version: None,
+        npm_target,
+        latest_npm_version: None,
         latest_build_id: latest_info.and_then(|info| info.build_id),
         running_latest_binary,
         uncompiled_changes: Some(uncompiled_changes),
@@ -391,6 +411,10 @@ fn probe_version_checked(
             let owner = installed_package(&application.entry_point);
             available::target(&application.entry_point, owner.as_deref())
         });
+        result.application_npm_target = result
+            .application
+            .as_ref()
+            .and_then(|application| NpmTarget::package(&application.package));
     }
     if running.is_ok()
         && let Some(runtime @ ("Python" | "Java")) = result.runtime_name
@@ -834,8 +858,11 @@ mod tests {
                 version.latest_build_id
             );
             eprintln!(
-                "runtime={:?} application={:?}",
-                version.runtime_name, version.application,
+                "runtime={:?} application={:?} npm_target={:?} application_npm_target={:?}",
+                version.runtime_name,
+                version.application,
+                version.npm_target,
+                version.application_npm_target
             );
             eprintln!(
                 "current_launch={:?} hosted_launch={:?}",

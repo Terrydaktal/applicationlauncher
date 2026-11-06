@@ -3,7 +3,7 @@ use std::fs::File;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use super::{PackageTarget, ProgsMetadata, installation};
+use super::{NpmTarget, PackageTarget, ProgsMetadata, installation};
 
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
 const MAX_WRAPPER_BYTES: u64 = 64 * 1024;
@@ -55,6 +55,8 @@ pub(crate) struct ApplicationInfo {
     pub(crate) package: Option<String>,
     pub(crate) package_target: Option<PackageTarget>,
     pub(crate) latest_package_version: Option<String>,
+    pub(crate) npm_target: Option<NpmTarget>,
+    pub(crate) latest_npm_version: Option<String>,
     pub(crate) build_id: Option<String>,
     pub(crate) uncompiled_changes: Option<String>,
     pub(crate) launcher_installation: Option<String>,
@@ -65,12 +67,17 @@ impl ApplicationInfo {
     pub(crate) fn query_package_version(&self) -> Option<String> {
         self.package_target.as_ref().map(super::available::query)
     }
+
+    pub(crate) fn query_npm_version(&self) -> Option<String> {
+        self.npm_target.as_ref().map(super::npm::query)
+    }
 }
 
 #[derive(Debug)]
 pub(crate) enum ApplicationInfoUpdate {
     Details(ApplicationInfo),
     PackageVersion(String),
+    NpmVersion(String),
 }
 
 fn shell_word(input: &str) -> Option<(String, &str)> {
@@ -381,6 +388,7 @@ pub(crate) fn inspect_application(exec: &str, desktop_file: &Path) -> Applicatio
     result.launcher_installation = Some(label);
     result.launcher_metadata = metadata;
     result.launcher = Some(launcher.clone());
+    result.npm_target = super::npm::target(&launcher, None);
     if launcher.file_name().is_some_and(|name| name == "env") {
         result.resolution =
             "Unknown (environment launcher requires explicit target resolution)".into();
@@ -401,6 +409,8 @@ pub(crate) fn inspect_application(exec: &str, desktop_file: &Path) -> Applicatio
     let package = super::installed_package(executable);
     let (installation, metadata) = installation::inspect_with_owner(executable, package.as_deref());
     result.package_target = super::available::target(executable, package.as_deref());
+    result.npm_target =
+        super::npm::target(executable, version.version.as_deref()).or(result.npm_target);
     result.uncompiled_changes = Some(if package.is_some() {
         "Not applicable (package-managed installation)".into()
     } else {
@@ -552,6 +562,23 @@ mod tests {
         let uninspectable = fixture.0.join("x".repeat(300));
         assert_eq!(inspect_application("", &uninspectable).desktop_exists, None);
         assert_eq!(ApplicationInfo::default().desktop_exists, None);
+    }
+
+    #[test]
+    fn npm_application_tiles_use_manifest_identity_even_for_large_entry_points() {
+        let fixture = Fixture::new();
+        let entry = fixture.file("cli.js", vec![b'x'; MAX_WRAPPER_BYTES as usize + 1]);
+        fixture.file(
+            "package.json",
+            br#"{"name":"@example/tool","version":"1.0.0","bin":{"tool":"cli.js"}}"#,
+        );
+        let launcher = fixture.0.join("tool");
+        symlink(entry, &launcher).unwrap();
+        let info = inspect_application(launcher.to_str().unwrap(), &fixture.0.join("tool.desktop"));
+        assert_eq!(info.npm_target.as_ref().unwrap().name, "@example/tool");
+        assert!(info.latest_npm_version.is_none());
+        assert!(info.package_target.is_none());
+        assert!(info.version.is_none());
     }
 
     #[test]
