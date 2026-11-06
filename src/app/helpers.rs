@@ -1,5 +1,22 @@
 use super::*;
 
+pub(super) fn compact_panel_scrollbars(ui: &mut egui::Ui) {
+    let scroll = &mut ui.spacing_mut().scroll;
+    scroll.bar_width = 4.0;
+    scroll.floating_width = 2.0;
+}
+
+pub(super) fn application_scroll_content(ui: &mut egui::Ui, viewport: egui::Rect) {
+    let scroll = ui.spacing().scroll;
+    if scroll.floating {
+        // Reserve the fully expanded bar even while it is hidden, so grid columns stay stable.
+        let gutter = (scroll.bar_width + scroll.bar_outer_margin + 2.0
+            - scroll.floating_allocated_width)
+            .max(0.0);
+        ui.set_width((ui.available_width() - gutter).max(0.0));
+    }
+}
+
 pub(super) fn application_panel_status(ui: &mut egui::Ui, loading: bool) -> egui::Response {
     ui.set_min_width(ui.available_width());
     ui.vertical_centered(|ui| {

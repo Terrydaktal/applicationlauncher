@@ -102,6 +102,7 @@
   On Wayland, reselecting an open target uses KWin activation because the native backend's ordinary Focus command is a no-op. Each info viewport has a stable, process-specific application ID; lookup requires both the exact ID and PID and rejects missing, ambiguous or malformed matches. A single background worker keeps only the latest pending target, with two-second command timeouts and no lock held during compositor I/O. It never recreates the info window, moves or resizes it, or focuses a different application when lookup fails. No focus worker runs on redraws, scrolling or metadata updates, and the worker exits when idle.
 - Re-focuses the existing launcher instance instead of opening a second one.
 - Persists window size, pinned applications, and launcher settings under `$HOME/.config/applicationlauncher/`.
+- Application scrollbars have a reserved gutter so expanded handles never cover icons or change the number of columns.
 - Renders strikethrough in open-window and Recently closed titles as native styling, without changing saved titles or restore metadata.
 
 ## Runtime Architecture

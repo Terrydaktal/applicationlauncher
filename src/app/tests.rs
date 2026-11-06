@@ -527,6 +527,283 @@ mod tests {
     }
 
     #[test]
+    fn search_bar_controls_keep_symmetric_padding_without_overflow() {
+        for scale in [1.0, 1.5, 2.0] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            for width in [320.0, 560.0, 960.0, 1440.0] {
+                for count in [0, 84, 9999] {
+                    for mode in [LauncherMode::Windows, LauncherMode::Apps] {
+                        for mut query in [String::new(), "long search query ".repeat(30)] {
+                            let _ = ctx.run(
+                                egui::RawInput {
+                                    screen_rect: Some(egui::Rect::from_min_size(
+                                        egui::Pos2::ZERO,
+                                        egui::vec2(width, 200.0),
+                                    )),
+                                    ..Default::default()
+                                },
+                                |ctx| {
+                                    egui::CentralPanel::default().show(ctx, |ui| {
+                                        let available = ui.available_rect_before_wrap();
+                                        let bar = super::super::view::search_bar(
+                                            ui, &mut query, mode, count, false,
+                                        );
+                                        let rect = bar.response.rect;
+                                        let controls = bar.inner;
+                                        assert!(
+                                            rect.right() <= available.right() + 1.0,
+                                            "header overflow: {rect:?}, available={available:?}, scale={scale}, count={count}"
+                                        );
+                                        let left_padding = controls.icon_rect.left() - rect.left();
+                                        let right_padding =
+                                            rect.right() - controls.settings.rect.right();
+                                        assert!((left_padding - right_padding).abs() <= 1.0);
+                                        assert!(left_padding >= 12.0 && right_padding >= 12.0);
+                                        let widgets = [
+                                            controls.icon_rect,
+                                            controls.search.rect,
+                                            controls.count_rect,
+                                            controls.ordering.rect,
+                                            controls.history.rect,
+                                            controls.settings.rect,
+                                        ];
+                                        for pair in widgets.windows(2) {
+                                            assert!(
+                                                pair[0].right() <= pair[1].left(),
+                                                "header widgets overlap: {pair:?}"
+                                            );
+                                        }
+                                    });
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_bar_preserves_text_input_and_control_clicks() {
+        let ctx = egui::Context::default();
+        let render = |query: &mut String, events, focus_search| {
+            let mut response = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(960.0, 200.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let bar = super::super::view::search_bar(
+                            ui,
+                            query,
+                            LauncherMode::Windows,
+                            84,
+                            false,
+                        );
+                        if focus_search {
+                            bar.inner.search.request_focus();
+                        }
+                        response = Some(bar.inner);
+                    });
+                },
+            );
+            response.unwrap()
+        };
+        let mut query = String::new();
+        render(&mut query, Vec::new(), true);
+        let typed = render(&mut query, vec![egui::Event::Text("codex".into())], false);
+        assert_eq!(query, "codex");
+        assert!(typed.search.changed());
+        assert!(typed.search.has_focus());
+        for (index, pos) in [
+            typed.ordering.rect.center(),
+            typed.history.rect.center(),
+            typed.settings.rect.center(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for pressed in [true, false] {
+                let response = render(
+                    &mut query,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    false,
+                );
+                if !pressed {
+                    for (button_index, button) in
+                        [response.ordering, response.history, response.settings]
+                            .into_iter()
+                            .enumerate()
+                    {
+                        assert_eq!(button.clicked(), button_index == index);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn application_scrollbar_gutter_keeps_tiles_clear_and_columns_stable() {
+        for scale in [1.0, 1.5, 2.0] {
+            for width in [320.0, 367.0, 481.0, 980.0] {
+                for tile in [32.0, 48.0, 72.0] {
+                    let ctx = egui::Context::default();
+                    ctx.set_pixels_per_point(scale);
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 220.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |_| {},
+                    );
+                    let mut first_columns = None;
+                    let mut checked_bar = false;
+                    for frame in 0..8 {
+                        let _ = ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(width, 220.0),
+                                )),
+                                time: Some(frame as f64 / 10.0),
+                                events: vec![egui::Event::PointerMoved(egui::pos2(width - 12.0, 90.0))],
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                egui::CentralPanel::default().show(ctx, |ui| {
+                                    helpers::compact_panel_scrollbars(ui);
+                                    let mut tiles = Vec::new();
+                                    let area = egui::ScrollArea::vertical()
+                                        .auto_shrink([false, true])
+                                        .max_height(180.0)
+                                        .show_viewport(ui, |ui, viewport| {
+                                            let available_width = ui.available_width();
+                                            helpers::application_scroll_content(ui, viewport);
+                                            assert!((available_width - ui.available_width() - 6.0).abs() <= 1.0);
+                                            ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
+                                            let columns = helpers::grid_columns(ui.available_width(), tile, 10.0);
+                                            assert_eq!(*first_columns.get_or_insert(columns), columns);
+                                            let (visible, _) = helpers::virtual_items(ui, viewport, 500, columns, tile, 10.0, None);
+                                            ui.horizontal_wrapped(|ui| {
+                                                for index in visible {
+                                                    helpers::virtual_item(ui, index, egui::vec2(tile, tile), |ui| {
+                                                        let (rect, _) = ui.allocate_exact_size(egui::vec2(tile, tile), egui::Sense::click());
+                                                        tiles.push(rect);
+                                                    });
+                                                }
+                                            });
+                                        });
+                                    if let Some(bar) = ctx.read_response(area.id.with(1_usize)) {
+                                        assert!(bar.rect.width() <= 4.0 + 1.0 / scale);
+                                        for tile in tiles {
+                                            assert!(
+                                                tile.right() <= bar.rect.left() - 1.0,
+                                                "scrollbar overlaps tile: {tile:?}, bar={:?}, scale={scale}",
+                                                bar.rect
+                                            );
+                                        }
+                                        checked_bar = true;
+                                    }
+                                });
+                            },
+                        );
+                    }
+                    assert!(
+                        checked_bar,
+                        "overflowing grids must retain a working scrollbar"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn both_launcher_panels_keep_scrollbars_narrow_when_hovered_and_dragged() {
+        let ctx = egui::Context::default();
+        let mut hovered = [false; 2];
+        let mut dragged = [false; 2];
+        let mut bars: [Option<egui::Rect>; 2] = [None; 2];
+        for frame in 0..12 {
+            let index = usize::from(frame >= 6);
+            let x = bars[index].map_or(0.0, |bar| bar.center().x);
+            let mut events = vec![egui::Event::PointerMoved(egui::pos2(x, 35.0))];
+            if frame == 3 || frame == 9 {
+                events.push(egui::Event::PointerButton {
+                    pos: egui::pos2(x, 35.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            } else if frame == 4 || frame == 10 {
+                events[0] = egui::Event::PointerMoved(egui::pos2(x, 60.0));
+            } else if frame == 5 || frame == 11 {
+                events.push(egui::Event::PointerButton {
+                    pos: egui::pos2(x, 60.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 240.0),
+                    )),
+                    time: Some(frame as f64 / 10.0),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        helpers::compact_panel_scrollbars(ui);
+                        ui.columns(2, |panes| {
+                            for (index, ui) in panes.iter_mut().enumerate() {
+                                let area = egui::ScrollArea::vertical()
+                                    .id_salt(index)
+                                    .auto_shrink([false, true])
+                                    .max_height(180.0)
+                                    .show_viewport(ui, |ui, viewport| {
+                                        if index == 1 {
+                                            helpers::application_scroll_content(ui, viewport);
+                                        }
+                                        ui.set_height(1000.0);
+                                    });
+                                if let Some(bar) = ctx.read_response(area.id.with(1_usize)) {
+                                    assert!(bar.rect.width() <= 4.0);
+                                    bars[index] = Some(bar.rect);
+                                    hovered[index] |= bar.hovered();
+                                    dragged[index] |= bar.dragged();
+                                }
+                            }
+                        });
+                    });
+                },
+            );
+        }
+        assert_eq!(hovered, [true, true]);
+        assert_eq!(dragged, [true, true]);
+    }
+
+    #[test]
     fn application_panel_status_is_centered_inside_the_pane_after_resizing() {
         for loading in [false, true] {
             for scale in [1.0, 1.5, 2.0] {
@@ -1259,6 +1536,64 @@ mod tests {
             !super::super::popups::process_info_rows(&window, &node, Vec::new())
                 .iter()
                 .any(|row| row.label == "Script name")
+        );
+    }
+
+    #[test]
+    fn package_rows_distinguish_tools_owning_packages_and_explicit_dependency_roots() {
+        let mut version = crate::windows::versions::ProcessVersion {
+            installation: Some("[PDT] Pacman Dependency Tool (Package-managed)".into()),
+            package: Some("bash 5.3.15-2".into()),
+            progs_metadata: crate::windows::versions::ProgsMetadata {
+                package_type: Some("[PDP] Pacman Dependency (Package-managed)".into()),
+                root_packages: Some("base 3-3 [PEP] (132 other dependent packages; inferred from first recorded transaction)".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for role in ["Application", "Runtime"] {
+            let rows = super::super::popups::process_version_rows(role, Some(&version), false);
+            let owning = rows.iter().position(|row| row.label == "Package").unwrap();
+            assert_eq!(rows[owning].value, "bash 5.3.15-2 [PDP]");
+            assert_eq!(rows[owning + 1].label, "Root package");
+            assert!(rows[owning + 1].value.starts_with("base 3-3 [PEP]"));
+            assert!(
+                rows[owning + 1]
+                    .value
+                    .contains("132 other dependent packages")
+            );
+            assert_eq!(
+                rows.iter().find(|row| row.label == "Type").unwrap().value,
+                "PDT"
+            );
+            assert!(rows[owning..=owning + 1].iter().all(|row| {
+                row.scope == InfoFieldScope::Installation
+                    && !row.searched
+                    && !row.separator_before
+                    && row.binary_is_current.is_none()
+            }));
+        }
+        version.progs_metadata = Default::default();
+        let rows = super::super::popups::process_version_rows("Application", Some(&version), false);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.label == "Package")
+                .unwrap()
+                .value,
+            "bash 5.3.15-2"
+        );
+        assert!(
+            rows.iter()
+                .find(|row| row.label == "Root package")
+                .unwrap()
+                .value
+                .starts_with("Unknown")
+        );
+        version.package = None;
+        assert!(
+            !super::super::popups::process_version_rows("Application", Some(&version), false)
+                .iter()
+                .any(|row| row.label == "Root package")
         );
     }
 
@@ -2943,11 +3278,383 @@ mod tests {
     }
 
     #[test]
+    fn configured_terminal_titles_preserve_strikethrough_without_duplicate_markers() {
+        for mark in ['\u{0335}', '\u{0336}'] {
+            let strike = |text: &str| {
+                text.chars()
+                    .flat_map(|character| [character, mark])
+                    .collect::<String>()
+            };
+            let marker = strike("Terminal");
+            for program in ["codex".to_string(), strike("codex")] {
+                for separator in [" - ", " | "] {
+                    for dynamic_title in [
+                        format!(
+                            "{program}{separator}~/tasks/computersimulation{separator}Visualize Linux app startup"
+                        ),
+                        format!(
+                            "{program} \u{280b} ~/tasks/computersimulation{separator}Visualize Linux app startup"
+                        ),
+                        format!(
+                            "[ ! ] Action Required{separator}{program}{separator}~/tasks/computersimulation{separator}Visualize Linux app startup"
+                        ),
+                    ] {
+                        let expected = format!("{dynamic_title} - {marker}");
+                        for raw_title in [
+                            format!("{dynamic_title}{separator}{marker}"),
+                            format!("{marker}{separator}{dynamic_title}"),
+                        ] {
+                            assert_eq!(
+                                terminal_display_title(
+                                    &raw_title,
+                                    "codex",
+                                    Some("codex resume --last"),
+                                    Some("~/tasks/computersimulation"),
+                                    None,
+                                ),
+                                expected,
+                                "raw title: {raw_title:?}"
+                            );
+                        }
+                        let tmux_title = format!("tmux: simulation - {expected}");
+                        assert_eq!(
+                            terminal_display_title(
+                                &tmux_title,
+                                "tmux: client",
+                                None,
+                                Some("~"),
+                                None,
+                            ),
+                            tmux_title
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pi_title_alias_preserves_strikethrough_on_the_ascii_program_name() {
+        for mark in ['\u{0335}', '\u{0336}'] {
+            let strike = |text: &str| text.chars().flat_map(|ch| [ch, mark]).collect::<String>();
+            let program = strike("pi");
+            let terminal = strike("Terminal");
+            for alias in [strike("\u{03c0}"), program.clone()] {
+                for separator in [" - ", " — ", " – ", " : ", " | "] {
+                    for raw in [
+                        format!("{alias}{separator}alex{separator}{terminal}"),
+                        format!("{terminal}{separator}{alias}{separator}alex"),
+                    ] {
+                        for process in ["pi", "node"] {
+                            let title = terminal_display_title(
+                                &raw,
+                                process,
+                                Some("pi"),
+                                Some("~/tasks/alex"),
+                                None,
+                            );
+                            assert_eq!(
+                                title,
+                                format!("{program}{separator}~/tasks/alex{separator}{terminal}")
+                            );
+                            assert!(!title.contains('\u{03c0}'));
+                            let job = highlighted_title_job_from_segments(&title, 14.0, &[]);
+                            assert!(job.text.starts_with("pi"));
+                            assert!(
+                                job.sections
+                                    .iter()
+                                    .filter(|section| section.byte_range.start < 2)
+                                    .all(|section| section.format.strikethrough.width > 0.0)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pi_titles_with_full_paths_do_not_reinsert_the_original_program_marker() {
+        for mark in ['\u{0335}', '\u{0336}'] {
+            let strike = |text: &str| text.chars().flat_map(|ch| [ch, mark]).collect::<String>();
+            let program = strike("pi");
+            for directory in ["alex", "emma"] {
+                let cwd = format!("~/tasks/{directory}");
+                for terminal in ["Terminal".to_string(), strike("Terminal")] {
+                    for path in [cwd.clone(), format!("/home/lewis/tasks/{directory}")] {
+                        for spinner in ["", "\u{280b} "] {
+                            for alias in [strike("\u{03c0}"), program.clone()] {
+                                for separator in [" - ", " — ", " – ", " : ", " | "] {
+                                    let raw = format!(
+                                        "{alias}{separator}{spinner}{path}{separator}{terminal}"
+                                    );
+                                    for process in ["pi", "node"] {
+                                        let title = terminal_display_title(
+                                            &raw,
+                                            process,
+                                            Some("pi"),
+                                            Some(&cwd),
+                                            None,
+                                        );
+                                        assert_eq!(
+                                            title,
+                                            format!(
+                                                "{program}{separator}{spinner}{cwd}{separator}{terminal}"
+                                            ),
+                                            "raw title: {raw:?}"
+                                        );
+                                        assert!(!title.contains('\u{03c0}'));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn segmented_terminal_paths_preserve_tasks_and_spinners_without_duplication() {
+        for process in ["fish", "htop", "nvtop", "pi"] {
+            for path in ["~/old", "/old", "~/tasks/current"] {
+                let raw = format!("{process} - \u{280b} {path} - current task - Terminal");
+                assert_eq!(
+                    terminal_display_title(
+                        &raw,
+                        process,
+                        Some(process),
+                        Some("~/tasks/current"),
+                        None,
+                    ),
+                    format!("{process} - \u{280b} ~/tasks/current - current task - Terminal")
+                );
+            }
+        }
+        assert_eq!(
+            terminal_display_title(
+                "[lewis] /old - Terminal",
+                "fish",
+                Some("fish"),
+                Some("~/tasks/current"),
+                None,
+            ),
+            "fish - [lewis] ~/tasks/current - Terminal"
+        );
+    }
+
+    #[test]
+    fn pi_title_alias_keeps_spinner_attention_and_unstyled_program_names() {
+        for alias in ["\u{03c0}", "pi"] {
+            assert_eq!(
+                terminal_display_title(
+                    &format!("{alias} - alex - Terminal"),
+                    "pi",
+                    Some("pi"),
+                    Some("~/tasks/alex"),
+                    None
+                ),
+                "pi - ~/tasks/alex - Terminal",
+            );
+        }
+        let program = "p\u{0336}i\u{0336}";
+        assert_eq!(
+            terminal_display_title(
+                "\u{03c0}\u{0336} - \u{280b} alex - Terminal",
+                "pi",
+                Some("pi"),
+                Some("~/tasks/alex"),
+                None
+            ),
+            format!("{program} - \u{280b} ~/tasks/alex - Terminal"),
+        );
+        assert_eq!(
+            terminal_display_title(
+                "\u{03c0}\u{0336} - [ ! ] Action Required - alex - Terminal",
+                "pi",
+                Some("pi"),
+                Some("~/tasks/alex"),
+                None
+            ),
+            format!("{program} - [ ! ] Action Required - ~/tasks/alex - Terminal"),
+        );
+        assert_eq!(
+            terminal_display_title(
+                "[ ! ] Action Required - \u{03c0}\u{0336} - alex - Terminal",
+                "pi",
+                Some("pi"),
+                Some("~/tasks/alex"),
+                None,
+            ),
+            format!("{program} - [ ! ] Action Required - ~/tasks/alex - Terminal"),
+        );
+    }
+
+    #[test]
+    fn shell_and_ssh_terminal_titles_preserve_struck_terminal_markers() {
+        let marker = "T\u{0336}e\u{0336}r\u{0336}m\u{0336}i\u{0336}n\u{0336}a\u{0336}l\u{0336}";
+        for separator in [" - ", " — ", " – ", " : ", " | "] {
+            for raw_title in [
+                format!("~{separator}{marker}"),
+                format!("{marker}{separator}~"),
+            ] {
+                assert_eq!(
+                    terminal_display_title(&raw_title, "fish", Some("fish"), Some("~"), None),
+                    format!("fish{separator}~{separator}{marker}")
+                );
+            }
+            assert_eq!(
+                terminal_display_title(
+                    &format!("[lewis] /remote/path{separator}{marker}"),
+                    "ssh",
+                    None,
+                    Some("~"),
+                    Some("fish"),
+                ),
+                format!("ssh - [lewis] fish - /remote/path - {marker}")
+            );
+        }
+    }
+
+    #[test]
     fn fish_home_directory_keeps_tilde_in_terminal_title() {
         assert_eq!(
             terminal_display_title("~ - Terminal", "fish", Some("fish"), Some("~"), None),
             "fish - ~ - Terminal"
         );
+    }
+
+    #[test]
+    fn fish_command_directory_titles_do_not_repeat_the_command_or_split_directory_names() {
+        let struck_terminal =
+            "T\u{0336}e\u{0336}r\u{0336}m\u{0336}i\u{0336}n\u{0336}a\u{0336}l\u{0336}";
+        for process in ["fish", "htop", "nvtop"] {
+            for path in [
+                "~",
+                "~/repos/xfce4-terminal",
+                "/tmp/directory with spaces",
+                "~/directory - with | separators",
+                "~/\u{65e5}\u{672c}\u{8a9e}",
+            ] {
+                for marker in ["Terminal", struck_terminal] {
+                    for separator in [" - ", " | "] {
+                        for raw in [
+                            format!("{process} {path}{separator}{marker}"),
+                            format!("{marker}{separator}{process} {path}"),
+                        ] {
+                            for cwd in [None, Some(path)] {
+                                assert_eq!(
+                                    terminal_display_title(&raw, process, Some(process), cwd, None),
+                                    format!("{process}{separator}{path}{separator}{marker}"),
+                                    "{raw}, {cwd:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+                assert_eq!(
+                    terminal_display_title(
+                        &format!("{process} {path}"),
+                        process,
+                        Some(process),
+                        Some(path),
+                        None
+                    ),
+                    format!("{process} - {path} - Terminal")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fish_command_directory_titles_use_full_process_cwd_and_preserve_style_and_parents() {
+        for process in ["fish", "htop"] {
+            for raw_path in [
+                "~/r/x/xfce4-terminal",
+                "~/directory with spaces",
+                "~/directory - with separators",
+            ] {
+                assert_eq!(
+                    terminal_display_title(
+                        &format!("{process} {raw_path} - Terminal"),
+                        process,
+                        Some(process),
+                        Some("~/repos/xfce4-terminal"),
+                        None
+                    ),
+                    format!("{process} - ~/repos/xfce4-terminal - Terminal")
+                );
+            }
+        }
+        assert_eq!(
+            terminal_display_title(
+                "fish ~/r/x/xfce4-terminal - Terminal",
+                "fish",
+                Some("fish"),
+                Some("~/repos/xfce4-terminal"),
+                Some("codex")
+            ),
+            "codex - fish - ~/repos/xfce4-terminal - Terminal"
+        );
+        assert_eq!(
+            terminal_display_title(
+                "f\u{0336}i\u{0336}s\u{0336}h\u{0336} ~/old - Terminal",
+                "fish",
+                Some("fish"),
+                Some("~/repos/xfce4-terminal"),
+                None
+            ),
+            "f\u{0336}i\u{0336}s\u{0336}h\u{0336} - ~/repos/xfce4-terminal - Terminal"
+        );
+        assert_eq!(
+            terminal_display_title(
+                "fish \u{280b} ~/old - Terminal",
+                "fish",
+                Some("fish"),
+                Some("~/repos/xfce4-terminal"),
+                None
+            ),
+            "fish - \u{280b} ~/repos/xfce4-terminal - Terminal"
+        );
+    }
+
+    #[test]
+    fn fish_command_directory_handling_does_not_consume_existing_agent_task_fields() {
+        for process in ["pi", "codex"] {
+            assert_eq!(
+                terminal_display_title(
+                    &format!("{process} ~/tasks/current - current task - Terminal"),
+                    process,
+                    Some(process),
+                    Some("~/tasks/current"),
+                    None
+                ),
+                format!("{process} - ~/tasks/current - current task - Terminal")
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_fish_command_directory_titles_do_not_repeat_remote_shell_or_use_local_cwd() {
+        for parent in [None, Some("fish"), Some("bash")] {
+            for path in [
+                "~",
+                "~/remote/directory with spaces",
+                "/remote/directory - with separators",
+            ] {
+                let raw = format!("[remotehost] fish {path} - Terminal");
+                assert_eq!(
+                    terminal_display_title(
+                        &raw,
+                        "ssh",
+                        Some("ssh remotehost"),
+                        Some("~/local/path"),
+                        parent
+                    ),
+                    format!("ssh - [remotehost] fish - {path} - Terminal")
+                );
+            }
+        }
     }
 
     #[test]
@@ -3487,432 +4194,5 @@ mod tests {
         assert_eq!(projected.len(), "GIMP — İmage".chars().count());
         assert_eq!(projected, "gimp -  mage");
         assert!(search_queries("mpv").is_some());
-    }
-    #[test]
-    fn package_rows_distinguish_tools_owning_packages_and_explicit_dependency_roots() {
-        let mut version = crate::windows::versions::ProcessVersion {
-            installation: Some("[PDT] Pacman Dependency Tool (Package-managed)".into()),
-            package: Some("bash 5.3.15-2".into()),
-            progs_metadata: crate::windows::versions::ProgsMetadata {
-                package_type: Some("[PDP] Pacman Dependency (Package-managed)".into()),
-                root_packages: Some("base 3-3 [PEP] (132 other dependent packages; inferred from first recorded transaction)".into()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        for role in ["Application", "Runtime"] {
-            let rows = super::super::popups::process_version_rows(role, Some(&version), false);
-            let owning = rows.iter().position(|row| row.label == "Package").unwrap();
-            assert_eq!(rows[owning].value, "bash 5.3.15-2 [PDP]");
-            assert_eq!(rows[owning + 1].label, "Root package");
-            assert!(rows[owning + 1].value.starts_with("base 3-3 [PEP]"));
-            assert!(
-                rows[owning + 1]
-                    .value
-                    .contains("132 other dependent packages")
-            );
-            assert_eq!(
-                rows.iter().find(|row| row.label == "Type").unwrap().value,
-                "PDT"
-            );
-            assert!(rows[owning..=owning + 1].iter().all(|row| {
-                row.scope == InfoFieldScope::Installation
-                    && !row.searched
-                    && !row.separator_before
-                    && row.binary_is_current.is_none()
-            }));
-        }
-        version.progs_metadata = Default::default();
-        let rows = super::super::popups::process_version_rows("Application", Some(&version), false);
-        assert_eq!(
-            rows.iter()
-                .find(|row| row.label == "Package")
-                .unwrap()
-                .value,
-            "bash 5.3.15-2"
-        );
-        assert!(
-            rows.iter()
-                .find(|row| row.label == "Root package")
-                .unwrap()
-                .value
-                .starts_with("Unknown")
-        );
-        version.package = None;
-        assert!(
-            !super::super::popups::process_version_rows("Application", Some(&version), false)
-                .iter()
-                .any(|row| row.label == "Root package")
-        );
-    }
-    #[test]
-    fn configured_terminal_titles_preserve_strikethrough_without_duplicate_markers() {
-        for mark in ['\u{0335}', '\u{0336}'] {
-            let strike = |text: &str| {
-                text.chars()
-                    .flat_map(|character| [character, mark])
-                    .collect::<String>()
-            };
-            let marker = strike("Terminal");
-            for program in ["codex".to_string(), strike("codex")] {
-                for separator in [" - ", " | "] {
-                    for dynamic_title in [
-                        format!(
-                            "{program}{separator}~/tasks/computersimulation{separator}Visualize Linux app startup"
-                        ),
-                        format!(
-                            "{program} \u{280b} ~/tasks/computersimulation{separator}Visualize Linux app startup"
-                        ),
-                        format!(
-                            "[ ! ] Action Required{separator}{program}{separator}~/tasks/computersimulation{separator}Visualize Linux app startup"
-                        ),
-                    ] {
-                        let expected = format!("{dynamic_title} - {marker}");
-                        for raw_title in [
-                            format!("{dynamic_title}{separator}{marker}"),
-                            format!("{marker}{separator}{dynamic_title}"),
-                        ] {
-                            assert_eq!(
-                                terminal_display_title(
-                                    &raw_title,
-                                    "codex",
-                                    Some("codex resume --last"),
-                                    Some("~/tasks/computersimulation"),
-                                    None,
-                                ),
-                                expected,
-                                "raw title: {raw_title:?}"
-                            );
-                        }
-                        let tmux_title = format!("tmux: simulation - {expected}");
-                        assert_eq!(
-                            terminal_display_title(
-                                &tmux_title,
-                                "tmux: client",
-                                None,
-                                Some("~"),
-                                None,
-                            ),
-                            tmux_title
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn pi_title_alias_preserves_strikethrough_on_the_ascii_program_name() {
-        for mark in ['\u{0335}', '\u{0336}'] {
-            let strike = |text: &str| text.chars().flat_map(|ch| [ch, mark]).collect::<String>();
-            let program = strike("pi");
-            let terminal = strike("Terminal");
-            for alias in [strike("\u{03c0}"), program.clone()] {
-                for separator in [" - ", " — ", " – ", " : ", " | "] {
-                    for raw in [
-                        format!("{alias}{separator}alex{separator}{terminal}"),
-                        format!("{terminal}{separator}{alias}{separator}alex"),
-                    ] {
-                        for process in ["pi", "node"] {
-                            let title = terminal_display_title(
-                                &raw,
-                                process,
-                                Some("pi"),
-                                Some("~/tasks/alex"),
-                                None,
-                            );
-                            assert_eq!(
-                                title,
-                                format!("{program}{separator}~/tasks/alex{separator}{terminal}")
-                            );
-                            assert!(!title.contains('\u{03c0}'));
-                            let job = highlighted_title_job_from_segments(&title, 14.0, &[]);
-                            assert!(job.text.starts_with("pi"));
-                            assert!(
-                                job.sections
-                                    .iter()
-                                    .filter(|section| section.byte_range.start < 2)
-                                    .all(|section| section.format.strikethrough.width > 0.0)
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn pi_titles_with_full_paths_do_not_reinsert_the_original_program_marker() {
-        for mark in ['\u{0335}', '\u{0336}'] {
-            let strike = |text: &str| text.chars().flat_map(|ch| [ch, mark]).collect::<String>();
-            let program = strike("pi");
-            for directory in ["alex", "emma"] {
-                let cwd = format!("~/tasks/{directory}");
-                for terminal in ["Terminal".to_string(), strike("Terminal")] {
-                    for path in [cwd.clone(), format!("/home/lewis/tasks/{directory}")] {
-                        for spinner in ["", "\u{280b} "] {
-                            for alias in [strike("\u{03c0}"), program.clone()] {
-                                for separator in [" - ", " — ", " – ", " : ", " | "] {
-                                    let raw = format!(
-                                        "{alias}{separator}{spinner}{path}{separator}{terminal}"
-                                    );
-                                    for process in ["pi", "node"] {
-                                        let title = terminal_display_title(
-                                            &raw,
-                                            process,
-                                            Some("pi"),
-                                            Some(&cwd),
-                                            None,
-                                        );
-                                        assert_eq!(
-                                            title,
-                                            format!(
-                                                "{program}{separator}{spinner}{cwd}{separator}{terminal}"
-                                            ),
-                                            "raw title: {raw:?}"
-                                        );
-                                        assert!(!title.contains('\u{03c0}'));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn segmented_terminal_paths_preserve_tasks_and_spinners_without_duplication() {
-        for process in ["fish", "htop", "nvtop", "pi"] {
-            for path in ["~/old", "/old", "~/tasks/current"] {
-                let raw = format!("{process} - \u{280b} {path} - current task - Terminal");
-                assert_eq!(
-                    terminal_display_title(
-                        &raw,
-                        process,
-                        Some(process),
-                        Some("~/tasks/current"),
-                        None,
-                    ),
-                    format!("{process} - \u{280b} ~/tasks/current - current task - Terminal")
-                );
-            }
-        }
-        assert_eq!(
-            terminal_display_title(
-                "[lewis] /old - Terminal",
-                "fish",
-                Some("fish"),
-                Some("~/tasks/current"),
-                None,
-            ),
-            "fish - [lewis] ~/tasks/current - Terminal"
-        );
-    }
-
-    #[test]
-    fn pi_title_alias_keeps_spinner_attention_and_unstyled_program_names() {
-        for alias in ["\u{03c0}", "pi"] {
-            assert_eq!(
-                terminal_display_title(
-                    &format!("{alias} - alex - Terminal"),
-                    "pi",
-                    Some("pi"),
-                    Some("~/tasks/alex"),
-                    None
-                ),
-                "pi - ~/tasks/alex - Terminal",
-            );
-        }
-        let program = "p\u{0336}i\u{0336}";
-        assert_eq!(
-            terminal_display_title(
-                "\u{03c0}\u{0336} - \u{280b} alex - Terminal",
-                "pi",
-                Some("pi"),
-                Some("~/tasks/alex"),
-                None
-            ),
-            format!("{program} - \u{280b} ~/tasks/alex - Terminal"),
-        );
-        assert_eq!(
-            terminal_display_title(
-                "\u{03c0}\u{0336} - [ ! ] Action Required - alex - Terminal",
-                "pi",
-                Some("pi"),
-                Some("~/tasks/alex"),
-                None
-            ),
-            format!("{program} - [ ! ] Action Required - ~/tasks/alex - Terminal"),
-        );
-        assert_eq!(
-            terminal_display_title(
-                "[ ! ] Action Required - \u{03c0}\u{0336} - alex - Terminal",
-                "pi",
-                Some("pi"),
-                Some("~/tasks/alex"),
-                None,
-            ),
-            format!("{program} - [ ! ] Action Required - ~/tasks/alex - Terminal"),
-        );
-    }
-
-    #[test]
-    fn shell_and_ssh_terminal_titles_preserve_struck_terminal_markers() {
-        let marker = "T\u{0336}e\u{0336}r\u{0336}m\u{0336}i\u{0336}n\u{0336}a\u{0336}l\u{0336}";
-        for separator in [" - ", " — ", " – ", " : ", " | "] {
-            for raw_title in [
-                format!("~{separator}{marker}"),
-                format!("{marker}{separator}~"),
-            ] {
-                assert_eq!(
-                    terminal_display_title(&raw_title, "fish", Some("fish"), Some("~"), None),
-                    format!("fish{separator}~{separator}{marker}")
-                );
-            }
-            assert_eq!(
-                terminal_display_title(
-                    &format!("[lewis] /remote/path{separator}{marker}"),
-                    "ssh",
-                    None,
-                    Some("~"),
-                    Some("fish"),
-                ),
-                format!("ssh - [lewis] fish - /remote/path - {marker}")
-            );
-        }
-    }
-    #[test]
-    fn fish_command_directory_titles_do_not_repeat_the_command_or_split_directory_names() {
-        let struck_terminal =
-            "T\u{0336}e\u{0336}r\u{0336}m\u{0336}i\u{0336}n\u{0336}a\u{0336}l\u{0336}";
-        for process in ["fish", "htop", "nvtop"] {
-            for path in [
-                "~",
-                "~/repos/xfce4-terminal",
-                "/tmp/directory with spaces",
-                "~/directory - with | separators",
-                "~/\u{65e5}\u{672c}\u{8a9e}",
-            ] {
-                for marker in ["Terminal", struck_terminal] {
-                    for separator in [" - ", " | "] {
-                        for raw in [
-                            format!("{process} {path}{separator}{marker}"),
-                            format!("{marker}{separator}{process} {path}"),
-                        ] {
-                            for cwd in [None, Some(path)] {
-                                assert_eq!(
-                                    terminal_display_title(&raw, process, Some(process), cwd, None),
-                                    format!("{process}{separator}{path}{separator}{marker}"),
-                                    "{raw}, {cwd:?}"
-                                );
-                            }
-                        }
-                    }
-                }
-                assert_eq!(
-                    terminal_display_title(
-                        &format!("{process} {path}"),
-                        process,
-                        Some(process),
-                        Some(path),
-                        None
-                    ),
-                    format!("{process} - {path} - Terminal")
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn fish_command_directory_titles_use_full_process_cwd_and_preserve_style_and_parents() {
-        for process in ["fish", "htop"] {
-            for raw_path in [
-                "~/r/x/xfce4-terminal",
-                "~/directory with spaces",
-                "~/directory - with separators",
-            ] {
-                assert_eq!(
-                    terminal_display_title(
-                        &format!("{process} {raw_path} - Terminal"),
-                        process,
-                        Some(process),
-                        Some("~/repos/xfce4-terminal"),
-                        None
-                    ),
-                    format!("{process} - ~/repos/xfce4-terminal - Terminal")
-                );
-            }
-        }
-        assert_eq!(
-            terminal_display_title(
-                "fish ~/r/x/xfce4-terminal - Terminal",
-                "fish",
-                Some("fish"),
-                Some("~/repos/xfce4-terminal"),
-                Some("codex")
-            ),
-            "codex - fish - ~/repos/xfce4-terminal - Terminal"
-        );
-        assert_eq!(
-            terminal_display_title(
-                "f\u{0336}i\u{0336}s\u{0336}h\u{0336} ~/old - Terminal",
-                "fish",
-                Some("fish"),
-                Some("~/repos/xfce4-terminal"),
-                None
-            ),
-            "f\u{0336}i\u{0336}s\u{0336}h\u{0336} - ~/repos/xfce4-terminal - Terminal"
-        );
-        assert_eq!(
-            terminal_display_title(
-                "fish \u{280b} ~/old - Terminal",
-                "fish",
-                Some("fish"),
-                Some("~/repos/xfce4-terminal"),
-                None
-            ),
-            "fish - \u{280b} ~/repos/xfce4-terminal - Terminal"
-        );
-    }
-
-    #[test]
-    fn fish_command_directory_handling_does_not_consume_existing_agent_task_fields() {
-        for process in ["pi", "codex"] {
-            assert_eq!(
-                terminal_display_title(
-                    &format!("{process} ~/tasks/current - current task - Terminal"),
-                    process,
-                    Some(process),
-                    Some("~/tasks/current"),
-                    None
-                ),
-                format!("{process} - ~/tasks/current - current task - Terminal")
-            );
-        }
-    }
-
-    #[test]
-    fn ssh_fish_command_directory_titles_do_not_repeat_remote_shell_or_use_local_cwd() {
-        for parent in [None, Some("fish"), Some("bash")] {
-            for path in [
-                "~",
-                "~/remote/directory with spaces",
-                "/remote/directory - with separators",
-            ] {
-                let raw = format!("[remotehost] fish {path} - Terminal");
-                assert_eq!(
-                    terminal_display_title(
-                        &raw,
-                        "ssh",
-                        Some("ssh remotehost"),
-                        Some("~/local/path"),
-                        parent
-                    ),
-                    format!("ssh - [remotehost] fish - {path} - Terminal")
-                );
-            }
-        }
     }
 }

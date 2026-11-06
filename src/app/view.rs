@@ -10,6 +10,91 @@ pub(super) fn open_window_count_label(ui: &egui::Ui, count: usize) -> (egui::Lab
     (egui::Label::new(galley).selectable(false), width)
 }
 
+pub(super) struct SearchBarResponse {
+    pub search: egui::Response,
+    pub ordering: egui::Response,
+    pub history: egui::Response,
+    pub settings: egui::Response,
+    #[cfg(test)]
+    pub icon_rect: egui::Rect,
+    #[cfg(test)]
+    pub count_rect: egui::Rect,
+}
+
+pub(super) fn search_bar(
+    ui: &mut egui::Ui,
+    query: &mut String,
+    mode: LauncherMode,
+    window_count: usize,
+    order_by_last_activation: bool,
+) -> egui::InnerResponse<SearchBarResponse> {
+    egui::Frame {
+        fill: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10),
+        corner_radius: egui::CornerRadius::same(8),
+        inner_margin: egui::Margin::symmetric(12, 8),
+        stroke: egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15),
+        ),
+        ..Default::default()
+    }
+    .show(ui, |ui| {
+        ui.horizontal(|ui| {
+            let _icon = ui.label(
+                egui::RichText::new("🔍")
+                    .size(18.0)
+                    .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160)),
+            );
+            ui.add_space(4.0);
+            // Lay out controls from the padded edge, leaving their actual remainder for search.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let settings = ui
+                    .button(
+                        egui::RichText::new("⚙")
+                            .size(16.0)
+                            .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 190)),
+                    )
+                    .on_hover_text("Settings");
+                let history = ui
+                    .button(egui::RichText::new("H").size(15.0))
+                    .on_hover_text("Window history and sessions (F9)");
+                let ordering = ui
+                    .add(
+                        egui::Button::new(egui::RichText::new("↕").size(16.0))
+                            .selected(order_by_last_activation),
+                    )
+                    .on_hover_text("Order windows by last activation, newest first");
+                let (count_label, _) = open_window_count_label(ui, window_count);
+                let _count = ui.add(count_label).on_hover_text("Open windows");
+                ui.add_space(8.0);
+                let hint_text = match mode {
+                    LauncherMode::Apps => "Search applications...",
+                    LauncherMode::Windows => "Search open windows...",
+                };
+                let search = ui.add(
+                    egui::TextEdit::singleline(query)
+                        .hint_text(hint_text)
+                        .desired_width(ui.available_width())
+                        .frame(false)
+                        .font(egui::FontId::proportional(16.0)),
+                );
+                SearchBarResponse {
+                    search,
+                    ordering,
+                    history,
+                    settings,
+                    #[cfg(test)]
+                    icon_rect: _icon.rect,
+                    #[cfg(test)]
+                    count_rect: _count.rect,
+                }
+            })
+            .inner
+        })
+        .inner
+    })
+}
+
 impl eframe::App for App {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
         applicationlauncher::observability::sample_gui_frame(input);
@@ -444,6 +529,7 @@ impl eframe::App for App {
                 };
 
                 container_frame.show(ui, |ui| {
+                    helpers::compact_panel_scrollbars(ui);
                     if let Some(ref err) = self.error_message {
                         ui.vertical_centered(|ui| {
                             ui.add_space(20.0);
@@ -464,92 +550,36 @@ impl eframe::App for App {
                     }
 
                     // 1. Search Bar Container
-                    let search_bar_frame = egui::Frame {
-                        fill: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10),
-                        corner_radius: egui::CornerRadius::same(8),
-                        inner_margin: egui::Margin::symmetric(12, 8),
-                        stroke: egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15),
-                        ),
-                        ..Default::default()
-                    };
-
-                    let mut text_edit_response = None;
-                    let mut search_query_changed = false;
-
-                    search_bar_frame.show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("🔍")
-                                    .size(18.0)
-                                    .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160)),
-                            );
-                            ui.add_space(4.0);
-                            let hint_text = match self.mode {
-                                LauncherMode::Apps => "Search applications...",
-                                LauncherMode::Windows => "Search open windows...",
-                            };
-                            let (window_count_label, window_count_width) =
-                                open_window_count_label(ui, self.windows.len());
-                            let search_width = (ui.available_width()
-                                - 78.0
-                                - window_count_width
-                                - ui.spacing().item_spacing.x)
-                                .max(120.0);
-                            let text_edit = egui::TextEdit::singleline(&mut self.search_query)
-                                .hint_text(hint_text)
-                                .desired_width(search_width)
-                                .frame(false)
-                                .font(egui::FontId::proportional(16.0));
-
-                            let response = ui.add(text_edit);
-                            search_query_changed = response.changed();
-                            text_edit_response = Some(response);
-                            ui.add_space(8.0);
-                            ui.add(window_count_label).on_hover_text("Open windows");
-                            let ordering_button = egui::Button::new(
-                                egui::RichText::new("↕").size(16.0),
-                            )
-                            .selected(self.order_windows_by_last_activation);
-                            if ui
-                                .add(ordering_button)
-                                .on_hover_text(
-                                    "Order windows by last activation, newest first",
-                                )
-                                .clicked()
-                            {
-                                self.order_windows_by_last_activation =
-                                    !self.order_windows_by_last_activation;
-                                self.selected_index = 0;
-                                self.scroll_to_first_window_on_focus = true;
-                            }
-                            if ui
-                                .button(egui::RichText::new("H").size(15.0))
-                                .on_hover_text("Window history and sessions (F9)")
-                                .clicked()
-                            {
-                                if self.show_history_popup { self.close_history_popup(); } else { self.open_history_popup(); }
-                            }
-                            if ui
-                                .button(
-                                    egui::RichText::new("⚙")
-                                        .size(16.0)
-                                        .color(egui::Color32::from_rgba_unmultiplied(
-                                            255, 255, 255, 190,
-                                        )),
-                                )
-                                .on_hover_text("Settings")
-                                .clicked()
-                            {
-                                if self.show_settings_menu {
-                                    self.close_settings_menu();
-                                } else {
-                                    self.open_settings_menu();
-                                }
-                            }
-                        });
-                    });
+                    let search_bar = search_bar(
+                        ui,
+                        &mut self.search_query,
+                        self.mode,
+                        self.windows.len(),
+                        self.order_windows_by_last_activation,
+                    )
+                    .inner;
+                    let search_query_changed = search_bar.search.changed();
+                    let text_edit_response = Some(search_bar.search);
+                    if search_bar.ordering.clicked() {
+                        self.order_windows_by_last_activation =
+                            !self.order_windows_by_last_activation;
+                        self.selected_index = 0;
+                        self.scroll_to_first_window_on_focus = true;
+                    }
+                    if search_bar.history.clicked() {
+                        if self.show_history_popup {
+                            self.close_history_popup();
+                        } else {
+                            self.open_history_popup();
+                        }
+                    }
+                    if search_bar.settings.clicked() {
+                        if self.show_settings_menu {
+                            self.close_settings_menu();
+                        } else {
+                            self.open_settings_menu();
+                        }
+                    }
 
                     // KWin may raise the window a few frames after we request it.
                     // Keep retrying briefly so shortcut activation lands in search.
@@ -1198,8 +1228,10 @@ impl eframe::App for App {
                         egui::ScrollArea::vertical()
                             .wheel_scroll_multiplier(egui::vec2(1.0, sensitivity))
                             .id_salt("apps_main_icon_grid_scroll")
+                            .auto_shrink([false, true])
                             .max_height(list_height)
                             .show_viewport(ui, |ui, viewport| {
+                                    helpers::application_scroll_content(ui, viewport);
 	                                ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
                                     let rendered_columns = helpers::grid_columns(ui.available_width(), self.app_icon_tile_size, 12.0);
                                     let (visible, _) = helpers::virtual_items(ui, viewport, total_items, rendered_columns, self.app_icon_tile_size, 12.0, scroll_to_selected.then_some(self.selected_index));
@@ -1406,12 +1438,16 @@ impl eframe::App for App {
                         };
                         egui::ScrollArea::vertical()
                             .wheel_scroll_multiplier(egui::vec2(1.0, sensitivity))
+                            .auto_shrink([false, true])
                             .id_salt(match self.mode {
                                 LauncherMode::Apps => "apps_main_list_scroll",
                                 LauncherMode::Windows => "windows_main_list_scroll",
 	                            })
 	                            .max_height(list_height)
-	                            .show_viewport(ui, |ui, viewport| {
+                            .show_viewport(ui, |ui, viewport| {
+                                    if self.mode == LauncherMode::Apps {
+                                        helpers::application_scroll_content(ui, viewport);
+                                    }
                                     let previous_item_spacing = ui.spacing().item_spacing;
                                     ui.spacing_mut().item_spacing.y = 0.0;
                                     let (visible, centers) = helpers::virtual_items(ui, viewport, total_items, 1, row_height, 0.0, scroll_to_selected.then_some(self.selected_index));
@@ -2219,8 +2255,12 @@ impl eframe::App for App {
                                         egui::ScrollArea::vertical()
                                             .wheel_scroll_multiplier(egui::vec2(1.0, sensitivity))
                                             .id_salt("apps_side_panel_scroll")
+                                            .auto_shrink([false, true])
                                             .max_height(list_height)
                                             .show_viewport(ui, |ui, viewport| {
+                                                    if !filtered_apps.is_empty() {
+                                                        helpers::application_scroll_content(ui, viewport);
+                                                    }
 		                                        if filtered_apps.is_empty() {
 		                                            self.rendered_side_panel_item_centers.clear();
 		                                            self.rendered_side_panel_grid_columns = 1;
