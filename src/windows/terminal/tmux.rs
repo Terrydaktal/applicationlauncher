@@ -596,6 +596,33 @@ mod tests {
     }
 
     #[test]
+    fn fish_command_directory_pane_titles_keep_session_and_full_cwd_without_duplication() {
+        let mut window = window();
+        let mut metadata = metadata();
+        metadata.pane.session.session_name = "opsec".into();
+        metadata.pane.process_name = "fish".into();
+        metadata.pane.cwd = "/tasks/directory with spaces".into();
+        metadata.chain.clear();
+        metadata.command_summary = Some("fish".into());
+        for pane_title in [
+            "fish /t/directory with spaces",
+            "fish /t/directory with spaces - Terminal",
+        ] {
+            metadata.pane.title = pane_title.into();
+            metadata.apply(&mut window);
+            assert_eq!(
+                window.title,
+                "tmux: opsec - fish - /tasks/directory with spaces - Terminal"
+            );
+            assert_eq!(window.active_process.as_deref(), Some("fish"));
+            assert_eq!(window.tmux_pane.as_ref().unwrap().title, pane_title);
+            let previous = window.clone();
+            metadata.apply(&mut window);
+            assert_eq!(window, previous);
+        }
+    }
+
+    #[test]
     fn configured_codex_title_matches_the_actual_terminal_title_without_duplicate_fields() {
         let mut window = window();
         let mut metadata = metadata();

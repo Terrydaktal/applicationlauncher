@@ -274,7 +274,7 @@ pub(crate) fn terminal_display_title(
         .strip_prefix("- ")
         .unwrap_or(raw_title.trim());
 
-    let (dynamic_title, terminal_marker, _) = split_terminal_title_marker(raw_title);
+    let (dynamic_title, terminal_marker, separator) = split_terminal_title_marker(raw_title);
     // These titles already contain their program/context in the user's selected order.
     if dynamic_title.starts_with("tmux: ")
         || (is_codex_process(proc_name) && is_configured_codex_title(dynamic_title))
@@ -286,6 +286,17 @@ pub(crate) fn terminal_display_title(
         && let Some(title) = ssh_terminal_display_title(raw_title, parent_program)
     {
         return title;
+    }
+
+    if let Some(segments) = command_directory_title_segments(
+        dynamic_title,
+        proc_name,
+        command_summary,
+        cwd,
+        parent_program,
+        terminal_marker,
+    ) {
+        return segments.join(separator);
     }
 
     for sep in separators {
@@ -336,6 +347,66 @@ pub(crate) fn terminal_display_title(
         terminal_marker,
     )
     .join(" - ")
+}
+
+fn command_directory_fields(value: &str) -> Option<(&str, &str)> {
+    let (program, context) = value.split_once(char::is_whitespace)?;
+    let context = context.trim_start();
+    let path = strip_leading_braille_spinner(context);
+    (path.starts_with(['~', '/'])
+        || matches!(path, "." | "..")
+        || path.starts_with("./")
+        || path.starts_with("../"))
+    .then_some((program, context))
+}
+
+fn command_directory_title_segments(
+    dynamic_title: &str,
+    proc_name: &str,
+    command_summary: Option<&str>,
+    cwd: Option<&str>,
+    parent_program: Option<&str>,
+    terminal_marker: &str,
+) -> Option<Vec<String>> {
+    let (program, context) = command_directory_fields(dynamic_title)?;
+    // Agent captions can carry a task after the path, unlike Fish's directory-only field.
+    if (unstyled_title_characters(program).eq("codex".chars())
+        || unstyled_title_characters(program).eq("pi".chars()))
+        && [" - ", " — ", " – ", " : ", " | "]
+            .iter()
+            .any(|separator| context.contains(separator))
+    {
+        return None;
+    }
+    let matches_process = unstyled_title_characters(program).eq(unstyled_title_characters(
+        terminal_process_display_name(proc_name),
+    ));
+    let matches_summary = command_summary.is_some_and(|summary| {
+        unstyled_title_characters(program).eq(unstyled_title_characters(summary.trim()))
+    });
+    if !matches_process && !matches_summary {
+        return None;
+    }
+    let primary = terminal_primary_title(proc_name, command_summary);
+    let mut segments = Vec::new();
+    if let Some(parent) = parent_program {
+        push_unique_terminal_segment(&mut segments, parent);
+        push_unique_terminal_segment(&mut segments, program);
+    } else if unstyled_title_characters(program).eq(unstyled_title_characters(&primary)) {
+        push_unique_terminal_segment(&mut segments, program);
+    } else {
+        push_unique_terminal_segment(&mut segments, primary);
+    }
+    // Fish's command and directory share one field; spaces and separators can belong to the path.
+    let directory = match cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) {
+        Some(cwd) => terminal_segment_leading_spinner(context)
+            .map(|spinner| format!("{spinner} {cwd}"))
+            .unwrap_or_else(|| cwd.to_owned()),
+        None => context.to_owned(),
+    };
+    push_unique_terminal_segment(&mut segments, directory);
+    segments.push(terminal_marker.to_owned());
+    Some(segments)
 }
 
 pub(crate) fn is_configured_codex_title(title: &str) -> bool {
@@ -418,6 +489,14 @@ fn ssh_terminal_display_title(raw_title: &str, parent_program: Option<&str>) -> 
     let remote_context = dynamic_title[closing_bracket + 1..].trim();
     if remote_user.len() <= 2 || remote_context.is_empty() {
         return None;
+    }
+
+    if let Some((shell, directory)) =
+        command_directory_fields(remote_context).filter(|(program, _)| is_shell_process(program))
+    {
+        return Some(format!(
+            "ssh - {remote_user} {shell} - {directory} - {terminal_marker}"
+        ));
     }
 
     let remote_shell = parent_program

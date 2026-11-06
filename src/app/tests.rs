@@ -3783,4 +3783,136 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn fish_command_directory_titles_do_not_repeat_the_command_or_split_directory_names() {
+        let struck_terminal =
+            "T\u{0336}e\u{0336}r\u{0336}m\u{0336}i\u{0336}n\u{0336}a\u{0336}l\u{0336}";
+        for process in ["fish", "htop", "nvtop"] {
+            for path in [
+                "~",
+                "~/repos/xfce4-terminal",
+                "/tmp/directory with spaces",
+                "~/directory - with | separators",
+                "~/\u{65e5}\u{672c}\u{8a9e}",
+            ] {
+                for marker in ["Terminal", struck_terminal] {
+                    for separator in [" - ", " | "] {
+                        for raw in [
+                            format!("{process} {path}{separator}{marker}"),
+                            format!("{marker}{separator}{process} {path}"),
+                        ] {
+                            for cwd in [None, Some(path)] {
+                                assert_eq!(
+                                    terminal_display_title(&raw, process, Some(process), cwd, None),
+                                    format!("{process}{separator}{path}{separator}{marker}"),
+                                    "{raw}, {cwd:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+                assert_eq!(
+                    terminal_display_title(
+                        &format!("{process} {path}"),
+                        process,
+                        Some(process),
+                        Some(path),
+                        None
+                    ),
+                    format!("{process} - {path} - Terminal")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fish_command_directory_titles_use_full_process_cwd_and_preserve_style_and_parents() {
+        for process in ["fish", "htop"] {
+            for raw_path in [
+                "~/r/x/xfce4-terminal",
+                "~/directory with spaces",
+                "~/directory - with separators",
+            ] {
+                assert_eq!(
+                    terminal_display_title(
+                        &format!("{process} {raw_path} - Terminal"),
+                        process,
+                        Some(process),
+                        Some("~/repos/xfce4-terminal"),
+                        None
+                    ),
+                    format!("{process} - ~/repos/xfce4-terminal - Terminal")
+                );
+            }
+        }
+        assert_eq!(
+            terminal_display_title(
+                "fish ~/r/x/xfce4-terminal - Terminal",
+                "fish",
+                Some("fish"),
+                Some("~/repos/xfce4-terminal"),
+                Some("codex")
+            ),
+            "codex - fish - ~/repos/xfce4-terminal - Terminal"
+        );
+        assert_eq!(
+            terminal_display_title(
+                "f\u{0336}i\u{0336}s\u{0336}h\u{0336} ~/old - Terminal",
+                "fish",
+                Some("fish"),
+                Some("~/repos/xfce4-terminal"),
+                None
+            ),
+            "f\u{0336}i\u{0336}s\u{0336}h\u{0336} - ~/repos/xfce4-terminal - Terminal"
+        );
+        assert_eq!(
+            terminal_display_title(
+                "fish \u{280b} ~/old - Terminal",
+                "fish",
+                Some("fish"),
+                Some("~/repos/xfce4-terminal"),
+                None
+            ),
+            "fish - \u{280b} ~/repos/xfce4-terminal - Terminal"
+        );
+    }
+
+    #[test]
+    fn fish_command_directory_handling_does_not_consume_existing_agent_task_fields() {
+        for process in ["pi", "codex"] {
+            assert_eq!(
+                terminal_display_title(
+                    &format!("{process} ~/tasks/current - current task - Terminal"),
+                    process,
+                    Some(process),
+                    Some("~/tasks/current"),
+                    None
+                ),
+                format!("{process} - ~/tasks/current - current task - Terminal")
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_fish_command_directory_titles_do_not_repeat_remote_shell_or_use_local_cwd() {
+        for parent in [None, Some("fish"), Some("bash")] {
+            for path in [
+                "~",
+                "~/remote/directory with spaces",
+                "/remote/directory - with separators",
+            ] {
+                let raw = format!("[remotehost] fish {path} - Terminal");
+                assert_eq!(
+                    terminal_display_title(
+                        &raw,
+                        "ssh",
+                        Some("ssh remotehost"),
+                        Some("~/local/path"),
+                        parent
+                    ),
+                    format!("ssh - [remotehost] fish - {path} - Terminal")
+                );
+            }
+        }
+    }
 }
