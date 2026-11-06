@@ -80,6 +80,7 @@
 - `src/windows/versions/pi.rs`: Bounded reader for Coherence Pi's installed build manifest and per-process startup receipt. Validates PID/start time, ownership, file safety, freshness and SDK/extension/patch identities without running Node or reading conversation contents.
 - `src/windows/versions/installation.rs`: Bounded, cached, read-only lookup of Progs' saved installation classifications for Show Info, including local fork launch wrappers.
 - `src/windows/versions/available.rs`: Read-only Pacman sync-database and Paru/AUR package-version queries, exact package matching, bounded caching and timeouts.
+- `src/popups/foreground.rs`: On-demand Wayland info-window reactivation, matching the launcher PID and a unique native viewport identity before unminimizing, activating and raising it.
 - `kwin/applicationlauncher-window-feed/`: Transactional KWin script that sends compositor window events to the daemon.
 - `scripts/applicationlauncher`: Fast launch wrapper that activates compatible release binaries, repairs incompatible binary pairs in the background, and reports newer source without compiling it.
 - `scripts/lib/release-compatibility.sh`: Cached binary-build checks and bounded paired rebuilds for the wrapper.
@@ -98,6 +99,7 @@
 - Keeps normal applications ahead of system settings modules on the default page when system modules are shown.
 - Provides context actions on windows, including closing the window and opening Show Info with metadata and a process tree.
 - Opens independent Show Info windows for different window entries and application tiles, keeping each window's selection, geometry, dropdowns and background lookups separate. Selecting Show Info again for the same target brings its existing information window to the foreground. Closing one leaves the others intact; at most 32 information windows can be open at once.
+  On Wayland, reselecting an open target uses KWin activation because the native backend's ordinary Focus command is a no-op. Each info viewport has a stable, process-specific application ID; lookup requires both the exact ID and PID and rejects missing, ambiguous or malformed matches. A single background worker keeps only the latest pending target, with two-second command timeouts and no lock held during compositor I/O. It never recreates the info window, moves or resizes it, or focuses a different application when lookup fails. No focus worker runs on redraws, scrolling or metadata updates, and the worker exits when idle.
 - Re-focuses the existing launcher instance instead of opening a second one.
 - Persists window size, pinned applications, and launcher settings under `$HOME/.config/applicationlauncher/`.
 - Renders strikethrough in open-window and Recently closed titles as native styling, without changing saved titles or restore metadata.

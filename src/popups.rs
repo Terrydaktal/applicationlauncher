@@ -1,5 +1,7 @@
 use eframe::egui;
 
+pub(crate) mod foreground;
+
 const PROCESS_TREE_INDENT: f32 = 12.0;
 const INFO_POPUP_MARGIN: i8 = 16;
 use std::sync::mpsc::Sender;
@@ -623,6 +625,7 @@ pub(crate) fn show_deferred_info_popup(
 ) {
     let builder = egui::ViewportBuilder::default()
         .with_title(data.title.clone())
+        .with_app_id(foreground::app_id(std::process::id(), viewport_id))
         .with_inner_size(inner_size)
         .with_min_inner_size(min_inner_size)
         .with_resizable(true)
@@ -842,6 +845,10 @@ mod tests {
         });
         for (index, id) in ids.into_iter().enumerate() {
             let viewport = &output.viewport_output[&id];
+            assert_eq!(
+                viewport.builder.app_id.as_deref(),
+                Some(foreground::app_id(std::process::id(), id).as_str())
+            );
             assert_eq!(viewport.builder.inner_size, Some(egui::vec2(1200.0, 800.0)));
             assert_eq!(viewport.builder.resizable, Some(true));
             assert_eq!(
