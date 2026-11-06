@@ -19,6 +19,11 @@ pub(super) struct InstalledExecutable {
 }
 
 impl InstalledExecutable {
+    pub(super) fn launcher(&self) -> &Path {
+        self.aliases
+            .first()
+            .map_or(self.path.as_path(), PathBuf::as_path)
+    }
     fn original(path: &Path) -> Self {
         Self {
             path: path.to_owned(),
@@ -458,6 +463,18 @@ impl Inventory {
         Some(result)
     }
 
+    fn launch_alias(&self, executable: &Path) -> Option<PathBuf> {
+        let expected = std::fs::canonicalize(executable).ok()?;
+        self.matching_programs(executable)?
+            .into_iter()
+            .flat_map(|program| &program.binaries)
+            .take(MAX_INSTALLED_ALIASES)
+            .filter_map(|binary| normalized_path(binary.path.clone()))
+            .find(|alias| {
+                alias != &expected && std::fs::canonicalize(alias).ok().as_ref() == Some(&expected)
+            })
+    }
+
     fn package_name(&self, executable: &Path) -> Option<(String, bool)> {
         let mut result = None;
         for program in self.matching_programs(executable)? {
@@ -534,6 +551,10 @@ fn inventory() -> Option<Arc<Inventory>> {
 
 pub(super) fn package_name(executable: &Path) -> Option<(String, bool)> {
     inventory()?.package_name(executable)
+}
+
+pub(super) fn launch_alias(executable: &Path) -> Option<PathBuf> {
+    inventory()?.launch_alias(executable)
 }
 
 pub(super) fn installed_executable(executable: &Path) -> Option<InstalledExecutable> {
@@ -1358,5 +1379,22 @@ mod tests {
                 "{origin}/{role}: tool"
             );
         }
+    }
+    #[test]
+    fn launch_aliases_for_toolchain_applications_must_still_point_to_the_exact_entry() {
+        let root = Fixture::new();
+        let entry = root.0.join("cli.js");
+        let other = root.0.join("other.js");
+        std::fs::write(&entry, "not executed").unwrap();
+        std::fs::write(&other, "not executed").unwrap();
+        let alias = root.0.join("tool");
+        std::os::unix::fs::symlink(&entry, &alias).unwrap();
+        let mut record = program("Npm", "ToolchainManaged", json!({}));
+        record["binaries"] = json!([{"name":"tool", "path":alias, "target":entry}]);
+        let inventory = Inventory::parse(&inventory(vec![record])).unwrap();
+        assert_eq!(inventory.launch_alias(&entry).as_ref(), Some(&alias));
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&other, &alias).unwrap();
+        assert!(inventory.launch_alias(&entry).is_none());
     }
 }

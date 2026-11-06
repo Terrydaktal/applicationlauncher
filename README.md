@@ -198,6 +198,16 @@ The project builds a native `eframe` / `egui` GUI and a separate user-session da
 
 ### Pi Application Build Details
 
+Window/process launch lookup runs only in the existing bounded background
+worker when a section is first expanded. Desktop-entry targets must match the
+inspected installation; otherwise verified Progs installation symlinks or the
+known on-disk executable are used. A current chain is not proof of the original
+route used to launch a process. Identification-method details remain internal
+and are not displayed as a Show Info field.
+Hosted Application and Runtime metadata remain independent.
+Pi receipt refreshes also update the launch metadata if its installed entry
+point changes, without reprobing the runtime or package repositories.
+
 Show Info compares forks and Git clones with their upstream Pacman/AUR package
 version. Progs' explicit fork/clone classification controls these inferred package
 lookups; original local projects do not get a package-version row or a redundant

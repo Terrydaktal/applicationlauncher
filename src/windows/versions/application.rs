@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::File;
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use super::{PackageTarget, ProgsMetadata, installation};
@@ -8,6 +8,36 @@ use super::{PackageTarget, ProgsMetadata, installation};
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
 const MAX_WRAPPER_BYTES: u64 = 64 * 1024;
 const MAX_LAUNCH_STEPS: usize = 24;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ApplicationLaunch {
+    pub(crate) executable: Option<PathBuf>,
+    pub(crate) chain: Vec<PathBuf>,
+    pub(crate) identification: String,
+    pub(crate) desktop_entry: Option<crate::models::AppInfo>,
+    pub(crate) desktop_exists: Option<bool>,
+}
+
+impl ApplicationLaunch {
+    pub(super) fn declare_window_entry(&mut self, entry: &crate::models::AppInfo) {
+        if self.desktop_entry.is_none() {
+            self.desktop_entry = Some(entry.clone());
+            self.desktop_exists = desktop_exists(&entry.desktop_file_path);
+            if !self.identification.is_empty() {
+                self.identification.push_str("; ");
+            }
+            self.identification.push_str("Desktop entry declared by the window; launcher target not verified against this process");
+        }
+    }
+}
+
+fn desktop_exists(path: &Path) -> Option<bool> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Some(metadata.is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ApplicationInfo {
@@ -259,6 +289,78 @@ fn resolve(launcher: &Path) -> Resolution {
         Err(reason) => result.reason = reason.into(),
     }
     result
+}
+
+pub(super) fn process_launch(
+    executable: &Path,
+    installed: Option<&installation::InstalledExecutable>,
+    entry: Option<&crate::models::AppInfo>,
+) -> ApplicationLaunch {
+    let Some(installed) = installed else {
+        return ApplicationLaunch {
+            identification: "Unknown (installed executable aliases identify different builds)"
+                .into(),
+            ..Default::default()
+        };
+    };
+    let expected = std::fs::metadata(&installed.path).ok();
+    if let Some(entry) = entry
+        && entry.exec.len() <= MAX_COMMAND_BYTES
+        && let Some(launcher) = crate::search::executable_path_from_exec(&entry.exec)
+    {
+        let resolved = resolve(&launcher);
+        let matches = resolved.executable.as_ref().is_some_and(|(_, file)| {
+            file.metadata().is_ok_and(|metadata| {
+                expected.as_ref().is_some_and(|expected| {
+                    metadata.dev() == expected.dev() && metadata.ino() == expected.ino()
+                })
+            })
+        });
+        if matches
+            && resolved.unchanged()
+            && expected
+                .as_ref()
+                .is_some_and(|metadata| installed.unchanged(metadata))
+        {
+            return ApplicationLaunch {
+                executable: resolved.executable.map(|(path, _)| path),
+                chain: resolved.chain,
+                identification:
+                    "Current desktop-entry launch chain; original process launch route not recorded"
+                        .into(),
+                desktop_entry: Some(entry.clone()),
+                desktop_exists: desktop_exists(&entry.desktop_file_path),
+            };
+        }
+    }
+    let alias = (installed.launcher() == installed.path)
+        .then(|| installation::launch_alias(&installed.path))
+        .flatten();
+    let launcher = alias.as_deref().unwrap_or_else(|| installed.launcher());
+    let resolved = resolve(launcher);
+    let unchanged = resolved.unchanged()
+        && expected.as_ref().is_some_and(|metadata| {
+            installed.unchanged(metadata)
+                && resolved.executable.as_ref().is_some_and(|(_, file)| {
+                    file.metadata().is_ok_and(|actual| {
+                        super::executable_identity(&actual) == super::executable_identity(metadata)
+                    })
+                })
+        });
+    let path = resolved.executable.as_ref().map(|(path, _)| path.clone());
+    let identification = if !unchanged {
+        "Unknown (current installation changed or could not be resolved)".into()
+    } else if launcher != executable {
+        "Current published installation symlink; original process launch route not recorded".into()
+    } else {
+        "On-disk executable; original launcher/symlink route not recorded".into()
+    };
+    ApplicationLaunch {
+        executable: unchanged.then_some(path).flatten(),
+        chain: resolved.chain,
+        identification,
+        ..Default::default()
+    }
 }
 
 pub(crate) fn inspect_application(exec: &str, desktop_file: &Path) -> ApplicationInfo {
@@ -558,5 +660,81 @@ mod tests {
         if std::env::var_os("APPLICATIONLAUNCHER_TEST_APPLICATION_PACKAGE_QUERY").is_some() {
             eprintln!("available_package={:?}", info.query_package_version());
         }
+    }
+    #[test]
+    fn window_declared_entry_does_not_replace_the_verified_executable_or_chain() {
+        let entry = crate::models::AppInfo {
+            name: "GUI application".into(),
+            exec: "/unsupported/launcher".into(),
+            comment: None,
+            icon_path: None,
+            desktop_file_path: "/missing/tool.desktop".into(),
+            is_settings_module: false,
+        };
+        let mut launch = ApplicationLaunch {
+            executable: Some("/actual/program".into()),
+            chain: vec!["/actual/program".into()],
+            ..Default::default()
+        };
+        launch.declare_window_entry(&entry);
+        assert_eq!(
+            launch.executable.as_deref(),
+            Some(Path::new("/actual/program"))
+        );
+        assert_eq!(launch.chain, vec![PathBuf::from("/actual/program")]);
+        assert_eq!(launch.desktop_entry.as_ref(), Some(&entry));
+        assert!(launch.identification.contains("declared by the window"));
+        assert!(launch.identification.contains("not verified"));
+    }
+
+    #[test]
+    fn process_launch_keeps_current_entry_metadata_separate_from_running_identity() {
+        let fixture = Fixture::new();
+        let executable = fixture.file("program", b"\x7fELFnot-executed");
+        let link = fixture.0.join("published");
+        symlink(&executable, &link).unwrap();
+        let desktop = fixture.file("tool.desktop", "[Desktop Entry]\nName=Tool\n");
+        let entry = crate::models::AppInfo {
+            name: "Tool".into(),
+            exec: link.display().to_string(),
+            comment: Some("A tool".into()),
+            icon_path: None,
+            desktop_file_path: desktop.clone(),
+            is_settings_module: false,
+        };
+        let installed = installation::installed_executable(&executable).unwrap();
+        let result = process_launch(&executable, Some(&installed), Some(&entry));
+        assert_eq!(result.executable.as_ref(), Some(&executable));
+        assert_eq!(result.chain, vec![link.clone(), executable.clone()]);
+        assert_eq!(result.desktop_entry.as_ref(), Some(&entry));
+        assert_eq!(result.desktop_exists, Some(true));
+        assert!(
+            result
+                .identification
+                .contains("original process launch route not recorded")
+        );
+        std::fs::remove_file(desktop).unwrap();
+        assert_eq!(
+            process_launch(&executable, Some(&installed), Some(&entry)).desktop_exists,
+            Some(false)
+        );
+        let other = fixture.file("unrelated", b"\x7fELFother");
+        std::fs::remove_file(&link).unwrap();
+        symlink(&other, &link).unwrap();
+        let rejected = process_launch(&executable, Some(&installed), Some(&entry));
+        assert!(rejected.desktop_entry.is_none());
+        assert_eq!(rejected.executable.as_ref(), Some(&executable));
+        assert!(!rejected.chain.contains(&other));
+    }
+
+    #[test]
+    fn unresolved_process_launch_never_claims_a_desktop_entry_or_installed_binary() {
+        let fixture = Fixture::new();
+        let missing = fixture.0.join("missing");
+        let installed = installation::installed_executable(&missing).unwrap();
+        let result = process_launch(&missing, Some(&installed), None);
+        assert!(result.executable.is_none() && result.desktop_entry.is_none());
+        assert_eq!(result.chain, vec![missing]);
+        assert!(result.identification.starts_with("Unknown"));
     }
 }

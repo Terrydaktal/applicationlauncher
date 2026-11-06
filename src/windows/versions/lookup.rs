@@ -32,6 +32,7 @@ struct ReceiptRequest {
     executable_identity: Option<(u64, u64)>,
     application: super::NodeApplication,
     program: String,
+    desktop_entry: Option<crate::models::AppInfo>,
 }
 
 #[derive(Default)]
@@ -141,6 +142,15 @@ impl ProcessVersionCache {
                     };
                     worker.set_state("reading-pi-build-receipt");
                     let (application, evidence) = receipt_probe(&request);
+                    let updated_launch =
+                        (application.entry_point != request.application.entry_point).then(|| {
+                            super::application::process_launch(
+                                &application.entry_point,
+                                super::installation::installed_executable(&application.entry_point)
+                                    .as_ref(),
+                                request.desktop_entry.as_ref(),
+                            )
+                        });
                     let publish = {
                         let mut state = receipt_shared
                             .0
@@ -157,6 +167,9 @@ impl ProcessVersionCache {
                             let version = Arc::make_mut(version);
                             version.application = Some(application);
                             version.application_build = Some(evidence);
+                            if let Some(launch) = updated_launch {
+                                version.application_launch = Some(launch);
+                            }
                             true
                         } else {
                             false
@@ -319,6 +332,15 @@ impl ProcessVersionCache {
         node: &ProcessInfoNode,
         refresh_receipt: bool,
     ) -> Option<Arc<ProcessVersion>> {
+        self.request_for_application(node, refresh_receipt, || None)
+    }
+
+    pub(crate) fn request_for_application<'a>(
+        &self,
+        node: &ProcessInfoNode,
+        refresh_receipt: bool,
+        application: impl FnOnce() -> Option<(&'a crate::models::AppInfo, bool)>,
+    ) -> Option<Arc<ProcessVersion>> {
         let mut state = self
             .shared
             .0
@@ -344,6 +366,10 @@ impl ProcessVersionCache {
                     executable_identity: node.executable_identity,
                     application: application.clone(),
                     program: node.name.clone(),
+                    desktop_entry: result
+                        .as_ref()
+                        .and_then(|version| version.application_launch.as_ref())
+                        .and_then(|launch| launch.desktop_entry.clone()),
                 });
                 state.receipt_pending.insert(node.identity);
                 state.receipt_checked.insert(node.identity, Instant::now());
@@ -358,6 +384,7 @@ impl ProcessVersionCache {
             return None;
         }
         let generation = state.generation;
+        let application = application();
         state.pending.push_back(Request {
             generation,
             identity: node.identity,
@@ -366,6 +393,8 @@ impl ProcessVersionCache {
                 pid: node.identity.pid,
                 executable: executable.clone(),
                 program: Some(node.name.clone()),
+                application_entry: application.map(|(entry, _)| entry.clone()),
+                window_declared_entry: application.is_some_and(|(_, declared)| declared),
             },
         });
         state.results.insert(node.identity, None);
@@ -770,5 +799,35 @@ mod tests {
                 .latest_package_version
                 .is_none()
         );
+    }
+    #[test]
+    fn cached_process_metadata_does_not_resolve_desktop_candidates_again_each_frame() {
+        let cache =
+            ProcessVersionCache::start(egui::Context::default(), egui::ViewportId::ROOT, |_| {
+                ProcessVersion::default()
+            });
+        let resolutions = std::cell::Cell::new(0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let result = cache.request_for_application(&node(1), false, || {
+                resolutions.set(resolutions.get() + 1);
+                None
+            });
+            if result.is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for _ in 0..100 {
+            assert!(
+                cache
+                    .request_for_application(&node(1), false, || panic!(
+                        "cached metadata must not rescan desktop entries"
+                    ))
+                    .is_some()
+            );
+        }
+        assert_eq!(resolutions.get(), 1);
     }
 }

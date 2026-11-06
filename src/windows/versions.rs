@@ -17,7 +17,9 @@ mod node;
 mod pi;
 mod script;
 
-pub(crate) use application::{ApplicationInfo, ApplicationInfoUpdate, inspect_application};
+pub(crate) use application::{
+    ApplicationInfo, ApplicationInfoUpdate, ApplicationLaunch, inspect_application,
+};
 pub(crate) use available::PackageTarget;
 pub(crate) use installation::ProgsMetadata;
 pub(crate) use lookup::PI_RECEIPT_REFRESH;
@@ -35,6 +37,8 @@ pub(crate) struct ProcessVersionTarget {
     pid: i32,
     executable: PathBuf,
     program: Option<String>,
+    application_entry: Option<crate::models::AppInfo>,
+    window_declared_entry: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -59,6 +63,8 @@ pub(crate) struct ProcessVersion {
     pub(crate) installation: Option<String>,
     pub(crate) progs_metadata: ProgsMetadata,
     pub(crate) build_id: Option<String>,
+    pub(crate) launch: Option<ApplicationLaunch>,
+    pub(crate) application_launch: Option<ApplicationLaunch>,
 }
 
 impl ProcessVersion {
@@ -74,6 +80,7 @@ impl ProcessVersion {
         self.application_progs_metadata = ProgsMetadata::default();
         self.application_package_target = None;
         self.application_latest_package_version = None;
+        self.application_launch = None;
     }
 }
 
@@ -324,8 +331,18 @@ fn probe_version_checked(
         _ => "Unknown (on-disk binary unavailable)".to_owned(),
     };
     let package = installed_package(&clean_path);
-    let (installation, progs_metadata) = installation::inspect(&clean_path);
+    let (installation, progs_metadata) =
+        installation::inspect_with_owner(&clean_path, package.as_deref());
     let package_target = available::target(&clean_path, package.as_deref());
+    let launch = application::process_launch(
+        &clean_path,
+        installed.as_ref(),
+        if runtime_name(name).is_none() {
+            target.application_entry.as_ref()
+        } else {
+            None
+        },
+    );
     let mut result = ProcessVersion {
         running_unavailable: running.as_ref().err().copied(),
         runtime_name: runtime_name(name),
@@ -347,6 +364,8 @@ fn probe_version_checked(
         installation: Some(installation),
         progs_metadata,
         build_id: running_info.build_id,
+        launch: Some(launch),
+        application_launch: None,
     };
     if running.is_ok()
         && let Some(program) = target.program.as_deref()
@@ -362,6 +381,11 @@ fn probe_version_checked(
             let (installation, metadata) = installation::inspect(&application.entry_point);
             result.application_installation = Some(installation);
             result.application_progs_metadata = metadata;
+            result.application_launch = Some(self::application::process_launch(
+                &application.entry_point,
+                installation::installed_executable(&application.entry_point).as_ref(),
+                target.application_entry.as_ref(),
+            ));
         }
         result.application_package_target = result.application.as_ref().and_then(|application| {
             let owner = installed_package(&application.entry_point);
@@ -382,6 +406,11 @@ fn probe_version_checked(
             result.application_progs_metadata = metadata;
             let package = installed_package(entry);
             result.application_package_target = available::target(entry, package.as_deref());
+            result.application_launch = Some(application::process_launch(
+                entry,
+                installation::installed_executable(entry).as_ref(),
+                target.application_entry.as_ref(),
+            ));
         }
     }
     if let Some(disk) = latest_identity
@@ -391,9 +420,25 @@ fn probe_version_checked(
     {
         result.latest_version = None;
         result.latest_build_id = None;
+        result.launch = Some(ApplicationLaunch {
+            identification: "Unknown (on-disk binary changed during inspection)".into(),
+            ..Default::default()
+        });
         result.running_latest_binary = None;
         result.uncompiled_changes =
             Some("Unknown (on-disk binary changed during inspection)".into());
+    }
+    if target.window_declared_entry
+        && let Some(entry) = &target.application_entry
+    {
+        let launch = if result.runtime_name.is_some() {
+            result
+                .application_launch
+                .get_or_insert_with(Default::default)
+        } else {
+            result.launch.get_or_insert_with(Default::default)
+        };
+        launch.declare_window_entry(entry);
     }
     if let Ok((_, identity)) = &running
         && (!identity_is_current()
@@ -462,6 +507,8 @@ mod tests {
             pid,
             executable,
             program: Some("tmux".into()),
+            application_entry: None,
+            window_declared_entry: false,
         });
         assert_ne!(
             result.version, expected.version,
@@ -500,6 +547,8 @@ mod tests {
             pid: std::process::id() as i32,
             executable: "/definitely/not/the/running/binary".into(),
             program: None,
+            application_entry: None,
+            window_declared_entry: false,
         };
         let result = probe_version(&target);
         assert!(result.version.is_none() && result.package.is_none() && result.build_id.is_none());
@@ -511,6 +560,8 @@ mod tests {
             pid: i32::MAX,
             executable: std::env::current_exe().unwrap(),
             program: None,
+            application_entry: None,
+            window_declared_entry: false,
         };
         let result = probe_version(&target);
         assert!(
@@ -533,6 +584,8 @@ mod tests {
             pid: std::process::id() as i32,
             executable: std::fs::read_link("/proc/self/exe").unwrap(),
             program: None,
+            application_entry: None,
+            window_declared_entry: false,
         };
         let checks = std::cell::Cell::new(0);
         let result = probe_version_checked(&target, || {
@@ -558,6 +611,8 @@ mod tests {
             pid: i32::MAX,
             executable: "/usr/bin/bwrap".into(),
             program: Some("bwrap".into()),
+            application_entry: None,
+            window_declared_entry: false,
         };
         let result = probe_version(&target);
         assert!(
@@ -680,6 +735,8 @@ mod tests {
             pid: process.child.id() as i32,
             executable: path.clone(),
             program: None,
+            application_entry: None,
+            window_declared_entry: false,
         };
         let version = probe_version(&target);
         assert!(
@@ -751,6 +808,8 @@ mod tests {
                 pid,
                 executable: std::fs::read_link(format!("/proc/{pid}/exe")).unwrap(),
                 program: crate::windows::read_process_stat(pid).map(|stat| stat.name),
+                application_entry: None,
+                window_declared_entry: false,
             };
             let version = probe_version(&target);
             assert!(
@@ -776,7 +835,11 @@ mod tests {
             );
             eprintln!(
                 "runtime={:?} application={:?}",
-                version.runtime_name, version.application
+                version.runtime_name, version.application,
+            );
+            eprintln!(
+                "current_launch={:?} hosted_launch={:?}",
+                version.launch, version.application_launch
             );
         }
     }
