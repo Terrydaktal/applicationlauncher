@@ -727,21 +727,26 @@ mod tests {
             super::super::popups::process_version_rows("Application", version, pending)
         };
         assert!(rows(None, true).iter().all(|row| row.value == "Loading..."));
-        assert!(
-            rows(None, false)
-                .iter()
-                .all(|row| row.value == "Unavailable")
-        );
+        assert!(rows(None, false).iter().all(|row| row.value
+            == if row.label == "Package" {
+                "-"
+            } else {
+                "Unavailable"
+            }));
         let version = crate::windows::versions::ProcessVersion {
             uncompiled_changes: Some("Unknown (no supported local build metadata)".into()),
             ..Default::default()
         };
         let rows = rows(Some(&version), false);
-        assert_eq!(rows.len(), 8);
-        assert!(!rows.iter().any(|row| row.label.contains("version source")));
+        assert_eq!(rows.len(), 10);
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.label.to_ascii_lowercase().contains("version source"))
+        );
         assert!(
             rows.iter()
-                .find(|row| row.label == "Application uncompiled changes")
+                .find(|row| row.label == "Uncompiled changes")
                 .unwrap()
                 .value
                 .starts_with("Unknown")
@@ -751,6 +756,41 @@ mod tests {
                 && !row.separator_before
                 && row.binary_is_current.is_none())
         );
+    }
+
+    #[test]
+    fn native_info_rows_keep_all_running_identity_before_installation_metadata() {
+        let version = crate::windows::versions::ProcessVersion {
+            package_target: Some(crate::windows::versions::PackageTarget {
+                name: "test-application".into(),
+                inferred: false,
+            }),
+            ..Default::default()
+        };
+        for role in ["Application", "Runtime"] {
+            for (version, pending) in [(None, true), (None, false), (Some(&version), false)] {
+                let rows = super::super::popups::process_version_rows(role, version, pending);
+                let mut expected = vec![
+                    "Version",
+                    "ELF build ID",
+                    "Latest version (on disk)",
+                    "Latest ELF build ID (on disk)",
+                    "Uncompiled changes",
+                    "Type",
+                    "Package",
+                ];
+                if version.is_some() {
+                    expected.push("Latest package version (Pacman/AUR)");
+                }
+                expected.extend(["Launch chain", "Description", "Capabilities"]);
+                assert_eq!(
+                    rows.iter()
+                        .map(|row| row.label.as_str())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]
@@ -764,35 +804,25 @@ mod tests {
             progs_metadata: crate::windows::versions::ProgsMetadata {
                 capabilities: Some("CLI".into()),
                 description: Some("Unprivileged sandboxing tool".into()),
+                ..Default::default()
             },
             ..Default::default()
         };
         let rows = super::super::popups::process_version_rows("Application", Some(&version), false);
         let value = |label: &str| &rows.iter().find(|row| row.label == label).unwrap().value;
         assert_eq!(
-            value("Application version"),
+            value("Version"),
             "Unavailable (process exited before inspection)"
         );
         assert_eq!(
-            value("Application ELF build ID"),
+            value("ELF build ID"),
             "Unavailable (process exited before inspection)"
         );
-        assert_eq!(
-            value("Application description"),
-            "Unprivileged sandboxing tool"
-        );
-        assert_eq!(value("Application capabilities"), "CLI");
-        assert!(
-            value("Application installation").contains("installed package: bubblewrap 0.11.2-1.1")
-        );
-        assert_eq!(
-            value("Application latest version (on disk)"),
-            "bubblewrap 0.11.2"
-        );
-        assert_eq!(
-            value("Application latest ELF build ID (on disk)"),
-            "on-disk-build-id"
-        );
+        assert_eq!(value("Description"), "Unprivileged sandboxing tool");
+        assert_eq!(value("Capabilities"), "CLI");
+        assert_eq!(value("Package"), "bubblewrap 0.11.2-1.1");
+        assert_eq!(value("Latest version (on disk)"), "bubblewrap 0.11.2");
+        assert_eq!(value("Latest ELF build ID (on disk)"), "on-disk-build-id");
         assert!(
             rows.iter()
                 .all(|row| !row.searched && row.binary_is_current.is_none())
@@ -807,6 +837,7 @@ mod tests {
                     "GUI \u{00b7} CLI  \u{2022}  Primary role: GUI application".into(),
                 ),
                 description: Some("A cross-platform, GPU-accelerated terminal emulator".into()),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -824,7 +855,9 @@ mod tests {
             ] {
                 let row = rows
                     .iter()
-                    .find(|row| row.label == format!("{role} {suffix}"))
+                    .find(|row| {
+                        row.label == super::super::popups::info_metadata_label(role, suffix)
+                    })
                     .unwrap();
                 assert_eq!(row.value, expected);
                 assert!(!row.searched && !row.separator_before && row.binary_is_current.is_none());
@@ -849,19 +882,33 @@ mod tests {
                     };
                     let rows =
                         super::super::popups::process_version_rows(role, Some(&version), false);
-                    assert!(
-                        !rows
-                            .iter()
-                            .any(|row| row.label.ends_with("running latest binary"))
-                    );
+                    assert!(!rows.iter().any(|row| row.label.ends_with("latest binary")));
                     let running_index = rows
                         .iter()
-                        .position(|row| row.label == format!("{role} ELF build ID"))
+                        .position(|row| {
+                            row.label
+                                == super::super::popups::info_metadata_label(role, "ELF build ID")
+                        })
                         .unwrap();
                     let running = &rows[running_index];
                     assert_eq!(
+                        rows.last().unwrap().label,
+                        super::super::popups::info_metadata_label(role, "capabilities")
+                    );
+                    assert_eq!(
+                        rows[running_index - 1].label,
+                        super::super::popups::info_metadata_label(role, "version")
+                    );
+                    assert_eq!(
                         rows[running_index + 1].label,
-                        format!("{role} latest ELF build ID (on disk)")
+                        super::super::popups::info_metadata_label(role, "latest version (on disk)")
+                    );
+                    assert_eq!(
+                        rows[running_index + 2].label,
+                        super::super::popups::info_metadata_label(
+                            role,
+                            "latest ELF build ID (on disk)"
+                        )
                     );
                     assert_eq!(
                         running.binary_is_current,
@@ -891,27 +938,27 @@ mod tests {
         };
         let pending =
             super::super::popups::process_version_rows("Application", Some(&version), false);
-        assert!(pending.iter().any(
-            |row| row.label.ends_with("latest package version (Pacman/AUR)")
-                && row.value == "Checking Pacman/AUR..."
-        ));
-        version.latest_package_version = Some(
-            "extra/xfce4-terminal 1.2.0-1 (Pacman sync database); Last Pacman sync: 2026-10-07 20:48:01 +01:00"
-                .into(),
+        assert!(
+            pending
+                .iter()
+                .any(|row| row.label == "Latest package version (Pacman/AUR)"
+                    && row.value == "Checking Pacman/AUR...")
         );
+        version.latest_package_version =
+            Some("extra/xfce4-terminal 1.2.0-1 (Last Pacman sync: 2026-10-07)".into());
         let rows = super::super::popups::process_version_rows("Application", Some(&version), false);
         assert!(
             rows.iter()
-                .any(|row| row.label == "Application version" && row.value == "running binary")
+                .any(|row| row.label == "Version" && row.value == "running binary")
         );
         assert!(
             rows.iter()
-                .any(|row| row.label == "Application latest version (on disk)"
+                .any(|row| row.label == "Latest version (on disk)"
                     && row.value == "on disk binary")
         );
         let repository = rows
             .iter()
-            .find(|row| row.label.ends_with("latest package version (Pacman/AUR)"))
+            .find(|row| row.label == "Latest package version (Pacman/AUR)")
             .unwrap();
         assert_eq!(repository.value, version.latest_package_version.unwrap());
         assert!(repository.binary_is_current.is_none() && !repository.searched);
@@ -919,16 +966,16 @@ mod tests {
 
     #[test]
     fn original_local_version_rows_omit_unrelated_package_information() {
-        for installation in ["[DVM] DEV (User-managed)", "[NPT] npm (Toolchain-managed)"] {
+        for installation in [
+            "[DEV] DEV (User-managed)",
+            "[NET] npm Explicit Tool (Toolchain-managed)",
+        ] {
             let version = crate::windows::versions::ProcessVersion {
                 installation: Some(installation.into()),
                 version: Some("running version".into()),
                 latest_version: Some("local on-disk version".into()),
                 uncompiled_changes: Some("Yes".into()),
-                latest_package_version: Some(
-                    "No exact Pacman/AUR package found: progs; package-name match for local build"
-                        .into(),
-                ),
+                latest_package_version: Some("No exact Pacman/AUR package found: progs".into()),
                 ..Default::default()
             };
             for role in ["Application", "Runtime"] {
@@ -936,16 +983,14 @@ mod tests {
                 assert!(
                     !rows
                         .iter()
-                        .any(|row| row.label.contains("latest package version")
+                        .any(|row| row.label.contains("Latest package version")
                             || row.label.contains("update source")
                             || row.value.contains("No exact Pacman/AUR"))
                 );
                 assert!(rows.iter().any(|row| row.value == "local on-disk version"));
-                assert!(
-                    rows.iter()
-                        .any(|row| row.label == format!("{role} uncompiled changes")
-                            && row.value == "Yes")
-                );
+                assert!(rows.iter().any(|row| row.label
+                    == super::super::popups::info_metadata_label(role, "uncompiled changes")
+                    && row.value == "Yes"));
             }
         }
     }
@@ -953,8 +998,8 @@ mod tests {
     #[test]
     fn fork_and_clone_version_rows_retain_upstream_package_comparisons() {
         for installation in [
-            "[FKM] Fork (User-managed)",
-            "[CLX] Git Clone (External source)",
+            "[FRK] Fork (User-managed)",
+            "[CLO] Git Clone (External source)",
         ] {
             let mut version = crate::windows::versions::ProcessVersion {
                 installation: Some(installation.into()),
@@ -964,7 +1009,10 @@ mod tests {
                 }),
                 ..Default::default()
             };
-            for latest in [None, Some("extra/fish 4.6.0-1 (Pacman sync database)")] {
+            for latest in [
+                None,
+                Some("extra/fish 4.6.0-1 (Last Pacman sync: 2026-10-07)"),
+            ] {
                 version.latest_package_version = latest.map(str::to_owned);
                 for role in ["Application", "Runtime"] {
                     let rows =
@@ -972,7 +1020,11 @@ mod tests {
                     let package = rows
                         .iter()
                         .find(|row| {
-                            row.label == format!("{role} latest package version (Pacman/AUR)")
+                            row.label
+                                == super::super::popups::info_metadata_label(
+                                    role,
+                                    "latest package version (Pacman/AUR)",
+                                )
                         })
                         .expect("forks and clones must retain the upstream package comparison");
                     assert_eq!(package.value, latest.unwrap_or("Checking Pacman/AUR..."));
@@ -988,7 +1040,7 @@ mod tests {
         for runtime in ["Node.js", "Python", "Java"] {
             let mut version = ProcessVersion {
                 runtime_name: Some(runtime),
-                application_installation: Some("[DVM] DEV (User-managed)".into()),
+                application_installation: Some("[DEV] DEV (User-managed)".into()),
                 application_latest_package_version: Some(
                     "No exact Pacman/AUR package found: local-app".into(),
                 ),
@@ -996,7 +1048,9 @@ mod tests {
                     name: "runtime".into(),
                     inferred: false,
                 }),
-                latest_package_version: Some("core/runtime 1.0 (Pacman sync database)".into()),
+                latest_package_version: Some(
+                    "core/runtime 1.0 (Last Pacman sync: 2026-10-07)".into(),
+                ),
                 ..Default::default()
             };
             if runtime == "Node.js" {
@@ -1021,19 +1075,18 @@ mod tests {
                 Some(&version),
                 false,
             );
+            assert!(!application.iter().any(|row| row.label == "Identification"));
             assert!(
-                !application
-                    .iter()
-                    .any(|row| row.label == "Application update source"),
+                !application.iter().any(|row| row.label == "Update source"),
                 "{runtime}"
             );
             assert!(
                 !application
                     .iter()
-                    .any(|row| row.label.contains("latest package version")),
+                    .any(|row| row.label.contains("Latest package version")),
                 "{runtime}"
             );
-            version.application_installation = Some("[FKM] Fork (User-managed)".into());
+            version.application_installation = Some("[FRK] Fork (User-managed)".into());
             version.application_package_target = Some(crate::windows::versions::PackageTarget {
                 name: "upstream-app".into(),
                 inferred: true,
@@ -1046,9 +1099,10 @@ mod tests {
                 false,
             );
             assert!(
-                application.iter().any(|row| row.label
-                    == "Application latest package version (Pacman/AUR)"
-                    && row.value == "aur/upstream-app 2.0 (Paru/AUR)"),
+                application
+                    .iter()
+                    .any(|row| row.label == "Latest package version (Pacman/AUR)"
+                        && row.value == "aur/upstream-app 2.0 (Paru/AUR)"),
                 "{runtime}"
             );
             assert!(
@@ -1060,9 +1114,10 @@ mod tests {
             let runtime_rows =
                 super::super::popups::process_version_rows("Runtime", Some(&version), false);
             assert!(
-                runtime_rows.iter().any(|row| row.label
-                    == "Runtime latest package version (Pacman/AUR)"
-                    && row.value == "core/runtime 1.0 (Pacman sync database)"),
+                runtime_rows
+                    .iter()
+                    .any(|row| row.label == "Latest package version (Pacman/AUR)"
+                        && row.value == "core/runtime 1.0 (Last Pacman sync: 2026-10-07)"),
                 "{runtime}"
             );
         }
@@ -1083,16 +1138,18 @@ mod tests {
             latest_version: Some("v26.4.0".into()),
             package: Some("nodejs 26.4.0-2".into()),
             installation: Some("[PEP] Pacman Explicit (Package-managed)".into()),
-            application_installation: Some("[NPT] npm (Toolchain-managed)".into()),
+            application_installation: Some("[NET] npm Explicit Tool (Toolchain-managed)".into()),
             application_progs_metadata: crate::windows::versions::ProgsMetadata {
                 capabilities: Some("CLI  \u{2022}  Primary role: Command-line tool".into()),
                 description: Some("Pi coding agent".into()),
+                ..Default::default()
             },
             progs_metadata: crate::windows::versions::ProgsMetadata {
                 capabilities: Some(
                     "CLI \u{00b7} LIB  \u{2022}  Primary role: Command-line tool".into(),
                 ),
                 description: Some("Node.js JavaScript runtime".into()),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -1102,47 +1159,50 @@ mod tests {
             super::super::popups::process_version_rows("Runtime", Some(&version), false);
         let value = |label: &str| {
             rows.iter()
-                .chain(runtime_rows.iter())
                 .find(|row| row.label == label)
                 .unwrap()
                 .value
                 .as_str()
         };
-        assert_eq!(value("Application installed version"), "0.84.2");
-        assert_eq!(
-            value("Application package"),
-            "@earendil-works/pi-coding-agent"
+        let runtime_value = |label: &str| {
+            runtime_rows
+                .iter()
+                .find(|row| row.label == label)
+                .unwrap()
+                .value
+                .as_str()
+        };
+        assert_eq!(value("Installed version"), "0.84.2");
+        assert_eq!(value("Package"), "@earendil-works/pi-coding-agent");
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.label == "Executable path (on disk)")
         );
         assert_eq!(
-            value("Application installed entry point"),
-            "/installed/pi/dist/cli.js"
+            value("Installed package manifest"),
+            "/installed/pi/package.json"
         );
-        assert!(value("Application running version").starts_with("Unknown"));
-        assert_eq!(value("Runtime version"), "v26.4.0");
-        assert_eq!(value("Application description"), "Pi coding agent");
+        assert!(value("Running version").starts_with("Unknown"));
+        assert_eq!(runtime_value("Version"), "v26.4.0");
+        assert_eq!(value("Description"), "Pi coding agent");
         assert_eq!(
-            value("Application capabilities"),
+            value("Capabilities"),
             "CLI  \u{2022}  Primary role: Command-line tool"
         );
-        assert_eq!(value("Runtime description"), "Node.js JavaScript runtime");
+        assert_eq!(runtime_value("Description"), "Node.js JavaScript runtime");
         assert_eq!(
-            value("Runtime capabilities"),
+            runtime_value("Capabilities"),
             "CLI \u{00b7} LIB  \u{2022}  Primary role: Command-line tool"
         );
         assert!(
             !rows
                 .iter()
-                .any(|row| row.label == "Application latest package version (Pacman/AUR)")
+                .any(|row| row.label == "Latest package version (Pacman/AUR)")
         );
-        assert_eq!(
-            value("Runtime installation"),
-            "[PEP] Pacman Explicit (Package-managed); installed package: nodejs 26.4.0-2"
-        );
-        assert_eq!(
-            value("Application installation"),
-            "[NPT] npm (Toolchain-managed)"
-        );
-        assert!(!rows.iter().any(|row| row.label == "Application version"));
+        assert_eq!(runtime_value("Type"), "PEP");
+        assert_eq!(value("Type"), "NET");
+        assert!(!rows.iter().any(|row| row.label == "Version"));
         assert!(
             rows.iter()
                 .all(|row| !row.searched && !row.separator_before)
@@ -1164,12 +1224,76 @@ mod tests {
             parent_pid: 41,
             depth: 2,
             name: name.into(),
+            script_name: None,
             header: format!("{name} (pid 42) - {executable}").into(),
             executable: Some(executable.into()),
             executable_identity: None,
             cwd: Some("/work".into()),
             command_line: Some(name.into()),
-            command_summary: Some(name.into()),
+        }
+    }
+
+    #[test]
+    fn script_name_is_separate_from_the_interpreter_and_raw_command_line() {
+        let window = test_window_info("pi - ~/work - Terminal");
+        let mut node = hosted_process("bash", "/usr/bin/bash");
+        node.script_name = Some("pi-remote-qwen-radiance".into());
+        node.command_line = Some("/usr/bin/bash /proc/self/fd/3 --session last".into());
+        let rows = super::super::popups::process_info_rows(&window, &node, Vec::new());
+        assert_eq!((&*rows[0].label, &*rows[0].value), ("Process name", "bash"));
+        assert_eq!(
+            (&*rows[1].label, &*rows[1].value),
+            ("Script name", "pi-remote-qwen-radiance")
+        );
+        assert_eq!(rows[1].scope, InfoFieldScope::RunningInstance);
+        assert!(!rows[1].searched);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.label == "Command line")
+                .unwrap()
+                .value,
+            "/usr/bin/bash /proc/self/fd/3 --session last"
+        );
+        node.script_name = None;
+        assert!(
+            !super::super::popups::process_info_rows(&window, &node, Vec::new())
+                .iter()
+                .any(|row| row.label == "Script name")
+        );
+    }
+
+    #[test]
+    fn info_fields_classify_window_process_and_installed_metadata_at_the_source() {
+        let window = test_window_info("fish - ~/work - Terminal");
+        let window_rows = super::super::popups::window_info_rows(&window, Vec::new());
+        assert_eq!(window_rows.len(), 9);
+        assert!(
+            window_rows
+                .iter()
+                .all(|row| row.scope == InfoFieldScope::Window)
+        );
+        let node = hosted_process("fish", "/usr/bin/fish");
+        let process_rows = super::super::popups::process_info_rows(&window, &node, Vec::new());
+        assert_eq!(process_rows.len(), 7);
+        assert!(
+            process_rows
+                .iter()
+                .all(|row| row.scope == InfoFieldScope::RunningInstance)
+        );
+        for pending in [false, true] {
+            for role in ["Application", "Runtime", "Custom role"] {
+                let rows = super::super::popups::process_version_rows(role, None, pending);
+                assert!(
+                    rows[..2]
+                        .iter()
+                        .all(|row| row.scope == InfoFieldScope::RunningInstance)
+                );
+                assert!(
+                    rows[2..]
+                        .iter()
+                        .all(|row| row.scope == InfoFieldScope::Installation)
+                );
+            }
         }
     }
 
@@ -1198,6 +1322,33 @@ mod tests {
         assert_eq!(groups[0].header.as_ref(), "Application: Pi");
         assert_eq!(groups[1].header.as_ref(), "Runtime: Node.js");
         assert_ne!(groups[0].id, groups[1].id);
+        for group in &groups {
+            for row in &group.rows {
+                let running = matches!(
+                    row.label.as_str(),
+                    "Executable path"
+                        | "Version"
+                        | "ELF build ID"
+                        | "Running version"
+                        | "Running entry point"
+                        | "Running code fingerprint"
+                        | "Running extensions fingerprint"
+                        | "Loaded extension roots"
+                        | "Startup build receipt"
+                );
+                assert_eq!(
+                    row.scope,
+                    if running {
+                        InfoFieldScope::RunningInstance
+                    } else {
+                        InfoFieldScope::Installation
+                    },
+                    "{}: {}",
+                    group.header,
+                    row.label
+                );
+            }
+        }
         assert!(groups.iter().all(|group| group.id != id));
         assert!(
             groups[0]
@@ -1209,19 +1360,19 @@ mod tests {
             groups[1]
                 .rows
                 .iter()
-                .any(|row| row.label == "Runtime executable path" && row.value == "/usr/bin/node")
+                .any(|row| row.label == "Executable path" && row.value == "/usr/bin/node")
         );
         assert!(
             groups[1]
                 .rows
                 .iter()
-                .any(|row| row.label == "Runtime version" && row.value == "v26.4.0")
+                .any(|row| row.label == "Version" && row.value == "v26.4.0")
         );
         assert!(
             groups[1]
                 .rows
                 .iter()
-                .any(|row| row.label == "Runtime ELF build ID" && row.value == "node-build-id")
+                .any(|row| row.label == "ELF build ID" && row.value == "node-build-id")
         );
         let mut closed = egui::collapsing_header::CollapsingState::load_with_default_open(
             &ctx,
@@ -1257,8 +1408,16 @@ mod tests {
             &node,
             None,
         );
-        assert_eq!(loading[0].rows.len(), 1);
-        assert_eq!(loading[0].rows[0].value, "Loading...");
+        assert_eq!(loading[0].header.as_ref(), "Application: Loading...");
+        assert!(loading[0].rows.is_empty());
+        for sections in [&groups, &other, &loading] {
+            assert!(
+                sections
+                    .iter()
+                    .flat_map(|section| &section.rows)
+                    .all(|row| row.label != "Identification")
+            );
+        }
     }
 
     #[test]
@@ -1301,13 +1460,34 @@ mod tests {
                 &node,
                 Some(&version),
             );
+            assert!(
+                groups
+                    .iter()
+                    .flat_map(|section| &section.rows)
+                    .all(|row| row.label != "Identification")
+            );
             assert_eq!(groups[0].header.as_ref(), format!("Application: {name}"));
             assert_eq!(groups[1].header.as_ref(), format!("Runtime: {runtime}"));
+            assert_eq!(
+                groups[0]
+                    .rows
+                    .iter()
+                    .find(|row| row.label == "Package")
+                    .unwrap()
+                    .value,
+                "-"
+            );
+            assert!(
+                groups
+                    .iter()
+                    .flat_map(|section| &section.rows)
+                    .all(|row| { row.label != "Executable path (on disk)" })
+            );
             assert!(
                 groups[0]
                     .rows
                     .iter()
-                    .any(|row| row.label == "Application entry point" && row.value == entry)
+                    .any(|row| row.label == "Launch target" && row.value == entry)
             );
             assert!(
                 groups[0]
@@ -1320,14 +1500,28 @@ mod tests {
                 groups[0]
                     .rows
                     .iter()
-                    .any(|row| row.label == "Application running version"
-                        && row.value.starts_with("Unknown"))
+                    .any(|row| row.label == "Running version" && row.value.starts_with("Unknown"))
+            );
+            assert_eq!(
+                groups[0]
+                    .rows
+                    .iter()
+                    .take(5)
+                    .map(|row| row.label.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "Kind",
+                    "Launch target",
+                    "Running version",
+                    "Build status",
+                    "Package",
+                ]
             );
             assert!(
                 groups[1]
                     .rows
                     .iter()
-                    .any(|row| row.label == "Runtime version" && row.value == "runtime 99")
+                    .any(|row| row.label == "Version" && row.value == "runtime 99")
             );
         }
     }
@@ -1356,24 +1550,13 @@ mod tests {
         let row = |rows: Vec<crate::models::InfoPopupRow>, name: &str| {
             rows.into_iter().find(|row| row.label == name).unwrap()
         };
-        assert!(
-            !rows
-                .iter()
-                .any(|row| row.label == "Application build status")
-        );
-        for label in [
-            "Application running code fingerprint",
-            "Application latest extensions fingerprint",
-        ] {
+        assert!(!rows.iter().any(|row| row.label == "Build status"));
+        for label in ["Running code fingerprint", "Latest extensions fingerprint"] {
             let fingerprint = row(rows.clone(), label);
             assert_eq!(fingerprint.value, "Unknown");
             assert_eq!(fingerprint.binary_is_current, None);
         }
-        assert!(
-            row(rows, "Application running version")
-                .value
-                .starts_with("Unknown")
-        );
+        assert!(row(rows, "Running version").value.starts_with("Unknown"));
         for (status, color) in [
             (PiBuildStatus::Current, Some(true)),
             (PiBuildStatus::RestartRequired, Some(false)),
@@ -1398,42 +1581,41 @@ mod tests {
                 Some(&version),
                 false,
             );
-            assert!(
-                !rows
-                    .iter()
-                    .any(|row| row.label == "Application build status")
-            );
+            assert!(!rows.iter().any(|row| row.label == "Build status"));
             assert!(rows.iter().all(|row| !row.separator_before));
             let labels: Vec<_> = rows.iter().map(|row| row.label.as_str()).collect();
             assert_eq!(labels.iter().collect::<HashSet<_>>().len(), labels.len());
-            for (running, installed) in [
-                (
-                    "Application running version",
-                    "Application installed version",
-                ),
-                (
-                    "Application running entry point",
-                    "Application installed entry point",
-                ),
-                (
-                    "Application running code fingerprint",
-                    "Application latest installed code fingerprint",
-                ),
-                (
-                    "Application running extensions fingerprint",
-                    "Application latest extensions fingerprint",
-                ),
+            assert_eq!(
+                &labels[..6],
+                [
+                    "Running version",
+                    "Running entry point",
+                    "Running code fingerprint",
+                    "Running extensions fingerprint",
+                    "Loaded extension roots",
+                    "Startup build receipt",
+                ]
+            );
+            for installed in [
+                "Package",
+                "Installed version",
+                "Latest installed code fingerprint",
+                "Latest extensions fingerprint",
+                "Installed patch verification",
+                "Installed package manifest",
+                "Installed build manifest",
+                "Capabilities",
+                "Description",
             ] {
                 assert!(
-                    labels.windows(2).any(|pair| pair == [running, installed]),
-                    "{running} and {installed} must be adjacent"
+                    labels.iter().position(|label| *label == installed).unwrap() >= 6,
+                    "{installed}"
                 );
             }
             for fingerprint in &rows {
                 let expected = if matches!(
                     fingerprint.label.as_str(),
-                    "Application running code fingerprint"
-                        | "Application latest extensions fingerprint"
+                    "Running code fingerprint" | "Latest extensions fingerprint"
                 ) {
                     color
                 } else {
@@ -1445,46 +1627,37 @@ mod tests {
                     fingerprint.label
                 );
             }
+            assert_eq!(row(rows.clone(), "Running version").value, "0.84.2");
+            assert_eq!(row(rows.clone(), "Installed version").value, "0.85.0");
             assert_eq!(
-                row(rows.clone(), "Application running version").value,
-                "0.84.2"
-            );
-            assert_eq!(
-                row(rows.clone(), "Application installed version").value,
-                "0.85.0"
-            );
-            assert_eq!(
-                row(rows.clone(), "Application running entry point").value,
+                row(rows.clone(), "Running entry point").value,
                 "/old/pi/dist/cli.js"
             );
-            assert_eq!(
-                row(rows.clone(), "Application installed entry point").value,
-                "/new/pi/dist/cli.js"
+            assert!(
+                !rows
+                    .iter()
+                    .any(|row| row.label == "Executable path (on disk)")
             );
             assert_eq!(
-                row(rows.clone(), "Application installed package manifest").value,
+                row(rows.clone(), "Installed package manifest").value,
                 "/new/pi/package.json"
             );
             assert_eq!(
-                row(rows.clone(), "Application running code fingerprint").value,
+                row(rows.clone(), "Running code fingerprint").value,
                 "a".repeat(64)
             );
             assert_eq!(
-                row(
-                    rows.clone(),
-                    "Application latest installed code fingerprint"
-                )
-                .value,
+                row(rows.clone(), "Latest installed code fingerprint").value,
                 "b".repeat(64)
             );
             assert_eq!(
-                row(rows.clone(), "Application latest extensions fingerprint").value,
+                row(rows.clone(), "Latest extensions fingerprint").value,
                 "d".repeat(64)
             );
             assert_eq!(
                 row(
                     super::super::popups::process_version_rows("Runtime", Some(&version), false),
-                    "Runtime ELF build ID"
+                    "ELF build ID"
                 )
                 .value,
                 "node-elf-identity"
@@ -1492,7 +1665,7 @@ mod tests {
             assert_eq!(
                 row(
                     super::super::popups::process_version_rows("Runtime", Some(&version), false),
-                    "Runtime ELF build ID"
+                    "ELF build ID"
                 )
                 .binary_is_current,
                 Some(true)
@@ -1534,10 +1707,7 @@ mod tests {
                     Some(&version),
                     false,
                 );
-                for label in [
-                    "Application running code fingerprint",
-                    "Application latest extensions fingerprint",
-                ] {
+                for label in ["Running code fingerprint", "Latest extensions fingerprint"] {
                     let row = rows.iter().find(|row| row.label == label).unwrap();
                     assert_eq!(row.binary_is_current, None, "{label}, {status:?}");
                 }
@@ -1562,7 +1732,7 @@ mod tests {
                     latest_build_id: Some("latest-elf-id".into()),
                     running_latest_binary: Some(false),
                     uncompiled_changes: Some("Yes".into()),
-                    installation: Some("[FKM] Fork (User-managed)".into()),
+                    installation: Some("[FRK] Fork (User-managed)".into()),
                     package_target: Some(crate::windows::versions::PackageTarget {
                         name: "xfce4-terminal".into(),
                         inferred: true,
@@ -1588,34 +1758,28 @@ mod tests {
                 cwd: window.cwd_path.clone().unwrap(),
                 title: "working".into(),
             });
-            let rows = super::super::popups::window_info_rows(
-                &window,
-                "/usr/share/applications/xfce4-terminal.desktop".into(),
-                version_rows("Application"),
-            );
+            let rows = super::super::popups::window_info_rows(&window, version_rows("Application"));
             let labels = vec![
                 "Applicationlauncher title",
                 "Raw window title",
                 "Application key",
-                "Window ID",
                 "Class",
-                "Window desktop file",
-                "Window PID",
-                "Window executable",
-                "Window executable path",
+                "Window ID",
                 "Geometry",
                 "Minimized",
                 "Last activated",
                 "Activation sequence",
-                "Application version",
-                "Application latest version (on disk)",
-                "Application latest package version (Pacman/AUR)",
-                "Application uncompiled changes",
-                "Application installation",
-                "Application capabilities",
-                "Application description",
-                "Application ELF build ID",
-                "Application latest ELF build ID (on disk)",
+                "Version",
+                "ELF build ID",
+                "Latest version (on disk)",
+                "Latest ELF build ID (on disk)",
+                "Uncompiled changes",
+                "Type",
+                "Package",
+                "Latest package version (Pacman/AUR)",
+                "Launch chain",
+                "Description",
+                "Capabilities",
             ];
             assert_eq!(
                 rows.iter()
@@ -1637,28 +1801,13 @@ mod tests {
                     .value
                     .as_str()
             };
-            assert_eq!(value("Window executable path"), "/usr/bin/xfce4-terminal");
-            assert_eq!(value("Window PID"), "1234");
             assert_eq!(value("Geometry"), "x=0, y=0, width=800, height=600");
-            assert_eq!(value("Application version"), "running version");
-            assert_eq!(
-                value("Application latest version (on disk)"),
-                "latest version"
-            );
-            assert_eq!(value("Application uncompiled changes"), "Yes");
-            assert_eq!(
-                value("Application installation"),
-                "[FKM] Fork (User-managed)"
-            );
-            assert_eq!(
-                value("Application latest ELF build ID (on disk)"),
-                "latest-elf-id"
-            );
-            let searched_labels = vec![
-                "Applicationlauncher title",
-                "Application key",
-                "Window executable",
-            ];
+            assert_eq!(value("Version"), "running version");
+            assert_eq!(value("Latest version (on disk)"), "latest version");
+            assert_eq!(value("Uncompiled changes"), "Yes");
+            assert_eq!(value("Type"), "FRK");
+            assert_eq!(value("Latest ELF build ID (on disk)"), "latest-elf-id");
+            let searched_labels = vec!["Applicationlauncher title", "Application key"];
             assert_eq!(
                 rows.iter()
                     .filter(|row| row.searched)
@@ -1716,19 +1865,25 @@ mod tests {
                 parent_pid: 4,
                 depth: 0,
                 name: name.into(),
+                script_name: None,
                 header: name.into(),
                 executable: Some(executable.into()),
                 executable_identity: None,
                 cwd: cwd.clone(),
                 command_line: Some(name.into()),
-                command_summary: Some(name.into()),
             };
             let rows = super::super::popups::process_info_rows(
                 &window,
                 &node,
-                format!("/applications/{name}.desktop"),
-                Vec::new(),
+                super::super::popups::process_version_rows("Application", None, true),
             );
+            let position = |label: &str| rows.iter().position(|row| row.label == label).unwrap();
+            assert!(position("Process start (ticks since boot)") < position("Version"));
+            assert!(position("ELF build ID") < position("Latest version (on disk)"));
+            assert!(!rows.iter().any(|row| row.label == "Process desktop file"));
+            if [5, 20].contains(&pid) {
+                assert!(position("Tmux pane directory") < position("Version"));
+            }
             let value = |label: &str| {
                 rows.iter()
                     .find(|row| row.label == label)
@@ -1739,10 +1894,6 @@ mod tests {
             assert_eq!(value("Process name"), name);
             assert_eq!(value("PID"), pid.to_string());
             assert_eq!(value("Executable path"), executable);
-            assert_eq!(
-                value("Desktop file"),
-                format!("/applications/{name}.desktop")
-            );
             assert_eq!(
                 value("Working directory"),
                 display_path(cwd.as_deref().unwrap())

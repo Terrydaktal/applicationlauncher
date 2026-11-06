@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use super::process::{is_shell, parse_proc_stat, summarize_command_line};
+use super::process::{is_shell, parse_proc_stat};
 use crate::models::{ProcessIdentity, ProcessInfoNode, ProcessTreeSnapshot, WindowInfo};
 
 const MAX_SCANNED_PROCESSES: usize = 32_768;
@@ -220,7 +220,6 @@ struct TreeNode {
     executable_identity: Option<(u64, u64)>,
     cwd: Option<PathBuf>,
     command_line: Option<String>,
-    command_summary: Option<String>,
 }
 
 fn script_name(root: &Path, process: &Process, arguments: &[String]) -> Option<String> {
@@ -266,7 +265,6 @@ fn read_node(root: &Path, process: &Process) -> Option<TreeNode> {
         .map(|part| String::from_utf8_lossy(part).into_owned())
         .collect();
     let script = script_name(root, process, &arguments);
-    let command_summary = command_read.and_then(|_| summarize_command_line(&arguments));
     let command_line = command_read.map(|_| {
         let mut command = single_line(&arguments.join(" "));
         if truncated {
@@ -282,7 +280,6 @@ fn read_node(root: &Path, process: &Process) -> Option<TreeNode> {
         executable_identity,
         cwd,
         command_line,
-        command_summary,
     })
 }
 
@@ -355,12 +352,12 @@ fn render_snapshot(
             parent_pid: node.process.parent,
             depth,
             name: node.process.name.clone(),
+            script_name: node.script.clone(),
             header: output_line[header_start..].trim_end().into(),
             executable: node.executable.clone(),
             executable_identity: node.executable_identity,
             cwd: node.cwd.clone(),
             command_line: node.command_line.clone(),
-            command_summary: node.command_summary.clone(),
         });
         let next_prefix = format!(
             "{prefix}{}",
@@ -608,7 +605,6 @@ mod tests {
                     executable_identity: None,
                     cwd: None,
                     command_line: None,
-                    command_summary: None,
                 },
             )
         })
@@ -649,7 +645,26 @@ mod tests {
         std::fs::remove_file(fixture.0.join("7/exe")).unwrap();
         symlink("/usr/bin/node", fixture.0.join("7/exe")).unwrap();
 
-        let document = capture(&target(3, Some(7)), &fixture.0);
+        let snapshot = capture_snapshot(&target(3, Some(7)), &fixture.0);
+        let shell = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.identity.pid == 5)
+            .unwrap();
+        assert_eq!(shell.name, "bash");
+        assert_eq!(
+            shell.script_name.as_deref(),
+            Some("pi-remote-qwen-radiance")
+        );
+        assert_eq!(shell.command_line.as_deref(), Some("bash /proc/self/fd/3"));
+        assert!(
+            snapshot
+                .nodes
+                .iter()
+                .filter(|node| node.identity.pid != 5)
+                .all(|node| node.script_name.is_none())
+        );
+        let document = snapshot.text;
         assert!(document.starts_with("systemd (pid 1) - /usr/bin/systemd\n"));
         assert!(document.contains("bash: pi-remote-qwen-radiance (pid 5) - /usr/bin/bash\n"));
         assert_eq!(
@@ -771,7 +786,6 @@ mod tests {
                         executable_identity: None,
                         cwd: None,
                         command_line: None,
-                        command_summary: None,
                     },
                 )
             })
@@ -813,7 +827,6 @@ mod tests {
                         executable_identity: None,
                         cwd: None,
                         command_line: None,
-                        command_summary: None,
                     },
                 )
             })

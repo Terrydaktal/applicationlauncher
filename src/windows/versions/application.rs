@@ -44,7 +44,7 @@ pub(crate) struct ApplicationInfo {
     pub(crate) launcher: Option<PathBuf>,
     pub(crate) launcher_resolved: Option<PathBuf>,
     pub(crate) launcher_exists: bool,
-    pub(crate) desktop_exists: bool,
+    pub(crate) desktop_exists: Option<bool>,
     pub(crate) chain: Vec<PathBuf>,
     pub(crate) resolution: String,
     pub(crate) executable: Option<PathBuf>,
@@ -365,7 +365,7 @@ pub(super) fn process_launch(
 
 pub(crate) fn inspect_application(exec: &str, desktop_file: &Path) -> ApplicationInfo {
     let mut result = ApplicationInfo {
-        desktop_exists: desktop_file.is_file(),
+        desktop_exists: desktop_exists(desktop_file),
         ..Default::default()
     };
     if exec.len() > MAX_COMMAND_BYTES {
@@ -460,6 +460,98 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn window_declared_entry_does_not_replace_the_verified_executable_or_chain() {
+        let entry = crate::models::AppInfo {
+            name: "GUI application".into(),
+            exec: "/unsupported/launcher".into(),
+            comment: None,
+            icon_path: None,
+            desktop_file_path: "/missing/tool.desktop".into(),
+            is_settings_module: false,
+        };
+        let mut launch = ApplicationLaunch {
+            executable: Some("/actual/program".into()),
+            chain: vec!["/actual/program".into()],
+            ..Default::default()
+        };
+        launch.declare_window_entry(&entry);
+        assert_eq!(
+            launch.executable.as_deref(),
+            Some(Path::new("/actual/program"))
+        );
+        assert_eq!(launch.chain, vec![PathBuf::from("/actual/program")]);
+        assert_eq!(launch.desktop_entry.as_ref(), Some(&entry));
+        assert!(launch.identification.contains("declared by the window"));
+        assert!(launch.identification.contains("not verified"));
+    }
+
+    #[test]
+    fn process_launch_keeps_current_entry_metadata_separate_from_running_identity() {
+        let fixture = Fixture::new();
+        let executable = fixture.file("program", b"\x7fELFnot-executed");
+        let link = fixture.0.join("published");
+        symlink(&executable, &link).unwrap();
+        let desktop = fixture.file("tool.desktop", "[Desktop Entry]\nName=Tool\n");
+        let entry = crate::models::AppInfo {
+            name: "Tool".into(),
+            exec: link.display().to_string(),
+            comment: Some("A tool".into()),
+            icon_path: None,
+            desktop_file_path: desktop.clone(),
+            is_settings_module: false,
+        };
+        let installed = installation::installed_executable(&executable).unwrap();
+        let result = process_launch(&executable, Some(&installed), Some(&entry));
+        assert_eq!(result.executable.as_ref(), Some(&executable));
+        assert_eq!(result.chain, vec![link.clone(), executable.clone()]);
+        assert_eq!(result.desktop_entry.as_ref(), Some(&entry));
+        assert_eq!(result.desktop_exists, Some(true));
+        assert!(
+            result
+                .identification
+                .contains("original process launch route not recorded")
+        );
+        std::fs::remove_file(desktop).unwrap();
+        assert_eq!(
+            process_launch(&executable, Some(&installed), Some(&entry)).desktop_exists,
+            Some(false)
+        );
+        let other = fixture.file("unrelated", b"\x7fELFother");
+        std::fs::remove_file(&link).unwrap();
+        symlink(&other, &link).unwrap();
+        let rejected = process_launch(&executable, Some(&installed), Some(&entry));
+        assert!(rejected.desktop_entry.is_none());
+        assert_eq!(rejected.executable.as_ref(), Some(&executable));
+        assert!(!rejected.chain.contains(&other));
+    }
+
+    #[test]
+    fn unresolved_process_launch_never_claims_a_desktop_entry_or_installed_binary() {
+        let fixture = Fixture::new();
+        let missing = fixture.0.join("missing");
+        let installed = installation::installed_executable(&missing).unwrap();
+        let result = process_launch(&missing, Some(&installed), None);
+        assert!(result.executable.is_none() && result.desktop_entry.is_none());
+        assert_eq!(result.chain, vec![missing]);
+        assert!(result.identification.starts_with("Unknown"));
+    }
+
+    #[test]
+    fn desktop_file_existence_is_captured_even_when_the_launch_command_is_unavailable() {
+        let fixture = Fixture::new();
+        let desktop = fixture.file("tool.desktop", "[Desktop Entry]\nName=Tool\n");
+        assert_eq!(inspect_application("", &desktop).desktop_exists, Some(true));
+        std::fs::remove_file(&desktop).unwrap();
+        assert_eq!(
+            inspect_application("", &desktop).desktop_exists,
+            Some(false)
+        );
+        let uninspectable = fixture.0.join("x".repeat(300));
+        assert_eq!(inspect_application("", &uninspectable).desktop_exists, None);
+        assert_eq!(ApplicationInfo::default().desktop_exists, None);
     }
 
     #[test]
@@ -660,81 +752,5 @@ mod tests {
         if std::env::var_os("APPLICATIONLAUNCHER_TEST_APPLICATION_PACKAGE_QUERY").is_some() {
             eprintln!("available_package={:?}", info.query_package_version());
         }
-    }
-    #[test]
-    fn window_declared_entry_does_not_replace_the_verified_executable_or_chain() {
-        let entry = crate::models::AppInfo {
-            name: "GUI application".into(),
-            exec: "/unsupported/launcher".into(),
-            comment: None,
-            icon_path: None,
-            desktop_file_path: "/missing/tool.desktop".into(),
-            is_settings_module: false,
-        };
-        let mut launch = ApplicationLaunch {
-            executable: Some("/actual/program".into()),
-            chain: vec!["/actual/program".into()],
-            ..Default::default()
-        };
-        launch.declare_window_entry(&entry);
-        assert_eq!(
-            launch.executable.as_deref(),
-            Some(Path::new("/actual/program"))
-        );
-        assert_eq!(launch.chain, vec![PathBuf::from("/actual/program")]);
-        assert_eq!(launch.desktop_entry.as_ref(), Some(&entry));
-        assert!(launch.identification.contains("declared by the window"));
-        assert!(launch.identification.contains("not verified"));
-    }
-
-    #[test]
-    fn process_launch_keeps_current_entry_metadata_separate_from_running_identity() {
-        let fixture = Fixture::new();
-        let executable = fixture.file("program", b"\x7fELFnot-executed");
-        let link = fixture.0.join("published");
-        symlink(&executable, &link).unwrap();
-        let desktop = fixture.file("tool.desktop", "[Desktop Entry]\nName=Tool\n");
-        let entry = crate::models::AppInfo {
-            name: "Tool".into(),
-            exec: link.display().to_string(),
-            comment: Some("A tool".into()),
-            icon_path: None,
-            desktop_file_path: desktop.clone(),
-            is_settings_module: false,
-        };
-        let installed = installation::installed_executable(&executable).unwrap();
-        let result = process_launch(&executable, Some(&installed), Some(&entry));
-        assert_eq!(result.executable.as_ref(), Some(&executable));
-        assert_eq!(result.chain, vec![link.clone(), executable.clone()]);
-        assert_eq!(result.desktop_entry.as_ref(), Some(&entry));
-        assert_eq!(result.desktop_exists, Some(true));
-        assert!(
-            result
-                .identification
-                .contains("original process launch route not recorded")
-        );
-        std::fs::remove_file(desktop).unwrap();
-        assert_eq!(
-            process_launch(&executable, Some(&installed), Some(&entry)).desktop_exists,
-            Some(false)
-        );
-        let other = fixture.file("unrelated", b"\x7fELFother");
-        std::fs::remove_file(&link).unwrap();
-        symlink(&other, &link).unwrap();
-        let rejected = process_launch(&executable, Some(&installed), Some(&entry));
-        assert!(rejected.desktop_entry.is_none());
-        assert_eq!(rejected.executable.as_ref(), Some(&executable));
-        assert!(!rejected.chain.contains(&other));
-    }
-
-    #[test]
-    fn unresolved_process_launch_never_claims_a_desktop_entry_or_installed_binary() {
-        let fixture = Fixture::new();
-        let missing = fixture.0.join("missing");
-        let installed = installation::installed_executable(&missing).unwrap();
-        let result = process_launch(&missing, Some(&installed), None);
-        assert!(result.executable.is_none() && result.desktop_entry.is_none());
-        assert_eq!(result.chain, vec![missing]);
-        assert!(result.identification.starts_with("Unknown"));
     }
 }

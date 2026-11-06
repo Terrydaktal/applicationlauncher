@@ -46,6 +46,8 @@ impl InstalledExecutable {
 pub(crate) struct ProgsMetadata {
     pub(crate) capabilities: Option<String>,
     pub(crate) description: Option<String>,
+    pub(crate) package_type: Option<String>,
+    pub(crate) root_packages: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -337,6 +339,32 @@ impl Inventory {
             .then_some(inventory)
     }
 
+    fn metadata_for(&self, programs: &[&Program]) -> ProgsMetadata {
+        let Some(first) = programs.first() else {
+            return ProgsMetadata::default();
+        };
+        let mut metadata = first.metadata();
+        if !programs
+            .iter()
+            .all(|program| program.metadata() == metadata)
+        {
+            return ProgsMetadata::default();
+        }
+        let name = first.package_name();
+        if matches!(first.origin.as_str(), "Pacman" | "Aur")
+            && super::valid_package_name(name)
+            && programs.iter().all(|program| {
+                matches!(program.origin.as_str(), "Pacman" | "Aur")
+                    && program.package_name() == name
+            })
+        {
+            metadata.package_type = unique_label(programs.iter().copied(), Program::label)
+                .ok()
+                .flatten();
+        }
+        metadata
+    }
+
     fn matching_programs(&self, executable: &Path) -> Option<Vec<&Program>> {
         let executable = normalized_path(executable.to_owned())?;
         let exact = self
@@ -380,38 +408,28 @@ impl Inventory {
         let label = unique_label(programs.iter().copied(), Program::tool_label)
             .ok()
             .flatten();
-        let metadata = programs
-            .first()
-            .map(|program| program.metadata())
-            .filter(|first| {
-                programs
-                    .iter()
-                    .skip(1)
-                    .all(|program| program.metadata() == *first)
-            })
-            .unwrap_or_default();
+        let metadata = self.metadata_for(&programs);
         (label, metadata)
     }
 
     fn inspect_owner(&self, package: &str) -> (Option<String>, ProgsMetadata) {
-        let programs = self.scan.apps.iter().filter(|program| {
-            matches!(program.origin.as_str(), "Pacman" | "Aur")
-                && if program.owning_package.is_empty() {
-                    program.name == package
-                } else {
-                    program.owning_package == package
-                }
-        });
-        let label = unique_label(programs.clone(), Program::tool_label)
+        let programs = self
+            .scan
+            .apps
+            .iter()
+            .filter(|program| {
+                matches!(program.origin.as_str(), "Pacman" | "Aur")
+                    && if program.owning_package.is_empty() {
+                        program.name == package
+                    } else {
+                        program.owning_package == package
+                    }
+            })
+            .collect::<Vec<_>>();
+        let label = unique_label(programs.iter().copied(), Program::tool_label)
             .ok()
             .flatten();
-        let mut metadata = programs.map(Program::metadata);
-        let first = metadata.next().unwrap_or_default();
-        let metadata = if metadata.all(|value| value == first) {
-            first
-        } else {
-            ProgsMetadata::default()
-        };
+        let metadata = self.metadata_for(&programs);
         (label, metadata)
     }
 
@@ -573,13 +591,14 @@ pub(super) fn inspect_with_owner(
     installed_package: Option<&str>,
 ) -> (String, ProgsMetadata) {
     let inventory = inventory();
+    let owner_name = installed_package
+        .and_then(|value| value.split_whitespace().next())
+        .filter(|name| super::valid_package_name(name));
     let (label, metadata) = inventory
         .as_ref()
         .map(|inventory| {
             let (label, metadata) = inventory.inspect(executable);
-            let owner = installed_package
-                .and_then(|value| value.split_whitespace().next())
-                .filter(|name| super::valid_package_name(name))
+            let owner = owner_name
                 .map(|name| inventory.inspect_owner(name))
                 .unwrap_or_default();
             (
@@ -587,6 +606,12 @@ pub(super) fn inspect_with_owner(
                 ProgsMetadata {
                     capabilities: metadata.capabilities.or(owner.1.capabilities),
                     description: metadata.description.or(owner.1.description),
+                    package_type: if installed_package.is_some() {
+                        owner.1.package_type
+                    } else {
+                        metadata.package_type
+                    },
+                    root_packages: None,
                 },
             )
         })

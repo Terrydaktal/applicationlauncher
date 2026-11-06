@@ -83,46 +83,6 @@ impl App {
             .map(|app| app.desktop_file_path.clone())
     }
 
-    pub(super) fn desktop_file_path_for_process(&self, process_name: &str) -> Option<PathBuf> {
-        let process_key = normalize_app_match_key(process_name);
-        if process_key.is_empty() {
-            return None;
-        }
-
-        let matching_app = self
-            .apps
-            .iter()
-            .filter_map(|app| {
-                let exec_matches = command_basename(&app.exec)
-                    .is_some_and(|name| normalize_app_match_key(&name) == process_key);
-                let stem_matches = app
-                    .desktop_file_path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .is_some_and(|stem| normalize_app_match_key(stem) == process_key);
-                let name_matches = normalize_app_match_key(&app.name) == process_key;
-                let score = if exec_matches {
-                    0
-                } else if stem_matches {
-                    1
-                } else if name_matches {
-                    2
-                } else {
-                    return None;
-                };
-                Some((score, app))
-            })
-            .min_by_key(|(score, app)| (*score, app.is_settings_module))
-            .map(|(_, app)| app.desktop_file_path.clone());
-
-        matching_app.or_else(|| {
-            let executable_name = Path::new(process_name)
-                .file_name()
-                .and_then(|name| name.to_str())?;
-            resolve_desktop_file_path(&format!("{executable_name}.desktop"))
-        })
-    }
-
     pub(super) fn launch_window_app_and_exit(&self, win: &WindowInfo, ctx: &egui::Context) {
         self.rapid_polling
             .store(true, std::sync::atomic::Ordering::SeqCst);

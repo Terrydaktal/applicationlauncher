@@ -379,9 +379,18 @@ pub struct IdleCodexActionState {
     pub message: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InfoFieldScope {
+    Neutral,
+    Window,
+    RunningInstance,
+    Installation,
+}
+
 #[derive(Clone)]
 pub struct InfoPopupRow {
     pub label: String,
+    pub scope: InfoFieldScope,
     pub value: String,
     pub searched: bool,
     pub separator_before: bool,
@@ -424,12 +433,12 @@ pub struct ProcessInfoNode {
     pub parent_pid: i32,
     pub depth: usize,
     pub name: String,
+    pub script_name: Option<String>,
     pub header: Arc<str>,
     pub executable: Option<PathBuf>,
     pub executable_identity: Option<(u64, u64)>,
     pub cwd: Option<PathBuf>,
     pub command_line: Option<String>,
-    pub command_summary: Option<String>,
 }
 
 #[derive(Clone)]

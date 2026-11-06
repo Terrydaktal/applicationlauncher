@@ -8,7 +8,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use crate::models::{InfoPopupData, InfoPopupRow, PopupEvent, ProcessIdentity};
+use crate::models::{InfoFieldScope, InfoPopupData, InfoPopupRow, PopupEvent, ProcessIdentity};
 
 pub(crate) fn process_info_section_id(
     window: impl std::hash::Hash,
@@ -610,6 +610,7 @@ mod tests {
         let mut data = tree_info();
         data.process_tree.as_mut().unwrap().sections[0].rows = (0..80)
             .map(|index| InfoPopupRow {
+                scope: InfoFieldScope::Neutral,
                 label: format!("Metadata {index}"),
                 value: "A long metadata value ".repeat(30),
                 searched: false,
@@ -686,6 +687,7 @@ mod tests {
             let mut data = if tree { tree_info() } else { window_info() };
             let rows = (0..120)
                 .map(|index| InfoPopupRow {
+                    scope: InfoFieldScope::Neutral,
                     label: format!("Metadata {index}"),
                     value: "A long metadata value ".repeat(30),
                     searched: false,
@@ -861,6 +863,7 @@ mod tests {
             scroll_sensitivity: 1.0,
             rows: vec![
                 InfoPopupRow {
+                    scope: InfoFieldScope::Neutral,
                     label: "Window PID".into(),
                     value: "1234".into(),
                     searched: false,
@@ -868,6 +871,7 @@ mod tests {
                     binary_is_current: None,
                 },
                 InfoPopupRow {
+                    scope: InfoFieldScope::Neutral,
                     label: "Application version".into(),
                     value: "1.2.0".into(),
                     searched: false,
@@ -875,6 +879,7 @@ mod tests {
                     binary_is_current: None,
                 },
                 InfoPopupRow {
+                    scope: InfoFieldScope::Neutral,
                     label: "Active process".into(),
                     value: "codex".into(),
                     searched: true,
@@ -882,6 +887,7 @@ mod tests {
                     binary_is_current: None,
                 },
                 InfoPopupRow {
+                    scope: InfoFieldScope::Neutral,
                     label: "Working directory".into(),
                     value: "~/project".into(),
                     searched: true,
@@ -889,6 +895,7 @@ mod tests {
                     binary_is_current: None,
                 },
                 InfoPopupRow {
+                    scope: InfoFieldScope::Neutral,
                     label: "Executable path".into(),
                     value: "/usr/bin/codex".into(),
                     searched: false,
@@ -936,6 +943,7 @@ mod tests {
                 data.rows.insert(
                     1,
                     InfoPopupRow {
+                        scope: InfoFieldScope::Neutral,
                         label: "Raw window title".into(),
                         value: raw_title.clone(),
                         searched: false,
@@ -992,6 +1000,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut data = window_info();
         data.rows.insert(0, InfoPopupRow {
+            scope: InfoFieldScope::Neutral,
             label: "Raw window title".into(),
             value: "\u{3bb} - T\u{0336}e\u{0336}r\u{0336}m\u{0336}i\u{0336}n\u{0336}a\u{0336}l\u{0336}".into(),
             searched: true,
@@ -1080,6 +1089,7 @@ mod tests {
                     data.rows.insert(
                         1 + index,
                         InfoPopupRow {
+                            scope: InfoFieldScope::Neutral,
                             label: (*label).into(),
                             value: hash.into(),
                             searched: false,
@@ -1278,6 +1288,7 @@ mod tests {
                         default_open: true,
                         metadata_sections: Vec::new(),
                         rows: vec![InfoPopupRow {
+                            scope: InfoFieldScope::Neutral,
                             label: "Window PID".into(),
                             value: "1".into(),
                             searched: false,
@@ -1292,6 +1303,7 @@ mod tests {
                         default_open: false,
                         metadata_sections: Vec::new(),
                         rows: vec![InfoPopupRow {
+                            scope: InfoFieldScope::Neutral,
                             label: "Process name".into(),
                             value: "fish".into(),
                             searched: true,
@@ -1380,6 +1392,7 @@ mod tests {
             let tree = data.process_tree.as_mut().unwrap();
             tree.sections[0].rows = (0..28)
                 .map(|index| InfoPopupRow {
+                    scope: InfoFieldScope::Neutral,
                     label: format!("Metadata {index}"),
                     value: "Value".into(),
                     searched: false,
@@ -1564,6 +1577,7 @@ mod tests {
                 data.process_tree.as_mut().unwrap().sections[0]
                     .rows
                     .push(InfoPopupRow {
+                        scope: InfoFieldScope::Neutral,
                         label: "Version".into(),
                         value: "Background probe finished".into(),
                         searched: false,
@@ -1712,6 +1726,7 @@ mod tests {
         data.process_tree.as_mut().unwrap().sections[0]
             .rows
             .push(InfoPopupRow {
+                scope: InfoFieldScope::Neutral,
                 label: "Raw window title".into(),
                 value: "Original title - Terminal".into(),
                 searched: false,
@@ -1797,6 +1812,7 @@ mod tests {
             header: header.into(),
             default_open: true,
             rows: vec![InfoPopupRow {
+                scope: InfoFieldScope::Neutral,
                 label: label.into(),
                 value: value.into(),
                 searched: false,

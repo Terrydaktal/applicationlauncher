@@ -327,6 +327,7 @@ impl ProcessVersionCache {
         self.request_expanded(node, true)
     }
 
+    #[cfg(test)]
     pub(crate) fn request_expanded(
         &self,
         node: &ProcessInfoNode,
@@ -434,12 +435,12 @@ mod tests {
             parent_pid: 0,
             depth: 0,
             name: "test".into(),
+            script_name: None,
             header: "test".into(),
             executable: Some("/not-executed/test".into()),
             executable_identity: None,
             cwd: None,
             command_line: None,
-            command_summary: None,
         }
     }
 
