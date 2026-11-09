@@ -12,6 +12,42 @@ pub struct TrackerClient {
 }
 
 impl TrackerClient {
+    pub fn begin_application_update_preview(&self, window_id: &str) -> Result<String, String> {
+        decode_result(&self.call("BeginApplicationUpdatePreview", &(window_id,))?)
+    }
+
+    pub fn begin_process_update_preview(
+        &self,
+        window_id: &str,
+        process: &super::ProgramUpdateIdentity,
+    ) -> Result<String, String> {
+        process.validate()?;
+        decode_result(&self.call(
+            "BeginProcessUpdatePreview",
+            &(
+                window_id,
+                process.pid,
+                process.start_ticks,
+                process.application.as_str(),
+            ),
+        )?)
+    }
+
+    pub fn application_update_report(
+        &self,
+        id: &str,
+    ) -> Result<super::ApplicationUpdateReport, String> {
+        decode_result(&self.call("GetApplicationUpdateReport", &(id,))?)
+    }
+
+    pub fn start_application_update(
+        &self,
+        id: &str,
+        action: &str,
+        confirmed: bool,
+    ) -> Result<super::ApplicationUpdateReport, String> {
+        decode_result(&self.call("StartApplicationUpdate", &(id, action, confirmed))?)
+    }
     pub fn begin_terminal_upgrade_preview(&self) -> Result<String, String> {
         decode_result(&self.call("BeginTerminalUpgradePreview", &())?)
     }

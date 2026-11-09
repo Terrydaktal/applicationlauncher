@@ -1,5 +1,24 @@
 use super::*;
 
+pub(super) fn window_open_actions(
+    ui: &mut egui::Ui,
+    window: &WindowInfo,
+) -> (Option<InfoUpdateTarget>, bool) {
+    let update = terminal_maintenance::window_update_target(window);
+    let update_clicked = ui
+        .add_enabled(update.is_some(), egui::Button::new("Update window"))
+        .on_hover_text("Choose whether to update this xfce4-terminal window or all outdated terminal windows in place, preserving their position and size.")
+        .on_disabled_hover_text("In-place window updates are currently supported only for xfce4-terminal.")
+        .clicked();
+    let open = ui.button("Open window").clicked();
+    (update.filter(|_| update_clicked), open)
+}
+
+pub(super) fn launcher_modal_open(ctx: &egui::Context) -> bool {
+    ctx.memory(|memory| memory.top_modal_layer().is_some())
+        || crate::popups::window_update_dialog_is_open(ctx)
+}
+
 pub(super) fn open_window_count_label(ui: &egui::Ui, count: usize) -> (egui::Label, f32) {
     let galley = ui.painter().layout_no_wrap(
         count.to_string(),
@@ -195,6 +214,7 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
         self.process_popup_events();
+        let modal_open = launcher_modal_open(ctx);
         while let Ok(status) = self.tracker_status_receiver.try_recv() {
             self.recovery_prompt = status.recovery_pending;
         }
@@ -502,6 +522,7 @@ impl eframe::App for App {
             && !self.show_history_popup
             && self.info_popups.is_empty()
             && !self.terminal_maintenance_is_open()
+            && !modal_open
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
@@ -587,6 +608,7 @@ impl eframe::App for App {
                         if self
                             .search_focus_until
                             .is_some_and(|deadline| Instant::now() <= deadline)
+                            && !modal_open
                         {
                             resp.request_focus();
                         } else {
@@ -599,8 +621,9 @@ impl eframe::App for App {
                     }
 
                     ui.add_space(10.0);
+                    crate::popups::show_terminal_update_status(ui);
 
-	                    // 2. Filtering list
+		                    // 2. Filtering list
 	                    let mut filtered_apps: Arc<Vec<(AppInfo, bool)>> = Arc::new(Vec::new());
 	                    let mut filtered_windows: Arc<Vec<WindowInfo>> = Arc::new(Vec::new());
                         let mut filtered_app_display_titles: Arc<Vec<String>> = Arc::new(Vec::new());
@@ -883,7 +906,7 @@ impl eframe::App for App {
                         1
                     };
 
-                    if ctx.input(|i| i.key_pressed(egui::Key::F10)) {
+                    if !modal_open && ctx.input(|i| i.key_pressed(egui::Key::F10)) {
                         if self.show_settings_menu {
                             self.close_settings_menu();
                         } else {
@@ -891,11 +914,12 @@ impl eframe::App for App {
                         }
                     }
 
-                    if ctx.input(|i| i.key_pressed(egui::Key::F9)) {
+                    if !modal_open && ctx.input(|i| i.key_pressed(egui::Key::F9)) {
                         if self.show_history_popup { self.close_history_popup(); } else { self.open_history_popup(); }
                     }
 
-                    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    if !modal_open
+                        && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                         if self.show_history_popup {
                             self.close_history_popup();
                         } else if self.show_settings_menu {
@@ -907,7 +931,7 @@ impl eframe::App for App {
                         }
                     }
 
-                    if !self.show_settings_menu {
+                    if !self.show_settings_menu && !modal_open {
                         // Keyboard navigation inputs
                         if render_side_panel && self.icon_only {
 	                            if self.active_pane == ActivePane::Windows {
@@ -1188,6 +1212,7 @@ impl eframe::App for App {
                     };
 
                     let mut pending_pin_move = None;
+                    let mut pending_window_update = None;
                     if render_side_panel {
                         let previous_spacing = ui.spacing().item_spacing;
                         ui.spacing_mut().item_spacing.x = 0.0;
@@ -2040,6 +2065,10 @@ impl eframe::App for App {
                                                 }
                                                 LauncherMode::Windows => {
                                                     let win = &filtered_windows[index];
+                                                    if ui.button("Show info").clicked() {
+                                                        self.open_window_info_popup(ctx, win.clone());
+                                                        ui.close();
+                                                    }
                                                     if ui.button("Clone window").clicked() {
                                                         self.active_pane = ActivePane::Windows;
                                                         self.selected_index = index;
@@ -2052,11 +2081,12 @@ impl eframe::App for App {
                                                         self.launch_window_app_and_exit(win, ctx);
                                                         ui.close();
                                                     }
-                                                    if ui.button("Show info").clicked() {
-                                                        self.open_window_info_popup(ctx, win.clone());
+                                                    let (update, open) = window_open_actions(ui, win);
+                                                    if let Some(target) = update {
+                                                        pending_window_update = Some(target);
                                                         ui.close();
                                                     }
-                                                    if ui.button("Open window").clicked() {
+                                                    if open {
                                                         self.active_pane = ActivePane::Windows;
                                                         self.selected_index = index;
                                                         self.activate_and_exit(win.id.clone(), ctx);
@@ -2147,7 +2177,7 @@ impl eframe::App for App {
                                                     }
 
                                                     ui.separator();
-                                                    if ui.button("Close application").clicked() {
+                                                    if ui.button("Close window").clicked() {
                                                         self.close_window_and_exit(win.id.clone(), ctx);
                                                         ui.close();
                                                     }
@@ -2691,9 +2721,13 @@ impl eframe::App for App {
                     self.show_terminal_maintenance(ctx);
                     self.show_deployment_warnings(ctx);
                     self.show_terminal_action_message(ctx);
+                    if let Some(event) = crate::popups::show_window_update_dialog(ctx, pending_window_update) {
+                        let _ = self.popup_event_sender.send(event);
+                        ctx.request_repaint();
+                    }
 
                     if let Some(ref resp) = text_edit_response {
-                        if ctx.input(|i| i.focused) {
+                        if ctx.input(|i| i.focused) && !launcher_modal_open(ctx) {
                             resp.request_focus();
                         }
                     }

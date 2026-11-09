@@ -1,9 +1,79 @@
 use super::*;
-mod tmux;
-use crate::models::InfoMetadataSection;
+use crate::models::{InfoMetadataSection, InfoProgram, InfoUpdateTarget};
 use std::sync::atomic::AtomicBool;
 
+mod tmux;
+
 const MAX_INFO_POPUPS: usize = 32;
+
+fn terminal_update_window(
+    window: &WindowInfo,
+    node: &ProcessInfoNode,
+    binary_is_current: Option<bool>,
+) -> Option<String> {
+    (binary_is_current == Some(false)
+        && window.pid == Some(node.identity.pid)
+        && window.class.to_ascii_lowercase().contains("xfce4-terminal")
+        && node.executable.as_ref().is_some_and(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "xfce4-terminal" || name == "xfce4-terminal (deleted)")
+        }))
+    .then(|| window.id.clone())
+}
+
+fn process_update_target(
+    window: &WindowInfo,
+    node: &ProcessInfoNode,
+    binary_is_current: Option<bool>,
+) -> Option<InfoUpdateTarget> {
+    if let Some(window) = terminal_update_window(window, node, binary_is_current) {
+        return Some(InfoUpdateTarget::TerminalWindow(window));
+    }
+    if binary_is_current == Some(false)
+        && !window.id.is_empty()
+        && window.pid.is_some_and(|pid| pid > 1)
+        && matches!(
+            window.class.to_ascii_lowercase().as_str(),
+            "xfce4-terminal" | "org.xfce.terminal"
+        )
+        && node.identity.pid > 1
+        && node.identity.start_ticks > 0
+    {
+        let application = node.executable.as_ref().and_then(|path| {
+            match path.file_name()?.to_str()?.trim_end_matches(" (deleted)") {
+                "fish" => Some(InfoProgram::Fish),
+                "codex" | "codex-code-mode" => Some(InfoProgram::Codex),
+                _ => None,
+            }
+        });
+        if let Some(application) = application {
+            return Some(InfoUpdateTarget::Program {
+                window: window.id.clone(),
+                process: node.identity,
+                application,
+            });
+        }
+    }
+    let pane = window.tmux_pane.as_ref()?;
+    (binary_is_current == Some(false)
+        && window.class.to_ascii_lowercase().contains("xfce4-terminal")
+        && node.identity.pid == pane.session.server_pid
+        && node.identity.pid != pane.client_pid
+        && node.identity.start_ticks > 0
+        && Path::new(&pane.session.socket_path).is_absolute()
+        && node.executable.as_ref().is_some_and(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "tmux" || name == "tmux (deleted)")
+        }))
+    .then(|| InfoUpdateTarget::TmuxServer {
+        window: window.id.clone(),
+        server: applicationlauncher::tracker::TmuxServerIdentity {
+            pid: node.identity.pid,
+            start_ticks: node.identity.start_ticks,
+            socket_path: pane.session.socket_path.clone(),
+        },
+    })
+}
 
 #[derive(Default)]
 pub(super) struct InfoPopups {
@@ -1345,6 +1415,25 @@ impl App {
                     self.close_history_popup();
                     restore_launcher_focus = true;
                 }
+                PopupEvent::UpdateTerminalWindow { window, info } => {
+                    let error = super::terminal_maintenance::open_direct(
+                        &self.terminal_maintenance,
+                        window.clone(),
+                        info,
+                    )
+                    .err();
+                    crate::popups::bind_terminal_update_status(
+                        &self.repaint_ctx,
+                        info,
+                        window,
+                        self.terminal_maintenance.clone(),
+                        error,
+                    );
+                    self.repaint_ctx.request_repaint_of(info);
+                }
+                PopupEvent::UpdateTerminalWindows { window } => {
+                    super::terminal_maintenance::open(&self.terminal_maintenance, window);
+                }
             }
         }
         if restore_launcher_focus && self.info_popups.is_empty() {
@@ -1406,9 +1495,10 @@ impl App {
             egui::ViewportId::from_hash_of("launcher_settings_popup"),
             builder,
             move |ctx, _class| {
+                let modal_open = ctx.memory(|memory| memory.top_modal_layer().is_some());
                 let close_requested = ctx.input(|input| {
                     input.viewport().close_requested()
-                        || input.key_pressed(egui::Key::Escape)
+                        || (!modal_open && input.key_pressed(egui::Key::Escape))
                         || input.key_pressed(egui::Key::F10)
                 });
                 if close_requested {
@@ -1574,6 +1664,7 @@ impl App {
                 depth: node.depth,
                 header: node.header.clone(),
                 binary_is_current,
+                update_target: process_update_target(window_info, node, binary_is_current),
                 default_open: owner,
                 rows,
                 metadata_sections,
@@ -1593,6 +1684,7 @@ impl App {
                 id: process_info_section_id((viewport_id, &window_info.id), identity),
                 depth: 0,
                 binary_is_current: None,
+                update_target: None,
                 header: format!(
                     "{} (window owner; process metadata {})",
                     window_application_key(window_info),
@@ -1784,7 +1876,12 @@ impl App {
                 )
                 .open(&mut is_open)
                 .show(ctx, |ui| {
-                    crate::popups::render_info_popup_scroll_area(ui, &data);
+                    crate::popups::render_info_popup_contents(
+                        ui,
+                        &data,
+                        popup.id,
+                        &self.popup_event_sender,
+                    );
                 });
             if popup.focus_requested.swap(false, Ordering::Relaxed)
                 && let Some(response) = response
@@ -3205,7 +3302,6 @@ mod tests {
 
     pub(super) fn window(id: &str) -> InfoTarget {
         InfoTarget::Window(WindowInfoPopup {
-            tmux: None,
             window: WindowInfo {
                 id: id.into(),
                 title: "Same window title".into(),
@@ -3229,7 +3325,122 @@ mod tests {
             },
             lookup: None,
             versions: None,
+            tmux: None,
         })
+    }
+
+    #[test]
+    fn terminal_update_target_requires_a_verified_outdated_terminal_window_owner() {
+        let InfoTarget::Window(mut popup) = window("exact-kwin-window-id") else {
+            unreachable!();
+        };
+        popup.window.pid = Some(176434);
+        popup.window.class = "Xfce4-terminal".into();
+        let mut node = ProcessInfoNode {
+            identity: ProcessIdentity {
+                pid: 176434,
+                start_ticks: 42,
+            },
+            parent_pid: 3140,
+            depth: 2,
+            name: "xfce4-terminal".into(),
+            script_name: None,
+            header: "xfce4-terminal (pid 176434) [window owner]".into(),
+            executable_error: None,
+            cwd_error: None,
+            raw_argv0: None,
+            executable: Some("/fixture/xfce4-terminal (deleted)".into()),
+            executable_identity: None,
+            cwd: None,
+            command_line: None,
+        };
+        for status in [None, Some(true), Some(false)] {
+            assert_eq!(
+                terminal_update_window(&popup.window, &node, status).as_deref(),
+                (status == Some(false)).then_some("exact-kwin-window-id")
+            );
+        }
+        node.identity.pid += 1;
+        assert!(terminal_update_window(&popup.window, &node, Some(false)).is_none());
+        node.identity.pid -= 1;
+        for executable in [
+            None,
+            Some("/usr/bin/fish".into()),
+            Some("/usr/bin/bash".into()),
+        ] {
+            node.executable = executable;
+            assert!(terminal_update_window(&popup.window, &node, Some(false)).is_none());
+        }
+        node.executable = Some("/fixture/xfce4-terminal".into());
+        popup.window.class = "alacritty".into();
+        assert!(terminal_update_window(&popup.window, &node, Some(false)).is_none());
+    }
+
+    #[test]
+    fn program_update_target_requires_an_outdated_exact_fish_or_codex_in_a_terminal() {
+        let InfoTarget::Window(mut popup) = window("program-window") else {
+            unreachable!();
+        };
+        popup.window.pid = Some(176434);
+        popup.window.class = "Xfce4-terminal".into();
+        let mut node = ProcessInfoNode {
+            identity: ProcessIdentity {
+                pid: 1234,
+                start_ticks: 456,
+            },
+            parent_pid: 176434,
+            depth: 3,
+            name: "untrusted-title".into(),
+            script_name: None,
+            header: "program (pid 1234)".into(),
+            executable_error: None,
+            cwd_error: None,
+            raw_argv0: None,
+            executable: None,
+            executable_identity: None,
+            cwd: None,
+            command_line: None,
+        };
+        for (name, application) in [
+            ("fish", InfoProgram::Fish),
+            ("codex", InfoProgram::Codex),
+            ("codex-code-mode", InfoProgram::Codex),
+        ] {
+            for suffix in ["", " (deleted)"] {
+                node.executable = Some(format!("/fixture/{name}{suffix}").into());
+                for status in [None, Some(true), Some(false)] {
+                    let expected = (status == Some(false)).then(|| InfoUpdateTarget::Program {
+                        window: "program-window".into(),
+                        process: node.identity,
+                        application,
+                    });
+                    assert_eq!(
+                        process_update_target(&popup.window, &node, status),
+                        expected
+                    );
+                }
+            }
+        }
+        for executable in [
+            None,
+            Some("/usr/bin/bash".into()),
+            Some("/fixture/not-codex".into()),
+        ] {
+            node.executable = executable;
+            assert!(process_update_target(&popup.window, &node, Some(false)).is_none());
+        }
+        node.executable = Some("/fixture/fish".into());
+        for mutation in 0..4 {
+            let mut window = popup.window.clone();
+            let mut node = node.clone();
+            match mutation {
+                0 => window.id.clear(),
+                1 => window.class = "another-terminal".into(),
+                2 => node.identity.pid = 1,
+                _ => node.identity.start_ticks = 0,
+            }
+            assert!(process_update_target(&window, &node, Some(false)).is_none());
+        }
     }
 
     #[test]

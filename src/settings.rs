@@ -8,6 +8,8 @@ use crate::models::{IdleCodexActionState, LauncherSettings, SettingsWindowState}
 mod persistence;
 pub(crate) use persistence::{flush_writes, queue_write};
 
+pub(crate) const SETTINGS_GRID_SPACING: [f32; 2] = [12.0, 4.0];
+
 impl SettingsWindowState {
     pub(crate) fn new(
         settings: LauncherSettings,
@@ -15,6 +17,9 @@ impl SettingsWindowState {
         terminal_maintenance: Arc<Mutex<crate::models::TerminalMaintenanceState>>,
     ) -> Self {
         let settings = settings.sanitized();
+        if let Ok(mut state) = idle_codex_action.lock() {
+            state.confirmation = false;
+        }
         Self {
             pending_ui_scale: settings.ui_scale,
             scale_anchor: settings.ui_scale,
@@ -311,10 +316,6 @@ pub(crate) fn render_deferred_settings_panel(
         state.save_changed_settings();
     }
 
-    ui.heading("Terminal Maintenance");
-    crate::app::terminal_maintenance::settings_button(ui, &state.terminal_maintenance);
-    render_idle_codex_action(ui, &state.idle_codex_action);
-    ui.add_space(16.0);
     let mut close_requested = false;
     ui.vertical_centered(|ui| {
         close_requested = ui
@@ -632,16 +633,55 @@ impl Drop for IdleCodexJob {
     }
 }
 
-pub(crate) fn render_idle_codex_action(
-    ui: &mut egui::Ui,
-    shared: &Arc<Mutex<IdleCodexActionState>>,
-) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfirmationResponse {
+    Pending,
+    Cancel,
+    Confirm,
+}
+
+pub(crate) fn destructive_action_confirmation(
+    ctx: &egui::Context,
+    id: &str,
+    title: &str,
+    message: &str,
+    confirm_label: &str,
+) -> ConfirmationResponse {
+    let response = egui::Modal::new(egui::Id::new(id)).show(ctx, |ui| {
+        ui.set_width((ctx.content_rect().width() - 48.0).clamp(1.0, 460.0));
+        ui.heading(title);
+        ui.add_space(8.0);
+        ui.label(message);
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            let cancel = ui.button("Cancel");
+            let confirm = ui.button(confirm_label);
+            let focused = ctx.memory(|memory| memory.focused());
+            if focused != Some(cancel.id) && focused != Some(confirm.id) {
+                cancel.request_focus();
+            }
+            if cancel.clicked() {
+                ConfirmationResponse::Cancel
+            } else if confirm.clicked() {
+                ConfirmationResponse::Confirm
+            } else {
+                ConfirmationResponse::Pending
+            }
+        })
+        .inner
+    });
+    if response.should_close() {
+        ConfirmationResponse::Cancel
+    } else {
+        response.inner
+    }
+}
+
+fn idle_codex_action_panel(ui: &mut egui::Ui, state: &mut IdleCodexActionState) -> bool {
     ui.add_space(12.0);
     ui.separator();
     ui.add_space(8.0);
-    let Ok(mut state) = shared.lock() else {
-        return;
-    };
+    let was_confirming = state.confirmation;
     if ui
         .add_enabled(
             !state.running,
@@ -650,22 +690,28 @@ pub(crate) fn render_idle_codex_action(
         .clicked()
     {
         state.confirmation = true;
+        ui.ctx().request_repaint();
     }
     ui.small("Only sessions with no spinner or attention request. Interrupts Codex, not its terminal or shell.");
     let mut start = false;
-    if state.confirmation && !state.running {
-        ui.label("Send SIGINT to all verified idle Codex sessions? Busy, changed or unverified sessions will be skipped.");
-        ui.horizontal(|ui| {
-            if ui.button("Interrupt idle Codex").clicked() {
+    // Do not let the click that opens the dialog also approve the action.
+    if was_confirming && state.confirmation && !state.running {
+        match destructive_action_confirmation(
+            ui.ctx(),
+            "stop_idle_codex_confirmation",
+            "Stop idle Codex sessions?",
+            "Send SIGINT to all verified local idle Codex sessions? This interrupts Codex but leaves its terminals and shells open. Busy, changed or unverified sessions are skipped. This cannot be undone.",
+            "Interrupt idle Codex",
+        ) {
+            ConfirmationResponse::Confirm => {
                 state.confirmation = false;
                 state.running = true;
                 state.message = None;
                 start = true;
             }
-            if ui.button("Cancel").clicked() {
-                state.confirmation = false;
-            }
-        });
+            ConfirmationResponse::Cancel => state.confirmation = false,
+            ConfirmationResponse::Pending => {}
+        }
     }
     if state.running {
         ui.small("Checking terminal state and interrupting idle Codex sessions...");
@@ -673,7 +719,17 @@ pub(crate) fn render_idle_codex_action(
     if let Some(message) = &state.message {
         ui.small(message);
     }
-    drop(state);
+    start
+}
+
+pub(crate) fn render_idle_codex_action(
+    ui: &mut egui::Ui,
+    shared: &Arc<Mutex<IdleCodexActionState>>,
+) {
+    let start = match shared.lock() {
+        Ok(mut state) => idle_codex_action_panel(ui, &mut state),
+        Err(_) => return,
+    };
 
     if start {
         let mut job = IdleCodexJob {
@@ -790,6 +846,132 @@ mod info_settings_tests {
 #[cfg(test)]
 mod idle_codex_action_tests {
     use super::*;
+
+    fn render(
+        ctx: &egui::Context,
+        state: &mut IdleCodexActionState,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, bool) {
+        let mut start = false;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 700.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // Test only the decision, never the renderer that starts a real worker.
+                    start = idle_codex_action_panel(ui, state);
+                });
+            },
+        );
+        (output, start)
+    }
+
+    fn button_center(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == label => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("expected button label")
+    }
+
+    fn click(position: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(position),
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ]
+    }
+
+    fn key(key: egui::Key) -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }]
+    }
+
+    #[test]
+    fn idle_codex_modal_requires_a_separate_explicit_confirmation_and_emits_only_one_start() {
+        let ctx = egui::Context::default();
+        let mut state = IdleCodexActionState::default();
+        let (output, start) = render(&ctx, &mut state, vec![]);
+        assert!(!start);
+        let open = button_center(&output, "Stop idle Codex sessions...");
+        assert!(!render(&ctx, &mut state, click(open)).1);
+        assert!(state.confirmation);
+        assert!(!state.running);
+        for _ in 0..3 {
+            assert!(!render(&ctx, &mut state, vec![]).1);
+        }
+        let (output, _) = render(&ctx, &mut state, vec![]);
+        let confirm = button_center(&output, "Interrupt idle Codex");
+        assert!(render(&ctx, &mut state, click(confirm)).1);
+        assert!(state.running);
+        assert!(!state.confirmation);
+        assert!(!render(&ctx, &mut state, click(confirm)).1);
+    }
+
+    #[test]
+    fn idle_codex_modal_cancel_escape_enter_and_backdrop_never_start_work() {
+        for dismissal in ["cancel", "escape", "enter", "backdrop"] {
+            let ctx = egui::Context::default();
+            let mut state = IdleCodexActionState {
+                confirmation: true,
+                message: Some("Previous result".into()),
+                ..Default::default()
+            };
+            for _ in 0..3 {
+                assert!(!render(&ctx, &mut state, vec![]).1);
+            }
+            let (output, _) = render(&ctx, &mut state, vec![]);
+            let events = match dismissal {
+                "cancel" => click(button_center(&output, "Cancel")),
+                "escape" => key(egui::Key::Escape),
+                "enter" => key(egui::Key::Enter),
+                _ => click(egui::pos2(2.0, 2.0)),
+            };
+            assert!(!render(&ctx, &mut state, events).1, "{dismissal}");
+            assert!(!state.running, "{dismissal}");
+            assert!(!state.confirmation, "{dismissal}");
+            assert_eq!(state.message.as_deref(), Some("Previous result"));
+        }
+    }
+
+    #[test]
+    fn reopening_settings_discards_unconfirmed_idle_codex_consent() {
+        let shared = Arc::new(Mutex::new(IdleCodexActionState {
+            confirmation: true,
+            ..Default::default()
+        }));
+        let _settings =
+            SettingsWindowState::new(LauncherSettings::default(), shared.clone(), Arc::default());
+        let state = shared.lock().unwrap();
+        assert!(!state.confirmation);
+        assert!(!state.running);
+    }
 
     #[test]
     fn rendering_settings_never_arms_or_runs_the_action() {

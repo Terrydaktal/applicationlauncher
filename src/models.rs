@@ -348,6 +348,13 @@ pub enum PopupEvent {
     CloseSettings,
     CloseInfo(eframe::egui::ViewportId),
     CloseHistory,
+    UpdateTerminalWindow {
+        window: String,
+        info: eframe::egui::ViewportId,
+    },
+    UpdateTerminalWindows {
+        window: Option<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -365,10 +372,15 @@ pub struct SettingsWindowState {
 #[derive(Default)]
 pub struct TerminalMaintenanceState {
     pub open: bool,
+    pub focus_requested: bool,
     pub worker_running: bool,
     pub report: Option<applicationlauncher::tracker::TerminalUpgradeReport>,
     pub selected: HashSet<String>,
+    pub scope_window: Option<String>,
+    pub info_viewport: Option<eframe::egui::ViewportId>,
+    pub update_window_on_ready: bool,
     pub confirmed: bool,
+    pub confirming_update: bool,
     pub error: Option<String>,
 }
 
@@ -403,9 +415,40 @@ pub struct InfoProcessSection {
     pub depth: usize,
     pub header: Arc<str>,
     pub binary_is_current: Option<bool>,
+    pub update_target: Option<InfoUpdateTarget>,
     pub default_open: bool,
     pub rows: Vec<InfoPopupRow>,
     pub metadata_sections: Vec<InfoMetadataSection>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InfoUpdateTarget {
+    TerminalWindow(String),
+    CopyQ(ProcessIdentity),
+    Program {
+        window: String,
+        process: ProcessIdentity,
+        application: InfoProgram,
+    },
+    TmuxServer {
+        window: String,
+        server: applicationlauncher::tracker::TmuxServerIdentity,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InfoProgram {
+    Fish,
+    Codex,
+}
+
+impl InfoProgram {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Fish => "fish",
+            Self::Codex => "codex",
+        }
+    }
 }
 
 #[derive(Clone)]

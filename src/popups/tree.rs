@@ -4,7 +4,7 @@ use super::{
     InfoText, PROCESS_TREE_INDENT, info_popup_layout, info_process_header_layout, info_text_layout,
     render_info_text,
 };
-use crate::models::{InfoPopupData, InfoPopupRow};
+use crate::models::{InfoPopupData, InfoPopupRow, InfoUpdateTarget};
 
 struct Toggle {
     id: egui::Id,
@@ -18,7 +18,7 @@ struct Toggle {
 struct UpdateLink {
     start: usize,
     end: usize,
-    target: (),
+    target: InfoUpdateTarget,
 }
 
 struct Document {
@@ -128,7 +128,7 @@ impl Document {
         depth: usize,
         level: usize,
         default_open: bool,
-        update_target: Option<&()>,
+        update_target: Option<&InfoUpdateTarget>,
     ) -> usize {
         let state = egui::collapsing_header::CollapsingState::load_with_default_open(
             ui.ctx(),
@@ -150,7 +150,7 @@ impl Document {
             .fonts_mut(|fonts| fonts.row_height(&self.font))
             .max(ui.spacing().interact_size.y);
         let update = update_target
-            .filter(|target| current == Some(false))
+            .filter(|target| current == Some(false) || matches!(target, InfoUpdateTarget::CopyQ(_)))
             .map(|target| {
                 job.append(
                     "  ",
@@ -231,7 +231,7 @@ fn build(ui: &egui::Ui, data: &InfoPopupData) -> Document {
             section.depth,
             0,
             section.default_open,
-            None,
+            section.update_target.as_ref(),
         );
         if document.toggles[toggle].open {
             document.gap(ui.spacing().item_spacing.y);
@@ -308,7 +308,7 @@ fn build(ui: &egui::Ui, data: &InfoPopupData) -> Document {
 pub(super) fn render(
     ui: &mut egui::Ui,
     data: &InfoPopupData,
-) -> (egui::text_edit::TextEditOutput, Option<()>) {
+) -> (egui::text_edit::TextEditOutput, Option<InfoUpdateTarget>) {
     let document = build(ui, data);
     let link_height = ui.fonts_mut(|fonts| fonts.row_height(&document.font));
     let text = InfoText::new(document.job);
@@ -384,7 +384,12 @@ pub(super) fn render(
                     egui::Sense::click(),
                 )
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("Update");
+                .on_hover_text(match &link.target {
+                    InfoUpdateTarget::TerminalWindow(_) => "Update this terminal window or all outdated terminal windows",
+                    InfoUpdateTarget::CopyQ(_) => "Restart CopyQ's user autostart service to load the installed application",
+                    InfoUpdateTarget::Program { .. } => "Update only this program in its existing terminal tab or tmux pane",
+                    InfoUpdateTarget::TmuxServer { .. } => "Update this tmux server and restart all its sessions in the existing terminal windows",
+                });
             response.widget_info(|| {
                 egui::WidgetInfo::labeled(egui::WidgetType::Link, ui.is_enabled(), "Update")
             });

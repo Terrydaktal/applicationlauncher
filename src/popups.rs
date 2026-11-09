@@ -3,6 +3,7 @@ use eframe::egui;
 pub(crate) mod foreground;
 mod selection;
 mod tree;
+mod updates;
 
 const PROCESS_TREE_INDENT: f32 = 12.0;
 const INFO_POPUP_MARGIN: i8 = 16;
@@ -13,7 +14,7 @@ use std::sync::{
 };
 
 use crate::models::{
-    InfoFieldScope, InfoPopupData, InfoPopupRow, PopupEvent, ProcessIdentity,
+    InfoFieldScope, InfoPopupData, InfoPopupRow, InfoUpdateTarget, PopupEvent, ProcessIdentity,
 };
 
 pub(crate) fn process_info_section_id(
@@ -572,7 +573,7 @@ fn copy_shown_info(data: &InfoPopupData) -> String {
 
 type InfoPopupOutput = (
     Vec<egui::text_edit::TextEditOutput>,
-    Option<()>,
+    Option<InfoUpdateTarget>,
 );
 
 pub(crate) fn render_info_popup_panel(ui: &mut egui::Ui, data: &InfoPopupData) -> InfoPopupOutput {
@@ -606,14 +607,43 @@ pub(crate) fn render_info_popup_scroll_area(
         .show(ui, |ui| render_info_popup_panel(ui, data))
 }
 
+pub(crate) fn bind_terminal_update_status(
+    ctx: &egui::Context,
+    info: egui::ViewportId,
+    window: String,
+    shared: Arc<std::sync::Mutex<crate::models::TerminalMaintenanceState>>,
+    error: Option<String>,
+) {
+    updates::bind_terminal_status(ctx, info, window, shared, error);
+}
+
+pub(crate) fn show_terminal_update_status(ui: &mut egui::Ui) {
+    updates::show_terminal_status(ui, ui.ctx().viewport_id());
+}
+
+pub(crate) fn window_update_dialog_is_open(ctx: &egui::Context) -> bool {
+    updates::terminal_choice_is_open(ctx, egui::ViewportId::ROOT)
+}
+
+pub(crate) fn show_window_update_dialog(
+    ctx: &egui::Context,
+    clicked_target: Option<InfoUpdateTarget>,
+) -> Option<PopupEvent> {
+    updates::show(ctx, egui::ViewportId::ROOT, clicked_target)
+}
+
 pub(crate) fn render_info_popup_contents(
     ui: &mut egui::Ui,
     data: &InfoPopupData,
     popup_id: egui::ViewportId,
     event_sender: &Sender<PopupEvent>,
 ) {
-    let _ = (popup_id, event_sender);
-    render_info_popup_scroll_area(ui, data);
+    updates::show_terminal_status(ui, popup_id);
+    let (_, update) = render_info_popup_scroll_area(ui, data).inner;
+    if let Some(event) = updates::show(ui.ctx(), popup_id, update) {
+        let _ = event_sender.send(event);
+        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+    }
 }
 
 pub(crate) fn info_popup_initial_size(
@@ -877,6 +907,91 @@ mod tests {
                 ((faster - normal) - normal * 4.0).length() < 0.01,
                 "normal={normal:?}, faster={faster:?}"
             );
+        }
+    }
+
+    #[test]
+    fn inline_terminal_update_status_preserves_scroll_selection_and_expanded_sections() {
+        let ctx = egui::Context::default();
+        let info = egui::ViewportId::ROOT;
+        let mut data = tree_info();
+        let tree = data.process_tree.as_mut().unwrap();
+        let child = tree.sections[1].id;
+        let mut expanded =
+            egui::collapsing_header::CollapsingState::load_with_default_open(&ctx, child, false);
+        expanded.set_open(true);
+        expanded.store(&ctx);
+        tree.sections[0].rows = (0..80)
+            .map(|index| InfoPopupRow {
+                label: format!("Metadata {index}"),
+                scope: InfoFieldScope::Neutral,
+                value: "Captured value".into(),
+                searched: false,
+                separator_before: false,
+                binary_is_current: None,
+            })
+            .collect();
+        let shared = Arc::new(std::sync::Mutex::new(
+            crate::models::TerminalMaintenanceState {
+                info_viewport: Some(info),
+                scope_window: Some("other-window".into()),
+                error: Some("Unsupported legacy terminal; restart it once manually".into()),
+                ..Default::default()
+            },
+        ));
+        bind_terminal_update_status(&ctx, info, "fixture-window".into(), shared.clone(), None);
+        let frame = || {
+            let mut result = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640.0, 300.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        show_terminal_update_status(ui);
+                        let output = render_info_popup_scroll_area(ui, &data);
+                        result = Some((output.id, output.state, output.inner.0[0].response.id));
+                    });
+                },
+            );
+            result.unwrap()
+        };
+        frame();
+        let (scroll_id, mut scroll, editor_id) = frame();
+        scroll.offset.y = 120.0;
+        scroll.store(&ctx, scroll_id);
+        let mut selection = egui::text_edit::TextEditState::load(&ctx, editor_id).unwrap();
+        let range = egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(12),
+        );
+        selection.cursor.set_char_range(Some(range));
+        selection.store(&ctx, editor_id);
+        for visible in [true, false, true] {
+            shared.lock().unwrap().scope_window = Some(
+                if visible {
+                    "fixture-window"
+                } else {
+                    "other-window"
+                }
+                .into(),
+            );
+            let (current_scroll, state, current_editor) = frame();
+            assert_eq!(current_scroll, scroll_id);
+            assert_eq!(current_editor, editor_id);
+            assert_eq!(state.offset.y, 120.0);
+            assert_eq!(
+                egui::text_edit::TextEditState::load(&ctx, editor_id)
+                    .unwrap()
+                    .cursor
+                    .char_range(),
+                Some(range)
+            );
+            assert!(process_info_section_is_open(&ctx, child, false));
         }
     }
 
@@ -1995,6 +2110,7 @@ mod tests {
                         depth: 0,
                         header: "xfce4-terminal (pid 1)".into(),
                         binary_is_current: None,
+                        update_target: None,
                         default_open: true,
                         metadata_sections: Vec::new(),
                         rows: vec![InfoPopupRow {
@@ -2011,6 +2127,7 @@ mod tests {
                         depth: 1,
                         header: "fish (pid 2)".into(),
                         binary_is_current: None,
+                        update_target: None,
                         default_open: false,
                         metadata_sections: Vec::new(),
                         rows: vec![InfoPopupRow {
@@ -2580,6 +2697,252 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
         };
         vec![egui::Event::PointerMoved(pos), button(true), button(false)]
+    }
+
+    #[test]
+    fn outdated_terminal_update_link_is_inline_text_height_and_does_not_toggle_the_tree() {
+        for scale in [1.0, 2.0] {
+            for font_size in [13.0, 24.0] {
+                for open in [false, true] {
+                    let ctx = egui::Context::default();
+                    ctx.set_pixels_per_point(scale);
+                    ctx.style_mut(|style| {
+                        style.animation_time = 0.0;
+                        style.text_styles.insert(
+                            egui::TextStyle::Monospace,
+                            egui::FontId::monospace(font_size),
+                        );
+                    });
+                    let mut data = tree_info();
+                    let owner = &mut data.process_tree.as_mut().unwrap().sections[0];
+                    owner.header = "xfce4-terminal (pid 176434) [window owner]".into();
+                    owner.binary_is_current = Some(false);
+                    owner.update_target =
+                        Some(InfoUpdateTarget::TerminalWindow("fixture-window".into()));
+                    owner.default_open = open;
+                    let id = owner.id;
+                    let header = owner.header.clone();
+                    let (_, editors) = tree_frame(&ctx, &data, vec![]);
+                    let editor = &editors[0];
+                    assert!(
+                        editor
+                            .galley
+                            .job
+                            .text
+                            .contains(&format!("{header}  Update\n"))
+                    );
+                    let link = ctx.read_response(id.with("terminal-update-link")).unwrap();
+                    let index = editor.galley.job.text.find(header.as_ref()).unwrap();
+                    let cursor = editor.galley.job.text[..index].chars().count();
+                    let row = editor
+                        .galley
+                        .pos_from_cursor(egui::text::CCursor::new(cursor))
+                        .translate(editor.galley_pos.to_vec2());
+                    assert!(link.rect.left() > row.left());
+                    assert!(link.rect.top() >= row.top() - 0.5);
+                    assert!(link.rect.bottom() <= row.bottom() + 0.5);
+                    let height = ctx
+                        .fonts_mut(|fonts| fonts.row_height(&egui::FontId::monospace(font_size)));
+                    assert!((link.rect.height() - height).abs() <= 1.0);
+                    let pos = link.rect.center();
+                    let (output, _) = tree_frame(&ctx, &data, vec![egui::Event::PointerMoved(pos)]);
+                    assert_eq!(
+                        output.platform_output.cursor_icon,
+                        egui::CursorIcon::PointingHand
+                    );
+                    tree_frame(&ctx, &data, pointer_events(pos));
+                    assert_eq!(process_info_section_is_open(&ctx, id, !open), open);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fish_and_codex_update_links_emit_only_the_exact_program_without_toggling_sections() {
+        use crate::models::{InfoProgram, ProcessIdentity};
+        for application in [InfoProgram::Fish, InfoProgram::Codex] {
+            for open in [false, true] {
+                for scale in [1.0, 2.0] {
+                    let ctx = egui::Context::default();
+                    ctx.set_pixels_per_point(scale);
+                    let mut data = tree_info();
+                    let section = &mut data.process_tree.as_mut().unwrap().sections[0];
+                    let target = InfoUpdateTarget::Program {
+                        window: "exact-window".into(),
+                        process: ProcessIdentity {
+                            pid: 123,
+                            start_ticks: 456,
+                        },
+                        application,
+                    };
+                    section.header = format!("{} (pid 123) [tmux pane]", application.name()).into();
+                    section.binary_is_current = Some(false);
+                    section.default_open = open;
+                    section.update_target = Some(target.clone());
+                    let id = section.id;
+                    let render = |events| {
+                        let mut clicked = None;
+                        let _ = ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(1200.0, 800.0),
+                                )),
+                                events,
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                egui::CentralPanel::default().show(ctx, |ui| {
+                                    clicked = render_info_popup_panel(ui, &data).1;
+                                });
+                            },
+                        );
+                        clicked
+                    };
+                    render(vec![]);
+                    render(vec![]);
+                    let link = ctx.read_response(id.with("terminal-update-link")).unwrap();
+                    assert_eq!(render(pointer_events(link.rect.center())), Some(target));
+                    assert_eq!(process_info_section_is_open(&ctx, id, !open), open);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn update_link_is_absent_for_current_unknown_and_unsupported_processes() {
+        for (status, target) in [
+            (Some(true), Some("window")),
+            (None, Some("window")),
+            (Some(false), None),
+        ] {
+            let ctx = egui::Context::default();
+            let mut data = tree_info();
+            let owner = &mut data.process_tree.as_mut().unwrap().sections[0];
+            owner.binary_is_current = status;
+            owner.update_target =
+                target.map(|window| InfoUpdateTarget::TerminalWindow(window.to_owned()));
+            let id = owner.id;
+            let (_, editors) = tree_frame(&ctx, &data, vec![]);
+            assert!(!editors[0].galley.job.text.contains("Update"));
+            assert!(ctx.read_response(id.with("terminal-update-link")).is_none());
+        }
+    }
+
+    #[test]
+    fn native_info_update_link_opens_a_cancellable_scope_dialog_and_emits_scoped_update_events() {
+        for choice in ["Cancel", "Escape", "This window", "All outdated windows"] {
+            let ctx = egui::Context::default();
+            ctx.set_embed_viewports(false);
+            let popup = egui::ViewportId::from_hash_of("native-info-update-fixture");
+            let mut data = tree_info();
+            let owner = &mut data.process_tree.as_mut().unwrap().sections[0];
+            owner.binary_is_current = Some(false);
+            owner.update_target = Some(InfoUpdateTarget::TerminalWindow(
+                "exact-kwin-window-id".into(),
+            ));
+            let id = owner.id;
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let registered = ctx.run(egui::RawInput::default(), |ctx| {
+                show_deferred_info_popup(
+                    ctx,
+                    popup,
+                    data.clone(),
+                    [1200.0, 800.0],
+                    [520.0, 360.0],
+                    Arc::new(AtomicBool::new(false)),
+                    sender.clone(),
+                );
+            });
+            let callback = registered.viewport_output[&popup]
+                .viewport_ui_cb
+                .as_ref()
+                .unwrap();
+            let link_rect = std::cell::Cell::new(None);
+            let frame = |events| {
+                let mut input = egui::RawInput {
+                    viewport_id: popup,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 800.0),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                input.viewports.insert(
+                    popup,
+                    egui::ViewportInfo {
+                        parent: Some(egui::ViewportId::ROOT),
+                        ..Default::default()
+                    },
+                );
+                ctx.run(input, |ctx| {
+                    callback(ctx);
+                    if let Some(link) = ctx.read_response(id.with("terminal-update-link")) {
+                        link_rect.set(Some(link.rect));
+                    }
+                })
+            };
+            for _ in 0..3 {
+                frame(vec![]);
+            }
+            let pos = link_rect
+                .get()
+                .expect("native info header has an Update link")
+                .center();
+            frame(pointer_events(pos));
+            assert!(receiver.try_recv().is_err());
+            for _ in 0..2 {
+                frame(vec![]);
+            }
+            let output = frame(vec![]);
+            let events = if choice == "Escape" {
+                vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }]
+            } else {
+                let pos = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.job.text == choice => {
+                            Some(text.pos + text.galley.size() * 0.5)
+                        }
+                        _ => None,
+                    })
+                    .expect("scope choice must appear inside Show Info");
+                pointer_events(pos)
+            };
+            let output = frame(events);
+            assert!(
+                !output.viewport_output[&popup]
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, egui::ViewportCommand::Close)),
+                "Cancelling the dialog must leave Show Info open"
+            );
+            assert!(process_info_section_is_open(&ctx, id, false));
+            if matches!(choice, "Cancel" | "Escape") {
+                assert!(receiver.try_recv().is_err());
+            } else {
+                match receiver.try_recv().unwrap() {
+                    PopupEvent::UpdateTerminalWindow { window, info } => {
+                        assert_eq!(choice, "This window");
+                        assert_eq!(window, "exact-kwin-window-id");
+                        assert_eq!(info, popup);
+                    }
+                    PopupEvent::UpdateTerminalWindows { window: None } => {
+                        assert_eq!(choice, "All outdated windows")
+                    }
+                    other => panic!("unexpected update scope: {other:?}"),
+                }
+                assert!(receiver.try_recv().is_err());
+            }
+        }
     }
 
     #[test]

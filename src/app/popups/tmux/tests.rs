@@ -102,6 +102,31 @@ fn field<'a>(rows: &'a [InfoPopupRow], label: &str) -> &'a str {
 }
 
 #[test]
+fn only_the_verified_outdated_tmux_server_has_a_server_update_target() {
+    let (mut popup, client, mut server, _) = fixture();
+    popup.window.class = "xfce4-terminal".into();
+    assert!(
+        matches!(super::super::process_update_target(&popup.window, &server, Some(false)),
+        Some(InfoUpdateTarget::TmuxServer { window, server: identity })
+            if window == popup.window.id && identity.pid == 20 && identity.start_ticks == 200
+                && identity.socket_path == "/fixture/server.sock")
+    );
+    for status in [None, Some(true)] {
+        assert!(super::super::process_update_target(&popup.window, &server, status).is_none());
+    }
+    assert!(super::super::process_update_target(&popup.window, &client, Some(false)).is_none());
+    server.identity.start_ticks = 0;
+    assert!(super::super::process_update_target(&popup.window, &server, Some(false)).is_none());
+    server.identity.start_ticks = 200;
+    server.executable = Some("/fixture/bash".into());
+    assert!(super::super::process_update_target(&popup.window, &server, Some(false)).is_none());
+    server.executable = Some("/fixture/tmux (deleted)".into());
+    assert!(super::super::process_update_target(&popup.window, &server, Some(false)).is_some());
+    popup.window.tmux_pane = None;
+    assert!(super::super::process_update_target(&popup.window, &server, Some(false)).is_none());
+}
+
+#[test]
 fn tmux_server_information_does_not_borrow_the_selected_clients_pane_or_session() {
     let (popup, client, server, _) = fixture();
     let client_rows = process_rows(&popup.window, &client);

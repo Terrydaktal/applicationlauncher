@@ -2,6 +2,8 @@ mod commands;
 mod feed;
 mod helpers;
 mod input;
+#[cfg(test)]
+mod maintenance_ui_tests;
 mod popups;
 mod settings;
 pub(crate) mod terminal_maintenance;
@@ -489,6 +491,9 @@ impl App {
     }
 
     fn close_settings_menu(&mut self) {
+        if let Ok(mut state) = self.idle_codex_action.lock() {
+            state.confirmation = false;
+        }
         if let Some(state) = self.settings_popup_state.as_ref()
             && let Ok(mut state) = state.lock()
         {

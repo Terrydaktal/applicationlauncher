@@ -282,15 +282,16 @@ The project builds a native `eframe` / `egui` GUI and a separate user-session da
 - Live tmux windows:
   A read-only background monitor maps each local tmux client to its active pane. Window entries use that pane's foreground program, working directory and actual title, preserving braille spinners and attention markers even when `set-titles` is off. Codex entries match the native tmux desktop title: `tmux: diet - codex: ~/tasks/diet - Check ChatGPT link access - Terminal`, with activity immediately before the directory when present. Both legacy `task | project` titles and newer Codex title selections are normalized using the pane's real directory rather than its abbreviated project label; task separators become ` - `. The session label, directory and task remain searchable. The window PID/executable still identify the terminal emulator; Show Info separately lists the tmux client, server socket, session and pane. Queries are batched per server at at most ten updates/second, publish only the latest state, briefly tolerate unavailable servers, and do not rerank searches for spinner-only changes. Idle shells are checked for entry into tmux every two seconds; no remote SSH pane inference or terminal input injection is used.
 - Window and process version information:
-  Each expanded Show Info process section reports that executable's running version, latest installed local version, local uncompiled-changes status, and both ELF build IDs. The running ELF build ID is coloured using build IDs (or the same executable inode), never just version strings: uncommitted rebuilds can print identical versions while containing different code. This applies independently to the terminal emulator, Fish, Bash, tmux, the active program and other inspected processes. Known noninteractive version switches are probed in a background worker against separately pinned running and on-disk ELF binaries, so deleted old executables retain their real running version after replacement. Unknown executables and shell scripts are never launched for inspection. "Latest" means the local installed binary, not a network/update check or an unbuilt source version. For local checkouts, Progs' published installation links can identify a newer build even while an older immutable release directory still exists (for example, tmux). The executable name and checkout must match, and up to 64 distinct aliases must agree on the same build; ambiguous targets are not guessed. Links and the pinned disk file are checked again after probing, so installation changes during inspection invalidate the comparison. Uncompiled changes use the selected installed build's path with a read-only Ninja target dry-run or a bounded Cargo dep-info/source/configuration timestamp check; the Cargo result is qualified because it is not Cargo's build planner. Ninja's always-run checks, such as Meson revision-header generators, do not prove uncompiled changes: without evidence of changed/missing inputs or commands the result is Unknown, not a false Yes. Missing/unsupported build metadata also reports Unknown, never a guessed No. Source status is checked again after reopening Show Info and expanding the section; no application is compiled or restarted. A disk binary replaced during inspection is reported as Unknown. Installed Arch package versions remain separate from executable versions. A single worker services at most 16 queued requests and 512 per-popup results; duplicate expansions reuse results. Closing/reopening cancels queued work and discards stale in-flight results. Both process start time and running executable identity are checked to reject PID reuse and exec changes.
-  Node-backed terminal applications are resolved separately from their runtime. A bounded, read-only lookup validates the script against a package.json bin entry and shows its installed package name/version, canonical entry point, and manifest. CLI programs such as Pi that overwrite their command line can be identified through their command symlink; this is explicitly labelled an inferred command lookup, and ambiguous matches are rejected. Installed package metadata is not claimed to be the exact version already loaded by an older process. Node's version, Arch package, ELF IDs and binary freshness are labelled as runtime information, never as Pi's version. No application JavaScript, npm commands, or application --version switches are executed to obtain package metadata.
+  Each expanded Show Info process section reports that executable's running version, latest installed local version, local uncompiled-changes status, and both ELF build IDs. The running ELF build ID is coloured using build IDs (or the same executable inode), never just version strings: uncommitted rebuilds can print identical versions while containing different code. This applies independently to the terminal emulator, Fish, Bash, tmux, the active program and other inspected processes. Known noninteractive version switches are probed in a background worker against separately pinned running and on-disk ELF binaries, so deleted old executables retain their real running version after replacement. Unknown executables and shell scripts are never launched for inspection. "Latest" means the local installed binary, not a network/update check or an unbuilt source version. For local checkouts, Progs' published installation links can identify a newer build even while an older immutable release directory still exists (for example, tmux). The executable name and checkout must match, and up to 64 distinct aliases must agree on the same build; ambiguous targets are not guessed. Links and the pinned disk file are checked again after probing, so installation changes during inspection invalidate the comparison. Uncompiled changes use the selected installed build's path with read-only Ninja metadata tools or a bounded Cargo dep-info/source/configuration timestamp check; ordinary Ninja dry-runs are forbidden because they can modify response files or logs. Timestamp results are qualified, not a clean-build certification. Successful complete timestamp enumeration with no newer/missing recorded inputs is shown explicitly even when full build status remains unknown. Ninja's target-reachable always-run triggers, such as Meson revision-header generators, do not by themselves prove uncompiled source changes. Missing/unsupported metadata and invalidated checks still report Unknown. A validated partial scan may show known changed-input counts with an explicit scan-incomplete suffix, but never a successful no-newer observation. Source status is checked again after reopening Show Info and expanding the section; no application is compiled or restarted. A disk binary replaced during inspection is reported as Unknown. Installed Arch package versions remain separate from executable versions. A single worker services at most 16 queued requests and 512 per-popup results; duplicate expansions reuse results. Closing/reopening cancels queued work and discards stale in-flight results. Both process start time and running executable identity are checked to reject PID reuse and exec changes.
+  Only the running **Version (ELF build ID)** value uses the comparison colour: green for matching verified builds, red for different builds, and neutral when unknown or no real ID is available. **Latest version on disk (ELF build ID)** always uses the ordinary value colour. **Uncompiled changes** observations and compact counts are green for No, red for Yes and yellow for Unknown; explicit uncertainty suffixes are yellow independently of the observation colour. Detailed reasons remain in backend evidence. Loading, unavailable and not-applicable results stay neutral. Native browser headers also accept an existing desktop entry whose current command and statically resolved wrapper chain select the inspected installation. A retained off-PATH image, missing/stale desktop entry, unrelated wrapper target or changed process does not establish that publication. Collapsed header checks use the same proof without package queries or executing wrappers.
+  Node-backed terminal applications are resolved separately from their runtime. A bounded, read-only lookup validates the script against a package.json bin entry and shows its installed package name/version, canonical entry point, and manifest. CLI programs such as Pi that overwrite their command line can be identified through their command symlink; this is explicitly labelled an inferred command lookup, and ambiguous matches are rejected. Installed package metadata is not claimed to be the exact version already loaded by an older process. Node's version, Arch package, ELF IDs and binary freshness are labelled as runtime information, never as Pi's version. No application JavaScript, npm commands, or application --version switches are executed to obtain package metadata. Pi's running code and running extensions fingerprints are coloured independently against their respective installed hashes; the installed hashes remain neutral. Missing, malformed or untrusted comparisons stay neutral. Patch verification, comparison timestamps/reasons and fingerprint coverage remain internal validation evidence rather than Show Info rows.
 - Show Info process trees:
   Field names use muted grey-based colours by scope: blue-grey for window metadata, green-grey for the running instance and warm grey for installation/on-disk metadata. This classification is explicit and independent of field wording or searchability. Recognized Progs classification badges use their source/role colours wherever they appear, including `[PDP]` in Package, multiple `[PEP]`/`[AEP]` roots, other fields and tree headers. Bare classification values such as `FRK` use the same palette. Only the badge text changes colour; surrounding values retain searchable highlights, red/green build identities or their ordinary colour. Unknown or malformed bracketed text is left unchanged. Styling preserves the exact text, continuous selection, raw strikethrough copying and divider positions, with no new metadata lookup or background polling.
-  Within each process, application and runtime section, running-instance details come first. Native metadata then follows this fixed order: latest on-disk version and ELF build ID, Uncompiled changes, Type, Package, available Pacman/AUR and npm versions when applicable, Root package when applicable, Launch chain, Desktop file, Icon path, Name, Comment, Description and Capabilities. The running Executable path remains; resolved installation paths appear in Launch chain without a separate on-disk executable-path row. A missing Package is shown as `-` once loading finishes. Ambiguous always-run Ninja checks show `Unknown` without a parenthetical explanation. Window-only fields remain ahead of process identity, command line and running version/build ID. Interpreted applications retain their own version/build evidence and put Description and Capabilities last without borrowing their runtime's identity. Each native ELF build ID appears immediately below its corresponding running or on-disk version; optional registry results retain their position while loading.
+  Within each process, application and runtime section, running-instance details come first. Native versions use **Version (ELF build ID)** followed by **Latest version on disk (ELF build ID)**. Each value includes its own build ID in parentheses, for example `Xfce Terminal 1.2.0-fork0.4.9-46 (4fcbbefb36addaaee2f2948a22e2b808698149fa)`, without separate ELF-ID rows. Only the running version retains the verified green/red comparison colour; the on-disk version always stays neutral, as do missing IDs, unknown comparisons and application-only installation views. Missing-version/build-ID explanations remain visible and identical loading or unavailable messages are not repeated. These fields are followed by Uncompiled changes, Type, Package, available Pacman/AUR and npm versions when applicable, Root package when applicable, Launch chain, Desktop file, Icon path, Name, Comment, Description and Capabilities. The running Executable path remains; resolved installation paths appear in Launch chain without a separate on-disk executable-path row. A missing Package is shown as `-` once loading finishes. Scoped no-newer-input observations and their checked-input count are green; only the following full-build-unknown caveat is yellow, without changing the selectable/copied text. Window-only fields remain ahead of process identity, command line and running version/build ID. Interpreted applications retain their own version/build evidence and put Description and Capabilities last without borrowing their runtime's identity. Optional registry results retain their position while loading.
   Settings -> Show Info -> Scroll Sensitivity controls wheel scrolling in all info windows, independently of either launcher panel. It applies immediately, is saved between launches, and supports 0.1x to 10x speed (default 2.5x). Scrollbar dragging and text selection are unchanged.
   Process header text (including PIDs, executable paths and deleted-binary markers) is read-only and selectable for copying. Use the arrow beside a header to expand or collapse its details; selecting text does not toggle the section.
   A recovered shell/Python script name appears separately after Process name. Descriptor-backed scripts such as `/proc/self/fd/3` retain their memfd script name without rewriting the raw command line or replacing the interpreter's process identity.
-  Window Info is a top-down process tree with independent dropdowns, branch connectors, PIDs, executable paths and window-owner/active-process markers. The window-owner dropdown starts expanded and contains titles, geometry, minimization, activation history, desktop entry and window application versions. Other dropdowns contain only their own PID, executable, working directory, command, desktop entry and lazily loaded versions. Tmux session/pane fields appear only under the corresponding tmux client/server, not under Pi or a shell. Pi's installed application metadata stays separate from Node's runtime metadata. Collapsing details leaves the hierarchy visible. Each section keeps continuous cross-row text selection; **Copy shown info** copies the headers and currently supplied details across sections.
+  Window Info is a top-down process tree with independent dropdowns, branch connectors, PIDs, executable paths and window-owner/active-process markers. The window-owner dropdown starts expanded and contains titles, geometry, minimization, activation history, desktop entry and window application versions. Other dropdowns contain only their own PID, executable, working directory, command, desktop entry and lazily loaded versions. Tmux session/pane fields appear only under the corresponding tmux client/server, not under Pi or a shell. Pi's installed application metadata stays separate from Node's runtime metadata. Collapsing details leaves the hierarchy visible. Text selection spans the visible tree, including headers; copy selected text with the keyboard or the right-click **Copy** and **Copy HTML** actions.
   The tree includes the owning process's descendants, so a Pi launcher shows Pi and its SSH tunnel as siblings rather than incorrectly presenting SSH as Pi's parent. Ancestors are included without unrelated application branches. Detached tmux panes retain their actual server ancestry; no false parent-child connection to the terminal client is drawn. Shared terminal/browser processes can cover more than one window. The snapshot is collected once per Show Info opening (or a change of target process) by a named background worker, not during startup, search, scrolling or each frame. Collection is capped at 32,768 scanned entries, 512 displayed processes, bounded ancestry/descendant depth, 16 KiB per command line and a 500 ms work budget; exited/reused processes and partial captures are reported rather than guessed. Threads are omitted. Reopen Show Info for a fresh snapshot; spinner/title changes do not refresh it or reset dropdowns/text selection. No process is started, signalled or modified to collect the tree; optional version probes use only the existing noninteractive allowlist.
 - Show Info installation classification:
   Application tiles show the installed application's on-disk version, Progs installation classification, installed package, available package version, ELF build ID and supported local-build status. Launch chains retain resolved symlink/wrapper paths without describing a browser as its custom launch script. Resolution follows at most 24 file/link steps and reads at most 64 KiB per script. Only literal absolute final `exec` targets and the verified Chromium `CHROME_WRAPPER`/`HERE` template are followed; dynamic, conditional, missing, cyclic or unsupported targets are explicitly unresolved, never evaluated. Scripts are never run, and interpreted applications retain their script identity rather than inheriting their interpreter's version. Every captured launch file/link is rechecked after native metadata probing. An exact Pacman package owner can supply Progs classification and description when its inner executable is not indexed as a launch command; unrelated names and conflicting descriptions are not guessed. A named background worker publishes local metadata first, then optional bounded Pacman/AUR and npm queries, using at most three queued updates. Closing the popup cancels remaining work and rejects late results. Drawing uses captured file-existence state, not repeated filesystem checks, and no application-tile probes run during startup, searching or scrolling. The pane fits its natural content height at 1200 logical pixels wide, subject to screen limits, while retaining continuous text selection.
@@ -298,7 +299,7 @@ The project builds a native `eframe` / `egui` GUI and a separate user-session da
   Installation rows display only Progs' current classification initials: Type uses bare codes such as `FRK`, `DEV`, `CLO`, npm's `NET` or Bash's `PDT`, with the existing Progs colours. npm, uv and Cargo tools retain their explicit/dependency/unknown installation roles rather than using obsolete generic source codes; rustup remains `RUT`. Older local aliases are normalized to current names (`FKM` to `FRK`, for example), while legacy generic toolchain codes become unknown-role tool codes rather than claiming an installation reason. Package retains the owning package's name/version followed by a bracketed package code such as `[PDP]`; expanded classification and management names are omitted. They read `$XDG_CACHE_HOME/progs/scan-v1.json` (or `~/.cache/progs/scan-v1.json`) in the existing background info worker, never run Progs or trigger an inventory scan. Exact executable/alias targets take priority; a local source wrapper can identify a compiled binary only when its name and Git checkout both match. Conflicting, absent, unsupported or oversized inventory data reports UNC instead of guessing from the process name. The parser is capped at 16 MiB, 8,192 programs, 32,768 binaries and 65,536 reverse dependency edges; parsed data is reused until the inventory file changes. These classifications describe the last saved Progs inventory, not proof of the running binary's version. Refresh Progs, then close and reopen Show Info for updated classifications. Actual Pacman package versions are retained in the installation row, independently of executable versions and ELF IDs. Node application entry points and their Node runtime are classified separately.
   Root package shows one original requested target followed by the number of all other installed packages that depend on the inspected package, directly or indirectly. The root is the first target, in command order, from the package's earliest recorded installation transaction whose dependency chain includes that package. Matching uses the current saved Progs dependency graph, not a captured historical graph, so the result is explicitly marked inferred. The displayed version and badge are the root's current Progs metadata; later changes to explicit/dependency flags do not choose a different root. Counts exclude the inspected package and the displayed root, include intermediate dependencies and packages beyond explicit roots, and deduplicate cycles and shared paths. Missing graph evidence produces an explicitly qualified lower bound; absent history, unsupported requests or no matching original target show Unknown rather than selecting an alphabetical/current root. `/var/log/pacman.log` is read without execution or subprocesses, bounded to 16 MiB, 64 KiB per line, 1,024 command arguments, 65,536 historical package/target records and a 200 ms parsing budget. Only completed transactions establish requests; later reinstalls do not replace the first recorded installation. Repository-qualified sync targets, ordinary installer options and version-checked local/AUR package archive targets are supported; skipped `--needed` targets, ambiguous quoting, stdin targets and unsupported options do not invent attribution. The entire available regular log is inspected, not just a recent tail; missing or rotated-away older history cannot be reconstructed. Parsed history is cached until file identity changes, and up to 128 root/count results are cached per inventory and history revision. Reads and traversal run only in the existing on-demand background metadata worker, never in startup, searching, scrolling or frame rendering; no watcher, polling loop, new database or package operation is added.
 - Available package versions:
-  `Latest package version (Pacman/AUR)` is separate from the running version and latest binary on disk. Installed executable ownership identifies the package first; Progs can identify an exact package or a local source checkout's name. Unmanaged scripts and npm/uv/Cargo command names are not assumed to identify OS packages. Node application entry points and the Node runtime are checked independently. A dedicated background worker reads `pacman -Si` in configured repository priority order, then tries `paru -Si --aur` when no exact repository package is found. It never refreshes databases, installs, builds or upgrades packages, prompts for privileges, or runs discovered applications. Pacman values reflect the local sync databases and use the compact format `repository/package version (Last Pacman sync: 2 hours ago)`, switching to whole days at 24 hours and showing `less than 1 hour ago` for recent syncs. The age uses the complete timestamp and timezone offset of the latest recorded synchronization request in `/var/log/pacman.log`; the record does not prove that every repository downloaded successfully. Only the last 1 MiB of the regular log file is read, off the GUI thread, and the parsed timestamp is cached until the file changes. Age is recalculated when a package result is requested, even when the package version is cached; no timer or extra polling is added. Missing, unreadable, invalid or future timestamps show `unknown`; database download/publication timestamps are not substituted. Paru may contact the AUR using only the package name, and its results do not inherit a Pacman sync age. Each tool has a three-second timeout and a 64 KiB accepted response bound. Up to 128 results are cached for five minutes (failures for 15 seconds), with default Pacman sync-directory changes invalidating cache keys. The per-popup package queue is capped at 16 requests and sleeps when empty. Ordinary binary metadata is published first and is not blocked by slow AUR queries. Closing or retargeting an info window clears queued work and rejects stale in-flight results; no lookup runs during startup, search, scrolling or unopened process sections.
+  `Latest version (in last Pacman sync)` and `Latest version (AUR)` is separate from the running version and latest binary on disk. Installed executable ownership identifies the package first; Progs can identify an exact package or a local source checkout's name. Unmanaged scripts and npm/uv/Cargo command names are not assumed to identify OS packages. Node application entry points and the Node runtime are checked independently. A dedicated background worker reads `pacman -Si` in configured repository priority order, then tries `paru -Si --aur` when no exact repository package is found. It never refreshes databases, installs, builds or upgrades packages, prompts for privileges, or runs discovered applications. Pacman values reflect the local sync databases and use the compact format `repository/package version (synced 2 hours ago)`, switching to whole days at 24 hours and showing `less than 1 hour ago` for recent syncs. The age uses the complete timestamp and timezone offset of the latest recorded synchronization request in `/var/log/pacman.log`; the record does not prove that every repository downloaded successfully. Only the last 1 MiB of the regular log file is read, off the GUI thread, and the parsed timestamp is cached until the file changes. Ages are recalculated when the info rows are drawn, including cached results; rendering reads only captured timestamps and does not launch a query, read the log, or add a timer or polling. Missing, unreadable, invalid or future sync timestamps show `sync time unknown`; database download/publication timestamps are not substituted. Paru may contact the AUR using only the package name. AUR values use `aur/package version (checked 2 minutes ago)`, with a monotonic timestamp captured only after a successful lookup and preserved through cache reads and worker publication. They show `checked just now` during the first minute, then minutes, hours and days. AUR never inherits a Pacman sync age. Labels follow the structured query source, not the repository name; pending and failed lookups use neutral `Latest version (Pacman/AUR)` labels rather than inventing a sync or check time. Each tool has a three-second timeout and a 64 KiB accepted response bound. Up to 128 results are cached for five minutes (failures for 15 seconds), with default Pacman sync-directory changes invalidating cache keys. The per-popup package queue is capped at 16 requests and sleeps when empty. Ordinary binary metadata is published first and is not blocked by slow AUR queries. Closing or retargeting an info window clears queued work and rejects stale in-flight results; no lookup runs during startup, search, scrolling or unopened process sections.
 - Audio indicators:
   Rings respond to actual playback samples, not volume-slider values, MPRIS status or a synthetic animation. Each PulseAudio sink input is monitored individually on its output's monitor source, with no default-source or mixed-output fallback. The worker analyses 16 kHz stereo into eight frequency bands (60 Hz to 6.5 kHz) and peaks in 20 ms blocks, publishing at most 25 updates/second. Silence, corking, mute and stale samples clear the indicator. Audio is consumed in memory and discarded, never saved or sent to the GUI; the GUI receives only bounded, quantised levels and displays the latest result rather than replaying an update backlog. Monitoring is capped at 32 streams with requested 100 ms buffers and 256 metadata records, and reconnects with bounded retry delays after server loss. No analysis, audio-server I/O or process spawning occurs in the drawing path.
 
@@ -364,6 +365,9 @@ Application and window/process Show Info share the installed-application fields:
 current launch chain, on-disk version/build ID, package versions,
 build status, installation classification and description.
 Desktop file, icon, display name and comment follow those fields.
+When no desktop entry is associated, Desktop file is `None` and Icon path, Name
+and Comment are `-`. Pending discovery stays `Loading...`; a known expected
+desktop-file path still reports `(missing)` when the file does not exist.
 Running-process identity remains separate even when its path/version matches
 the installed copy. Installed application tiles never invent a PID or claim
 that their on-disk version is a running version. Redundant launcher basename,
@@ -409,8 +413,16 @@ the separate **Runtime: Node.js** dropdown identifies the native runtime and
 its ELF build ID.
 
 Show Info renders Unicode combining strikethrough marks as native styling in
-titles, process headers and metadata. Copying selected text or using **Copy shown
-info** preserves the original Unicode text, including the raw window title.
+titles, process headers and metadata. Copying selected text preserves the original
+Unicode text, including the raw window title.
+Selection can span the entire visible process tree, including headings and
+expanded Application/Runtime sections. Right-click selected text for **Copy** or
+**Copy HTML**, which preserves colours and strikethrough with a plain-text fallback.
+Process headings use the arrow pointer without disabling selection; the collapse
+arrows use the hand pointer, and metadata retains the text-selection cursor.
+Ordinary application/process metadata stays captured until the information window
+is closed and reopened or its process identity changes, without periodic full
+reloads. Pi's lightweight startup-receipt updates remain separate.
 Pi's Unicode program marker is normalized to `pi` in launcher titles, carrying
 any strikethrough onto both letters. Raw window and tmux pane titles are unchanged.
 
@@ -432,7 +444,8 @@ Matching values are retained so their distinct sources remain clear; installed
 paths are explicitly labelled.
 Window-owner fields begin with titles, application key, class, window ID, geometry
 and activation history. Console processes omit those window fields. Both then use
-process identity, the full command line, running version/build ID, installed
+process name, PID, Parent PID, process start, working directory, command line,
+executable path, running version/build ID, installed
 version/build ID, Uncompiled changes, Type, Package, available package versions,
 Root package when applicable, Launch chain, Desktop file, Icon path, Name, Comment,
 Description and Capabilities. The lossy command
@@ -497,7 +510,6 @@ For explicit live verification while Firefox is playing, enable `APPLICATIONLAUN
 - Middle-click on a window entry to launch another instance of the underlying application.
 - Right-click on a window entry to open, clone, show metadata and the process tree, or close the application.
 - Optional close-on-blur behavior.
-- Settings includes **Stop idle Codex sessions...**, an explicit, confirmed action that sends one `SIGINT` to each verified local idle Codex process. It checks fresh terminal-tab metadata and window titles for spinners/attention, then rechecks process identity and foreground ownership before signalling through a PID handle. It requires a shell underneath Codex and never signals terminal windows, shells or whole process groups, never force-kills or retries, and does not run automatically. Unsupported/inactive tabs and ambiguous or changed sessions are skipped. This is a signal interrupt, not a literal TUI Ctrl+C keypress; Codex versions can handle the two differently. Title-based idle detection is conservative but cannot make the final title-read/signal boundary atomic with Codex starting a new turn.
 - Temporary border overlay support for highlighting a target window.
 
 ## Requirements
@@ -604,41 +616,298 @@ Current settings cover:
 - Application panel:
   `Show System Modules`, `Icon Grid Mode`, `Icon Size`, `Tile Size`, `Show Names`, `Name Size`
 - Open window view:
-  Row height, icon size, padding, text spacing, line height, title size, path size, and whether the subtitle path is shown
+  Row height, icon size, padding, text spacing, line height, title size, path size, and whether the subtitle path is shown.
+  `Show Launcher Window` includes the launcher's main window in the window list and count.
+  It is off by default, applies immediately, and is saved across restarts. Settings and
+  Show Info windows remain excluded; session history and recovery are unchanged.
+  The daemon publishes the main launcher through a separate live-only collection:
+  it participates in incremental and full window-feed updates but never in saved
+  windows, restore inference, closed history, or mass-disappearance recovery counts.
 - General:
   `Disable text select cursor (I-beam)`
 
+Displayed calendar dates use `DD-MM-YYYY`, including saved-session capture dates
+and Show Info activation timestamps. Times, UTC markers and relative ages remain
+unchanged, as do stored timestamps and user-supplied names or titles. Settings use
+compact 4-point grid-row gaps without shrinking the controls.
+
+## Tmux Process Information
+
+Show Info keeps tmux server properties separate from the selected terminal's
+client and active pane. The server shows its listener, running/installed build
+identity, host, sizing monitor and session/client counts. Independent dropdowns
+describe every session (including detached sessions) and every attached client.
+Server properties are merged directly into its main process fields, without a
+second "Tmux server" dropdown or repeated version/outdated rows. The distinct
+running and installed SHA256 hashes sit beside their respective ELF build IDs;
+the existing version comparison colours and inline Update link are unchanged.
+Capture errors remain visible in the same fields, and metadata from a different
+server PID/start-time/listener is not merged.
+The client process shows only the record matching its own PID and process start
+time, never a different attachment or the server's default active pane.
+Its connection fields are merged into the main process details, without a separate
+connection dropdown or repeated session/pane/PID fields. The four tmux/network
+socket fields replace legacy Socket, address/port and inode aliases; older records
+are normalized without confusing Unix IPC sockets with network endpoints. Frontend
+PID, versions and build evidence are omitted when that exact PID/start-time pair
+already has its own process-tree entry. Distinct remote frontends, running versus
+installed evidence, unknown fields and guest routes remain available.
+
+Detailed data comes from the installed `tmux-mosh --socket PATH clients --json`
+collector in the separate `../tmux-mosh` repository. It includes local/SSH/Mosh
+transport, frontend versions/fingerprints, attachment and reachability state,
+keyboard activity versus network packet age, TTY, dimensions, sizing policy and
+controlling client, verified Unix socket pairs, network endpoints and guest/VM
+route metadata where available. Shared listeners are not connected endpoints.
+Latest installed references remain separate from running build evidence.
+
+Collection starts only when a tmux process section is expanded, runs in the
+background once per Info capture, shares concurrent requests for the same server
+and does not expire on a rendering timer. Session/client subgroups format their
+details only when expanded. Reopen Info for a new capture. Missing helpers,
+unsupported servers, changed identities and failed queries are shown explicitly;
+unknown network state is not treated as disconnected. This path never starts a
+server or sizing monitor, changes flags, attaches/detaches clients or runs update
+or cleanup commands.
+
 ## Terminal Maintenance
 
-Open `F10` -> `Terminal Maintenance` -> `Update outdated terminal windows...`.
-The popup is an optional client of XFCE Terminal's own update API. It queries
-`GetUpdateStatus(window_uuid)` on each terminal's unique D-Bus owner and sends
-`UpdateInPlace(window_uuid)` for selected outdated windows. The terminal owns
-confirmation, executable pinning, application resume, private recovery commands,
-startup gates and KWin placement; Application Launcher does not launch replacements
-or close terminal windows. Non-tmux confirmation still appears in the terminal.
+The **Update application...** context-menu entry and standalone **Update Application**
+popup have been removed. Settings no longer includes **Terminal Maintenance** or
+**Stop idle Codex sessions...**. Their backend operations and safety checks remain
+available. Show Info now places a text-height **Update** link after a verified
+outdated `xfce4-terminal` window-owner header. Choosing **This window** confirms
+that exact window and starts its update after a fresh eligibility check, without
+another launcher confirmation. **All outdated windows** opens the existing preview
+and confirmation workflow. Current or unknown terminal builds and unrelated processes have no
+terminal-update link. Cancelling the chooser leaves Show Info open without starting any work;
+up-to-date windows are never selected for restart.
+These operations use already built/installed binaries; they do not build or upgrade packages.
+The window-list context menu starts with **Show info** and uses **Close window**
+for closing the selected window. It also has **Update window** immediately above
+**Open window**. It opens the same **Update xfce4-terminal?** confirmation dialog
+as Show Info, with **This window**, **All outdated windows** and **Cancel**.
+Opening the dialog starts no update. The target is the exact window owner, not
+its foreground program, tmux client or tmux server. This is currently enabled
+only for `xfce4-terminal`; other window owners have a disabled entry. After
+confirmation, progress and errors for this window appear inline below the
+launcher's search bar; the all-windows choice opens the reviewed bulk workflow.
+Launcher navigation and search refocusing are suspended while the modal is open.
+The same fresh eligibility and outdated-build checks apply, so current windows
+are not restarted.
+Both terminal-update dialogs explain the in-place geometry preservation: tmux
+tabs reattach to their existing sessions without restarting the server or its
+applications, while supported non-tmux applications are restarted in their working
+directories. Single-window validation runs automatically after the scope choice,
+without opening the Update Terminal Windows maintenance window. Progress and any
+blocking error appear inline in the originating Show Info window; an unsupported
+terminal never falls back to the bulk review UI or to a forced restart. Older
+terminal builds can use daemon-owned replacement without a manual restart. Busy or pending
+updates cannot be retargeted or queue another update. Bulk updates still require
+reviewing the preview and confirming. Updated terminals accept the launcher's
+explicit consent without opening a second confirmation; their native context menu
+still shows the captured non-tmux restart plan. Native identity, tab, startup and
+placement checks cannot be bypassed by confirmation.
 
-The popup observes the returned terminal-owned helper service and reports its
-result. Closing or restarting Application Launcher does not cancel that helper.
-Duplicate starts do not repeat requests. An ambiguous shared-process window or a
-terminal without the new API is ineligible rather than using a daemon-owned
-fallback. Old running terminals need one manual restart to acquire the new API.
-The old `BeginTerminalUpdatePreview` endpoint and tracker-owned replacement worker
-have been removed. Existing saved sessions, automatic snapshots, terminal session
-restoration and old named backups remain supported and are not deleted.
+### Lifecycle Ownership
 
-XFCE Terminal's right-click **Update in Place** works without Application Launcher
-or its tracking daemon. New recovery metadata belongs to the terminal under
-`~/.local/state/xfce4-terminal/updates/`, not to the tracker snapshot database.
-Window identity mapping uses the terminal owner PID and lifetime UUID; identical
-captions in one shared process are refused rather than guessed. There is no
-terminal-maintenance scanning during ordinary launcher use.
+`applicationlauncherd` owns restart policy and transaction coordination through
+the versioned `/Lifecycle` D-Bus interface. The GUI only selects scope, obtains
+consent and displays results. Native terminal cooperation supplies accurate tab
+metadata, holds and controlled handover where supported. Without its updater/hold
+API, the daemon stages a new terminal through the normal CLI and restores placement
+and closes the exact original window through KWin. Both paths use the same
+application/session adapters and restart policy, not separate Codex detectors.
+For compatibility updates, original tmux clients and their dedicated idle shell
+ancestry are retired only after replacement attachments verify. The tmux server
+and pane applications keep running; unrelated background shell jobs block the
+update instead of being terminated by a window-close request.
+
+The compatibility preview uses read-only `ListTerminals` metadata when present.
+Without it, the daemon requires exactly one actual KWin window for that PID and
+one verifiable controlling-PTY child session. Multiple tabs without metadata,
+ambiguous shared-process windows, changed sessions and unsupported applications
+are refused before interruption, rather than guessing from a title. Previews
+record exact process/build/session identities; confirmation cannot silently select
+a different conversation. Running-current terminal builds are not restarted.
+
+Confirmed operations run in independent transient user services using the same
+daemon executable. They survive GUI closure and daemon replacement. Private,
+fsynced plans, stage journals, worker identities and results allow a new daemon
+to report the outcome; interrupted work is never blindly replayed. One shared
+cross-process lock excludes overlapping window/program/server restarts and
+session restores. Automatic snapshots wait while replacements are staged.
+
+A terminal-only update pins each native application's running executable,
+including deleted/replaced files, rather than implicitly upgrading it. A
+content-addressed recovery copy and literal recovery arguments are retained in
+`$XDG_STATE_HOME/applicationlauncher/lifecycle/builds/`; per-window plans and
+reports live in `lifecycle/<operation-id>/`. Backups remain until manually removed.
+The native image limit is 1 GiB per captured binary. These are restart recipes,
+not snapshots of loaded libraries, process memory, unsaved shell state or scrollback.
+Individual Fish/Codex updates deliberately select the latest installed build.
+
+Restarted Codex runs under an interactive Fish parent. Normal exit, failed exit
+and Ctrl+C return to Fish instead of closing the terminal tab. Its exact
+conversation, literal arguments (including argv[0]) and working directory remain
+unchanged. Window-only updates pin an existing Fish ancestor's running image;
+without one they prepare a verified installed Fish before interrupting anything.
+Both Fish and Codex get durable recovery images and a return-to-shell command.
+This is shared daemon-side policy for native and compatibility window updates,
+not application detection in the terminal helper. It applies to new restarts;
+existing Codex processes launched by earlier updates are not modified in place.
+
+With a native hold, the old window stays open until replacement application identities
+verify. Without one, the daemon fully prepares a minimized, correctly placed
+replacement before stopping applications; the old terminal may then auto-close as
+its child exits. The already-placed replacement is shown while its applications
+are verified. Tmux applications keep running and reattach to their exact existing
+server/session. Failures retain recovery records and any usable windows rather
+than force-killing, guessing another conversation or replaying a restart blindly.
+A non-tmux Pi window remains unsupported because
+its complete loaded runtime/extensions build cannot yet be preserved; Pi inside
+tmux stays running. The old terminal version is not itself a reason to refuse a
+whole-window replacement. This does not introduce a persistent PTY
+server or transfer a running non-tmux process to another window.
+
+The main CopyQ window-owner process has an **Update** link regardless of build
+status. Its modal runs `systemctl --user restart app-com.github.hluk.copyq@autostart.service`
+only after **Restart CopyQ** is clicked. This restarts the installed application;
+it does not build or install anything. Cancellation has no effect. The bounded
+background restart reports success or errors, refuses a changed process identity,
+and cannot queue duplicate restarts across information windows.
+
+Verified outdated **Fish** and **Codex** process headers have their own **Update**
+links. The confirmation restarts only that exact PID/start-time identity using
+its latest installed binary, in the same terminal tab or tmux pane. The terminal,
+tmux server and other panes stay running. The preview checks only that program,
+not every session on the server. Codex resumes its exact conversation; Fish must
+be idle, with no foreground application or background jobs. Missing terminal
+handoff support, changed process identities and ambiguous conversations block
+the restart rather than targeting another process. Explicit consent is required;
+closing the dialog does not start work or cancel an already confirmed operation.
+Reopen Show Info after completion to capture the restarted process. These links
+do not build, install or download anything.
+
+Program/server restart APIs require a fresh preview, an eligible action and explicit
+confirmation. Codex resumes its exact observed main session ID with supported launch
+and permission options. Open child-agent logs are excluded only when their parent
+metadata forms a verified chain back to that main conversation. Conflicting roots,
+unknown lineage, unreadable metadata or unsupported options are refused, never
+replaced with `--last`. Pi's Radiance launcher is supported separately: a sealed
+launcher source, same-user PID/start-bound activity marker and unique matching
+project session header identify its exact session file, including verified history
+migration identities. Restarts replay only supported launcher options, reuse the
+backend without installing anything, and never select `--session last`. Only the
+launcher's verified loopback SSH tunnel is treated as an owned helper; active
+tools and unrelated shell jobs still block a restart. After confirmation Pi is
+stopped gracefully and its launcher/tunnel must exit before its pane is recreated.
+The restored Pi must match the captured session, installed launcher/entry point and
+Node image, not merely have the same process title.
+Native tab replacement requires the new xfce4-terminal
+`PrepareTabRestart`, `CommitTabRestart`, `CancelTabRestart` and `GetTabRestartStatus`
+methods. Update older terminal windows first. The terminal retains its existing
+window and tab UUIDs and placement while its child is replaced; unrelated terminal
+windows and tmux panes are not restarted. Shell state in the replaced tab/pane is
+not preserved. Fish with foreground/background jobs cannot be restarted alone.
+
+Whole-server replacement captures all sessions, windows, pane layouts, directories,
+supported program recipes and terminal-client bindings. Every local client must map to
+a restart-capable xfce4-terminal tab. A failed client handoff check names its
+session and client PID; update that terminal window first, then refresh the
+server preview. Grouped sessions, linked windows, unsupported
+programs, unrelated shell jobs and more than 128 panes are refused before shutdown.
+Prepared tabs remain open as the old server exits. The new server recreates the
+sessions and layouts, clients reattach in their original tabs, and startup gates
+release the programs only after the client/session bindings are checked. The
+final program binary, working directory and exact Codex/Pi session are verified.
+Scrollback, shell-local variables and runtime-only tmux options are not preserved.
+The original server's global colour preferences (`NO_COLOR`, `FORCE_COLOR`,
+`CLICOLOR`, `CLICOLOR_FORCE` and `COLORTERM`) are captured separately. Replacement
+startup uses those values, including their absence, rather than inheriting colour
+overrides from the updater's command environment. Other environment values are
+not copied into this colour snapshot, and intentional no-colour preferences remain
+respected.
+
+Before interrupting any application, the updater rehearses the full replacement
+on a short private socket using the installed tmux binary and startup configuration.
+All application gates stay closed, and the private server is stopped afterward.
+A failed rehearsal leaves the original server and its applications running.
+Process and terminal identities are checked again after this startup check.
+If the real replacement exits unexpectedly during its first startup, it can be
+retried at most three times, and only while its listener is provably unused and
+no application gate has opened. An existing listener is never adopted or killed.
+Once started, subsequent commands are pinned to that server with auto-start
+disabled. A lost shutdown acknowledgement does not prevent restoration when the
+old server's exact process identity has exited. Uncommitted native-tab holds are
+released even after a post-shutdown failure, rather than leaving input disabled
+until the terminal's timeout expires.
+
+Attached tmux clients with verified same-user `mosh-server` ancestry are listed
+separately in the preview and do not require a local terminal handoff. Confirming
+the server update authorizes disconnecting these clients when the old server
+shuts down. Their sessions and supported programs are still recreated, but remote
+clients are not reattached automatically; reconnect manually afterward. No mosh
+process is directly killed and preview never disconnects a client. The captured
+client PID/start/build, parent chain and complete attached-client list are checked
+again before shutdown. Missing, changed or ambiguous ancestry, unknown remote
+transports and unmapped local clients still block the update.
+
+A verified outdated **tmux-server** header in Show Info has its own inline **Update**
+link. Its modal offers only **Update server and restart all sessions**, not a
+terminal-window or single-pane update. The read-only preview lists every session,
+including detached sessions, and its pane applications/directories and replacement
+binary. Confirmation requires accepting interruption explicitly. The server PID,
+start ticks and socket must match the captured header before confirmation can be
+enabled; an old daemon without structured scope metadata cannot enable it. The
+saved plan is revalidated again before execution, and existing terminal windows
+and tabs are retained. Codex, verified Pi launchers, idle fish/bash/zsh, htop and
+nvtop have restart recipes. Unsupported applications, unverified/unmapped clients
+and unsafe shell jobs block the entire update before sessions are stopped.
+
+Daemon-owned, fsynced recovery plans are kept at
+`~/.local/state/applicationlauncher/application-updates/<operation>/restart-plan.json`
+in private directories until manually deleted. Operation reports include the path.
+Server restarts also retain a private, fsynced `restart-events.jsonl` alongside
+the plan, recording startup attempts, the replacement process identity, rebuilt
+pane/gate mappings, client reattachment, application release and the failing stage.
+Commands are identified by verb; captured command lines and environment values
+are not copied into this progress journal.
+These are restart recipes, not a promise to recover unsaved program memory, and
+are separate from F9 session snapshots. Changed identities and expired previews
+are refused, jobs are serialized with restores and terminal maintenance, and
+confirmed work continues if the GUI closes. Failures after shutdown are reported
+as failures with the retained backup, never as successful updates or automatic
+force-kills. No scanning or restart worker runs during ordinary window listing.
+
+The retained idle-Codex helper sends one `SIGINT` to each verified local idle Codex
+process, after checking terminal titles for spinners/attention and rechecking process
+identity and foreground ownership. It does not signal terminals, shells or process
+groups, force-kill or automatically retry. Unsupported, busy or ambiguous sessions
+are skipped. SIGINT is not a literal TUI Ctrl+C keypress; the final title-read/signal
+boundary cannot be atomic with Codex starting a new turn. Nothing invokes this helper
+from the settings page.
+
+The terminal-maintenance client uses the native mechanics path when the running
+terminal advertises both update status and safe window holds. It requests
+`UpdateInPlaceWithConsent(window_uuid, true)` when available, otherwise the older
+`UpdateInPlace` request. Without those capabilities it uses the daemon-owned
+compatibility path described above, not a manual-restart requirement. Both
+transports use the same lifecycle coordinator and application adapters; the GUI
+does not implement restart policy. The GUI can be closed, and confirmed workers
+survive a daemon restart with their private recovery records intact.
+Window mapping uses the terminal PID and lifetime UUID; identical captions in
+one shared process are refused rather than guessed. There is no maintenance scan
+during ordinary listing. Existing sessions, snapshots and named backups remain.
 
 Isolated adapter and popup checks:
 
 ```bash
 cargo test --lib terminal_upgrade
 cargo test --bin applicationlauncher app::terminal_maintenance
+UV_CACHE_DIR=/data/.cache/uv uv run --no-project --python /usr/bin/python3 python3 -m unittest discover -s tests -p test_application_updates.py -v
+UV_CACHE_DIR=/data/.cache/uv uv run --no-project --python /usr/bin/python3 python3 -m unittest discover -s tests -p test_lifecycle_windows.py -v
+UV_CACHE_DIR=/data/.cache/uv uv run --no-project --python /usr/bin/python3 python3 tests/application_update_native.py --wayland ~/repos/xfce4-terminal/build/terminal/xfce4-terminal
 ```
 
 ## Keyboard and Mouse Behavior

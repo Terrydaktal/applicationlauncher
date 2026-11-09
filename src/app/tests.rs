@@ -1000,6 +1000,199 @@ mod tests {
     }
 
     #[test]
+    fn update_window_targets_the_terminal_owner_not_its_foreground_application_or_tmux_server() {
+        for program in ["codex", "pi", "tmux", "fish", "bash"] {
+            for session in [None, Some("work")] {
+                let mut window = console_window("exact-window-id", program, session);
+                window.exe_path = Some("/build/xfce4-terminal (deleted)".into());
+                match super::super::terminal_maintenance::window_update_target(&window) {
+                    Some(InfoUpdateTarget::TerminalWindow(window)) => {
+                        assert_eq!(window, "exact-window-id");
+                    }
+                    other => panic!("expected a terminal-owner confirmation target, got {other:?}"),
+                }
+            }
+        }
+        let mut window = test_window_info("pi - Terminal");
+        window.exe_path = None;
+        assert!(super::super::terminal_maintenance::window_update_target(&window).is_some());
+    }
+
+    #[test]
+    fn update_window_is_unavailable_for_unsupported_owners_and_invalid_window_identities() {
+        for invalid in [
+            "class",
+            "executable",
+            "missing-pid",
+            "invalid-pid",
+            "window-id",
+        ] {
+            let mut window = test_window_info("xfce4-terminal - codex - pi");
+            match invalid {
+                "class" => window.class = "firefox".into(),
+                "executable" => window.exe_path = Some("/usr/bin/firefox".into()),
+                "missing-pid" => window.pid = None,
+                "invalid-pid" => window.pid = Some(1),
+                "window-id" => window.id.clear(),
+                _ => unreachable!(),
+            }
+            assert!(
+                super::super::terminal_maintenance::window_update_target(&window).is_none(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_window_menu_item_precedes_open_window_and_requires_the_shared_confirmation() {
+        fn render(
+            ctx: &egui::Context,
+            window: &WindowInfo,
+            events: Vec<egui::Event>,
+        ) -> (egui::FullOutput, Option<PopupEvent>, bool) {
+            let mut actions = (None, false);
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640.0, 300.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    let mut target = None;
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        (target, actions.1) = super::super::view::window_open_actions(ui, window);
+                    });
+                    actions.0 = crate::popups::show_window_update_dialog(ctx, target);
+                },
+            );
+            (output, actions.0, actions.1)
+        }
+        let button = |output: &egui::FullOutput, label: &str| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == label => {
+                        Some(text.pos + text.galley.rect.center().to_vec2())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let click = |pos| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        for (supported, choice) in [
+            (false, "unsupported"),
+            (true, "This window"),
+            (true, "All outdated windows"),
+            (true, "Cancel"),
+            (true, "Escape"),
+            (true, "Enter"),
+        ] {
+            let ctx = egui::Context::default();
+            let mut window = test_window_info("tmux - codex - Terminal");
+            if !supported {
+                window.class = "firefox".into();
+            }
+            for _ in 0..2 {
+                let (_, update, open) = render(&ctx, &window, vec![]);
+                assert!(update.is_none() && !open);
+            }
+            let (output, _, _) = render(&ctx, &window, vec![]);
+            let update = button(&output, "Update window");
+            let open = button(&output, "Open window");
+            assert!(update.y < open.y);
+            let (output, event, opened) = render(&ctx, &window, click(update));
+            assert!(
+                event.is_none() && !opened,
+                "the opening click must never start an update"
+            );
+            if supported {
+                assert!(crate::popups::window_update_dialog_is_open(&ctx));
+                assert!(super::super::view::launcher_modal_open(&ctx));
+                let mut dialog = output.clone();
+                for _ in 0..3 {
+                    let (output, event, opened) = render(&ctx, &window, vec![]);
+                    assert!(event.is_none() && !opened);
+                    dialog = output;
+                }
+                for label in [
+                    "Update xfce4-terminal?",
+                    "Cancel",
+                    "This window",
+                    "All outdated windows",
+                ] {
+                    button(&dialog, label);
+                }
+                assert!(dialog.shapes.iter().any(|shape| matches!(&shape.shape,
+                    egui::Shape::Text(text) if text.galley.job.text.contains("progress and errors stay in the launcher"))));
+                let events = match choice {
+                    "Escape" | "Enter" => vec![egui::Event::Key {
+                        key: if choice == "Escape" {
+                            egui::Key::Escape
+                        } else {
+                            egui::Key::Enter
+                        },
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    label => click(button(&dialog, label)),
+                };
+                let (_, event, opened) = render(&ctx, &window, events);
+                assert!(!opened);
+                match (choice, event) {
+                    ("This window", Some(PopupEvent::UpdateTerminalWindow { window, info })) => {
+                        assert_eq!(window, "test-window");
+                        assert_eq!(info, egui::ViewportId::ROOT);
+                    }
+                    (
+                        "All outdated windows",
+                        Some(PopupEvent::UpdateTerminalWindows { window: None }),
+                    ) => {}
+                    ("Cancel" | "Escape" | "Enter", None) => {}
+                    (_, event) => panic!("unexpected action for {choice}: {event:?}"),
+                }
+                assert!(!crate::popups::window_update_dialog_is_open(&ctx));
+                for _ in 0..3 {
+                    let (_, event, opened) = render(&ctx, &window, vec![]);
+                    assert!(event.is_none() && !opened);
+                }
+            } else {
+                assert!(!crate::popups::window_update_dialog_is_open(&ctx));
+            }
+            assert!(ctx.memory(|memory| memory.top_modal_layer().is_none()));
+            assert!(
+                output
+                    .viewport_output
+                    .keys()
+                    .all(|id| *id == egui::ViewportId::ROOT)
+            );
+            let (_, event, opened) = render(&ctx, &window, click(open));
+            assert!(event.is_none() && opened);
+        }
+    }
+
+    #[test]
     fn window_version_rows_preserve_loading_and_unknown_build_status() {
         let rows = |version, pending| {
             super::super::popups::process_version_rows("Application", version, pending)

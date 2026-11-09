@@ -1,0 +1,205 @@
+{
+  "schema_version": 1,
+  "scope": "Shared program-metadata core consumer integration and exact installed/running identity",
+  "profile": "release",
+  "behaviors": [
+    {
+      "id": "METADATA-CORE-14",
+      "contract": "Native version workers preserve shared compiled Qt application-version evidence, complete fork suffixes and its visible qualification. Supported bounded Qt/KDE metadata initialization is proven from each exact pinned ELF, not today's source metadata or an arbitrary neighboring UTF-16 string. Retained and installed images remain independent; neither this evidence nor a retained desktop association changes current-image verification. No discovered GUI program is executed for this passive fallback.",
+      "tests": [
+        "program_metadata::executable::qt_application::tests",
+        "program_metadata::executable::qt_literal_constructors::tests",
+        "program_metadata::tests/shared_consumers.rs::cross_application_discovery_agrees_at_both_consumer_boundaries",
+        "pinned_running_desktop_preserves_latest_installation_and_refreshes_fields",
+        "pinned_running_desktop_cannot_promote_a_retained_image_to_published"
+      ]
+    },
+    {
+      "id": "METADATA-CORE-13",
+      "contract": "Desktop fields may belong to an exact retained running image even when the current installation points to a newer build. Installed and pinned-running association use fresh, bounded shared desktop receipts; they never alter the current installation, launch chain or publication proof. Names, copied/replaced images, hidden or non-application entries and dynamic shell commands cannot establish identity. Fresh metadata replaces stale cached fields; missing installed icons are not guessed from a checkout.",
+      "tests": [
+        "pinned_running_desktop_preserves_latest_installation_and_refreshes_fields",
+        "pinned_running_desktop_cannot_promote_a_retained_image_to_published",
+        "current_desktop_candidates_refresh_fields_after_exact_route_verification",
+        "actual_retained_desktop_keeps_current_installation_identity_separate"
+      ]
+    },
+    {
+      "id": "METADATA-CROSS-APPLICATION-01",
+      "contract": "Existing processes use shared generic native/component/desktop discovery, not app-specific frontend fallbacks. Pinned running versions remain separate from replacement disk components; compiled-initializer qualifications survive display adaptation. Exact live desktop routes restore GUI roles for forks and can identify an explicitly inferred upstream package without conferring native ownership/AUR permission. Large Ninja input observations retain original bounds and read-only log enforcement. An inaccessible deleted product library stays an explicit unknown; no application is launched, signalled or restarted by acceptance checks.",
+      "tests": [
+        "cross_application_metadata_uses_the_shared_backend_without_losing_process_evidence"
+      ],
+      "environment": [
+        "APPLICATIONLAUNCHER_TEST_SHARED_METADATA_JSON"
+      ]
+    },
+    {
+      "id": "METADATA-SSH-TOOL-01",
+      "contract": "An explicitly supplied existing SSH tunnel retains its PID/start/image and command line while metadata reports the SSH client's exact portable product version and ELF build ID separately from the openssh package release and OpenSSL dependency. The provided executable remains PET and its owning explicit Pacman package remains PEP. Per-tool capabilities preserve direct SSH service targets but do not inherit ssh-keygen's JOB role or unrelated package GUI/library roles. Package-managed compilation remains not applicable. Native process and installed-application consumers agree; no tunnel is created, changed or restarted, and only the audited trusted client -V recipe may execute if passive evidence is unavailable.",
+      "tests": [
+        "reported_ssh_keeps_exact_product_version_and_direct_tool_roles_without_touching_the_tunnel"
+      ],
+      "environment": [
+        "APPLICATIONLAUNCHER_TEST_SSH_PID",
+        "APPLICATIONLAUNCHER_TEST_SSH_START_TICKS",
+        "APPLICATIONLAUNCHER_TEST_SSH_VERSION",
+        "APPLICATIONLAUNCHER_TEST_SSH_BUILD_ID"
+      ]
+    },
+    {
+      "id": "METADATA-CODEX-HELPER-01",
+      "contract": "An existing deleted Codex code-mode host image and the independently inspected disk image retain their own compiled service versions/build IDs through the shared passive decoder. The helper inherits only exact supported Cargo target provenance from its indexed checkout, receives its own product description/CLI role, and does not borrow the parent CLI's release or desktop fields. Missing old generated Cargo inputs remain counted but alone report qualified Unknown compilation evidence, not edited source. No helper, project or version command executes.",
+      "tests": [
+        "reported_codex_helper_preserves_pinned_version_source_and_missing_generated_evidence"
+      ],
+      "environment": [
+        "APPLICATIONLAUNCHER_TEST_CODEX_HOST_PID",
+        "APPLICATIONLAUNCHER_TEST_CODEX_HOST_START_TICKS",
+        "APPLICATIONLAUNCHER_TEST_CODEX_HOST_VERSION",
+        "APPLICATIONLAUNCHER_TEST_CODEX_HOST_BUILD_ID",
+        "APPLICATIONLAUNCHER_TEST_CODEX_HOST_CHECKOUT",
+        "APPLICATIONLAUNCHER_TEST_CODEX_HOST_NEWER_INPUT"
+      ]
+    },
+    {
+      "id": "METADATA-PI-01",
+      "contract": "Pi's running SDK and extensions hashes compare independently against their own installed hashes. Only running hashes are coloured; matching code stays green when extensions differ, while stale, missing, malformed or untrusted evidence stays neutral. Installed patch verification, comparison checked/reason and coverage remain backend evidence and do not appear as redundant Show Info fields. Runtime identity and installed package metadata remain separate.",
+      "tests": ["pi_fingerprints_compare_each_running_component_without_colouring_installed_hashes", "pi_startup_build_evidence_is_separate_from_node_and_never_inferred_from_package_version", "pi_missing_fingerprints_are_neutral_even_with_a_known_build_status", "identity_values_are_red_or_green_without_colouring_labels_or_other_values", "pi_identity_rows_render_independent_colours_and_neutral_installed_hashes"]
+    },
+    {
+      "id": "METADATA-UV-PYTHON-SOURCE-01",
+      "contract": "The shared passive decoder can recover an exact uv product release from a renamed uv-bin's native initializer without executing it or mistaking uvx's shim for uv. Each pinned image retains its own version and ELF identity. The Python runtime remains UVR, independent of uv's own unresolved installation provenance. Exact Python source metadata supplies its own description and proven CLI role, and non-Git local Dev project attribution is displayed as a Source directory. Unbound helpers do not inherit nearby project versions, and current files do not establish running versions or source changes since startup.",
+      "tests": [
+        "python_source_checkout_does_not_invent_a_loaded_version_or_compilation_status",
+        "reported_uv_and_python_source_keep_product_runtime_and_source_evidence_separate"
+      ],
+      "environment": [
+        "APPLICATIONLAUNCHER_TEST_UV_PID",
+        "APPLICATIONLAUNCHER_TEST_UV_PID_START_TICKS",
+        "APPLICATIONLAUNCHER_TEST_UV_VERSION",
+        "APPLICATIONLAUNCHER_TEST_PYTHON_SOURCE_PID",
+        "APPLICATIONLAUNCHER_TEST_PYTHON_SOURCE_PID_START_TICKS",
+        "APPLICATIONLAUNCHER_TEST_PYTHON_SOURCE"
+      ]
+    },
+    {
+      "id": "METADATA-COMPILATION-NOT-APPLICABLE-01",
+      "contract": "Uncompiled changes is displayed and copied as a neutral '-' for confirmed not-applicable results in installed application, native process and hosted runtime Info. Detailed backend reasons remain intact for diagnostics. Unknown, unavailable, pending, changed and no-newer results retain their distinct meaning; other fields' not-applicable explanations are unchanged.",
+      "tests": [
+        "not_applicable_uncompiled_changes_use_dash_in_application_process_and_runtime_rows",
+        "uncompiled_changes_values_use_status_colours_in_application_and_process_info"
+      ]
+    },
+    {
+      "id": "METADATA-RECORDED-INPUTS-01",
+      "contract": "Application and process Info display the shared compact Uncompiled changes summary: observation, unique recorded inputs checked, separately counted newer and missing inputs, and added: unknown for unrecorded new inputs. Backend explanations and example paths stay out of the main row. A complete revalidated zero-newer/zero-missing observation is distinct from full build completeness, with a full-build-unknown suffix when needed; it is not a clean-build claim. Partial validated scans retain their uncertainty and cannot become a successful no-newer observation; invalidated artifacts and failed inspections cannot display false zero counts. Main-row selection and Copy preserve the exact contiguous UTF-8 text. Inspection must preserve response files and must not run project recipes.",
+      "tests": [
+        "shared_ninja_queries_preserve_response_files_and_never_execute_build_commands",
+        "shared_compact_input_counts_reach_installed_application_metadata",
+        "not_applicable_uncompiled_changes_use_dash_in_application_process_and_runtime_rows",
+        "unsupported_sources_remain_unknown_instead_of_using_repository_wide_timestamps_as_proof",
+        "uncompiled_changes_values_use_status_colours_in_application_and_process_info"
+      ]
+    },
+    {
+      "id": "METADATA-COREUTILS-VERSION-01",
+      "contract": "Expanded native-process and installed-application metadata both report the exact GNU coreutils cat product banner, preserving independent package versions and ELF build IDs. A current package-owned cat has not-applicable compilation status; an invalidated process identity suppresses running evidence while retaining separately inspected disk metadata. This opt-in system integration starts only its own stdin-blocked cat fixture and bounded --version probes, and always reaps its fixture without modifying a user's process.",
+      "tests": [
+        "package_owned_cat_versions_and_compilation_status_reach_native_info_consumers"
+      ],
+      "environment": [
+        "APPLICATIONLAUNCHER_TEST_COREUTILS_VERSION"
+      ]
+    },
+    {
+      "id": "METADATA-SUBPROCESS-01",
+      "contract": "Off-PATH native subprocess build status uses independent pinned running/disk identity and fresh exact package image evidence, not parent status or a desktop-name match. Window desktop entries are unverified child candidates until worker-side current-record/static-chain matching proves the exact image; ambiguous, missing, hidden, stale and mismatched records do not identify children. Window-only metadata and icon fallback do not leak to helpers. Verified package-managed native installations report compilation status not applicable.",
+      "tests": ["child_desktop_candidates_require_a_current_exact_desktop_record", "chrome_children_receive_the_owner_desktop_only_as_an_unverified_candidate", "ambiguous_desktop_names_or_commands_never_select_the_first_candidate", "child_desktop_candidates_remain_unverified_and_results_stay_per_process", "package_owned_off_path_process_headers_use_independent_image_proofs", "package_managed_compilation_status_is_consistent_across_native_info_consumers"],
+      "environment": ["APPLICATIONLAUNCHER_TEST_PACKAGE_IMAGE_PROCESSES", "APPLICATIONLAUNCHER_TEST_PACKAGE_DESKTOP_FILE", "APPLICATIONLAUNCHER_TEST_PACKAGE_COMPILATION_IMAGE"]
+    },
+    {
+      "id": "METADATA-PACKAGE-QUERY-01",
+      "contract": "Package-version loading text describes checking an available version rather than refreshing databases. Shared package availability coalesces identical active queries without completed-result or disk response caching; each popup retains only its explicitly captured metadata snapshot, and a new lookup can perform a fresh AUR request.",
+      "tests": ["application_details_are_published_before_the_available_package_query_finishes", "failed_package_worker_does_not_leave_the_application_info_checking_forever"]
+    },
+    {
+      "id": "METADATA-WRAPPER-IMAGE-01",
+      "contract": "Unresolved same-named source wrappers never replace the exact native image. Running and disk versions/build IDs remain available and stale cached CLI classification yields to exact immutable product metadata. A captured absolute argv0 that remains unchanged and resolves to the independently pinned installed native image verifies the comparison target even outside PATH; matching running builds are green and changed running builds are red in both headers and version fields, including unchanged version text. Retained images without that evidence, rewritten or relative argv0 and changed process identities remain unknown. The GUI and daemon publish independent passive product records in their optimized ELF images; discovered wrappers are never executed.",
+      "tests": ["native_process_metadata_survives_an_unresolved_same_name_wrapper"]
+    },
+    {
+      "id": "METADATA-LOCAL-TRUST-01",
+      "contract": "Expanded process and installed-application queries use shared explicit local grants when passive evidence is unavailable. Local results bypass the main-only inner cache so grants/revocations are reread on worker queries. Inventory discovery and inferred argv0 metadata remain passive. The pinned deleted running Fish version and the separately pinned current installation retain their own versions, build IDs and process identity without restarting the shell.",
+      "tests": ["trusted_local_probe_consumers_recheck_grants_without_executing_inferred_candidates", "trusted_fish_keeps_deleted_running_version_separate_from_current_installation"],
+      "environment": ["APPLICATIONLAUNCHER_TEST_FISH_PID", "APPLICATIONLAUNCHER_TEST_FISH_START_TICKS"]
+    },
+    {
+      "id": "METADATA-NATIVE-COMPONENT-01",
+      "contract": "CopyQ's complete Qt-object version and Mousepad's private-library version come from the shared passive reader, not executing GUI applications or borrowing source/package versions. Running Mousepad libraries require independent process-mapping proof, installed tiles use disk context, and neither a shared main image nor its build ID proves required components current. Component queries bypass the main-only inner cache and cannot reuse on-disk results as process evidence.",
+      "tests": ["private_version_components_are_independent_of_the_main_executable_build", "installed_mousepad_and_copyq_versions_use_shared_passive_product_evidence", "running_mousepad_and_copyq_keep_old_versions_separate_from_current_published_builds"],
+      "environment": ["APPLICATIONLAUNCHER_TEST_MOUSEPAD", "APPLICATIONLAUNCHER_TEST_COPYQ", "APPLICATIONLAUNCHER_TEST_MOUSEPAD_PID", "APPLICATIONLAUNCHER_TEST_COPYQ_PID"]
+    },
+    {
+      "id": "METADATA-CORE-01",
+      "contract": "Native product versions/build IDs and launch resolution use program-metadata; unknown or misleading names never authorize execution of user programs",
+      "tests": ["unknown_executables_are_never_probed_as_programs", "fifo_and_shell_scripts_named_like_allowlisted_applications_are_never_executed", "replaced_binary_reports_the_pinned_running_version_not_the_replacement", "unsupported_version_reasons_reach_info_without_becoming_version_values"]
+    },
+    {
+      "id": "METADATA-CORE-02",
+      "contract": "Installed Node and Python payload metadata is distinct from interpreter metadata; unresolved runtime launches remain Unknown and Python/Java installed versions do not claim running-loaded versions",
+      "tests": ["npm_application_tiles_use_manifest_identity_even_for_large_entry_points", "python_application_tiles_read_exact_installed_wheel_version_without_executing_it", "interpreted_launches_without_an_exact_payload_never_inherit_runtime_versions", "python_and_java_installed_versions_never_claim_the_running_loaded_version", "electron_process_details_prefer_installed_product_metadata_without_claiming_loaded_assets", "electron_info_distinguishes_running_engine_version_from_installed_product_version"]
+    },
+    {
+      "id": "METADATA-CORE-03",
+      "contract": "Build freshness delegates to the shared exact-artifact passive query plan; it does not execute project recipes or mutate response files, and unsupported/source-only inference cannot prove a clean build",
+      "tests": ["shared_ninja_queries_preserve_response_files_and_never_execute_build_commands", "shared_cargo_receipts_track_exact_artifact_without_running_project_build_scripts", "retained_pinned_old_artifact_cannot_receive_replacement_build_status", "unsupported_sources_remain_unknown_instead_of_using_repository_wide_timestamps_as_proof"]
+    },
+    {
+      "id": "METADATA-CORE-04",
+      "contract": "Verified Open Info metadata is captured once and does not expire on a render timer; observed process executable path or identity changes still invalidate it, stale generations and revisions are rejected, Pi receipt updates stay separate and network queries do not block binary details. Only unverified on-disk candidates have a ten-second bounded background refresh. Process snapshots themselves are captured when Show Info opens, not continuously monitored.",
+      "tests": ["completed_application_metadata_is_not_refetched_on_repeated_polls", "completed_metadata_survives_elapsed_time_and_refreshes_only_for_identity_changes", "completed_metadata_refreshes_for_renamed_or_deleted_path_with_same_running_inode", "renamed_running_path_cancels_queued_requests_and_rejects_in_flight_results", "expanded_pi_receipts_refresh_without_reprobing_node_or_packages", "slow_package_lookups_do_not_block_binary_metadata_and_discard_reset_results", "identity_change_during_inspection_discards_only_running_metadata"]
+    },
+    {
+      "id": "METADATA-CORE-05",
+      "contract": "Shared installation labels and package freshness preserve their own evidence; inferred upstream names never authorize AUR queries and running/installed facts stay separate",
+      "tests": ["exact_owner_targets_are_preserved_without_authorizing_inferred_aur_names", "shared_package_versions_keep_freshness_and_source_separate", "installed_application_and_process_views_share_the_same_application_fields", "process_launch_keeps_current_entry_metadata_separate_from_running_identity"]
+    },
+    {
+      "id": "METADATA-CORE-06",
+      "contract": "Renamed/deleted self-updated native images recover their current installation through shared process-context validation, without backup-filename heuristics or mistaking installed metadata for running evidence. Lost process identity cannot authorize recovery and inferred launch routes are identified as such. Recovered interpreters retain their runtime classification without borrowing the replacement's version or authorizing new executable probes.",
+      "tests": ["renamed_running_image_recovers_installation_without_a_backup_filename_pattern", "replaced_binary_reports_the_pinned_running_version_not_the_replacement", "identity_change_during_inspection_discards_only_running_metadata"]
+    },
+    {
+      "id": "METADATA-CORE-07",
+      "contract": "User-owned tmux versions are extracted passively by program-metadata from the exact pinned ELF function and referenced literal; launcher forwards complete fork versions and independently cached running/installed build identities without executing tmux. The opt-in real-artifact regression requires explicit old/current paths and does not inspect or alter a live server.",
+      "tests": ["archived_tmux_versions_remain_distinct_through_shared_metadata_and_launcher_cache"],
+      "environment": ["PROGRAM_METADATA_TEST_TMUX_OLD", "PROGRAM_METADATA_TEST_TMUX_CURRENT"]
+    },
+    {
+      "id": "METADATA-CORE-08",
+      "contract": "Unreadable proc executable/cwd preserve access errors and exact raw argv0; an absolute, live-identity-checked, regular ELF candidate provides only separately labelled passive installed metadata. Display command text, scripts, FIFOs, changed argv0, symlink retargets and stale PID identity cannot authorize a candidate. Candidate refresh and filesystem validation occur on workers, never during painting.",
+      "tests": ["unreadable_proc_paths_keep_errors_and_raw_argv0_without_fabricating_executable", "truncated_or_empty_argv0_is_not_reconstructed_from_display_command_line", "inaccessible_running_image_recovers_only_passive_absolute_argv0_disk_metadata", "absolute_raw_argv0_candidates_are_background_bounded_and_never_use_display_text", "inferred_candidate_refresh_is_worker_only_and_does_not_stale_verified_metadata", "inaccessible_process_details_keep_permission_errors_separate_from_candidate_paths"]
+    },
+    {
+      "id": "METADATA-CORE-09",
+      "contract": "Python's exact version, genuine absence of a GNU build ID, uv runtime provenance and current validated .venv route stay independent. Script source checkout attribution does not invent a running-loaded version, installed distribution version or compilation status, and prebuilt uv runtime compilation status is not applicable.",
+      "tests": ["python_runtime_launch_keeps_exact_venv_argv0_without_claiming_a_different_image", "python_build_id_absence_is_independent_of_version_and_process_access", "python_source_checkout_does_not_invent_a_loaded_version_or_compilation_status", "python_and_java_application_groups_never_borrow_runtime_versions_or_packages"]
+    },
+    {
+      "id": "METADATA-CORE-10",
+      "contract": "Native browser freshness accepts a verified current desktop-entry wrapper chain in addition to published binary aliases. Headers and the running Version (ELF build ID) share the verified comparison, while the on-disk version always stays neutral. Unknown, inaccessible, missing/stale desktop, unrelated wrapper and retained-only identities also stay neutral. Collapsed checks remain cached, background-only and free of package lookups.",
+      "tests": ["browser_wrappers_verify_the_current_desktop_target_for_header_and_elf_colours", "browser_headers_and_running_versions_are_coloured_but_disk_versions_stay_neutral", "only_running_version_carries_freshness_without_a_separate_status_row", "on_disk_versions_stay_neutral_for_all_build_ids_and_comparisons", "collapsed_header_checks_are_cached_without_package_lookups_and_expand_on_demand"]
+    },
+    {
+      "id": "METADATA-CORE-11",
+      "contract": "Show Info combines running Version (ELF build ID) and Latest version on disk (ELF build ID) values as version (ID), without duplicate standalone ELF-ID rows. Process/runtime scopes are preserved and only the running version gets green/red comparison colouring; on-disk versions, missing IDs and installation-only views stay neutral. Diagnostic reasons remain visible and identical loading/unavailable messages are not duplicated. Tmux SHA256 rows follow their corresponding combined version field.",
+      "tests": ["combined_version_fields_use_the_requested_format_and_preserve_scope_and_freshness", "combined_version_fields_keep_loading_and_missing_builds_neutral_without_duplicates", "only_running_version_carries_freshness_without_a_separate_status_row", "on_disk_versions_stay_neutral_for_all_build_ids_and_comparisons", "browser_headers_and_running_versions_are_coloured_but_disk_versions_stay_neutral", "python_build_id_absence_is_independent_of_version_and_process_access"]
+    },
+    {
+      "id": "METADATA-CORE-12",
+      "contract": "Application and process Show Info colour Uncompiled changes observations and compact checked/newer/missing counts green for No, red for Yes and yellow for Unknown. Only explicit added: unknown, full build status unknown and scan incomplete suffixes are yellow independently of a known observation; no uncertainty text is dropped. Detailed explanations remain backend evidence, while field-label scope colours and original contiguous selected/copied UTF-8 bytes are preserved. Loading, unavailable and not-applicable values stay neutral. Absent desktop entries show None and dashes for their icon/name/comment fields, while pending discovery and known expected missing paths remain distinct.",
+      "tests": ["uncompiled_changes_values_use_status_colours_in_application_and_process_info", "absent_desktop_entries_use_none_and_dashes_for_apps_and_processes", "pending_desktop_entries_are_not_reported_as_absent", "application_desktop_file_row_combines_path_and_captured_existence"]
+    }
+  ]
+}
