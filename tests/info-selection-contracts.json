@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "scope": "Show Info continuous process-tree selection and rich clipboard copying",
+  "profile": "release",
+  "behaviors": [
+    {
+      "id": "INFO-SELECTION-01",
+      "contract": "Dragging selects continuously across the heading, process headers and expanded metadata at normal and high DPI without toggling sections; headers use the arrow pointer while metadata keeps its text cursor",
+      "tests": [
+        "selection_spans_the_entire_tree_including_headings_and_supports_the_copy_menu",
+        "process_headers_use_arrow_pointers_without_changing_field_text_cursors",
+        "hosted_metadata_dropdowns_preserve_selection_copying_and_independent_state"
+      ]
+    },
+    {
+      "id": "INFO-SELECTION-02",
+      "contract": "Right-click preserves a nonempty selection and offers Copy and Copy HTML; an open menu retains its selected fragment across metadata changes",
+      "tests": [
+        "right_click_preserves_selection_and_copy_actions_in_headers_and_details"
+      ]
+    },
+    {
+      "id": "INFO-SELECTION-03",
+      "contract": "Plain copying preserves raw Unicode; HTML copies only the selected fragment, escapes markup and retains field colours and strikethrough",
+      "tests": [
+        "html_contains_only_the_selected_unicode_text_and_escapes_active_content",
+        "html_preserves_colours_and_strikes_while_plain_copy_keeps_the_raw_marks",
+        "info_tree_headings_and_selectable_headers_render_strikes_and_keep_raw_copying"
+      ]
+    },
+    {
+      "id": "INFO-SELECTION-04",
+      "contract": "Copying is disabled without a selection; clipboard failures remain visible and allow retry rather than silently replacing the clipboard with plain text",
+      "tests": [
+        "empty_selection_does_not_copy_and_clipboard_failures_are_visible"
+      ]
+    },
+    {
+      "id": "INFO-SELECTION-05",
+      "contract": "Native clipboard transport offers both text/html and plain text on X11 and Wayland; these opt-in tests use disposable displays, runtime directories and session buses",
+      "tests": [
+        "rich_clipboard_roundtrip_on_private_x11",
+        "rich_clipboard_roundtrip_on_private_wayland"
+      ]
+    },
+    {
+      "id": "INFO-SELECTION-06",
+      "contract": "Live metadata updates preserve anchored selection and clamp changed text; native info windows retain independent selection and collapse state",
+      "tests": [
+        "live_updates_keep_unique_tree_selections_anchored_and_clamp_changed_text",
+        "process_header_text_is_selectable_and_copyable_across_viewport_and_metadata_updates",
+        "selecting_and_copying_across_rows_in_a_process_dropdown_survives_title_updates"
+      ]
+    },
+    {
+      "id": "INFO-SELECTION-07",
+      "contract": "Continuous selection retains readable section spacing, compact tree indentation, wheel settings, natural height and independent dropdowns without drag-to-pan, a top copy-all button or a reserved button row",
+      "tests": [
+        "dragging_info_background_does_not_pan_the_document",
+        "info_wheel_sensitivity_changes_live_on_both_axes_without_resetting_scroll",
+        "process_dropdowns_use_compact_depth_for_arrows_headers_and_details",
+        "process_tree_restores_heading_and_section_spacing_without_widening_field_rows",
+        "process_dropdowns_are_independent_and_keep_the_hierarchy_visible",
+        "natural_info_height_adds_eight_pixels_to_the_actual_visible_tree"
+      ]
+    }
+  ]
+}

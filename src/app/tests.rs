@@ -2,6 +2,7 @@ use super::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::windows::versions::PackageVersionSource;
     use fuzzy_rank::fields::fuzzy::{MetadataCandidate, MetadataQuery, SearchField};
 
     #[test]
@@ -1015,7 +1016,7 @@ mod tests {
             ..Default::default()
         };
         let rows = rows(Some(&version), false);
-        assert_eq!(rows.len(), 10);
+        assert_eq!(rows.len(), 8);
         assert!(
             !rows
                 .iter()
@@ -1048,16 +1049,14 @@ mod tests {
             for (version, pending) in [(None, true), (None, false), (Some(&version), false)] {
                 let rows = super::super::popups::process_version_rows(role, version, pending);
                 let mut expected = vec![
-                    "Version",
-                    "ELF build ID",
-                    "Latest version (on disk)",
-                    "Latest ELF build ID (on disk)",
+                    "Version (ELF build ID)",
+                    "Latest version on disk (ELF build ID)",
                     "Uncompiled changes",
                     "Type",
                     "Package",
                 ];
                 if version.is_some() {
-                    expected.push("Latest package version (Pacman/AUR)");
+                    expected.push("Latest version (Pacman/AUR)");
                 }
                 expected.extend(["Launch chain", "Description", "Capabilities"]);
                 assert_eq!(
@@ -1088,18 +1087,16 @@ mod tests {
         let rows = super::super::popups::process_version_rows("Application", Some(&version), false);
         let value = |label: &str| &rows.iter().find(|row| row.label == label).unwrap().value;
         assert_eq!(
-            value("Version"),
-            "Unavailable (process exited before inspection)"
-        );
-        assert_eq!(
-            value("ELF build ID"),
+            value("Version (ELF build ID)"),
             "Unavailable (process exited before inspection)"
         );
         assert_eq!(value("Description"), "Unprivileged sandboxing tool");
         assert_eq!(value("Capabilities"), "CLI");
         assert_eq!(value("Package"), "bubblewrap 0.11.2-1.1");
-        assert_eq!(value("Latest version (on disk)"), "bubblewrap 0.11.2");
-        assert_eq!(value("Latest ELF build ID (on disk)"), "on-disk-build-id");
+        assert_eq!(
+            value("Latest version on disk (ELF build ID)"),
+            "bubblewrap 0.11.2 (on-disk-build-id)"
+        );
         assert!(
             rows.iter()
                 .all(|row| !row.searched && row.binary_is_current.is_none())
@@ -1143,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn running_elf_id_carries_freshness_without_a_separate_status_row() {
+    fn only_running_version_carries_freshness_without_a_separate_status_row() {
         for role in ["Application", "Node.js runtime"] {
             for current in [Some(true), Some(false), None] {
                 for build_id in [
@@ -1164,7 +1161,10 @@ mod tests {
                         .iter()
                         .position(|row| {
                             row.label
-                                == super::super::popups::info_metadata_label(role, "ELF build ID")
+                                == super::super::popups::info_metadata_label(
+                                    role,
+                                    "Version (ELF build ID)",
+                                )
                         })
                         .unwrap();
                     let running = &rows[running_index];
@@ -1173,29 +1173,48 @@ mod tests {
                         super::super::popups::info_metadata_label(role, "capabilities")
                     );
                     assert_eq!(
-                        rows[running_index - 1].label,
-                        super::super::popups::info_metadata_label(role, "version")
-                    );
-                    assert_eq!(
                         rows[running_index + 1].label,
-                        super::super::popups::info_metadata_label(role, "latest version (on disk)")
-                    );
-                    assert_eq!(
-                        rows[running_index + 2].label,
                         super::super::popups::info_metadata_label(
                             role,
-                            "latest ELF build ID (on disk)"
+                            "Latest version on disk (ELF build ID)"
                         )
                     );
                     assert_eq!(
                         running.binary_is_current,
                         build_id.filter(|id| !id.is_empty()).and(current)
                     );
+                    assert_eq!(rows[running_index + 1].binary_is_current, None);
                     assert!(
                         rows.iter()
                             .filter(|row| row.label != running.label)
                             .all(|row| row.binary_is_current.is_none())
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn on_disk_versions_stay_neutral_for_all_build_ids_and_comparisons() {
+        for build_id in [None, Some(""), Some(" "), Some("installed-build-id")] {
+            for unavailable in [false, true] {
+                for current in [Some(true), Some(false), None] {
+                    let version = crate::windows::versions::ProcessVersion {
+                        latest_build_id: build_id.map(String::from),
+                        running_latest_binary: current,
+                        running_unavailable: unavailable.then_some("process changed"),
+                        ..Default::default()
+                    };
+                    let rows = super::super::popups::process_version_rows(
+                        "Application",
+                        Some(&version),
+                        false,
+                    );
+                    let latest = rows
+                        .iter()
+                        .find(|row| row.label == "Latest version on disk (ELF build ID)")
+                        .unwrap();
+                    assert_eq!(latest.binary_is_current, None);
                 }
             }
         }
@@ -1218,26 +1237,29 @@ mod tests {
         assert!(
             pending
                 .iter()
-                .any(|row| row.label == "Latest package version (Pacman/AUR)"
-                    && row.value == "Checking Pacman/AUR...")
+                .any(|row| row.label == "Latest version (Pacman/AUR)"
+                    && row.value == "Checking available package version...")
         );
-        version.latest_package_version =
-            Some("extra/xfce4-terminal 1.2.0-1 (Last Pacman sync: 2026-10-07)".into());
+        version.latest_package_version = Some(crate::windows::versions::available_package_fixture(
+            PackageVersionSource::Pacman,
+            "extra/xfce4-terminal 1.2.0-1",
+        ));
         let rows = super::super::popups::process_version_rows("Application", Some(&version), false);
+        assert!(rows.iter().any(|row| row.label == "Version (ELF build ID)"
+            && row.value == "running binary (Unavailable)"));
         assert!(
             rows.iter()
-                .any(|row| row.label == "Version" && row.value == "running binary")
-        );
-        assert!(
-            rows.iter()
-                .any(|row| row.label == "Latest version (on disk)"
-                    && row.value == "on disk binary")
+                .any(|row| row.label == "Latest version on disk (ELF build ID)"
+                    && row.value == "on disk binary (Unavailable)")
         );
         let repository = rows
             .iter()
-            .find(|row| row.label == "Latest package version (Pacman/AUR)")
+            .find(|row| row.label == "Latest version (in last Pacman sync)")
             .unwrap();
-        assert_eq!(repository.value, version.latest_package_version.unwrap().display());
+        assert_eq!(
+            repository.value,
+            version.latest_package_version.unwrap().display()
+        );
         assert!(repository.binary_is_current.is_none() && !repository.searched);
     }
 
@@ -1264,7 +1286,10 @@ mod tests {
                             || row.label.contains("update source")
                             || row.value.contains("No exact Pacman/AUR"))
                 );
-                assert!(rows.iter().any(|row| row.value == "local on-disk version"));
+                assert!(
+                    rows.iter()
+                        .any(|row| row.value == "local on-disk version (Unavailable)")
+                );
                 assert!(rows.iter().any(|row| row.label
                     == super::super::popups::info_metadata_label(role, "uncompiled changes")
                     && row.value == "Yes"));
@@ -1288,9 +1313,12 @@ mod tests {
             };
             for latest in [
                 None,
-                Some("extra/fish 4.6.0-1 (Last Pacman sync: 2026-10-07)"),
+                Some(crate::windows::versions::available_package_fixture(
+                    PackageVersionSource::Pacman,
+                    "extra/fish 4.6.0-1",
+                )),
             ] {
-                version.latest_package_version = latest.map(Into::into);
+                version.latest_package_version = latest.clone();
                 for role in ["Application", "Runtime"] {
                     let rows =
                         super::super::popups::process_version_rows(role, Some(&version), false);
@@ -1300,11 +1328,21 @@ mod tests {
                             row.label
                                 == super::super::popups::info_metadata_label(
                                     role,
-                                    "latest package version (Pacman/AUR)",
+                                    latest
+                                        .as_ref()
+                                        .map_or("latest version (Pacman/AUR)", |version| {
+                                            version.field_label()
+                                        }),
                                 )
                         })
                         .expect("forks and clones must retain the upstream package comparison");
-                    assert_eq!(package.value, latest.unwrap_or("Checking Pacman/AUR..."));
+                    assert_eq!(
+                        package.value,
+                        latest
+                            .as_ref()
+                            .map(|version| version.display())
+                            .unwrap_or_else(|| { "Checking available package version...".into() })
+                    );
                     assert!(!rows.iter().any(|row| row.label.ends_with("update source")));
                 }
             }
@@ -1325,9 +1363,10 @@ mod tests {
                     name: "runtime".into(),
                     inferred: false,
                 }),
-                latest_package_version: Some(
-                    "core/runtime 1.0 (Last Pacman sync: 2026-10-07)".into(),
-                ),
+                latest_package_version: Some(crate::windows::versions::available_package_fixture(
+                    PackageVersionSource::Pacman,
+                    "core/runtime 1.0",
+                )),
                 ..Default::default()
             };
             if runtime == "Node.js" {
@@ -1369,7 +1408,10 @@ mod tests {
                 inferred: true,
             });
             version.application_latest_package_version =
-                Some("aur/upstream-app 2.0 (Paru/AUR)".into());
+                Some(crate::windows::versions::available_package_fixture(
+                    PackageVersionSource::Aur,
+                    "aur/upstream-app 2.0",
+                ));
             let application = super::super::popups::application_version_rows(
                 "Application",
                 Some(&version),
@@ -1378,8 +1420,8 @@ mod tests {
             assert!(
                 application
                     .iter()
-                    .any(|row| row.label == "Latest package version (Pacman/AUR)"
-                        && row.value == "aur/upstream-app 2.0 (Paru/AUR)"),
+                    .any(|row| row.label == "Latest version (AUR)"
+                        && row.value == "aur/upstream-app 2.0 (checked 2 minutes ago)"),
                 "{runtime}"
             );
             assert!(
@@ -1393,8 +1435,8 @@ mod tests {
             assert!(
                 runtime_rows
                     .iter()
-                    .any(|row| row.label == "Latest package version (Pacman/AUR)"
-                        && row.value == "core/runtime 1.0 (Last Pacman sync: 2026-10-07)"),
+                    .any(|row| row.label == "Latest version (in last Pacman sync)"
+                        && row.value == "core/runtime 1.0 (synced 2 days ago)"),
                 "{runtime}"
             );
         }
@@ -1461,7 +1503,10 @@ mod tests {
             "/installed/pi/package.json"
         );
         assert!(value("Running version").starts_with("Unknown"));
-        assert_eq!(runtime_value("Version"), "v26.4.0");
+        assert_eq!(
+            runtime_value("Version (ELF build ID)"),
+            "v26.4.0 (Unavailable)"
+        );
         assert_eq!(value("Description"), "Pi coding agent");
         assert_eq!(
             value("Capabilities"),
@@ -1475,11 +1520,11 @@ mod tests {
         assert!(
             !rows
                 .iter()
-                .any(|row| row.label == "Latest package version (Pacman/AUR)")
+                .any(|row| row.label == "Latest version (Pacman/AUR)")
         );
         assert_eq!(runtime_value("Type"), "PEP");
         assert_eq!(value("Type"), "NET");
-        assert!(!rows.iter().any(|row| row.label == "Version"));
+        assert!(!rows.iter().any(|row| row.label == "Version (ELF build ID)"));
         assert!(
             rows.iter()
                 .all(|row| !row.searched && !row.separator_before)
@@ -1494,9 +1539,6 @@ mod tests {
 
     fn hosted_process(name: &str, executable: &str) -> ProcessInfoNode {
         ProcessInfoNode {
-            executable_error: None,
-            cwd_error: None,
-            raw_argv0: None,
             identity: ProcessIdentity {
                 pid: 42,
                 start_ticks: 100,
@@ -1507,8 +1549,11 @@ mod tests {
             script_name: None,
             header: format!("{name} (pid 42) - {executable}").into(),
             executable: Some(executable.into()),
+            executable_error: None,
             executable_identity: None,
             cwd: Some("/work".into()),
+            cwd_error: None,
+            raw_argv0: None,
             command_line: Some(name.into()),
         }
     }
@@ -1622,12 +1667,12 @@ mod tests {
             for role in ["Application", "Runtime", "Custom role"] {
                 let rows = super::super::popups::process_version_rows(role, None, pending);
                 assert!(
-                    rows[..2]
+                    rows[..1]
                         .iter()
                         .all(|row| row.scope == InfoFieldScope::RunningInstance)
                 );
                 assert!(
-                    rows[2..]
+                    rows[1..]
                         .iter()
                         .all(|row| row.scope == InfoFieldScope::Installation)
                 );
@@ -1665,8 +1710,7 @@ mod tests {
                 let running = matches!(
                     row.label.as_str(),
                     "Executable path"
-                        | "Version"
-                        | "ELF build ID"
+                        | "Version (ELF build ID)"
                         | "Running version"
                         | "Running entry point"
                         | "Running code fingerprint"
@@ -1704,13 +1748,8 @@ mod tests {
             groups[1]
                 .rows
                 .iter()
-                .any(|row| row.label == "Version" && row.value == "v26.4.0")
-        );
-        assert!(
-            groups[1]
-                .rows
-                .iter()
-                .any(|row| row.label == "ELF build ID" && row.value == "node-build-id")
+                .any(|row| row.label == "Version (ELF build ID)"
+                    && row.value == "v26.4.0 (node-build-id)")
         );
         let mut closed = egui::collapsing_header::CollapsingState::load_with_default_open(
             &ctx,
@@ -1756,6 +1795,90 @@ mod tests {
                     .all(|row| row.label != "Identification")
             );
         }
+    }
+
+    #[test]
+    fn hosted_metadata_headers_compare_application_and_runtime_independently() {
+        use crate::windows::versions::{
+            NodeApplication, PiBuildEvidence, PiBuildStatus, ProcessVersion,
+        };
+        let node = hosted_process("pi", "/usr/bin/node");
+        let id = egui::Id::new("independent-hosted-freshness");
+        for (status, application_current) in [
+            (None, None),
+            (Some(PiBuildStatus::Current), Some(true)),
+            (Some(PiBuildStatus::RestartRequired), Some(false)),
+            (Some(PiBuildStatus::InstallationUpdateRequired), Some(false)),
+            (Some(PiBuildStatus::Unknown), None),
+        ] {
+            for runtime_current in [Some(true), Some(false), None] {
+                for unavailable in [false, true] {
+                    for open in [false, true] {
+                        let ctx = egui::Context::default();
+                        let version = ProcessVersion {
+                            runtime_name: Some("Node.js"),
+                            application: Some(NodeApplication {
+                                package: "@earendil-works/pi-coding-agent".into(),
+                                installed_version: "0.84.2".into(),
+                                entry_point: "/installed/pi/dist/cli.js".into(),
+                                manifest: "/installed/pi/package.json".into(),
+                                identification: "test fixture",
+                            }),
+                            application_build: status.map(|status| PiBuildEvidence {
+                                status,
+                                ..Default::default()
+                            }),
+                            running_latest_binary: runtime_current,
+                            running_unavailable: unavailable.then_some("process changed"),
+                            ..Default::default()
+                        };
+                        for key in ["hosted-application", "runtime"] {
+                            let mut state =
+                                egui::collapsing_header::CollapsingState::load_with_default_open(
+                                    &ctx,
+                                    id.with(key),
+                                    true,
+                                );
+                            state.set_open(open);
+                            state.store(&ctx);
+                        }
+                        let groups = super::super::popups::hosted_metadata_sections(
+                            &ctx,
+                            id,
+                            &node,
+                            Some(&version),
+                        );
+                        assert_eq!(groups[0].header.as_ref(), "Application: Pi");
+                        assert_eq!(groups[1].header.as_ref(), "Runtime: Node.js");
+                        assert_eq!(
+                            groups[0].binary_is_current,
+                            if unavailable {
+                                None
+                            } else {
+                                application_current
+                            },
+                        );
+                        assert_eq!(
+                            groups[1].binary_is_current,
+                            if unavailable { None } else { runtime_current },
+                        );
+                        assert_eq!(groups[0].rows.is_empty(), !open);
+                        assert_eq!(groups[1].rows.is_empty(), !open);
+                    }
+                }
+            }
+        }
+        let loading = super::super::popups::hosted_metadata_sections(
+            &egui::Context::default(),
+            id,
+            &node,
+            None,
+        );
+        assert!(
+            loading
+                .iter()
+                .all(|section| section.binary_is_current.is_none())
+        );
     }
 
     #[test]
@@ -1844,14 +1967,19 @@ mod tests {
                 groups[0]
                     .rows
                     .iter()
-                    .take(5)
+                    .take(6)
                     .map(|row| row.label.as_str())
                     .collect::<Vec<_>>(),
                 [
                     "Kind",
                     "Launch target",
                     "Running version",
-                    "Build status",
+                    if runtime == "Python" {
+                        "Source changes since start"
+                    } else {
+                        "Build status"
+                    },
+                    "Installed version",
                     "Package",
                 ]
             );
@@ -1859,7 +1987,8 @@ mod tests {
                 groups[1]
                     .rows
                     .iter()
-                    .any(|row| row.label == "Version" && row.value == "runtime 99")
+                    .any(|row| row.label == "Version (ELF build ID)"
+                        && row.value == "runtime 99 (Unavailable)")
             );
         }
     }
@@ -1889,7 +2018,7 @@ mod tests {
             rows.into_iter().find(|row| row.label == name).unwrap()
         };
         assert!(!rows.iter().any(|row| row.label == "Build status"));
-        for label in ["Running code fingerprint", "Latest extensions fingerprint"] {
+        for label in ["Running code fingerprint", "Running extensions fingerprint"] {
             let fingerprint = row(rows.clone(), label);
             assert_eq!(fingerprint.value, "Unknown");
             assert_eq!(fingerprint.binary_is_current, None);
@@ -1907,9 +2036,23 @@ mod tests {
                 running_version: Some("0.84.2".into()),
                 running_entry: Some("/old/pi/dist/cli.js".into()),
                 running_sdk: Some("a".repeat(64)),
-                latest_sdk: Some("b".repeat(64)),
+                latest_sdk: Some(
+                    if status == PiBuildStatus::Current {
+                        "a"
+                    } else {
+                        "b"
+                    }
+                    .repeat(64),
+                ),
                 running_extensions: Some("c".repeat(64)),
-                latest_extensions: Some("d".repeat(64)),
+                latest_extensions: Some(
+                    if status == PiBuildStatus::Current {
+                        "c"
+                    } else {
+                        "d"
+                    }
+                    .repeat(64),
+                ),
                 scope: Some("Pi SDK and loaded extensions".into()),
                 record_path: Some("/run/user/1000/pi/processes/42-99.json".into()),
                 ..Default::default()
@@ -1939,7 +2082,6 @@ mod tests {
                 "Installed version",
                 "Latest installed code fingerprint",
                 "Latest extensions fingerprint",
-                "Installed patch verification",
                 "Installed package manifest",
                 "Installed build manifest",
                 "Capabilities",
@@ -1953,7 +2095,7 @@ mod tests {
             for fingerprint in &rows {
                 let expected = if matches!(
                     fingerprint.label.as_str(),
-                    "Running code fingerprint" | "Latest extensions fingerprint"
+                    "Running code fingerprint" | "Running extensions fingerprint"
                 ) {
                     color
                 } else {
@@ -1986,28 +2128,115 @@ mod tests {
             );
             assert_eq!(
                 row(rows.clone(), "Latest installed code fingerprint").value,
-                "b".repeat(64)
+                if status == PiBuildStatus::Current {
+                    "a"
+                } else {
+                    "b"
+                }
+                .repeat(64)
             );
             assert_eq!(
                 row(rows.clone(), "Latest extensions fingerprint").value,
-                "d".repeat(64)
+                if status == PiBuildStatus::Current {
+                    "c"
+                } else {
+                    "d"
+                }
+                .repeat(64)
             );
             assert_eq!(
                 row(
                     super::super::popups::process_version_rows("Runtime", Some(&version), false),
-                    "ELF build ID"
+                    "Version (ELF build ID)"
                 )
                 .value,
-                "node-elf-identity"
+                "v26.4.0 (node-elf-identity)"
             );
             assert_eq!(
                 row(
                     super::super::popups::process_version_rows("Runtime", Some(&version), false),
-                    "ELF build ID"
+                    "Version (ELF build ID)"
                 )
                 .binary_is_current,
                 Some(true)
             );
+        }
+    }
+
+    #[test]
+    fn pi_fingerprints_compare_each_running_component_without_colouring_installed_hashes() {
+        use crate::windows::versions::{
+            NodeApplication, PiBuildEvidence, PiBuildStatus, ProcessVersion,
+        };
+        for (status, same_code, same_extensions) in [
+            (PiBuildStatus::Current, true, true),
+            (PiBuildStatus::RestartRequired, true, false),
+            (PiBuildStatus::RestartRequired, false, true),
+            (PiBuildStatus::RestartRequired, false, false),
+            (PiBuildStatus::InstallationUpdateRequired, true, true),
+            (PiBuildStatus::Unknown, true, true),
+        ] {
+            let version = ProcessVersion {
+                runtime_name: Some("Node.js"),
+                application: Some(NodeApplication {
+                    package: "@earendil-works/pi-coding-agent".into(),
+                    installed_version: "0.84.2".into(),
+                    entry_point: "/pi/dist/cli.js".into(),
+                    manifest: "/pi/package.json".into(),
+                    identification: "Test fixture",
+                }),
+                application_build: Some(PiBuildEvidence {
+                    status,
+                    running_sdk: Some("a".repeat(64)),
+                    latest_sdk: Some(if same_code { "A" } else { "b" }.repeat(64)),
+                    running_extensions: Some("c".repeat(64)),
+                    latest_extensions: Some(if same_extensions { "c" } else { "d" }.repeat(64)),
+                    patches: Some("verified".into()),
+                    checked_at_ms: Some(1794184262526),
+                    check_age_seconds: Some(28),
+                    reason: "A different extension does not make the running SDK outdated".into(),
+                    scope: Some("Compiled SDK and extensions".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let rows = super::super::popups::application_version_rows(
+                "Application",
+                Some(&version),
+                false,
+            );
+            for (label, same) in [
+                ("Running code fingerprint", same_code),
+                ("Running extensions fingerprint", same_extensions),
+            ] {
+                let row = rows.iter().find(|row| row.label == label).unwrap();
+                assert_eq!(
+                    row.binary_is_current,
+                    (status != PiBuildStatus::Unknown).then_some(same),
+                    "{label}, {status:?}"
+                );
+            }
+            for label in [
+                "Latest installed code fingerprint",
+                "Latest extensions fingerprint",
+            ] {
+                assert_eq!(
+                    rows.iter()
+                        .find(|row| row.label == label)
+                        .unwrap()
+                        .binary_is_current,
+                    None,
+                    "{label}"
+                );
+            }
+            for removed in [
+                "Installed patch verification",
+                "Build comparison checked",
+                "Build comparison reason",
+                "Fingerprint coverage",
+            ] {
+                assert!(!rows.iter().any(|row| row.label == removed), "{removed}");
+            }
         }
     }
 
@@ -2022,32 +2251,59 @@ mod tests {
             PiBuildStatus::InstallationUpdateRequired,
             PiBuildStatus::Unknown,
         ] {
-            for fingerprint in [None, Some(String::new()), Some("   ".into())] {
-                let version = ProcessVersion {
-                    runtime_name: Some("Node.js"),
-                    application: Some(NodeApplication {
-                        package: "@earendil-works/pi-coding-agent".into(),
-                        installed_version: "0.85.0".into(),
-                        entry_point: "/pi/dist/cli.js".into(),
-                        manifest: "/pi/package.json".into(),
-                        identification: "Test fixture",
-                    }),
-                    application_build: Some(PiBuildEvidence {
-                        status,
-                        running_sdk: fingerprint.clone(),
-                        latest_extensions: fingerprint,
+            for fingerprint in [
+                None,
+                Some(String::new()),
+                Some("   ".into()),
+                Some("not-a-hash".into()),
+                Some("g".repeat(64)),
+                Some("a".repeat(63)),
+            ] {
+                for missing_latest in [false, true] {
+                    let version = ProcessVersion {
+                        runtime_name: Some("Node.js"),
+                        application: Some(NodeApplication {
+                            package: "@earendil-works/pi-coding-agent".into(),
+                            installed_version: "0.85.0".into(),
+                            entry_point: "/pi/dist/cli.js".into(),
+                            manifest: "/pi/package.json".into(),
+                            identification: "Test fixture",
+                        }),
+                        application_build: Some(PiBuildEvidence {
+                            status,
+                            running_sdk: if missing_latest {
+                                Some("a".repeat(64))
+                            } else {
+                                fingerprint.clone()
+                            },
+                            latest_sdk: if missing_latest {
+                                fingerprint.clone()
+                            } else {
+                                Some("a".repeat(64))
+                            },
+                            running_extensions: if missing_latest {
+                                Some("b".repeat(64))
+                            } else {
+                                fingerprint.clone()
+                            },
+                            latest_extensions: if missing_latest {
+                                fingerprint.clone()
+                            } else {
+                                Some("b".repeat(64))
+                            },
+                            ..Default::default()
+                        }),
                         ..Default::default()
-                    }),
-                    ..Default::default()
-                };
-                let rows = super::super::popups::application_version_rows(
-                    "Application",
-                    Some(&version),
-                    false,
-                );
-                for label in ["Running code fingerprint", "Latest extensions fingerprint"] {
-                    let row = rows.iter().find(|row| row.label == label).unwrap();
-                    assert_eq!(row.binary_is_current, None, "{label}, {status:?}");
+                    };
+                    let rows = super::super::popups::application_version_rows(
+                        "Application",
+                        Some(&version),
+                        false,
+                    );
+                    for label in ["Running code fingerprint", "Running extensions fingerprint"] {
+                        let row = rows.iter().find(|row| row.label == label).unwrap();
+                        assert_eq!(row.binary_is_current, None, "{label}, {status:?}");
+                    }
                 }
             }
         }
@@ -2107,14 +2363,12 @@ mod tests {
                 "Minimized",
                 "Last activated",
                 "Activation sequence",
-                "Version",
-                "ELF build ID",
-                "Latest version (on disk)",
-                "Latest ELF build ID (on disk)",
+                "Version (ELF build ID)",
+                "Latest version on disk (ELF build ID)",
                 "Uncompiled changes",
                 "Type",
                 "Package",
-                "Latest package version (Pacman/AUR)",
+                "Latest version (Pacman/AUR)",
                 "Launch chain",
                 "Description",
                 "Capabilities",
@@ -2140,11 +2394,16 @@ mod tests {
                     .as_str()
             };
             assert_eq!(value("Geometry"), "x=0, y=0, width=800, height=600");
-            assert_eq!(value("Version"), "running version");
-            assert_eq!(value("Latest version (on disk)"), "latest version");
+            assert_eq!(
+                value("Version (ELF build ID)"),
+                "running version (Unavailable)"
+            );
+            assert_eq!(
+                value("Latest version on disk (ELF build ID)"),
+                "latest version (latest-elf-id)"
+            );
             assert_eq!(value("Uncompiled changes"), "Yes");
             assert_eq!(value("Type"), "FRK");
-            assert_eq!(value("Latest ELF build ID (on disk)"), "latest-elf-id");
             let searched_labels = vec!["Applicationlauncher title", "Application key"];
             assert_eq!(
                 rows.iter()

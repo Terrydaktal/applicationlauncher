@@ -21,6 +21,7 @@ rusqlite = { version = "0.37.0", features = ["bundled"] }
 signal-hook = "0.3.18"
 libc = "0.2.174"
 libpulse-sys = "1.23.0"
+arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 
 # Keep routine checks and tests compact. Full production DWARF remains enabled
 # in the release profile and is preserved by build-debuggable-release.

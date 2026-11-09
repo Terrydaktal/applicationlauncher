@@ -1,6 +1,8 @@
 use eframe::egui;
 
 pub(crate) mod foreground;
+mod selection;
+mod tree;
 
 const PROCESS_TREE_INDENT: f32 = 12.0;
 const INFO_POPUP_MARGIN: i8 = 16;
@@ -10,7 +12,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use crate::models::{InfoFieldScope, InfoPopupData, InfoPopupRow, PopupEvent, ProcessIdentity};
+use crate::models::{
+    InfoFieldScope, InfoPopupData, InfoPopupRow, PopupEvent, ProcessIdentity,
+};
 
 pub(crate) fn process_info_section_id(
     window: impl std::hash::Hash,
@@ -72,7 +76,7 @@ fn installation_palette_color(badge: &str) -> Option<egui::Color32> {
         "CUP" | "CUT" | "CUL" => muted(198, 91, 50),
         "NEP" | "NET" | "NEL" => egui::Color32::from_rgb(100, 155, 255),
         "NDP" | "NDT" | "NDL" | "NUP" | "NUT" | "NUL" => muted(59, 130, 246),
-        "UEP" | "UET" | "UEL" => egui::Color32::from_rgb(168, 85, 247),
+        "UEP" | "UET" | "UEL" | "UVR" => egui::Color32::from_rgb(168, 85, 247),
         "UDP" | "UDT" | "UDL" | "UUP" | "UUT" | "UUL" => muted(168, 85, 247),
         "POP" | "AOP" => egui::Color32::from_rgb(120, 120, 128),
         "DEV" => egui::Color32::from_rgb(255, 158, 170),
@@ -389,29 +393,57 @@ fn render_info_document(
         egui::TextStyle::Heading.resolve(ui.style()),
     );
     let text = InfoText::new(layout_job);
+    render_info_text(ui, &text, &divider_cursors)
+}
+
+fn render_info_text(
+    ui: &mut egui::Ui,
+    text: &InfoText,
+    divider_cursors: &[usize],
+) -> egui::text_edit::TextEditOutput {
     let divider_cursors: Vec<_> = divider_cursors
-        .into_iter()
-        .map(|cursor| text.display_cursor(cursor))
+        .iter()
+        .map(|cursor| text.display_cursor(*cursor))
         .collect();
     let document = &text.job.text;
-    let desired_rows = document.lines().count().max(1);
     let mut immutable_document = document.as_str();
     let mut layouter = |ui: &egui::Ui, _text: &dyn egui::TextBuffer, _wrap_width: f32| {
         let mut job = text.job.clone();
         job.wrap.max_width = f32::INFINITY;
         ui.fonts_mut(|fonts| fonts.layout_job(job))
     };
-    let id = ui.make_persistent_id(egui::Id::new("info-popup-document"));
+    let id = ui.make_persistent_id(("info-popup-document", ui.ctx().viewport_id()));
+    let previous_id = id.with("previous-info-text");
+    let previous = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<Arc<str>>(previous_id));
+    if previous.as_deref() != Some(document.as_str()) {
+        if let Some(previous) = previous
+            && let Some(mut state) = egui::text_edit::TextEditState::load(ui.ctx(), id)
+            && let Some(range) = state.cursor.char_range()
+        {
+            state
+                .cursor
+                .set_char_range(Some(rebase_info_selection(&previous, document, range)));
+            state.store(ui.ctx(), id);
+        }
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(previous_id, Arc::<str>::from(document.as_str())));
+    }
     let checkpoint = text.copy_checkpoint(ui.ctx(), id);
-    let output = egui::TextEdit::multiline(&mut immutable_document)
+    let before = egui::text_edit::TextEditState::load(ui.ctx(), id)
+        .and_then(|state| state.cursor.char_range());
+    let mut output = egui::TextEdit::multiline(&mut immutable_document)
         .id(id)
         .frame(false)
         .margin(egui::Margin::ZERO)
         .desired_width(f32::INFINITY)
-        .desired_rows(desired_rows)
+        .desired_rows(1)
         .layouter(&mut layouter)
         .show(ui);
+    InfoText::preserve_secondary_selection(ui, &mut output, before);
     text.restore_raw_copy(ui.ctx(), &output, checkpoint);
+    text.show_copy_menu(ui, &output);
     // Paint inside the single selectable document instead of creating separate widgets.
     let clip = output.text_clip_rect.intersect(ui.clip_rect());
     let painter = ui.painter().with_clip_rect(clip);
@@ -428,6 +460,52 @@ fn render_info_document(
     output
 }
 
+fn rebase_info_selection(
+    old: &str,
+    new: &str,
+    mut range: egui::text::CCursorRange,
+) -> egui::text::CCursorRange {
+    let selected = range.slice_str(old);
+    if !selected.is_empty()
+        && let Some(start) = new.find(selected)
+        && new.rfind(selected) == Some(start)
+    {
+        let start = new[..start].chars().count();
+        let end = start + selected.chars().count();
+        let forward = range.primary.index >= range.secondary.index;
+        range.primary.index = if forward { end } else { start };
+        range.secondary.index = if forward { start } else { end };
+        return range;
+    }
+    let prefix = old
+        .chars()
+        .zip(new.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let old_len = old.chars().count();
+    let new_len = new.chars().count();
+    let suffix = old
+        .chars()
+        .rev()
+        .zip(new.chars().rev())
+        .take(old_len.min(new_len) - prefix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let map = |index: usize| {
+        if index <= prefix {
+            index
+        } else if index >= old_len - suffix {
+            (new_len - suffix + index.saturating_sub(old_len - suffix)).min(new_len)
+        } else {
+            index.min(new_len - suffix)
+        }
+    };
+    range.primary.index = map(range.primary.index);
+    range.secondary.index = map(range.secondary.index);
+    range
+}
+
+#[cfg(test)]
 fn copy_shown_info(data: &InfoPopupData) -> String {
     let mut output = format!("{}\n{}\n\n", data.heading, data.subtitle);
     let mut append_rows = |rows: &[InfoPopupRow]| {
@@ -492,133 +570,33 @@ fn copy_shown_info(data: &InfoPopupData) -> String {
     output
 }
 
-fn render_collapsible_info(
-    ui: &mut egui::Ui,
-    id: egui::Id,
-    header: &str,
-    default_open: bool,
-    body: impl FnOnce(&mut egui::Ui) -> Vec<egui::text_edit::TextEditOutput>,
-) -> Vec<egui::text_edit::TextEditOutput> {
-    let state = egui::collapsing_header::CollapsingState::load_with_default_open(
-        ui.ctx(),
-        id,
-        default_open,
-    );
-    let header = state.show_header(ui, |ui| {
-        let job = info_text_layout(
-            header,
-            egui::TextStyle::Monospace.resolve(ui.style()),
-            ui.visuals().text_color(),
-        );
-        let text = InfoText::new(job);
-        let mut display = text.job.text.as_str();
-        let mut layouter = |ui: &egui::Ui, _: &dyn egui::TextBuffer, _: f32| {
-            ui.fonts_mut(|fonts| fonts.layout_job(text.job.clone()))
-        };
-        let id = id.with("process-header-text");
-        let checkpoint = text.copy_checkpoint(ui.ctx(), id);
-        let output = egui::TextEdit::singleline(&mut display)
-            .id(id)
-            .font(egui::TextStyle::Monospace)
-            .frame(false)
-            .margin(egui::Margin::ZERO)
-            .desired_width(0.0)
-            .clip_text(false)
-            .layouter(&mut layouter)
-            .show(ui);
-        text.restore_raw_copy(ui.ctx(), &output, checkpoint);
-        output
-    });
-    let (toggle, _, contents) = header.body(|ui| ui.push_id(id, body).inner);
-    if toggle.clicked() {
-        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
-    }
-    contents.map(|body| body.inner).unwrap_or_default()
-}
+type InfoPopupOutput = (
+    Vec<egui::text_edit::TextEditOutput>,
+    Option<()>,
+);
 
-pub(crate) fn render_info_popup_panel(
-    ui: &mut egui::Ui,
-    data: &InfoPopupData,
-) -> Vec<egui::text_edit::TextEditOutput> {
-    let Some(tree) = &data.process_tree else {
-        return vec![render_info_document(
-            ui,
-            &data.heading,
-            &data.subtitle,
-            &data.rows,
-        )];
-    };
-    let heading = info_text_layout(
-        &data.heading,
-        egui::TextStyle::Heading.resolve(ui.style()),
-        ui.visuals().text_color(),
-    );
-    ui.label(crate::search::render_title_strikethrough(heading));
-    ui.label(info_text_layout(
-        &data.subtitle,
-        egui::TextStyle::Body.resolve(ui.style()),
-        ui.visuals().weak_text_color(),
-    ));
-    if ui.button("Copy shown info").clicked() {
-        ui.ctx().copy_text(copy_shown_info(data));
-    }
-    ui.add_space(8.0);
-    let mut editors = Vec::new();
-    for section in &tree.sections {
-        let mut rect = ui.available_rect_before_wrap();
-        rect.min.x += section.depth as f32 * PROCESS_TREE_INDENT;
-        // Indent the whole section, not the label, so arrows and details follow the same tree.
-        ui.scope_builder(
-            egui::UiBuilder::new().id_salt(section.id).max_rect(rect),
-            |ui| {
-                editors.extend(render_collapsible_info(
-                    ui,
-                    section.id,
-                    &section.header,
-                    section.default_open,
-                    |ui| {
-                        let mut documents = Vec::new();
-                        if !section.rows.is_empty() {
-                            documents.push(render_info_document(ui, "", "", &section.rows));
-                        } else if section.metadata_sections.is_empty() {
-                            ui.label("Loading process details...");
-                        }
-                        for metadata in &section.metadata_sections {
-                            documents.extend(render_collapsible_info(
-                                ui,
-                                metadata.id,
-                                &metadata.header,
-                                metadata.default_open,
-                                |ui| {
-                                    if metadata.rows.is_empty() {
-                                        ui.label("Loading application details...");
-                                        Vec::new()
-                                    } else {
-                                        vec![render_info_document(ui, "", "", &metadata.rows)]
-                                    }
-                                },
-                            ));
-                        }
-                        documents
-                    },
-                ));
-            },
+pub(crate) fn render_info_popup_panel(ui: &mut egui::Ui, data: &InfoPopupData) -> InfoPopupOutput {
+    if data.process_tree.is_none() {
+        return (
+            vec![render_info_document(
+                ui,
+                &data.heading,
+                &data.subtitle,
+                &data.rows,
+            )],
+            None,
         );
     }
-    ui.add_space(8.0);
-    ui.label(info_text_layout(
-        tree.notice.as_ref(),
-        egui::TextStyle::Small.resolve(ui.style()),
-        ui.visuals().weak_text_color(),
-    ));
-    editors
+    let (editor, update) = tree::render(ui, data);
+    (vec![editor], update)
 }
 
 pub(crate) fn render_info_popup_scroll_area(
     ui: &mut egui::Ui,
     data: &InfoPopupData,
-) -> egui::scroll_area::ScrollAreaOutput<Vec<egui::text_edit::TextEditOutput>> {
+) -> egui::scroll_area::ScrollAreaOutput<InfoPopupOutput> {
     egui::ScrollArea::both()
+        .id_salt(("show-info-scroll", ui.ctx().viewport_id()))
         .scroll_source(egui::scroll_area::ScrollSource {
             drag: false,
             ..egui::scroll_area::ScrollSource::ALL
@@ -626,6 +604,16 @@ pub(crate) fn render_info_popup_scroll_area(
         .auto_shrink([false, false])
         .wheel_scroll_multiplier(egui::Vec2::splat(data.scroll_sensitivity))
         .show(ui, |ui| render_info_popup_panel(ui, data))
+}
+
+pub(crate) fn render_info_popup_contents(
+    ui: &mut egui::Ui,
+    data: &InfoPopupData,
+    popup_id: egui::ViewportId,
+    event_sender: &Sender<PopupEvent>,
+) {
+    let _ = (popup_id, event_sender);
+    render_info_popup_scroll_area(ui, data);
 }
 
 pub(crate) fn info_popup_initial_size(
@@ -701,10 +689,11 @@ pub(crate) fn show_deferred_info_popup(
         .with_always_on_top();
 
     ctx.show_viewport_deferred(viewport_id, builder, move |ctx, _class| {
+        let modal_open = ctx.memory(|memory| memory.top_modal_layer().is_some());
         let close_requested = ctx.input(|input| {
             input.viewport().close_requested()
-                || input.key_pressed(egui::Key::Escape)
-                || input.key_pressed(egui::Key::F10)
+                || (!modal_open
+                    && (input.key_pressed(egui::Key::Escape) || input.key_pressed(egui::Key::F10)))
         });
         if close_requested {
             let _ = event_sender.send(PopupEvent::CloseInfo(viewport_id));
@@ -726,7 +715,7 @@ pub(crate) fn show_deferred_info_popup(
                     .inner_margin(egui::Margin::same(INFO_POPUP_MARGIN)),
             )
             .show(ctx, |ui| {
-                render_info_popup_scroll_area(ui, &data);
+                render_info_popup_contents(ui, &data, viewport_id, &event_sender);
             });
     });
 }
@@ -756,12 +745,19 @@ mod tests {
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         let output = render_info_popup_scroll_area(ui, data);
-                        let editor = &output.inner[0].response;
+                        let editor = &output.inner.0[0];
                         let gutter = egui::pos2(
-                            (output.inner_rect.left() + editor.rect.left()) / 2.0,
+                            output.inner_rect.left() + 2.0,
                             output.inner_rect.bottom() - 32.0,
                         );
-                        assert!(gutter.x < editor.rect.left());
+                        let label_byte = editor.galley.job.text.find("Metadata 0").unwrap();
+                        let label_cursor = editor.galley.job.text[..label_byte].chars().count();
+                        let label_x = editor.galley_pos.x
+                            + editor
+                                .galley
+                                .pos_from_cursor(egui::text::CCursor::new(label_cursor))
+                                .left();
+                        assert!(gutter.x < label_x);
                         result = Some((output.state.offset, gutter));
                     });
                 },
@@ -839,7 +835,7 @@ mod tests {
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         let output = render_info_popup_scroll_area(ui, data);
-                        result = Some((output.state.offset, output.inner[0].response.id));
+                        result = Some((output.state.offset, output.inner.0[0].response.id));
                     });
                 },
             );
@@ -1092,7 +1088,7 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    editor = render_info_popup_panel(ui, data).into_iter().next();
+                    editor = render_info_popup_panel(ui, data).0.into_iter().next();
                 });
             },
         );
@@ -1506,9 +1502,9 @@ mod tests {
         let owner = &mut tree.sections[0];
         owner.header = "xfce4-terminal [PDP]".into();
         owner.metadata_sections.push(InfoMetadataSection {
-            binary_is_current: None,
             id: owner.id.with("metadata"),
             header: "Application [NET]".into(),
+            binary_is_current: None,
             default_open: true,
             rows: vec![InfoPopupRow {
                 label: "Root package".into(),
@@ -1659,7 +1655,7 @@ mod tests {
         let labels = [
             "ELF build ID",
             "Running code fingerprint",
-            "Latest extensions fingerprint",
+            "Running extensions fingerprint",
         ];
         for scale in [1.0, 2.0] {
             for (status, colour) in [
@@ -1673,11 +1669,7 @@ mod tests {
                         1 + index,
                         InfoPopupRow {
                             label: (*label).into(),
-                            scope: if *label == "Latest extensions fingerprint" {
-                                InfoFieldScope::Installation
-                            } else {
-                                InfoFieldScope::RunningInstance
-                            },
+                            scope: InfoFieldScope::RunningInstance,
                             value: hash.into(),
                             searched: false,
                             separator_before: false,
@@ -1708,11 +1700,7 @@ mod tests {
                         .unwrap();
                     assert_eq!(
                         label_section.format.color,
-                        info_field_label_color(if label == "Latest extensions fingerprint" {
-                            InfoFieldScope::Installation
-                        } else {
-                            InfoFieldScope::RunningInstance
-                        })
+                        info_field_label_color(InfoFieldScope::RunningInstance)
                     );
                 }
                 let other = layout
@@ -2003,10 +1991,10 @@ mod tests {
                 notice: "Snapshot".into(),
                 sections: vec![
                     InfoProcessSection {
-                        binary_is_current: None,
                         id: owner,
                         depth: 0,
-                        header: "xfce4-terminal (pid 1) - /usr/bin/xfce4-terminal".into(),
+                        header: "xfce4-terminal (pid 1)".into(),
+                        binary_is_current: None,
                         default_open: true,
                         metadata_sections: Vec::new(),
                         rows: vec![InfoPopupRow {
@@ -2019,10 +2007,10 @@ mod tests {
                         }],
                     },
                     InfoProcessSection {
-                        binary_is_current: None,
                         id: fish,
                         depth: 1,
-                        header: "fish (pid 2) - /usr/bin/fish".into(),
+                        header: "fish (pid 2)".into(),
+                        binary_is_current: None,
                         default_open: false,
                         metadata_sections: Vec::new(),
                         rows: vec![InfoPopupRow {
@@ -2047,16 +2035,13 @@ mod tests {
             let mut data = tree_info();
             data.heading = format!("{struck} - ~/tasks/test - Terminal");
             let section = &mut data.process_tree.as_mut().unwrap().sections[0];
-            section.header = format!("{struck} (pid 1) - /local/codex").into();
-            let header_id = section.id.with("process-header-text");
-            let (output, _) = tree_frame(&ctx, &data, Vec::new());
-            for expected in [
-                "codex - ~/tasks/test - Terminal",
-                "codex (pid 1) - /local/codex",
-            ] {
+            section.header = format!("{struck} (pid 1)").into();
+            let (output, editors) = tree_frame(&ctx, &data, Vec::new());
+            let header_id = editors[0].response.id;
+            for expected in ["codex - ~/tasks/test - Terminal", "codex (pid 1)"] {
                 assert!(
                     output.shapes.iter().any(|shape| matches!(&shape.shape,
-                        egui::Shape::Text(text) if text.galley.job.text == expected
+                        egui::Shape::Text(text) if text.galley.job.text.contains(expected)
                             && text.galley.job.sections.iter().any(|section|
                                 &text.galley.job.text[section.byte_range.clone()] == "codex"
                                     && section.format.strikethrough.width > 0.0)
@@ -2065,11 +2050,13 @@ mod tests {
                 );
             }
             let mut state = egui::text_edit::TextEditState::load(&ctx, header_id).unwrap();
+            let start = editors[0].galley.job.text.find("codex (pid 1)").unwrap();
+            let start = editors[0].galley.job.text[..start].chars().count();
             state
                 .cursor
                 .set_char_range(Some(egui::text::CCursorRange::two(
-                    egui::text::CCursor::new(0),
-                    egui::text::CCursor::new(5),
+                    egui::text::CCursor::new(start),
+                    egui::text::CCursor::new(start + 5),
                 )));
             state.store(&ctx, header_id);
             ctx.memory_mut(|memory| memory.request_focus(header_id));
@@ -2077,6 +2064,171 @@ mod tests {
             assert!(output.platform_output.commands.iter().any(|command|
                 matches!(command, egui::OutputCommand::CopyText(value) if value == &struck)
             ));
+        }
+    }
+
+    #[test]
+    fn process_headers_colour_only_the_name_for_current_outdated_and_unknown_builds() {
+        for scale in [1.0, 2.0] {
+            for open in [false, true] {
+                let ctx = egui::Context::default();
+                ctx.set_pixels_per_point(scale);
+                let mut data = tree_info();
+                let section = &mut data.process_tree.as_mut().unwrap().sections[1];
+                section.header = "fish (pid 456416) [tmux pane]".into();
+                section.default_open = open;
+                for (current, colour) in [
+                    (Some(true), egui::Color32::from_rgb(130, 225, 145)),
+                    (Some(false), egui::Color32::from_rgb(255, 110, 110)),
+                    (None, ctx.style().visuals.text_color()),
+                ] {
+                    data.process_tree.as_mut().unwrap().sections[1].binary_is_current = current;
+                    let (output, _) = tree_frame(&ctx, &data, Vec::new());
+                    let header = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text)
+                                if text
+                                    .galley
+                                    .job
+                                    .text
+                                    .contains("fish (pid 456416) [tmux pane]") =>
+                            {
+                                Some(&text.galley.job)
+                            }
+                            _ => None,
+                        })
+                        .expect("the collapsed and expanded process header must be painted");
+                    assert!(
+                        header
+                            .sections
+                            .iter()
+                            .any(|section| &header.text[section.byte_range.clone()] == "fish"
+                                && section.format.color == colour)
+                    );
+                    let start = header.text.find("fish (pid 456416) [tmux pane]").unwrap();
+                    let end = start + "fish (pid 456416) [tmux pane]".len();
+                    assert!(header.sections.iter().filter(|section| section.byte_range.start >= start + "fish".len() && section.byte_range.start < end).all(|section| section.format.color == ctx.style().visuals.text_color()));
+                    assert!(copy_shown_info(&data).contains("fish (pid 456416) [tmux pane]"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hosted_metadata_headers_show_independent_freshness_when_open_or_collapsed() {
+        use crate::models::InfoMetadataSection;
+        for scale in [1.0, 2.0] {
+            for open in [false, true] {
+                for application in [Some(true), Some(false), None] {
+                    for runtime in [Some(true), Some(false), None] {
+                        let ctx = egui::Context::default();
+                        ctx.set_pixels_per_point(scale);
+                        let mut data = tree_info();
+                        let owner = &mut data.process_tree.as_mut().unwrap().sections[0];
+                        owner.metadata_sections = [
+                            ("Application: Pi", application),
+                            ("Runtime: Node.js", runtime),
+                        ]
+                        .into_iter()
+                        .map(|(header, current)| InfoMetadataSection {
+                            id: owner.id.with(header),
+                            header: header.into(),
+                            binary_is_current: current,
+                            default_open: open,
+                            rows: owner.rows.clone(),
+                        })
+                        .collect();
+                        let (_, editors) = tree_frame(&ctx, &data, Vec::new());
+                        assert_eq!(editors.len(), 1, "the whole tree stays selectable");
+                        let job = &editors[0].galley.job;
+                        for (header, current) in [
+                            ("Application: Pi", application),
+                            ("Runtime: Node.js", runtime),
+                        ] {
+                            let colour = binary_current_color(current)
+                                .unwrap_or(ctx.style().visuals.text_color());
+                            assert!(job.sections.iter().any(|section| {
+                                &job.text[section.byte_range.clone()] == header
+                                    && section.format.color == colour
+                            }));
+                            assert!(copy_shown_info(&data).contains(header));
+                        }
+                        assert!(!job.text.contains("Update"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn browser_headers_and_running_versions_are_coloured_but_disk_versions_stay_neutral() {
+        for browser in ["firefox", "chrome"] {
+            for scale in [1.0, 2.0] {
+                for (current, running, installed) in [
+                    (Some(true), "matching-build-id", "matching-build-id"),
+                    (Some(false), "old-build-id", "new-build-id"),
+                    (None, "unverified-build-id", "unverified-build-id"),
+                ] {
+                    let ctx = egui::Context::default();
+                    ctx.set_pixels_per_point(scale);
+                    let mut data = tree_info();
+                    let owner = &mut data.process_tree.as_mut().unwrap().sections[0];
+                    owner.header = format!("{browser} (pid 1) [window owner]").into();
+                    owner.binary_is_current = current;
+                    let running_value = format!("{browser} 1.0 ({running})");
+                    let installed_value = format!("{browser} 2.0 ({installed})");
+                    owner.rows = [
+                        (
+                            "Version (ELF build ID)",
+                            running_value.as_str(),
+                            InfoFieldScope::RunningInstance,
+                        ),
+                        (
+                            "Latest version on disk (ELF build ID)",
+                            installed_value.as_str(),
+                            InfoFieldScope::Installation,
+                        ),
+                    ]
+                    .into_iter()
+                    .map(|(label, value, scope)| InfoPopupRow {
+                        label: label.into(),
+                        value: value.into(),
+                        scope,
+                        searched: false,
+                        separator_before: false,
+                        binary_is_current: if scope == InfoFieldScope::RunningInstance {
+                            current
+                        } else {
+                            None
+                        },
+                    })
+                    .collect();
+                    let (_, editors) = tree_frame(&ctx, &data, vec![]);
+                    let job = &editors[0].galley.job;
+                    assert!(job.sections.iter().any(|section| {
+                        &job.text[section.byte_range.clone()] == browser
+                            && section.format.color
+                                == binary_current_color(current)
+                                    .unwrap_or(ctx.style().visuals.text_color())
+                    }));
+                    for (value, expected_colour) in [
+                        (
+                            running_value.as_str(),
+                            binary_current_color(current).unwrap_or(egui::Color32::WHITE),
+                        ),
+                        (installed_value.as_str(), egui::Color32::WHITE),
+                    ] {
+                        let field = job
+                            .sections
+                            .iter()
+                            .find(|section| job.text[section.byte_range.clone()].trim() == value)
+                            .unwrap();
+                        assert_eq!(field.format.color, expected_colour, "{value}");
+                    }
+                }
+            }
         }
     }
 
@@ -2217,7 +2369,7 @@ mod tests {
         );
         let output = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                editors = render_info_popup_panel(ui, data);
+                editors = render_info_popup_panel(ui, data).0;
             });
         });
         (output, editors)
@@ -2245,16 +2397,16 @@ mod tests {
                 let mut data = tree_info();
                 let section = &mut data.process_tree.as_mut().unwrap().sections[0];
                 section.default_open = open;
-                let text = "fish (pid 946747) - /home/lewis/repos/fish-shell/target/release/fish (deleted)";
+                let text = "fish (pid 946747) [tmux pane]";
                 section.header = text.into();
                 let section_id = section.id;
-                let header_id = section_id.with("process-header-text");
-                let (output, _) = tree_viewport_frame(&ctx, viewport, &data, Vec::new());
+                let (output, editors) = tree_viewport_frame(&ctx, viewport, &data, Vec::new());
+                let header_id = editors[0].response.id;
                 let (position, galley) = output
                     .shapes
                     .iter()
                     .find_map(|shape| match &shape.shape {
-                        egui::Shape::Text(shape) if shape.galley.job.text == text => {
+                        egui::Shape::Text(shape) if shape.galley.job.text.contains(text) => {
                             Some((shape.pos, shape.galley.clone()))
                         }
                         _ => None,
@@ -2267,8 +2419,10 @@ mod tests {
                             .center()
                             .to_vec2()
                 };
-                let start = cursor_position(0);
-                let end = cursor_position(text.chars().count());
+                let offset = galley.job.text.find(text).unwrap();
+                let offset = galley.job.text[..offset].chars().count();
+                let start = cursor_position(offset);
+                let end = cursor_position(offset + text.chars().count());
                 let pointer = |pos, pressed| egui::Event::PointerButton {
                     pos,
                     button: egui::PointerButton::Primary,
@@ -2285,13 +2439,13 @@ mod tests {
                 tree_viewport_frame(&ctx, viewport, &data, vec![pointer(end, false)]);
                 let selection = || {
                     egui::text_edit::TextEditState::load(&ctx, header_id)
-                        .expect("header needs its own persistent text selection")
+                        .expect("tree needs a persistent text selection")
                         .cursor
                         .char_range()
                         .unwrap()
                         .as_sorted_char_range()
                 };
-                assert_eq!(selection(), 0..text.chars().count());
+                assert_eq!(selection(), offset..offset + text.chars().count());
                 assert_eq!(process_info_section_is_open(&ctx, section_id, open), open);
 
                 // The launcher's root viewport keeps repainting while native info is open.
@@ -2307,9 +2461,17 @@ mod tests {
                         separator_before: false,
                         binary_is_current: None,
                     });
-                let (output, _) =
+                let (output, editors) =
                     tree_viewport_frame(&ctx, viewport, &data, vec![egui::Event::Copy]);
-                assert_eq!(selection(), 0..text.chars().count());
+                let current: String = editors[0]
+                    .galley
+                    .job
+                    .text
+                    .chars()
+                    .skip(selection().start)
+                    .take(selection().len())
+                    .collect();
+                assert_eq!(current, text);
                 assert!(output.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::CopyText(copied) if copied == text)));
                 assert_eq!(process_info_section_is_open(&ctx, section_id, open), open);
                 let (output, _) = tree_viewport_frame(
@@ -2318,7 +2480,7 @@ mod tests {
                     &data,
                     vec![egui::Event::Text("MUST NOT EDIT".into())],
                 );
-                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(shape) if shape.galley.job.text == text)));
+                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(shape) if shape.galley.job.text.contains(text) && !shape.galley.job.text.contains("MUST NOT EDIT"))));
             }
         }
     }
@@ -2353,37 +2515,217 @@ mod tests {
             sibling.header = "helper (pid 4) - /usr/bin/helper".into();
             sections.extend([grandchild, sibling]);
             tree_frame(&ctx, &data, Vec::new());
-            let (output, editors) = tree_frame(&ctx, &data, Vec::new());
+            let (_, editors) = tree_frame(&ctx, &data, Vec::new());
             let sections = &data.process_tree.as_ref().unwrap().sections;
-            assert_eq!(editors.len(), sections.len());
-            let root_x = ctx.read_response(sections[0].id).unwrap().rect.left();
-            for (section, editor) in sections.iter().zip(&editors) {
-                let arrow = ctx.read_response(section.id).unwrap().rect;
+            assert_eq!(editors.len(), 1);
+            let editor = &editors[0];
+            let root_x = ctx
+                .read_response(sections[0].id.with("tree-arrow"))
+                .unwrap()
+                .rect
+                .left();
+            for section in sections {
+                let arrow = ctx
+                    .read_response(section.id.with("tree-arrow"))
+                    .unwrap()
+                    .rect;
                 let indent = arrow.left() - root_x;
                 assert!(
                     (indent - section.depth as f32 * 12.0).abs() < 0.1,
                     "Arrow must follow the compact tree depth: depth={}, indent={indent}",
                     section.depth
                 );
-                let header_x = output
-                    .shapes
-                    .iter()
-                    .find_map(|shape| match &shape.shape {
-                        egui::epaint::Shape::Text(text)
-                            if text.galley.job.text == section.header.as_ref() =>
-                        {
-                            Some(text.pos.x)
-                        }
-                        _ => None,
-                    })
-                    .expect("process header must be visible");
+                let byte = editor
+                    .galley
+                    .job
+                    .text
+                    .find(section.header.as_ref())
+                    .unwrap();
+                let cursor = editor.galley.job.text[..byte].chars().count();
+                let header_x = editor.galley_pos.x
+                    + editor
+                        .galley
+                        .pos_from_cursor(egui::text::CCursor::new(cursor))
+                        .center()
+                        .x;
                 assert!(
-                    (header_x - arrow.right()).abs() < 0.1,
+                    (header_x - arrow.right() - 2.0).abs() < 0.1,
                     "Arrow must sit beside its own header"
                 );
+                let body_start = byte + section.header.len() + 1;
+                let body = &editor.galley.job.text[body_start..];
+                let offset = body.len() - body.trim_start_matches(char::is_whitespace).len();
+                let body_cursor = editor.galley.job.text[..body_start + offset]
+                    .chars()
+                    .count();
+                let body_x = editor.galley_pos.x
+                    + editor
+                        .galley
+                        .pos_from_cursor(egui::text::CCursor::new(body_cursor))
+                        .center()
+                        .x;
                 assert!(
-                    (editor.galley_pos.x - header_x).abs() < 0.1,
+                    (body_x - header_x).abs() < 0.1,
                     "Details must align beneath their process header"
+                );
+            }
+        }
+    }
+
+    fn pointer_events(pos: egui::Pos2) -> Vec<egui::Event> {
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        vec![egui::Event::PointerMoved(pos), button(true), button(false)]
+    }
+
+    #[test]
+    fn process_headers_use_arrow_pointers_without_changing_field_text_cursors() {
+        for scale in [1.0, 2.0] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            let mut data = tree_info();
+            let owner = &mut data.process_tree.as_mut().unwrap().sections[0];
+            owner.metadata_sections = vec![crate::models::InfoMetadataSection {
+                id: owner.id.with("application"),
+                header: "Application: Pi".into(),
+                binary_is_current: None,
+                default_open: true,
+                rows: owner.rows.clone(),
+            }];
+            tree_frame(&ctx, &data, Vec::new());
+            let (_, editors) = tree_frame(&ctx, &data, Vec::new());
+            let editor = &editors[0];
+            let pointer = |label: &str| {
+                let byte = editor.galley.job.text.find(label).unwrap();
+                editor.galley_pos
+                    + editor
+                        .galley
+                        .pos_from_cursor(egui::text::CCursor::new(
+                            editor.galley.job.text[..byte].chars().count(),
+                        ))
+                        .center()
+                        .to_vec2()
+                    + egui::vec2(4.0, 0.0)
+            };
+            for header in ["xfce4-terminal (pid 1)", "fish (pid 2)", "Application: Pi"] {
+                let (output, _) = tree_frame(
+                    &ctx,
+                    &data,
+                    vec![egui::Event::PointerMoved(pointer(header))],
+                );
+                assert_eq!(
+                    output.platform_output.cursor_icon,
+                    egui::CursorIcon::Default,
+                    "{header}"
+                );
+            }
+            let (output, _) = tree_frame(
+                &ctx,
+                &data,
+                vec![egui::Event::PointerMoved(pointer("Window PID"))],
+            );
+            assert_eq!(output.platform_output.cursor_icon, egui::CursorIcon::Text);
+        }
+    }
+
+    #[test]
+    fn process_tree_restores_heading_and_section_spacing_without_widening_field_rows() {
+        use crate::models::InfoMetadataSection;
+
+        for scale in [1.0, 2.0] {
+            for font_size in [13.0, 24.0] {
+                let ctx = egui::Context::default();
+                ctx.set_pixels_per_point(scale);
+                ctx.style_mut(|style| {
+                    style
+                        .text_styles
+                        .get_mut(&egui::TextStyle::Monospace)
+                        .unwrap()
+                        .size = font_size;
+                });
+                let mut data = tree_info();
+                let owner = &mut data.process_tree.as_mut().unwrap().sections[0];
+                let mut field = owner.rows[0].clone();
+                field.label = "Window class".into();
+                owner.rows.push(field.clone());
+                owner.metadata_sections = ["Application: Pi", "Runtime: Node.js"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, header)| {
+                        let mut row = field.clone();
+                        row.label = format!("Nested field {index}");
+                        InfoMetadataSection {
+                            id: owner.id.with(index),
+                            header: header.into(),
+                            binary_is_current: None,
+                            default_open: true,
+                            rows: vec![row],
+                        }
+                    })
+                    .collect();
+                let (output, editors) = tree_frame(&ctx, &data, Vec::new());
+                assert!(!output.shapes.iter().any(|shape| matches!(
+                    &shape.shape,
+                    egui::Shape::Text(text) if text.galley.job.text == "Copy shown info"
+                )));
+                assert_eq!(editors.len(), 1, "The tree remains continuously selectable");
+                let editor = &editors[0];
+                let row = |label: &str| {
+                    let byte = editor.galley.job.text.find(label).unwrap();
+                    let cursor = editor.galley.job.text[..byte].chars().count();
+                    editor
+                        .galley
+                        .pos_from_cursor(egui::text::CCursor::new(cursor))
+                };
+                let gap = ctx.style().spacing.item_spacing.y;
+                let minimum_header = ctx.style().spacing.interact_size.y;
+                let owner = row("xfce4-terminal (pid 1)");
+                assert!(owner.height() >= minimum_header - 0.5);
+                assert!(
+                    (owner.top() - row("Process details").bottom() - gap - 8.0).abs() <= 0.5,
+                    "Removing the copy-all button must not leave its reserved row"
+                );
+                for (above, below) in [
+                    ("xfce4-terminal (pid 1)", "Window PID"),
+                    ("Window class", "Application: Pi"),
+                    ("Application: Pi", "Nested field 0"),
+                    ("Nested field 0", "Runtime: Node.js"),
+                    ("Runtime: Node.js", "Nested field 1"),
+                ] {
+                    let actual = row(below).top() - row(above).bottom();
+                    assert!(
+                        (actual - gap).abs() <= 0.5,
+                        "{above} -> {below}: gap={actual}, expected={gap}, scale={scale}"
+                    );
+                }
+                let between_processes = row("fish (pid 2)").top() - row("Nested field 1").bottom();
+                assert!((between_processes - 8.0).abs() <= 0.5);
+                assert!((row("Window class").top() - row("Window PID").bottom()).abs() <= 0.5);
+
+                let id = data.process_tree.as_ref().unwrap().sections[0].id;
+                let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                    &ctx, id, true,
+                );
+                state.set_open(false);
+                state.store(&ctx);
+                let (_, collapsed) = tree_frame(&ctx, &data, Vec::new());
+                let galley = &collapsed[0].galley;
+                let header = |label| {
+                    let byte = galley.job.text.find(label).unwrap();
+                    galley.pos_from_cursor(egui::text::CCursor::new(
+                        galley.job.text[..byte].chars().count(),
+                    ))
+                };
+                assert!(
+                    (header("fish (pid 2)").top()
+                        - header("xfce4-terminal (pid 1)").bottom()
+                        - gap)
+                        .abs()
+                        <= 0.5
                 );
             }
         }
@@ -2400,8 +2742,12 @@ mod tests {
         let tree = data.process_tree.as_ref().unwrap();
         let owner = tree.sections[0].id;
         let fish = tree.sections[1].id;
-        assert!(ctx.read_response(owner).is_some());
-        let position = ctx.read_response(fish).unwrap().rect.center();
+        assert!(ctx.read_response(owner.with("tree-arrow")).is_some());
+        let position = ctx
+            .read_response(fish.with("tree-arrow"))
+            .unwrap()
+            .rect
+            .center();
         let event = |pressed| egui::Event::PointerButton {
             pos: position,
             button: egui::PointerButton::Primary,
@@ -2413,15 +2759,16 @@ mod tests {
             &data,
             vec![egui::Event::PointerMoved(position), event(true)],
         );
-        let (_, editors) = tree_frame(&ctx, &data, vec![event(false)]);
-        assert_eq!(editors.len(), 2);
+        tree_frame(&ctx, &data, vec![event(false)]);
+        let (_, editors) = tree_frame(&ctx, &data, Vec::new());
+        assert_eq!(editors.len(), 1);
         assert!(process_info_section_is_open(&ctx, owner, true));
         assert!(process_info_section_is_open(&ctx, fish, false));
-        assert_ne!(editors[0].response.id, editors[1].response.id);
-        assert!(!editors[1].galley.job.text.contains("Window PID"));
+        assert!(editors[0].galley.job.text.contains("Window PID"));
+        assert!(editors[0].galley.job.text.contains("Process name"));
         data.heading = "pi - \u{280b} work - Terminal".into();
         let (_, editors) = tree_frame(&ctx, &data, Vec::new());
-        assert_eq!(editors.len(), 2);
+        assert_eq!(editors.len(), 1);
         assert_ne!(
             fish,
             process_info_section_id(
@@ -2437,7 +2784,7 @@ mod tests {
         state.store(&ctx);
         let (_, editors) = tree_frame(&ctx, &data, Vec::new());
         assert_eq!(editors.len(), 1);
-        assert!(ctx.read_response(fish).is_some());
+        assert!(ctx.read_response(fish.with("tree-arrow")).is_some());
         assert!(editors[0].galley.job.text.contains("fish"));
     }
 
@@ -2466,8 +2813,10 @@ mod tests {
                     .center()
                     .to_vec2()
         };
-        let start = position(0);
-        let end = position(editor.galley.job.text.chars().count() - 1);
+        let start_byte = editor.galley.job.text.find("Window PID").unwrap();
+        let end_byte = editor.galley.job.text.find("fish (pid 2)").unwrap();
+        let start = position(editor.galley.job.text[..start_byte].chars().count());
+        let end = position(editor.galley.job.text[..end_byte].chars().count());
         let pointer = |pos, pressed| egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
@@ -2505,8 +2854,8 @@ mod tests {
                 .cursor
                 .char_range()
                 .unwrap()
-                .as_sorted_char_range(),
-            range
+                .slice_str(&editors[0].galley.job.text),
+            selected
         );
         assert!(output.platform_output.commands.iter().any(
             |command| matches!(command, egui::OutputCommand::CopyText(text) if text == &selected)
@@ -2531,9 +2880,9 @@ mod tests {
         ]
         .into_iter()
         .map(|(key, header, label, value)| InfoMetadataSection {
-            binary_is_current: None,
             id: process.id.with(key),
             header: header.into(),
+            binary_is_current: None,
             default_open: true,
             rows: vec![InfoPopupRow {
                 label: label.into(),
@@ -2548,9 +2897,9 @@ mod tests {
         let app_id = process.metadata_sections[0].id;
         let runtime_id = process.metadata_sections[1].id;
         let (_, documents) = tree_frame(&ctx, &data, Vec::new());
-        assert_eq!(documents.len(), 3);
-        let runtime_editor_id = documents[2].response.id;
-        let editor = &documents[2];
+        assert_eq!(documents.len(), 1);
+        let runtime_editor_id = documents[0].response.id;
+        let editor = &documents[0];
         let position = |index| {
             editor.galley_pos
                 + editor
@@ -2559,8 +2908,10 @@ mod tests {
                     .center()
                     .to_vec2()
         };
-        let start = position(0);
-        let end = position(editor.galley.job.text.chars().count() - 1);
+        let start_byte = editor.galley.job.text.find("Version").unwrap();
+        let end_byte = start_byte + editor.galley.job.text[start_byte..].find('\n').unwrap();
+        let start = position(editor.galley.job.text[..start_byte].chars().count());
+        let end = position(editor.galley.job.text[..end_byte].chars().count());
         let pointer = |pos, pressed| egui::Event::PointerButton {
             pos,
             pressed,
@@ -2592,8 +2943,8 @@ mod tests {
         state.set_open(false);
         state.store(&ctx);
         let (_, documents) = tree_frame(&ctx, &data, Vec::new());
-        assert_eq!(documents.len(), 2);
-        assert_eq!(documents[1].response.id, runtime_editor_id);
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].response.id, runtime_editor_id);
         assert!(process_info_section_is_open(&ctx, runtime_id, true));
         assert!(!process_info_section_is_open(&ctx, app_id, true));
     }
@@ -2602,10 +2953,137 @@ mod tests {
     fn copying_process_sections_includes_headers_and_each_sections_own_fields() {
         let data = tree_info();
         let document = copy_shown_info(&data);
-        assert!(
-            document
-                .contains("xfce4-terminal (pid 1) - /usr/bin/xfce4-terminal\n    Window PID  1")
+        assert!(document.contains("xfce4-terminal (pid 1)\n    Window PID  1"));
+        assert!(document.contains("  fish (pid 2)\n      Process name  fish"));
+    }
+
+    #[test]
+    fn selection_spans_the_entire_tree_including_headings_and_supports_the_copy_menu() {
+        for scale in [1.0, 2.0] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            let mut data = tree_info();
+            data.process_tree.as_mut().unwrap().sections[1].default_open = true;
+            tree_frame(&ctx, &data, Vec::new());
+            let (_, editors) = tree_frame(&ctx, &data, Vec::new());
+            assert_eq!(
+                editors.len(),
+                1,
+                "The whole visible tree is one selectable document"
+            );
+            let editor = &editors[0];
+            let position = |index| {
+                editor.galley_pos
+                    + editor
+                        .galley
+                        .pos_from_cursor(egui::text::CCursor::new(index))
+                        .center()
+                        .to_vec2()
+            };
+            let start = position(0);
+            let end = position(editor.galley.job.text.chars().count() - 1);
+            let pointer = |pos, button, pressed| egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            tree_frame(
+                &ctx,
+                &data,
+                vec![
+                    egui::Event::PointerMoved(start),
+                    pointer(start, egui::PointerButton::Primary, true),
+                ],
+            );
+            tree_frame(&ctx, &data, vec![egui::Event::PointerMoved(end)]);
+            let (_, editors) = tree_frame(
+                &ctx,
+                &data,
+                vec![pointer(end, egui::PointerButton::Primary, false)],
+            );
+            let selected = editors[0]
+                .state
+                .cursor
+                .char_range()
+                .unwrap()
+                .slice_str(&editors[0].galley.job.text)
+                .to_owned();
+            for required in [
+                &data.heading,
+                "xfce4-terminal (pid 1)",
+                "Window PID",
+                "fish (pid 2)",
+                "Process name",
+            ] {
+                assert!(
+                    selected.contains(required),
+                    "Missing {required} from cross-tree selection"
+                );
+            }
+            tree_frame(
+                &ctx,
+                &data,
+                vec![
+                    egui::Event::PointerMoved(end),
+                    pointer(end, egui::PointerButton::Secondary, true),
+                    pointer(end, egui::PointerButton::Secondary, false),
+                ],
+            );
+            let (menu, _) = tree_frame(&ctx, &data, Vec::new());
+            let copy = menu
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == "Copy" => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .expect("The tree selection has a Copy context-menu item");
+            let (output, _) = tree_frame(
+                &ctx,
+                &data,
+                vec![
+                    egui::Event::PointerMoved(copy),
+                    pointer(copy, egui::PointerButton::Primary, true),
+                    pointer(copy, egui::PointerButton::Primary, false),
+                ],
+            );
+            assert!(output.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::CopyText(text) if text == &selected)));
+            for section in &data.process_tree.as_ref().unwrap().sections {
+                assert!(process_info_section_is_open(
+                    &ctx,
+                    section.id,
+                    section.default_open
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn live_updates_keep_unique_tree_selections_anchored_and_clamp_changed_text() {
+        let old = "old title\n\u{03c0} process\nPID 12\nold details";
+        let new = "a much longer title\n\u{03c0} process\nPID 12\nupdated details";
+        let start = old[..old.find('\u{03c0}').unwrap()].chars().count();
+        let end = start + "\u{03c0} process\nPID 12".chars().count();
+        for (a, b) in [(start, end), (end, start)] {
+            let before = egui::text::CCursorRange::two(
+                egui::text::CCursor::new(a),
+                egui::text::CCursor::new(b),
+            );
+            let after = rebase_info_selection(old, new, before);
+            assert_eq!(after.slice_str(new), before.slice_str(old));
+            assert_eq!(
+                after.primary.index > after.secondary.index,
+                before.primary.index > before.secondary.index
+            );
+        }
+        let before = egui::text::CCursorRange::two(
+            egui::text::CCursor::new(1),
+            egui::text::CCursor::new(old.chars().count()),
         );
-        assert!(document.contains("  fish (pid 2) - /usr/bin/fish\n      Process name  fish"));
+        let after = rebase_info_selection(old, "", before);
+        assert_eq!(after.as_sorted_char_range(), 0..0);
     }
 }
