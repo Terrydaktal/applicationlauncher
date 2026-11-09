@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "profile": "release",
-  "scope": "Optional delegation to terminal-owned updates; no launcher-owned replacement backend",
+  "scope": "Confirmed daemon-owned whole-window replacement with optional stable native cooperation, including terminals without updater APIs",
   "behaviors": [
     {
       "id": "TERMUPDATE-CLIENT-01",
@@ -19,10 +19,25 @@
     },
     {
       "id": "TERMUPDATE-CLIENT-03",
-      "contract": "Private-bus requests delegate once, do not use a launch/close backend, tolerate changing captions for single-window processes and refuse ambiguous shared windows",
+      "contract": "Private-bus requests delegate once to native mechanics, explicitly pass already collected consent when supported, retain the legacy request fallback, tolerate changing captions for single-window processes and refuse ambiguous shared windows",
       "tests": [
         "private_bus_update_requests_are_delegated_once_and_ambiguous_windows_are_refused"
       ]
+    },
+    {
+      "id": "TERMUPDATE-COMPAT-01",
+      "contract": "Absence of native update/hold APIs selects daemon-owned replacement rather than requiring a manual restart. Optional read-only tab metadata identifies ordered tabs; without it only one actual window and one verified PTY session are accepted. Ambiguous, changed and unsupported sessions are refused before interruption; terminal-only updates preserve the running application build and exact conversation.",
+      "tests": ["test_daemon_owned_compatibility_update_needs_no_native_hold", "test_missing_updater_and_tab_apis_use_only_an_unambiguous_proc_session", "test_multiple_windows_without_tab_metadata_are_refused_without_guessing", "test_identical_captions_with_native_tab_metadata_are_still_ambiguous", "test_proc_mapping_uses_the_real_controlling_pty_and_refuses_multiple_tabs", "test_tab_api_errors_are_not_all_treated_as_absent_capabilities", "terminal-update-wayland-external-codex", "terminal-update-wayland-external-without-tab-api", "terminal-update-wayland-external-shell"]
+    },
+    {
+      "id": "TERMUPDATE-COMPAT-03",
+      "contract": "A compatibility update retires only the original tmux client and dedicated shell ancestry after verifying its replacement attachment. The server and panes remain alive, no duplicate clients remain, and sibling jobs or failed attachment verification refuse retirement rather than trigger an old terminal close-running-programs dialog.",
+      "tests": ["test_external_tmux_client_retires_only_after_replacement_verification", "test_tmux_window_with_sibling_shell_jobs_is_refused_before_replacement", "terminal-update-wayland-external-tmux-shell"]
+    },
+    {
+      "id": "TERMUPDATE-COMPAT-02",
+      "contract": "Compatibility workers and PTY-bound startup gates are embedded in the release daemon, independent of a terminal helper or source checkout. The bootstrap does not replace PTY stdin, preserves argv[0] independently of the pinned image path, and validates literal commands, titles and allowlisted colour/locale environment before interruption.",
+      "tests": ["test_release_startup_gate_preserves_pty_stdin_command_name_and_colour", "test_connected_gate_waits_for_asynchronous_tab_pid_publication", "test_gate_with_different_process_credentials_is_a_fatal_staging_error", "test_cancelled_release_gate_never_executes_the_application", "test_prepared_commands_validate_before_any_application_can_be_stopped", "test_proc_descriptor_paths_do_not_invalidate_scope_but_sessions_and_processes_do", "test_only_expected_post_shutdown_window_exit_is_allowed"]
     }
   ],
   "terminal_transaction_contracts": "xfce4-terminal:tests/update-in-place-contracts.json"

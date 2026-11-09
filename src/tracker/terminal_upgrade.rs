@@ -1,4 +1,4 @@
-//! Optional bulk UI adapter. Terminals, not this daemon, own update transactions.
+//! Confirmed terminal updates, with optional native cooperation and a daemon-owned compatibility path.
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -46,7 +46,7 @@ pub struct TerminalUpgradeWindow {
 pub struct TerminalUpgradeReport {
     pub operation_id: String,
     pub phase: TerminalUpgradePhase,
-    // Retained for report compatibility; terminal-owned backups are not tracker snapshots.
+    // Retained for report compatibility; lifecycle recovery plans are not tracker snapshots.
     pub backup_snapshot_id: Option<i64>,
     pub windows: Vec<TerminalUpgradeWindow>,
     pub message: String,
@@ -57,6 +57,8 @@ struct Target {
     id: String,
     owner: String,
     uuid: String,
+    external: Option<serde_json::Value>,
+    external_job: String,
 }
 
 struct Job {
@@ -100,7 +102,7 @@ impl UpgradeRegistry {
             created: Instant::now(),
             report: TerminalUpgradeReport {
                 operation_id: id.clone(),
-                message: "Asking terminals about available updates...".into(),
+                message: "Inspecting terminal builds and safe replacement paths...".into(),
                 ..Default::default()
             },
             targets: Vec::new(),
@@ -173,7 +175,7 @@ impl UpgradeRegistry {
             .into();
         }
         state.report.message =
-            "Requesting terminal-owned updates; confirm non-tmux restarts in each terminal".into();
+            "Requesting confirmed terminal updates through the shared lifecycle backend".into();
         drop(state);
         Ok(Some(UpgradeWork { job, targets }))
     }
@@ -190,7 +192,7 @@ impl UpgradePreparation {
                 job.report.windows = rows;
                 job.targets = targets;
                 job.report.phase = TerminalUpgradePhase::Ready;
-                job.report.message = "No windows changed. Selected terminals manage their own update, confirmation, recovery and placement.".into();
+                job.report.message = "No windows changed. The daemon coordinates replacements; native terminal APIs are optional enhancements.".into();
             }
             Err(error) => {
                 job.report.phase = TerminalUpgradePhase::Failed;
@@ -289,17 +291,26 @@ fn inspect(windows: &[TrackedWindow]) -> Result<(Vec<TerminalUpgradeWindow>, Vec
     }
     let mut rows = Vec::new();
     let mut targets = Vec::new();
+    let mut compatibility = Vec::new();
     for window in windows
         .iter()
         .filter(|window| window.class.to_lowercase().contains("xfce4-terminal"))
         .take(512)
     {
         let mut row = TerminalUpgradeWindow {
-            window_id: window.id.clone(), terminal_window_uuid: String::new(), owner_pid: window.pid,
-            title: window.title.clone(), tabs: Vec::new(), eligible: false, recommended: false,
-            preserves_processes: false, executable: String::new(), build_id: None, sha256: String::new(),
+            window_id: window.id.clone(),
+            terminal_window_uuid: String::new(),
+            owner_pid: window.pid,
+            title: window.title.clone(),
+            tabs: Vec::new(),
+            eligible: false,
+            recommended: false,
+            preserves_processes: false,
+            executable: String::new(),
+            build_id: None,
+            sha256: String::new(),
             status: "unsupported".into(),
-            message: "This running terminal lacks the terminal-owned update API; restart it once manually".into(),
+            message: "Inspecting the daemon-owned compatibility path".into(),
         };
         let mut matches = Vec::new();
         if let Some(entries) = owners.get(&window.pid) {
@@ -332,18 +343,31 @@ fn inspect(windows: &[TrackedWindow]) -> Result<(Vec<TerminalUpgradeWindow>, Vec
         if let [(owner, uuid, records)] = matches.as_slice() {
             let terminal = proxy(&connection, owner, TERMINAL_PATH, TERMINAL_INTERFACE)?;
             if let Ok(status) = json_call(&terminal, "GetUpdateStatus", &(uuid.as_str(),)) {
+                let has_hold = proxy(
+                    &connection,
+                    owner,
+                    TERMINAL_PATH,
+                    "org.freedesktop.DBus.Introspectable",
+                )
+                .ok()
+                .and_then(|p| p.call::<_, _, String>("Introspect", &()).ok())
+                .is_some_and(|xml| {
+                    xml.contains("name=\"HoldForUpdate\"") || xml.contains("name='HoldForUpdate'")
+                });
                 row.terminal_window_uuid = uuid.clone();
                 row.tabs = records
                     .iter()
                     .filter(|record| text(record, "window_uuid") == *uuid)
                     .map(|record| text(record, "working_directory"))
                     .collect();
-                row.eligible = status["updatable"] == true && status["pending"] != true;
+                row.eligible = has_hold && status["updatable"] == true && status["pending"] != true;
                 row.recommended = row.eligible;
                 row.status = if row.eligible {
                     "ready"
                 } else if status["pending"] == true {
                     "pending"
+                } else if !has_hold {
+                    "unsupported"
                 } else {
                     "up_to_date"
                 }
@@ -359,11 +383,60 @@ fn inspect(windows: &[TrackedWindow]) -> Result<(Vec<TerminalUpgradeWindow>, Vec
                         id: window.id.clone(),
                         owner: (*owner).clone(),
                         uuid: uuid.clone(),
+                        external: None,
+                        external_job: String::new(),
                     });
                 }
             }
         }
+        if row.status == "unsupported" {
+            compatibility.push(window.clone());
+        }
         rows.push(row);
+    }
+    if !compatibility.is_empty() {
+        match crate::lifecycle::inspect_external_windows(&compatibility) {
+            Ok(values) => {
+                for value in values
+                    .as_array()
+                    .ok_or("Invalid daemon-owned terminal preview")?
+                {
+                    let row: TerminalUpgradeWindow =
+                        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+                    if row.eligible {
+                        let external = value
+                            .get("external")
+                            .filter(|v| v.is_object())
+                            .ok_or("Missing terminal replacement scope")?
+                            .clone();
+                        let external_job = std::fs::read_to_string("/proc/sys/kernel/random/uuid")
+                            .map_err(|e| e.to_string())?
+                            .trim()
+                            .to_owned();
+                        targets.push(Target {
+                            id: row.window_id.clone(),
+                            owner: String::new(),
+                            uuid: String::new(),
+                            external: Some(external),
+                            external_job,
+                        });
+                    }
+                    if let Some(original) = rows
+                        .iter_mut()
+                        .find(|original| original.window_id == row.window_id)
+                    {
+                        *original = row;
+                    }
+                }
+            }
+            Err(error) => {
+                for row in rows.iter_mut().filter(|row| row.status == "unsupported") {
+                    row.message = format!(
+                        "Compatibility inspection failed before any window changed: {error}"
+                    );
+                }
+            }
+        }
     }
     Ok((rows, targets))
 }
@@ -405,10 +478,22 @@ impl UpgradeWork {
         }
         let mut job = self.job.lock().unwrap();
         job.report.phase = TerminalUpgradePhase::Complete;
-        job.report.message = "Terminal-owned update requests finished. No application windows were launched or closed by Application Launcher.".into();
+        job.report.message = "Terminal update requests finished; per-window results describe completed or refused replacements.".into();
     }
 
     fn request(&self, target: &Target) -> Result<String, String> {
+        if let Some(plan) = &target.external {
+            let result = crate::lifecycle::execute_external_window(&target.external_job, plan)?;
+            let message = result["message"]
+                .as_str()
+                .unwrap_or("Invalid replacement result; inspect recovery records")
+                .to_owned();
+            return if result["ok"] == true {
+                Ok(message)
+            } else {
+                Err(message)
+            };
+        }
         let connection = connection()?;
         let terminal = proxy(
             &connection,
@@ -420,8 +505,12 @@ impl UpgradeWork {
         if status["updatable"] != true || status["pending"] == true {
             return Err("The terminal is no longer eligible for an update".into());
         }
-        let service: String = terminal
-            .call("UpdateInPlace", &(target.uuid.as_str(),))
+        let service: String =
+            if status["lifecycle_protocol"] == 1 && status["confirmed_updates"] == true {
+                terminal.call("UpdateInPlaceWithConsent", &(target.uuid.as_str(), true))
+            } else {
+                terminal.call("UpdateInPlace", &(target.uuid.as_str(),))
+            }
             .map_err(|error| error.to_string())?;
         if !valid_service(&service) {
             return Err("The terminal returned an invalid update service".into());
@@ -501,15 +590,18 @@ fn valid_service(service: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const FIXTURE_UUID: &str = "21e67a7a-6f26-47c4-9b4b-fb6e3e7776c3";
     const FIXTURE_SERVICE: &str = "org.xfce.Terminal5.Update.i21e67a7a_6f26_47c4_9b4b_fb6e3e7776c3";
 
-    struct TerminalFixture(Arc<AtomicUsize>);
+    struct TerminalFixture(Arc<AtomicUsize>, Arc<AtomicBool>);
 
     #[zbus::interface(name = "org.xfce.Terminal5")]
     impl TerminalFixture {
+        fn hold_for_update(&self, _window_uuid: &str, _service: &str, _enabled: bool) {
+            panic!("The preview must not acquire a native hold");
+        }
         fn list_terminals(&self) -> Records {
             let mut record = HashMap::new();
             for (key, value) in [
@@ -528,11 +620,22 @@ mod tests {
 
         fn get_update_status(&self, window_uuid: &str) -> String {
             assert_eq!(window_uuid, FIXTURE_UUID);
-            r#"{"updatable":true,"pending":false}"#.into()
+            serde_json::json!({"updatable":true,"pending":false,"lifecycle_protocol":1,
+                "confirmed_updates":self.1.load(Ordering::SeqCst)})
+            .to_string()
         }
 
         fn update_in_place(&self, window_uuid: &str) -> String {
+            assert!(!self.1.load(Ordering::SeqCst));
             assert_eq!(window_uuid, FIXTURE_UUID);
+            self.0.fetch_add(1, Ordering::SeqCst);
+            FIXTURE_SERVICE.into()
+        }
+
+        fn update_in_place_with_consent(&self, window_uuid: &str, confirmed: bool) -> String {
+            assert_eq!(window_uuid, FIXTURE_UUID);
+            assert!(confirmed);
+            assert!(self.1.load(Ordering::SeqCst));
             self.0.fetch_add(1, Ordering::SeqCst);
             FIXTURE_SERVICE.into()
         }
@@ -559,13 +662,17 @@ mod tests {
             return;
         }
         let requests = Arc::new(AtomicUsize::new(0));
+        let supports_consent = Arc::new(AtomicBool::new(false));
         let _fixture = zbus::blocking::connection::Builder::session()
             .unwrap()
             .name("org.xfce.Terminal5.Instance.ifixup")
             .unwrap()
             .name(FIXTURE_SERVICE)
             .unwrap()
-            .serve_at(TERMINAL_PATH, TerminalFixture(requests.clone()))
+            .serve_at(
+                TERMINAL_PATH,
+                TerminalFixture(requests.clone(), supports_consent.clone()),
+            )
             .unwrap()
             .serve_at(UPDATE_PATH, HelperFixture)
             .unwrap()
@@ -601,8 +708,28 @@ mod tests {
         assert_eq!(report.windows[0].status, "restarted");
         assert!(report.backup_snapshot_id.is_none());
         assert_eq!(requests.load(Ordering::SeqCst), 1);
-        assert!(registry.start(&id, &[window.id], true).unwrap().is_none());
+        assert!(
+            registry
+                .start(&id, &[window.id.clone()], true)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+        supports_consent.store(true, Ordering::SeqCst);
+        let (id, prepare) = registry.begin();
+        prepare.unwrap().prepare(vec![window.clone()]);
+        registry
+            .start(&id, &[window.id.clone()], true)
+            .unwrap()
+            .unwrap()
+            .run();
+        assert_eq!(
+            registry.report(&id).unwrap().phase,
+            TerminalUpgradePhase::Complete
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert!(registry.start(&id, &[window.id], true).unwrap().is_none());
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
     #[test]
     fn delegated_update_service_is_bounded_and_cannot_target_an_arbitrary_bus_name() {

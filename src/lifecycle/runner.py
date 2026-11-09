@@ -7,7 +7,7 @@ import traceback
 
 import lifecycle_worker as worker
 import lifecycle_external as external
-from lifecycle_window import atomic_record, private_request
+from lifecycle_window import WindowUpdate, atomic_record, private_request
 
 
 def run(mode, path):

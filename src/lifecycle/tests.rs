@@ -12,12 +12,71 @@ fn lifecycle_protocol_requires_bounded_operation_ids_and_explicit_native_scopes(
     assert!(!valid_uuid("12345678/1234-5678-9abc-123456789abc"));
     let value: Value = serde_json::from_str(&Service.get_capabilities()).unwrap();
     assert_eq!(value["protocol"], 1);
-    assert_eq!(value["terminal_replacement"], 0);
+    assert_eq!(value["terminal_replacement"], 1);
     assert_eq!(value["application_adapters"], 1);
-    assert_eq!(value["external_terminal_replacement"], 0);
+    assert_eq!(value["external_terminal_replacement"], 1);
     for id in ["", "../escape", "not-a-uuid"] {
         assert!(execute_external_window(id, &json!({})).is_err());
     }
+}
+
+#[test]
+fn private_bus_lifecycle_rejects_malformed_requests_and_callers_without_helper_ownership() {
+    const PRIVATE: &str = "APPLICATIONLAUNCHER_LIFECYCLE_TEST_PRIVATE";
+    if std::env::var(PRIVATE).as_deref() != Ok("1") {
+        let output = Command::new("dbus-run-session").arg("--")
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "lifecycle::tests::private_bus_lifecycle_rejects_malformed_requests_and_callers_without_helper_ownership", "--nocapture"])
+            .env(PRIVATE, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let id = "12345678-1234-5678-9abc-123456789abc";
+    let helper = format!("org.xfce.Terminal5.Update.i{}", id.replace('-', "_"));
+    let fixture = zbus::blocking::connection::Builder::session()
+        .unwrap()
+        .name(crate::tracker::SERVICE_NAME)
+        .unwrap()
+        .name(helper.as_str())
+        .unwrap()
+        .serve_at(PATH, Service)
+        .unwrap()
+        .build()
+        .unwrap();
+    let caller = zbus::blocking::Connection::session().unwrap();
+    assert_ne!(fixture.unique_name(), caller.unique_name());
+    let proxy =
+        zbus::blocking::Proxy::new(&caller, crate::tracker::SERVICE_NAME, PATH, INTERFACE).unwrap();
+    let capabilities: String = proxy.call("GetCapabilities", &()).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&capabilities).unwrap()["protocol"],
+        1
+    );
+    let valid_but_not_owned =
+        json!({"protocol":1,"job_id":id,"window_uuid":id,"token":"a".repeat(64),"service":helper})
+            .to_string();
+    for request in [
+        "{}".to_owned(),
+        "invalid-json".to_owned(),
+        "x".repeat(65537),
+        valid_but_not_owned,
+    ] {
+        assert!(
+            proxy
+                .call::<_, _, String>("BeginWindowUpdate", &(request,))
+                .is_err()
+        );
+    }
+    assert!(
+        proxy
+            .call::<_, _, String>("GetWindowUpdateReport", &("../escape",))
+            .is_err()
+    );
 }
 
 #[test]
@@ -151,5 +210,36 @@ fn native_restore_locks_share_the_lifecycle_worker_exclusion_boundary() {
     std::os::unix::fs::symlink(directory.join("missing"), directory.join("operation.lock"))
         .unwrap();
     assert!(OperationLock::busy_in(&directory).is_err());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn embedded_worker_publishes_a_minimal_identity_and_a_durable_failure_without_a_session_bus() {
+    let directory = std::env::temp_dir().join(format!(
+        "lifecycle-runner-{}-{}",
+        std::process::id(),
+        crate::tracker::now_ms()
+    ));
+    private_directory(&directory).unwrap();
+    let request = directory.join("request.json");
+    write_private(&request, &json!({"input":null})).unwrap();
+    let output = worker_command("program", &request)
+        .unwrap()
+        .env("XDG_STATE_HOME", &directory)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            "unix:path=/not-a-real-lifecycle-test-bus",
+        )
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let identity = read_private(&directory.join("worker.json")).unwrap();
+    assert!(identity["pid"].as_u64().unwrap() > 1);
+    assert!(identity["start"].as_u64().unwrap() > 0);
+    assert!(identity.get("arguments").is_none());
+    assert_eq!(
+        read_private(&directory.join("result.json")).unwrap()["ok"],
+        false
+    );
     fs::remove_dir_all(directory).unwrap();
 }

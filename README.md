@@ -195,7 +195,7 @@ version cache; opening a new Info snapshot inspects current installation state.
 - `src/main.rs`: GUI CLI parsing, single-instance startup, and native window creation.
 - `src/app/`: Launcher state, feeds, commands, search-row rendering, settings, popups, and the `eframe` update loop.
 - `src/app/terminal_maintenance.rs`: Separate terminal-restart confirmation/progress popup. Uses background D-Bus requests and never closes or launches terminals itself.
-- `src/tracker/terminal_upgrade.rs`: Optional bulk-request adapter for terminal-owned updates. Maps tracked windows conservatively to terminal UUIDs, requests updates through their D-Bus APIs and observes results; never launches replacements or closes terminals.
+- `src/tracker/terminal_upgrade.rs`: Confirmed single/bulk terminal updates. Uses native cooperation when available and daemon-owned replacement for older windows without updater APIs.
 - `src/launch/`: Desktop-entry parsing and application/window launch actions.
 - `src/audio.rs`: Stream-to-app/window attribution, volume controls and measured icon-ring rendering.
 - `src/audio/monitor.rs`: Named background worker using native PulseAudio per-playback-stream monitors. Publishes a single replaceable latest-result slot; never records a microphone or the mixed desktop output.

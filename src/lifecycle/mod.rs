@@ -258,7 +258,6 @@ pub(crate) fn worker_pending_or_alive(directory: &Path, request: &Path) -> bool 
 }
 
 pub fn worker_command(mode: &str, request: &Path) -> Result<Command, String> {
-    if mode != "program" { return Err("Terminal replacement transport is not enabled".into()); }
     if !matches!(
         mode,
         "program" | "window" | "window-external" | "window-preview" | "gate"
@@ -270,8 +269,8 @@ pub fn worker_command(mode: &str, request: &Path) -> Result<Command, String> {
         "import sys, types\nm=types.ModuleType('lifecycle_worker');sys.modules[m.__name__]=m\nexec({:?},m.__dict__)\nw=types.ModuleType('lifecycle_window');sys.modules[w.__name__]=w\nexec({:?},w.__dict__)\ne=types.ModuleType('lifecycle_external');sys.modules[e.__name__]=e\ne.PLACEMENT_JS={:?}\nexec({:?},e.__dict__)\nexec({:?})",
         include_str!("worker.py"),
         include_str!("window.py"),
-        "",
-        "",
+        include_str!("placement.js"),
+        include_str!("external.py"),
         include_str!("runner.py"),
     );
     // Keep the PTY on stdin for startup gates. The anonymous script file avoids
@@ -381,7 +380,7 @@ pub struct Service;
 #[zbus::interface(name = "com.terrydaktal.ApplicationLauncher.Lifecycle1")]
 impl Service {
     fn get_capabilities(&self) -> String {
-        json!({"protocol":1,"terminal_replacement":0,"application_adapters":1,"external_terminal_replacement":0}).to_string()
+        json!({"protocol":1,"terminal_replacement":1,"application_adapters":1,"external_terminal_replacement":1}).to_string()
     }
 
     fn get_window_update_report(&self, id: &str) -> zbus::fdo::Result<String> {
@@ -411,6 +410,87 @@ impl Service {
         Ok(status.to_string())
     }
 
+    async fn begin_window_update(
+        &self,
+        request: &str,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        let refuse = |reason: String| zbus::fdo::Error::Failed(reason);
+        if request.len() > 65536 {
+            return Err(refuse("Oversized lifecycle request".into()));
+        }
+        let mut value: Value = serde_json::from_str(request).map_err(|e| refuse(e.to_string()))?;
+        let id = value["job_id"]
+            .as_str()
+            .ok_or_else(|| refuse("Missing operation ID".into()))?
+            .to_owned();
+        let window = value["window_uuid"].as_str().unwrap_or_default();
+        let token = value["token"].as_str().unwrap_or_default();
+        if value["protocol"] != 1
+            || !valid_uuid(&id)
+            || !valid_uuid(window)
+            || token.len() != 64
+            || !token.bytes().all(|c| c.is_ascii_hexdigit())
+            || value["service"] != format!("org.xfce.Terminal5.Update.i{}", id.replace('-', "_"))
+        {
+            return Err(refuse(
+                "Unsupported lifecycle protocol or invalid operation identity".into(),
+            ));
+        }
+        let sender = header
+            .sender()
+            .ok_or_else(|| refuse("Missing helper identity".into()))?;
+        let bus = zbus::fdo::DBusProxy::new(connection).await?;
+        let name = zbus::names::BusName::try_from(value["service"].as_str().unwrap())
+            .map_err(|e| refuse(e.to_string()))?;
+        if bus.get_name_owner(name).await?.as_str() != sender.as_str()
+            || bus.get_connection_unix_user(sender.clone().into()).await?
+                != unsafe { libc::geteuid() }
+        {
+            return Err(refuse(
+                "The lifecycle caller does not own this terminal helper".into(),
+            ));
+        }
+        value["helper_owner"] = json!(sender.as_str());
+        let directory = state_dir().join(&id);
+        private_directory(&state_dir()).map_err(refuse)?;
+        if directory.exists() {
+            if read_private(&directory.join("request.json")).map_err(refuse)? != value {
+                return Err(refuse(
+                    "The operation ID already belongs to a different request".into(),
+                ));
+            }
+            return Ok(id);
+        }
+        let pending = fs::read_dir(state_dir())
+            .map_err(|e| refuse(e.to_string()))?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                valid_uuid(&entry.file_name().to_string_lossy())
+                    && entry.path().is_dir()
+                    && !entry.path().join("result.json").exists()
+                    && worker_pending_or_alive(&entry.path(), &entry.path().join("request.json"))
+            })
+            .take(16)
+            .count();
+        if pending >= 16 {
+            return Err(refuse(
+                "Too many unfinished lifecycle jobs; inspect retained reports".into(),
+            ));
+        }
+        private_directory(&directory).map_err(refuse)?;
+        let path = directory.join("request.json");
+        write_private(&path, &value).map_err(refuse)?;
+        if let Err(error) = spawn_job(&id, "window", &path) {
+            let _ = write_private(
+                &directory.join("result.json"),
+                &json!({"ok":false,"message":error}),
+            );
+            return Err(refuse(error));
+        }
+        Ok(id)
+    }
 }
 
 #[cfg(test)]

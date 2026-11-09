@@ -1,0 +1,241 @@
+"""Compatibility replacement guards. Only disposable processes and files are used."""
+import copy
+import fcntl
+import importlib.util
+import os
+import json
+from pathlib import Path
+import subprocess
+import socket
+import sys
+import tempfile
+import termios
+import unittest
+from unittest.mock import Mock, mock_open, patch
+
+from test_lifecycle_windows import SOURCE, worker, window
+
+spec = importlib.util.spec_from_file_location("lifecycle_external", SOURCE / "external.py")
+external = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = external
+spec.loader.exec_module(external)
+
+
+def saved_window(identifier="window", title="Terminal"):
+    rectangle = dict(x=-5, y=40, width=900, height=600)
+    result = dict(id=identifier, pid=50, title=title, geometry=rectangle, normal=rectangle.copy(),
+        output=dict(name="virtual", x=0, y=0, width=1280, height=800, scale=1000),
+        maximized=0, fullscreen=False, minimized=False, active=True, desktops=["desktop"], activities=[], above=[])
+    result.update(dict.fromkeys(("keepAbove", "keepBelow", "noBorder", "shaded", "skipTaskbar", "skipPager", "skipSwitcher"), False))
+    return result
+
+
+class Mapping(unittest.TestCase):
+    def test_missing_updater_and_tab_apis_use_only_an_unambiguous_proc_session(self):
+        actual = saved_window()
+        desktop = Mock()
+        desktop.call.side_effect = [actual, dict(windows=[actual])]
+        owner = dict(pid=50, executable="/fixture/xfce4-terminal", arguments=["xfce4-terminal"], start=60)
+        record = dict(child_pid=70, window_uuid="window", active=True)
+        with patch.object(worker, "process", return_value=owner), \
+                patch.object(external, "native_records", return_value=(None, None)), \
+                patch.object(external, "proc_record", return_value=record) as proc, \
+                patch.object(worker, "latest_binary", return_value="/fixture/new-terminal"), \
+                patch.object(worker, "file_identity", return_value=[1, 2, 3, 4]), \
+                patch.object(worker, "read_limited", return_value=b"DISPLAY=:5\0WAYLAND_DISPLAY=private-wayland\0SECRET=never-save\0"), \
+                patch("builtins.open", mock_open()), \
+                patch.object(external.hashlib, "file_digest", side_effect=[Mock(hexdigest=lambda: "new"), Mock(hexdigest=lambda: "old")]):
+            result = external.capture(object(), desktop, dict(id="window", pid=50))
+        proc.assert_called_once_with(50, "window")
+        self.assertEqual(result["records"], [record])
+        self.assertFalse(result["capabilities"]["hold"])
+        self.assertEqual(result["display_environment"], dict(DISPLAY=":5", WAYLAND_DISPLAY="private-wayland"))
+
+    def test_multiple_windows_without_tab_metadata_are_refused_without_guessing(self):
+        actual = saved_window()
+        desktop = Mock()
+        desktop.call.side_effect = [actual, dict(windows=[actual, saved_window("other")])]
+        with patch.object(worker, "process", return_value=dict(executable="/fixture/xfce4-terminal", arguments=[])), \
+                patch.object(external, "native_records", return_value=(None, None)), \
+                patch.object(external, "proc_record", side_effect=AssertionError("Ambiguous window mapping was guessed")):
+            with self.assertRaisesRegex(worker.Refused, "shared process"):
+                external.capture(object(), desktop, dict(id="window", pid=50))
+
+    def test_identical_captions_with_native_tab_metadata_are_still_ambiguous(self):
+        actual = saved_window()
+        desktop = Mock()
+        desktop.call.side_effect = [actual, dict(windows=[actual, saved_window("other")])]
+        records = [dict(window_uuid=identifier, window_title="Terminal") for identifier in ("one", "two")]
+        with patch.object(worker, "process", return_value=dict(executable="/fixture/xfce4-terminal", arguments=[])), \
+                patch.object(external, "native_records", return_value=(":1.7", records)):
+            with self.assertRaisesRegex(worker.Refused, "ambiguous"):
+                external.capture(object(), desktop, dict(id="window", pid=50))
+
+    def test_proc_mapping_uses_the_real_controlling_pty_and_refuses_multiple_tabs(self):
+        children, descriptors = [], []
+        def controlling_terminal():
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        try:
+            for count in range(2):
+                master, slave = os.openpty()
+                descriptors.extend([master, slave])
+                child = subprocess.Popen(["/bin/sleep", "30"], stdin=slave, stdout=slave, stderr=slave, preexec_fn=controlling_terminal)
+                children.append(child)
+                if count == 0:
+                    # Wait until the child's session and controlling terminal exist.
+                    import time
+                    deadline = time.monotonic() + 3
+                    while not worker.process(child.pid)["tty"]:
+                        self.assertLess(time.monotonic(), deadline)
+                    row = external.proc_record(os.getpid(), "private-window")
+                    self.assertEqual(row["child_pid"], child.pid)
+                    self.assertEqual(row["pty"], os.ttyname(slave))
+                else:
+                    with self.assertRaisesRegex(worker.Refused, "exactly one terminal session"):
+                        external.proc_record(os.getpid(), "private-window")
+        finally:
+            for child in children:
+                child.terminate()
+                child.wait(timeout=3)
+            for descriptor in descriptors: os.close(descriptor)
+
+    def test_tab_api_errors_are_not_all_treated_as_absent_capabilities(self):
+        system = Mock()
+        def bus(method, signature="()", arguments=()):
+            return {"ListNames": [["org.xfce.Terminal5"]], "GetNameOwner": [":1.8"], "GetConnectionUnixProcessID": [50]}[method]
+        system.dbus.side_effect = bus
+        system.call.side_effect = RuntimeError("org.freedesktop.DBus.Error.UnknownMethod")
+        self.assertEqual(external.native_records(system, 50), (None, None))
+        system.call.side_effect = RuntimeError("Timed out reading tabs")
+        with self.assertRaisesRegex(worker.Refused, "not safe to guess"):
+            external.native_records(system, 50)
+
+
+class Guards(unittest.TestCase):
+    def test_connected_gate_waits_for_asynchronous_tab_pid_publication(self):
+        backend = external.Backend.__new__(external.Backend)
+        backend.connections = []
+        with tempfile.TemporaryDirectory(prefix="lifecycle-gate-race-") as directory, \
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener, \
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            listener.bind(str(Path(directory) / "socket"))
+            listener.listen(1)
+            listener.settimeout(1)
+            backend.sockets = [listener]
+            client.connect(listener.getsockname())
+            client.setblocking(False)
+            try:
+                self.assertFalse(backend.accept_gates([dict(child_pid=0)]))
+                self.assertEqual(backend.connections, [])
+                with self.assertRaises(BlockingIOError): client.recv(1)
+                self.assertTrue(backend.accept_gates([dict(child_pid=os.getpid())]))
+                backend.connections[0].sendall(b"S")
+                client.settimeout(1)
+                self.assertEqual(client.recv(1), b"S")
+            finally:
+                for connection in backend.connections: connection.close()
+
+    def test_gate_with_different_process_credentials_is_a_fatal_staging_error(self):
+        backend = external.Backend.__new__(external.Backend)
+        backend.connections = []
+        listener, connection = Mock(), Mock()
+        listener.accept.return_value = (connection, None)
+        connection.getsockopt.return_value = external.struct.pack("3i", os.getpid() + 1, os.getuid(), 0)
+        backend.sockets = [listener]
+        with self.assertRaises(external.GateIdentityError):
+            backend.accept_gates([dict(child_pid=os.getpid())])
+        connection.close.assert_called_once()
+        self.assertEqual(backend.connections, [])
+
+    def test_release_startup_gate_preserves_pty_stdin_command_name_and_colour(self):
+        binary = SOURCE.parents[1] / "target/release/applicationlauncherd"
+        self.assertTrue(binary.is_file(), "Build the release daemon before the startup-gate regression")
+        with tempfile.TemporaryDirectory(prefix="lifecycle-gate-") as directory:
+            root = Path(directory)
+            master, slave = os.openpty()
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.settimeout(5)
+            listener.bind(str(root / "socket"))
+            listener.listen(1)
+            plan = root / "gate.json"
+            window.atomic_record(plan, dict(protocol=1, socket=listener.getsockname(), executable="/bin/sh",
+                argv=["preserved-command-name", "-c", 'test -t 0 && test -z "${NO_COLOR+x}" && printf "%s" "$0"'],
+                environment=dict(NO_COLOR=None)))
+            child = subprocess.Popen([str(binary), "--lifecycle-gate", str(plan)], stdin=slave,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=dict(os.environ, NO_COLOR="1"))
+            try:
+                connection, _ = listener.accept()
+                connection.sendall(b"S")
+                connection.close()
+                output, error = child.communicate(timeout=5)
+                self.assertEqual(child.returncode, 0, error)
+                self.assertEqual(output, b"preserved-command-name")
+            finally:
+                listener.close()
+                os.close(master)
+                os.close(slave)
+                if child.poll() is None:
+                    child.terminate()
+                    child.communicate(timeout=3)
+
+    def test_cancelled_release_gate_never_executes_the_application(self):
+        binary = SOURCE.parents[1] / "target/release/applicationlauncherd"
+        with tempfile.TemporaryDirectory(prefix="lifecycle-gate-cancel-") as directory, \
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            root = Path(directory)
+            listener.settimeout(5)
+            listener.bind(str(root / "socket"))
+            listener.listen(1)
+            plan = root / "gate.json"
+            window.atomic_record(plan, dict(protocol=1, socket=listener.getsockname(), executable="/usr/bin/touch",
+                argv=["touch", str(root / "must-not-exist")], environment={}))
+            child = subprocess.Popen([str(binary), "--lifecycle-gate", str(plan)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                connection, _ = listener.accept()
+                connection.close()
+                child.communicate(timeout=5)
+                self.assertNotEqual(child.returncode, 0)
+                self.assertFalse((root / "must-not-exist").exists())
+                self.assertIn("cancelled before release", json.loads(plan.with_suffix(".error.json").read_text())["error"])
+            finally:
+                if child.poll() is None:
+                    child.terminate()
+                    child.communicate(timeout=3)
+
+    def test_prepared_commands_validate_before_any_application_can_be_stopped(self):
+        valid = dict(protocol=1, executable="/fixture/exe", argv=["original-name"], environment=dict(NO_COLOR=None), title="literal %D")
+        external.validate_gate(valid)
+        for change in (dict(executable="relative"), dict(argv=[]), dict(argv=["bad\0argument"]),
+                       dict(environment=dict(SECRET="not-allowed")), dict(title="bad\033]52;clipboard\007")):
+            with self.subTest(change=change), self.assertRaises(worker.Refused):
+                external.validate_gate(dict(valid, **change))
+
+    def test_proc_descriptor_paths_do_not_invalidate_scope_but_sessions_and_processes_do(self):
+        tab = dict(program=dict(kind="codex", argv=["/proc/100/fd/5", "resume", "conversation-one"],
+            process=dict(pid=60, start=70, image=[1, 2, 3, 4])), record=dict(child_pid=60, active=True),
+            active=True, cwd="/fixture", environment={})
+        reference = window.scope_fingerprint([tab])
+        changed = copy.deepcopy(tab)
+        changed["program"]["argv"][0] = "/proc/200/fd/8"
+        self.assertEqual(reference, window.scope_fingerprint([changed]))
+        changed["program"]["argv"][2] = "conversation-two"
+        self.assertNotEqual(reference, window.scope_fingerprint([changed]))
+        changed = copy.deepcopy(tab)
+        changed["record"]["child_pid"] += 1
+        self.assertNotEqual(reference, window.scope_fingerprint([changed]))
+
+    def test_only_expected_post_shutdown_window_exit_is_allowed(self):
+        backend = external.Backend.__new__(external.Backend)
+        backend.request = dict(external=dict(window=dict(pid=50, id="exact-window"), binary="/fixture/new", installed=[1, 2, 3, 4]))
+        backend.desktop = Mock()
+        backend.desktop.call.return_value = dict(missing=True)
+        with self.assertRaisesRegex(worker.Refused, "before interruption"):
+            backend.preflight()
+        with patch.object(worker, "latest_binary", return_value="/fixture/new"), patch.object(worker, "file_identity", return_value=[1, 2, 3, 4]):
+            backend.preflight(stopped=True)
+        self.assertTrue(backend.closed)
+        self.assertEqual(backend.desktop.call.call_args.kwargs["id"], "exact-window")
+
+
+if __name__ == "__main__": unittest.main()
