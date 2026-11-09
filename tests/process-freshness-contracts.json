@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "profile": "release",
+  "scope": "Passive daemon-owned native executable freshness for subscribed terminal processes; no candidate execution, title rewriting or update orchestration",
+  "behaviors": [
+    {
+      "id": "PROCESS-FRESHNESS-01",
+      "contract": "Pinned native build identity distinguishes an update from a same-build new inode and clears on rollback, including verified launch symlink retargeting.",
+      "tests": ["comparison_requires_native_identity_not_version_text", "native_symlink_update_and_rollback", "identical_build_new_inode_is_current"]
+    },
+    {
+      "id": "PROCESS-FRESHNESS-02",
+      "contract": "Unverified launch entries, PID/start/device/inode mismatches and exited processes are unknown, not guessed current or outdated.",
+      "tests": ["unverified_launch_path_and_changed_identity_are_unknown", "dead_process_is_unknown"]
+    },
+    {
+      "id": "PROCESS-FRESHNESS-03",
+      "contract": "Missing, non-executable and script replacements are unknown and never executed, even after a native launch alias was established.",
+      "tests": ["missing_non_executable_and_script_targets_are_passive_unknown"]
+    },
+    {
+      "id": "PROCESS-FRESHNESS-04",
+      "contract": "Request handling only enqueues or returns cached reports, bounds targets and invalid-request responses, and versions new reports monotonically.",
+      "tests": ["requests_only_enqueue_bounded_versioned_cache_entries"]
+    },
+    {
+      "id": "PROCESS-FRESHNESS-05",
+      "contract": "The release service integrates with terminal process selection, independent host/application markers, replacement, rollback, tab switching, runtime children and tmux active panes on an isolated bus.",
+      "tests": ["xfce4-terminal:terminal-application-monitor", "xfce4-terminal:terminal-copy"],
+      "environment": ["TERMINAL_TEST_FRESHNESS_SERVICE=/absolute/path/to/target/release/examples/freshness-service", "private session bus", "Xvfb"]
+    }
+  ]
+}

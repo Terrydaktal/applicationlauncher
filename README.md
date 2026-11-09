@@ -780,6 +780,37 @@ cargo test --release --lib independent_scope_preserves_literal_tmux_ids_and_shel
 
 ## Resource Optimizations
 
+### Terminal Freshness API
+
+The existing `com.terrydaktal.ApplicationLauncher` session-bus service exposes
+`com.terrydaktal.ApplicationLauncher.Freshness1` at `/Freshness`:
+
+- `GetProcessStatus(pid: u32, start_time: u64, image_dev: u64, image_ino: u64, launch_path: string) -> string` returns a schema-versioned JSON report with `current`, `outdated` or `unknown` status, the exact requested target, the observed process identity, ELF build IDs and a report generation.
+- `ProcessStatusChanged(report: string)` publishes changed reports. Consumers must pin the service's unique owner, match the target and reject older generations; generations restart when the daemon restarts.
+
+Requests only enqueue work or return cached reports. One background worker checks
+leased targets every two seconds and sleeps when idle. Clients renew within 60
+seconds (xfce4-terminal uses 20 seconds); at most 512 targets and bounded identity
+caches are retained. Inspection is read-only, same-user and native ELF only. It
+pins PID start time and executable device/inode, verifies launch aliases before
+following retargets, rechecks process/file identity after reads, and never executes
+candidate binaries, scripts or version commands. Zero identity fields allow the
+caller to request discovery, as used by the terminal for its own process.
+
+This is comparison with the current local launch target, not source-tree freshness,
+package updates, interpreted code freshness or private-library component status.
+Missing/unsupported/ambiguous evidence is `unknown`; consumers must not retain a
+daemon-derived stale marker after service loss. GUI Show Info's richer metadata
+remains separate but uses the same native-build equality policy. The terminal
+continues to own title rendering, Update in Place and its independent replacement
+validation; this service does not own or initiate those operations.
+
+`cargo test --release --lib freshness::tests` checks the inspector and cache. The
+uninstalled `cargo build --release --example freshness-service` example serves the
+same implementation for xfce4-terminal's isolated cross-repository integration
+tests; its stdin lifetime and `READY` output are test orchestration, not additions
+to the production daemon's CLI.
+
 The implemented [twelve-step optimization plan](docs/OPTIMIZATIONS.md) documents
 cache invalidation, worker/queue bounds, compatibility fallbacks and safe release
 verification commands. Its [regression inventory](tests/optimization-contracts.json)

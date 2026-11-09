@@ -2664,6 +2664,7 @@ pub fn run_tracker_daemon() -> Result<(), String> {
     });
 
     pollster::block_on(async move {
+        let freshness = crate::freshness::Service::default();
         let _connection = zbus::connection::Builder::session()
             .map_err(|err| err.to_string())?
             .name(SERVICE_NAME)
@@ -2672,8 +2673,13 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             .map_err(|err| err.to_string())?
             .serve_at(TRACKER_PATH, TrackerApi(runtime))
             .map_err(|err| err.to_string())?
+            .serve_at(crate::freshness::PATH, freshness.clone())
+            .map_err(|err| err.to_string())?
             .build()
             .await
+            .map_err(|err| err.to_string())?;
+        let _freshness_worker = freshness
+            .start(_connection.clone())
             .map_err(|err| err.to_string())?;
         if let Err(err) = super::install::ensure_kwin_feed_installed() {
             eprintln!("Tracker could not install the KWin feed: {err}");
