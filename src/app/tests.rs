@@ -922,21 +922,33 @@ mod tests {
             daemon_version: None,
             daemon_build_id: None,
         };
-        assert_eq!(snapshot_label(&snapshot), "Hourly 2023-01-01 00:00 UTC");
+        assert_eq!(snapshot_label(&snapshot), "Hourly 01-01-2023 00:00 UTC");
         snapshot.created_at_ms += 3_600_000;
-        assert_eq!(snapshot_label(&snapshot), "Hourly 2023-01-01 01:00 UTC");
+        assert_eq!(snapshot_label(&snapshot), "Hourly 01-01-2023 01:00 UTC");
         snapshot.kind = "recent".into();
-        assert_eq!(snapshot_label(&snapshot), "5-minute 2023-01-01 01:00 UTC");
+        assert_eq!(snapshot_label(&snapshot), "5-minute 01-01-2023 01:00 UTC");
         snapshot.created_at_ms += 300_000;
-        assert_eq!(snapshot_label(&snapshot), "5-minute 2023-01-01 01:05 UTC");
+        assert_eq!(snapshot_label(&snapshot), "5-minute 01-01-2023 01:05 UTC");
         snapshot.kind = "named".into();
         snapshot.name = Some("Before reconstruction".into());
         assert_eq!(snapshot_label(&snapshot), "Before reconstruction");
         assert_eq!(format_activation_time(None), "Not recorded yet");
         assert!(
             format_activation_time(Some(1_672_531_200_123))
-                .starts_with("2023-01-01 00:00:00.123 UTC (")
+                .starts_with("01-01-2023 00:00:00.123 UTC (")
         );
+    }
+
+    #[test]
+    fn display_dates_use_day_month_year_without_changing_time_or_calendar_boundaries() {
+        for (timestamp, expected) in [
+            (0, "01-01-1970 00:00:00.000"),
+            (-1, "31-12-1969 23:59:59.999"),
+            (1_709_164_800_000, "29-02-2024 00:00:00.000"),
+            (1_793_279_045_006, "29-10-2026 13:04:05.006"),
+        ] {
+            assert_eq!(format_utc_timestamp(timestamp), expected);
+        }
     }
 
     #[test]

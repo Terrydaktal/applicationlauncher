@@ -20,7 +20,7 @@ impl App {
         ui.add_space(8.0);
 
         ui.add(egui::Separator::default());
-        ui.add_space(12.0);
+        ui.add_space(8.0);
 
         ui.horizontal(|ui| {
             let mut disable_ibeam = self.disable_ibeam;
@@ -36,10 +36,10 @@ impl App {
             }
         });
 
-        ui.add_space(10.0);
+        ui.add_space(6.0);
         egui::Grid::new("global_scale_settings_grid")
             .num_columns(2)
-            .spacing([12.0, 10.0])
+            .spacing(crate::settings::SETTINGS_GRID_SPACING)
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new("Global Scale:")
@@ -69,9 +69,9 @@ impl App {
                 ui.end_row();
             });
 
-        ui.add_space(14.0);
+        ui.add_space(8.0);
         ui.add(egui::Separator::default());
-        ui.add_space(10.0);
+        ui.add_space(6.0);
 
         ui.label(
             egui::RichText::new("Application panel")
@@ -79,11 +79,11 @@ impl App {
                 .strong()
                 .size(13.0),
         );
-        ui.add_space(6.0);
+        ui.add_space(4.0);
 
         egui::Grid::new("app_panel_settings_grid")
             .num_columns(2)
-            .spacing([12.0, 10.0])
+            .spacing(crate::settings::SETTINGS_GRID_SPACING)
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new("Show System Modules:")
@@ -231,9 +231,9 @@ impl App {
                 ui.end_row();
             });
 
-        ui.add_space(14.0);
+        ui.add_space(8.0);
         ui.add(egui::Separator::default());
-        ui.add_space(10.0);
+        ui.add_space(6.0);
 
         ui.label(
             egui::RichText::new("Open window view")
@@ -469,13 +469,13 @@ impl App {
                 ui.end_row();
             });
 
-        ui.add_space(14.0);
+        ui.add_space(8.0);
         ui.separator();
-        ui.add_space(10.0);
+        ui.add_space(6.0);
         ui.label(egui::RichText::new("Show Info").strong());
         egui::Grid::new("info_settings_grid")
             .num_columns(2)
-            .spacing([12.0, 10.0])
+            .spacing(crate::settings::SETTINGS_GRID_SPACING)
             .show(ui, |ui| {
                 ui.label("Scroll Sensitivity:");
                 if ui

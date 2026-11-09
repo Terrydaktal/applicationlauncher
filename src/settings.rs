@@ -77,7 +77,7 @@ pub(crate) fn render_deferred_settings_panel(
     });
     ui.add_space(8.0);
     ui.separator();
-    ui.add_space(12.0);
+    ui.add_space(8.0);
 
     settings_changed |= ui
         .checkbox(
@@ -88,10 +88,10 @@ pub(crate) fn render_deferred_settings_panel(
         )
         .changed();
 
-    ui.add_space(10.0);
+    ui.add_space(6.0);
     egui::Grid::new("deferred_global_scale_settings_grid")
         .num_columns(2)
-        .spacing([12.0, 10.0])
+        .spacing(SETTINGS_GRID_SPACING)
         .show(ui, |ui| {
             settings_row_label(ui, "Global Scale:");
             ui.horizontal(|ui| {
@@ -118,19 +118,19 @@ pub(crate) fn render_deferred_settings_panel(
             ui.end_row();
         });
 
-    ui.add_space(14.0);
+    ui.add_space(8.0);
     ui.separator();
-    ui.add_space(10.0);
+    ui.add_space(6.0);
     ui.label(
         egui::RichText::new("Application panel")
             .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220))
             .strong()
             .size(13.0),
     );
-    ui.add_space(6.0);
+    ui.add_space(4.0);
     egui::Grid::new("deferred_app_panel_settings_grid")
         .num_columns(2)
-        .spacing([12.0, 10.0])
+        .spacing(SETTINGS_GRID_SPACING)
         .show(ui, |ui| {
             settings_changed |= settings_checkbox_row(
                 ui,
@@ -191,9 +191,9 @@ pub(crate) fn render_deferred_settings_panel(
             );
         });
 
-    ui.add_space(14.0);
+    ui.add_space(8.0);
     ui.separator();
-    ui.add_space(10.0);
+    ui.add_space(6.0);
     ui.label(
         egui::RichText::new("Open window view")
             .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220))
@@ -300,13 +300,13 @@ pub(crate) fn render_deferred_settings_panel(
             );
         });
 
-    ui.add_space(14.0);
+    ui.add_space(8.0);
     ui.separator();
-    ui.add_space(10.0);
+    ui.add_space(6.0);
     ui.label(egui::RichText::new("Show Info").strong());
     egui::Grid::new("deferred_info_settings_grid")
         .num_columns(2)
-        .spacing([12.0, 10.0])
+        .spacing(SETTINGS_GRID_SPACING)
         .show(ui, |ui| {
             settings_changed |= settings_slider_row(
                 ui,
@@ -315,7 +315,7 @@ pub(crate) fn render_deferred_settings_panel(
                 0.1..=10.0,
             );
         });
-    ui.add_space(14.0);
+    ui.add_space(8.0);
 
     if settings_changed {
         state.save_changed_settings();
@@ -797,6 +797,60 @@ pub(crate) fn settings_slider_row(
 #[cfg(test)]
 mod info_settings_tests {
     use super::*;
+
+    #[test]
+    fn settings_rows_have_compact_spacing_without_smaller_controls_or_changed_values() {
+        for scale in [1.0, 2.0] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            let interact_height = ctx.style().spacing.interact_size.y;
+            let settings = LauncherSettings::default();
+            let mut state = SettingsWindowState::new(settings, Arc::default(), Arc::default());
+            for _ in 0..2 {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1200.0, 8000.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            assert!(!render_deferred_settings_panel(ui, &mut state));
+                            assert_eq!(ui.spacing().interact_size.y, interact_height);
+                        });
+                    },
+                );
+                let label_y = |label: &str| {
+                    output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if text.galley.job.text == label => {
+                                Some(text.pos.y)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("Missing settings label: {label}"))
+                };
+                let row_height = label_y("Icon Grid Mode:") - label_y("Show System Modules:");
+                assert!(
+                    row_height >= interact_height && row_height <= interact_height + 5.0,
+                    "Settings row={row_height}, control={interact_height}, scale={scale}"
+                );
+                assert!(label_y("Close Settings (F10)") - label_y("Launcher Settings") < 1000.0);
+                for label in ["Application panel", "Open window view", "Show Info"] {
+                    label_y(label);
+                }
+                assert_eq!(
+                    format_launcher_settings(state.settings),
+                    format_launcher_settings(settings)
+                );
+                assert_eq!(state.revision, 0);
+            }
+        }
+    }
 
     #[test]
     fn launcher_window_visibility_persists_and_legacy_or_invalid_settings_keep_it_hidden() {

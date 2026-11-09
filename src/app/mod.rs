@@ -167,7 +167,7 @@ fn format_utc_timestamp(timestamp_ms: i64) -> String {
     let month = month_prime + if month_prime < 10 { 3 } else { -9 };
     year += i64::from(month <= 2);
 
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{milliseconds:03}")
+    format!("{day:02}-{month:02}-{year:04} {hour:02}:{minute:02}:{second:02}.{milliseconds:03}")
 }
 
 fn snapshot_label(snapshot: &applicationlauncher::tracker::SnapshotSummary) -> String {
