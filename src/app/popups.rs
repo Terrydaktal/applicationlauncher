@@ -619,6 +619,12 @@ impl InfoPopups {
         }
     }
 
+    pub(super) fn cancel_focus_requests(&self) {
+        for popup in &self.items {
+            popup.focus_requested.store(false, Ordering::Relaxed);
+        }
+    }
+
     fn open(&mut self, target: InfoTarget) -> Result<egui::ViewportId, &'static str> {
         if let Some(index) = self
             .items
@@ -3677,6 +3683,35 @@ mod tests {
         assert_eq!(popups.items[0].id, first);
         assert!(popups.items.iter().any(|popup| popup.id == app_a));
         assert!(popups.items.iter().any(|popup| popup.id == app_b));
+    }
+
+    #[test]
+    fn focusing_launcher_cancels_old_info_focus_without_closing_or_resetting_popups() {
+        let mut popups = InfoPopups::default();
+        let first = popups.open(window("first")).unwrap();
+        let second = popups.open(app("/test/a.desktop")).unwrap();
+        popups.items[0].initial_size = Some([1200.0, 620.0]);
+        popups.cancel_focus_requests();
+        assert_eq!(popups.items.len(), 2);
+        assert_eq!(popups.items[0].id, first);
+        assert_eq!(popups.items[1].id, second);
+        assert_eq!(popups.items[0].initial_size, Some([1200.0, 620.0]));
+        assert!(
+            popups
+                .items
+                .iter()
+                .all(|popup| !popup.focus_requested.load(Ordering::Relaxed))
+        );
+
+        assert_eq!(popups.open(window("first")).unwrap(), first);
+        assert!(
+            popups
+                .items
+                .last()
+                .unwrap()
+                .focus_requested
+                .load(Ordering::Relaxed)
+        );
     }
 
     #[test]

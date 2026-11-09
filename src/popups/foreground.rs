@@ -30,8 +30,12 @@ impl Requests {
     }
 }
 
-pub(super) fn app_id(pid: u32, id: ViewportId) -> String {
-    format!("applicationlauncher-info-{pid}-{:016x}", id.0.value())
+pub(crate) fn app_id(pid: u32, id: ViewportId) -> String {
+    if id == ViewportId::ROOT {
+        "applicationlauncher".into()
+    } else {
+        format!("applicationlauncher-info-{pid}-{:016x}", id.0.value())
+    }
 }
 
 fn drain_requests(requests: &Mutex<Requests>, mut activate: impl FnMut(ViewportId)) {
@@ -60,10 +64,14 @@ pub(crate) fn request(id: ViewportId) {
     }
     // Winit's Wayland focus_window is a no-op. Run only on explicit reactivation,
     // with one worker and one latest-wins pending target, never during rendering.
-    applicationlauncher::observability::spawn_named("info-focus", move |worker| {
-        worker.set_state("raising-info-window");
+    applicationlauncher::observability::spawn_named("window-focus", move |worker| {
         let kdotool = applicationlauncher::process::kdotool_path();
         drain_requests(requests, |id| {
+            worker.set_state(if id == ViewportId::ROOT {
+                "raising-launcher-window"
+            } else {
+                "raising-info-window"
+            });
             let activated = activate_with(std::process::id(), id, |arguments| {
                 let mut command = Command::new(&kdotool);
                 command.args(arguments);
@@ -76,7 +84,7 @@ pub(crate) fn request(id: ViewportId) {
             });
             if !activated {
                 applicationlauncher::observability::record(
-                    applicationlauncher::observability::Event::new("info-focus", "failed")
+                    applicationlauncher::observability::Event::new("window-focus", "failed")
                         .reason("target-absent-ambiguous-or-activation-failed"),
                 );
             }
@@ -144,6 +152,73 @@ mod tests {
     use super::*;
 
     const WINDOW: &str = "{01234567-89ab-4cde-8f01-234567890abc}";
+
+    #[test]
+    fn launcher_activation_matches_only_its_pid_and_native_identity_not_title_substrings() {
+        let mut calls = Vec::new();
+        assert!(activate_with(42, ViewportId::ROOT, |args| {
+            calls.push(args.to_vec());
+            Some(if calls.len() == 1 {
+                format!("{WINDOW}\n").into_bytes()
+            } else {
+                Vec::new()
+            })
+        }));
+        assert_eq!(
+            calls[0],
+            [
+                "search",
+                "--all",
+                "--pid",
+                "42",
+                "--class",
+                "^applicationlauncher$"
+            ]
+            .map(str::to_owned)
+        );
+        assert_eq!(
+            calls[1],
+            [
+                "windowstate",
+                "--remove",
+                "MINIMIZED",
+                WINDOW,
+                "windowactivate",
+                WINDOW,
+                "windowraise",
+                WINDOW,
+            ]
+            .map(str::to_owned)
+        );
+        assert_eq!(calls.len(), 2);
+        assert_ne!(
+            app_id(42, ViewportId::ROOT),
+            app_id(42, ViewportId::from_hash_of("info-a"))
+        );
+    }
+
+    #[test]
+    fn shortcut_activation_follows_in_flight_info_and_supersedes_older_pending_info() {
+        let info = ViewportId::from_hash_of("info-a");
+        let other_info = ViewportId::from_hash_of("info-b");
+        let requests = Mutex::new(Requests::default());
+        assert!(requests.lock().unwrap().enqueue(info));
+        let mut activated = Vec::new();
+        drain_requests(&requests, |id| {
+            activated.push(id);
+            if id == info {
+                let mut pending = requests.lock().unwrap();
+                assert!(!pending.enqueue(other_info));
+                assert!(!pending.enqueue(ViewportId::ROOT));
+            }
+        });
+        assert_eq!(activated, [info, ViewportId::ROOT]);
+        assert!(!requests.lock().unwrap().running);
+
+        assert!(requests.lock().unwrap().enqueue(other_info));
+        drain_requests(&requests, |id| activated.push(id));
+        assert_eq!(activated, [info, ViewportId::ROOT, other_info]);
+    }
 
     #[test]
     fn foreground_activation_targets_only_the_exact_pid_and_info_identity_and_preserves_geometry() {

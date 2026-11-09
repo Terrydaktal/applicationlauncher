@@ -175,6 +175,7 @@ impl eframe::App for App {
 
         if focus_requested {
             handled_focus_launcher = true;
+            self.info_popups.cancel_focus_requests();
             if let Some((source_pending, symbols_unarchived)) = deployment_warnings {
                 self.source_changes_pending = source_pending;
                 self.symbols_unarchived = symbols_unarchived;

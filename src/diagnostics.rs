@@ -1,8 +1,6 @@
 use eframe::egui;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
@@ -149,68 +147,8 @@ pub(crate) fn get_socket_path(mode: LauncherMode) -> PathBuf {
     }
 }
 
-pub(crate) fn focus_existing_launcher_window() {
-    let kpath = get_kdotool_path();
-    let mut ids = Vec::new();
-
-    for args in [["search", "--title", "Open Application Windows"].as_slice()] {
-        if let Ok(output) = applicationlauncher::process::output_with_timeout(
-            {
-                let mut command = Command::new(&kpath);
-                command.args(args);
-                command
-            },
-            Duration::from_secs(3),
-        ) {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for id in stdout.lines().map(str::trim).filter(|id| !id.is_empty()) {
-                    if !ids.iter().any(|existing: &String| existing == id) {
-                        ids.push(id.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    for id in ids {
-        let _ = applicationlauncher::process::status_with_timeout(
-            {
-                let mut command = Command::new(&kpath);
-                command.args(["windowstate", "--remove", "MINIMIZED", &id]);
-                command
-            },
-            Duration::from_secs(3),
-        );
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        let _ = applicationlauncher::process::status_with_timeout(
-            {
-                let mut command = Command::new(&kpath);
-                command.args(["windowactivate", &id]);
-                command
-            },
-            Duration::from_secs(3),
-        );
-        let _ = applicationlauncher::process::status_with_timeout(
-            {
-                let mut command = Command::new(&kpath);
-                command.args(["windowraise", &id]);
-                command
-            },
-            Duration::from_secs(3),
-        );
-    }
-}
-
 pub(crate) fn request_launcher_foreground() {
-    static FOCUS_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-    if FOCUS_IN_FLIGHT.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    std::thread::spawn(|| {
-        focus_existing_launcher_window();
-        FOCUS_IN_FLIGHT.store(false, Ordering::Release);
-    });
+    crate::popups::foreground::request(egui::ViewportId::ROOT);
 }
 pub(crate) fn launcher_state_dir() -> PathBuf {
     if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {

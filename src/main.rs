@@ -49,6 +49,10 @@ fn launcher_native_options(width: f32, height: f32, title: &str) -> eframe::Nati
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(title)
+            .with_app_id(popups::foreground::app_id(
+                std::process::id(),
+                egui::ViewportId::ROOT,
+            ))
             .with_decorations(false)
             .with_transparent(true)
             .with_always_on_top()
@@ -386,7 +390,7 @@ fn main() -> eframe::Result {
                 (false, false) => "focus\n",
             };
             if send_launcher_control_request(&socket_path, focus_request, false).is_ok() {
-                focus_existing_launcher_window();
+                // The owning GUI serializes activation after pending popup focus work.
                 return Ok(());
             }
             // No listener answered, so this is a stale socket. Only remove it
@@ -511,5 +515,14 @@ mod native_options_tests {
             wgpu::PresentMode::AutoNoVsync
         );
         assert_eq!(options.wgpu_options.desired_maximum_frame_latency, Some(2));
+    }
+
+    #[test]
+    fn main_window_has_a_stable_native_identity_independent_of_its_title() {
+        let options = launcher_native_options(800.0, 600.0, "Applicationlauncher");
+        assert_eq!(
+            options.viewport.app_id.as_deref(),
+            Some("applicationlauncher")
+        );
     }
 }
