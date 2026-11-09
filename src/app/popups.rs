@@ -172,10 +172,13 @@ struct InstalledApplicationFields<'a> {
     executable: Option<&'a Path>,
     chain: Option<&'a [PathBuf]>,
     version: Option<&'a str>,
+    version_reason: Option<&'a str>,
+    installed_metadata: Option<&'a program_metadata::interpreted::InstalledVersion>,
     build_id: Option<&'a str>,
+    build_id_reason: Option<&'a str>,
     native: Option<bool>,
     package_target: bool,
-    latest_package_version: Option<&'a str>,
+    latest_package_version: Option<&'a crate::windows::versions::AvailablePackageVersion>,
     npm_target: Option<&'a crate::windows::versions::NpmTarget>,
     latest_npm_version: Option<&'a str>,
     uncompiled_changes: Option<&'a str>,
@@ -205,6 +208,20 @@ fn installation_type_value(value: &str) -> String {
         .unwrap_or(value)
         .to_owned()
 }
+
+fn metadata_issue_value(reason: &str) -> String {
+    if ["Not embedded", "Not applicable", "Unavailable", "Unknown"]
+        .iter()
+        .any(|prefix| reason.starts_with(prefix))
+    {
+        reason.to_owned()
+    } else {
+        format!("Unavailable ({reason})")
+    }
+}
+
+const VERSION_FIELD_LABEL: &str = "Version (ELF build ID)";
+const LATEST_VERSION_FIELD_LABEL: &str = "Latest version on disk (ELF build ID)";
 
 fn installed_application_rows(
     role: &str,
@@ -249,22 +266,41 @@ fn installed_application_rows(
             ),
         )
     });
-    [
+    let mut rows = [
         (
             "latest version (on disk)",
-            fields.version.map(str::to_owned),
+            fields
+                .version
+                .map(|version| match fields.installed_metadata {
+                    Some(metadata) => format!(
+                        "{version} ({}; installed metadata, not a running-version receipt)",
+                        metadata.kind
+                    ),
+                    None => version.to_owned(),
+                })
+                .or_else(|| {
+                    fields
+                        .version_reason
+                        .map(|reason| format!("Unavailable ({reason})"))
+                }),
         ),
         (
             "latest ELF build ID (on disk)",
             if fields.native == Some(false) {
                 Some("Not applicable (interpreted application entry point)".into())
             } else {
-                fields.build_id.map(str::to_owned)
+                fields
+                    .build_id
+                    .map(str::to_owned)
+                    .or_else(|| fields.build_id_reason.map(metadata_issue_value))
             },
         ),
         (
             "uncompiled changes",
-            fields.uncompiled_changes.map(str::to_owned),
+            fields
+                .uncompiled_changes
+                .map(program_metadata::build_status::display_uncompiled_changes)
+                .map(str::to_owned),
         ),
         (
             "installation",
@@ -276,6 +312,12 @@ fn installed_application_rows(
     .chain(package.map(|(label, value)| (label, Some(value))))
     .chain(npm.map(|(label, value)| (label, Some(value))))
     .chain(root_package)
+    .chain(
+        fields
+            .metadata
+            .and_then(|metadata| metadata.source_checkout.as_ref())
+            .map(|root| ("source checkout", Some(root.display().to_string()))),
+    )
     .chain([
         ("Launch chain", chain),
         (
@@ -308,12 +350,14 @@ fn installed_application_rows(
         separator_before: false,
         binary_is_current: None,
     })
-    .collect()
+    .collect();
+
+    rows
 }
 
 fn desktop_file_value(path: Option<&Path>, exists: Option<bool>, pending: bool) -> String {
     let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) else {
-        return "Unavailable (no associated desktop entry)".into();
+        return "None".into();
     };
     let path = path.to_string_lossy();
     match exists {
@@ -330,6 +374,9 @@ fn desktop_entry_rows(
     pending: bool,
     fallback_icon: Option<&Path>,
 ) -> Vec<InfoPopupRow> {
+    let pending_entry = entry.is_none() && pending;
+    let entry = entry.filter(|entry| !entry.desktop_file_path.as_os_str().is_empty());
+    let fallback_icon = fallback_icon.filter(|_| entry.is_some() || pending_entry);
     [
         (
             "Desktop file",
@@ -346,21 +393,21 @@ fn desktop_entry_rows(
                 .and_then(|entry| entry.icon_path.as_deref())
                 .or(fallback_icon)
                 .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "Unavailable".into()),
+                .unwrap_or_else(|| "-".into()),
             false,
         ),
         (
             "Name",
             entry
                 .map(|entry| entry.name.clone())
-                .unwrap_or_else(|| "Unavailable".into()),
+                .unwrap_or_else(|| "-".into()),
             true,
         ),
         (
             "Comment",
             entry
                 .and_then(|entry| entry.comment.clone())
-                .unwrap_or_else(|| "Unavailable".into()),
+                .unwrap_or_else(|| "-".into()),
             true,
         ),
     ]
@@ -368,7 +415,7 @@ fn desktop_entry_rows(
     .map(|(label, value, searched)| InfoPopupRow {
         label: label.into(),
         scope: InfoFieldScope::Installation,
-        value: if entry.is_none() && pending && label != "Icon path" {
+        value: if pending_entry && label != "Icon path" {
             "Loading...".into()
         } else {
             value
@@ -396,10 +443,13 @@ fn application_info_rows(state: &AppInfoPopup) -> Vec<InfoPopupRow> {
             executable: details.and_then(|info| info.executable.as_deref()),
             chain: details.map(|info| info.chain.as_slice()),
             version: details.and_then(|info| info.version.as_deref()),
+            version_reason: details.and_then(|info| info.version_reason.as_deref()),
+            installed_metadata: details.and_then(|info| info.installed_metadata.as_ref()),
             build_id: details.and_then(|info| info.build_id.as_deref()),
+            build_id_reason: details.and_then(|info| info.build_id_reason.as_deref()),
             native: details.and_then(|info| info.native),
             package_target: details.is_some_and(|info| info.package_target.is_some()),
-            latest_package_version: details.and_then(|info| info.latest_package_version.as_deref()),
+            latest_package_version: details.and_then(|info| info.latest_package_version.as_ref()),
             npm_target: details.and_then(|info| info.npm_target.as_ref()),
             latest_npm_version: details.and_then(|info| info.latest_npm_version.as_deref()),
             uncompiled_changes: details.and_then(|info| info.uncompiled_changes.as_deref()),
@@ -506,15 +556,17 @@ fn latest_npm_version_field(
 }
 
 fn latest_package_version_field(
-    latest_package_version: Option<&str>,
+    latest_package_version: Option<&crate::windows::versions::AvailablePackageVersion>,
     has_package_target: bool,
 ) -> Option<(&'static str, String)> {
     has_package_target.then(|| {
         (
-            "latest package version (Pacman/AUR)",
+            latest_package_version.map_or("latest version (Pacman/AUR)", |version| {
+                version.field_label()
+            }),
             latest_package_version
-                .unwrap_or("Checking Pacman/AUR...")
-                .to_owned(),
+                .map(|version| version.display())
+                .unwrap_or_else(|| "Checking available package version...".into()),
         )
     })
 }
@@ -538,35 +590,80 @@ pub(super) fn process_version_rows(
     .map(|(label, value)| InfoPopupRow {
         label: info_metadata_label(role, label),
         scope: InfoFieldScope::RunningInstance,
-        value: value.map(str::to_owned).unwrap_or_else(|| {
-            if let Some(reason) = version.and_then(|version| version.running_unavailable) {
-                format!("Unavailable ({reason})")
-            } else {
-                if pending { "Loading..." } else { "Unavailable" }.into()
-            }
-        }),
+        value: value
+            .map(|value| {
+                if label == "version"
+                    && version
+                        .and_then(|version| version.application_installed_metadata.as_ref())
+                        .is_some_and(|metadata| metadata.kind == "Electron package")
+                {
+                    format!("{value} (running native engine; loaded application version unknown)")
+                } else {
+                    value.to_owned()
+                }
+            })
+            .unwrap_or_else(|| {
+                if let Some(reason) = version.and_then(|version| version.running_unavailable) {
+                    format!("Unavailable ({reason})")
+                } else if label == "version"
+                    && let Some(reason) =
+                        version.and_then(|version| version.version_reason.as_deref())
+                {
+                    format!("Unavailable ({reason})")
+                } else if label == "ELF build ID"
+                    && let Some(reason) =
+                        version.and_then(|version| version.build_id_reason.as_deref())
+                {
+                    metadata_issue_value(reason)
+                } else {
+                    if pending { "Loading..." } else { "Unavailable" }.into()
+                }
+            }),
         searched: false,
         separator_before: false,
         binary_is_current: if label == "ELF build ID"
             && value.is_some_and(|value| !value.trim().is_empty())
         {
-            version.and_then(|version| version.running_latest_binary)
+            version
+                .filter(|version| version.running_unavailable.is_none())
+                .and_then(|version| version.running_latest_binary)
         } else {
             None
         },
     })
     .collect();
+
     let launch = version.and_then(|version| version.launch.as_ref());
+    if let Some(candidate) = version.and_then(|version| version.on_disk_candidate.as_ref()) {
+        rows.push(InfoPopupRow {
+            label: info_metadata_label(role, "on-disk candidate"),
+            scope: InfoFieldScope::Installation,
+            value: format!(
+                "{} — {}",
+                candidate.display(),
+                version
+                    .and_then(|version| version.on_disk_candidate_reason.as_deref())
+                    .unwrap_or("absolute argv[0]; running executable unverified")
+            ),
+            searched: false,
+            separator_before: false,
+            binary_is_current: None,
+        });
+    }
     rows.extend(installed_application_rows(
         role,
         InstalledApplicationFields {
             executable: launch.and_then(|launch| launch.executable.as_deref()),
             chain: launch.map(|launch| launch.chain.as_slice()),
             version: version.and_then(|version| version.latest_version.as_deref()),
+            version_reason: version.and_then(|version| version.latest_version_reason.as_deref()),
+            installed_metadata: version
+                .and_then(|version| version.application_installed_metadata.as_ref()),
             build_id: version.and_then(|version| version.latest_build_id.as_deref()),
+            build_id_reason: version.and_then(|version| version.latest_build_id_reason.as_deref()),
             package_target: version.is_some_and(|version| version.package_target.is_some()),
             latest_package_version: version
-                .and_then(|version| version.latest_package_version.as_deref()),
+                .and_then(|version| version.latest_package_version.as_ref()),
             npm_target: version.and_then(|version| version.npm_target.as_ref()),
             latest_npm_version: version.and_then(|version| version.latest_npm_version.as_deref()),
             uncompiled_changes: version.and_then(|version| version.uncompiled_changes.as_deref()),
@@ -603,7 +700,7 @@ pub(super) fn application_version_rows(
     if let Some(application) = version.and_then(|version| version.application.as_ref()) {
         let build = version.and_then(|version| version.application_build.as_ref());
         let package_field = latest_package_version_field(
-            version.and_then(|version| version.application_latest_package_version.as_deref()),
+            version.and_then(|version| version.application_latest_package_version.as_ref()),
             version.is_some_and(|version| version.application_package_target.is_some()),
         );
         rows.push(row(
@@ -661,8 +758,27 @@ pub(super) fn application_version_rows(
         ));
     }
     if let Some(application) = version.and_then(|version| version.script_application.as_ref()) {
+        let installed = version.and_then(|version| version.application_installed_metadata.as_ref());
+        installed_rows.push(row(
+            "installed version",
+            installed
+                .map(|metadata| metadata.version.clone())
+                .unwrap_or_else(|| {
+                    "Unknown (no exact installed application version metadata)".into()
+                }),
+        ));
+        if let Some(installed) = installed {
+            launch_rows.push(row(
+                "installed metadata",
+                format!(
+                    "{} — {}",
+                    installed.metadata_path.display(),
+                    installed.identification
+                ),
+            ));
+        }
         let package_field = latest_package_version_field(
-            version.and_then(|version| version.application_latest_package_version.as_deref()),
+            version.and_then(|version| version.application_latest_package_version.as_ref()),
             version.is_some_and(|version| version.application_package_target.is_some()),
         );
         for (label, value) in [
@@ -673,8 +789,16 @@ pub(super) fn application_version_rows(
                 "Unknown (no application build identity published)".into(),
             ),
             (
-                "build status",
-                "Unknown (no application build identity published)".into(),
+                if application.kind.starts_with("Python") {
+                    "source changes since start"
+                } else {
+                    "build status"
+                },
+                if application.kind.starts_with("Python") {
+                    "Unknown (no startup source snapshot published)".into()
+                } else {
+                    "Unknown (no application build identity published)".into()
+                },
             ),
         ] {
             rows.push(row(label, value));
@@ -797,12 +921,14 @@ pub(super) fn hosted_metadata_sections(
     };
     vec![
         InfoMetadataSection {
+            binary_is_current: None,
             id: app_id,
             header: format!("Application: {name}").into(),
             default_open: true,
             rows: application_rows,
         },
         InfoMetadataSection {
+            binary_is_current: None,
             id: runtime_id,
             header: format!("Runtime: {runtime}").into(),
             default_open: true,
@@ -992,19 +1118,17 @@ pub(super) fn process_info_rows(
         row("PID", node.identity.pid.to_string(), false),
         row("Parent PID", node.parent_pid.to_string(), false),
         row(
-            "Executable path",
-            node.executable
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "Unavailable".into()),
+            "Process start (ticks since boot)",
+            node.identity.start_ticks.to_string(),
             false,
         ),
         row(
             "Working directory",
-            node.cwd
-                .as_deref()
-                .map(display_path)
-                .unwrap_or_else(|| "Unavailable".into()),
+            node.cwd.as_deref().map(display_path).unwrap_or_else(|| {
+                node.cwd_error
+                    .map(metadata_issue_value)
+                    .unwrap_or_else(|| "Unavailable".into())
+            }),
             active && node.cwd == window.cwd_path,
         ),
         row(
@@ -1015,78 +1139,124 @@ pub(super) fn process_info_rows(
             active && node.command_line == window.command_line,
         ),
         row(
-            "Process start (ticks since boot)",
-            node.identity.start_ticks.to_string(),
+            "Executable path",
+            node.executable
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| {
+                    node.executable_error
+                        .map(metadata_issue_value)
+                        .unwrap_or_else(|| "Unavailable".into())
+                }),
             false,
         ),
     ];
     if let Some(script) = &node.script_name {
         rows.insert(1, row("Script name", script.clone(), false));
     }
-    if let Some(pane) = &window.tmux_pane
-        && [pane.client_pid, pane.session.server_pid].contains(&node.identity.pid)
-    {
-        rows.extend([
-            row("Tmux session", pane.session.session_name.clone(), true),
-            row("Tmux socket", pane.session.socket_path.clone(), false),
-            row("Tmux client PID", pane.client_pid.to_string(), false),
-            row("Tmux active pane", pane.pane_id.clone(), false),
-            row("Tmux pane title", pane.title.clone(), false),
-            row("Tmux pane PID", pane.pane_pid.to_string(), false),
-            row(
-                "Tmux server PID",
-                pane.session.server_pid.to_string(),
-                false,
-            ),
-            row("Tmux pane directory", display_path(&pane.cwd), false),
-        ]);
-    }
     rows.extend(version_rows);
     rows
 }
 
-impl App {
-    fn info_entry_for_process<'a>(
-        &'a self,
-        window: &WindowInfo,
-        node: &ProcessInfoNode,
-    ) -> Option<(&'a AppInfo, bool)> {
-        if window.pid == Some(node.identity.pid) {
-            if let Some(name) = window.desktop_file_name.as_deref()
-                && let Some(entry) = self.apps.iter().find(|entry| {
-                    entry.desktop_file_path.to_str() == Some(name)
-                        || entry
-                            .desktop_file_path
-                            .file_stem()
-                            .and_then(|stem| stem.to_str())
-                            == Some(name.trim_end_matches(".desktop"))
-                })
-            {
-                return Some((entry, true));
-            }
-            return self.find_app_for_window(window).map(|entry| (entry, false));
-        }
-        let key = normalize_app_match_key(&node.name);
-        self.apps
-            .iter()
-            .find(|entry| {
-                command_basename(&entry.exec)
-                    .is_some_and(|name| normalize_app_match_key(&name) == key)
-            })
-            .map(|entry| (entry, false))
-    }
+fn unique_desktop_candidate<'a>(
+    mut entries: impl Iterator<Item = &'a AppInfo>,
+) -> Option<&'a AppInfo> {
+    let entry = entries.next()?;
+    entries.next().is_none().then_some(entry)
+}
 
+fn window_desktop_candidate<'a>(
+    apps: &'a [AppInfo],
+    window: &WindowInfo,
+) -> Option<(&'a AppInfo, bool)> {
+    if let Some(name) = window.desktop_file_name.as_deref() {
+        let mut entries = apps.iter().filter(|entry| {
+            entry.desktop_file_path.to_str() == Some(name)
+                || entry
+                    .desktop_file_path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    == Some(name.trim_end_matches(".desktop"))
+        });
+        if let Some(entry) = entries.next() {
+            // A declared basename can match multiple XDG entries. Do not
+            // silently select whichever happened to be enumerated first.
+            return entries.next().is_none().then_some((entry, true));
+        }
+    }
+    let mut keys = Vec::new();
+    let class = window.class.trim();
+    if !class.is_empty() {
+        keys.push(normalize_app_match_key(class));
+        if let Some(segment) = class.rsplit('.').next() {
+            keys.push(normalize_app_match_key(segment));
+        }
+    }
+    if let Some(name) = window
+        .exe_path
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+    {
+        keys.push(normalize_app_match_key(name));
+    }
+    if let Some(name) = &window.active_process {
+        keys.push(normalize_app_match_key(name));
+    }
+    keys.retain(|key| !key.is_empty());
+    let mut best = None;
+    let mut ambiguous = false;
+    for entry in apps {
+        let Some(score) =
+            best_app_match_score(&keys, entry).map(|score| (score, entry.is_settings_module))
+        else {
+            continue;
+        };
+        match best {
+            None => best = Some((entry, score)),
+            Some((_, previous)) if score < previous => {
+                best = Some((entry, score));
+                ambiguous = false;
+            }
+            Some((_, previous)) if score == previous => ambiguous = true,
+            _ => {}
+        }
+    }
+    best.filter(|_| !ambiguous).map(|(entry, _)| (entry, false))
+}
+
+fn process_desktop_candidate<'a>(
+    apps: &'a [AppInfo],
+    window: &WindowInfo,
+    node: &ProcessInfoNode,
+) -> Option<(&'a AppInfo, bool)> {
+    let owner_entry = window_desktop_candidate(apps, window);
+    if window.pid == Some(node.identity.pid) {
+        return owner_entry;
+    }
+    // Only a candidate crosses from the window owner to a child. The worker
+    // must resolve it to that child's independently pinned executable, and the
+    // window-declared qualification must never cross the process boundary.
+    owner_entry.map(|(entry, _)| (entry, false)).or_else(|| {
+        let key = normalize_app_match_key(&node.name);
+        unique_desktop_candidate(apps.iter().filter(|entry| {
+            command_basename(&entry.exec).is_some_and(|name| normalize_app_match_key(&name) == key)
+        }))
+        .map(|entry| (entry, false))
+    })
+}
+
+impl App {
     fn process_desktop_rows(
         launch: Option<&crate::windows::versions::ApplicationLaunch>,
         pending: bool,
-        icon: Option<&Path>,
     ) -> Vec<InfoPopupRow> {
         let entry = launch.and_then(|launch| launch.desktop_entry.as_ref());
         desktop_entry_rows(
             entry,
             launch.and_then(|launch| launch.desktop_exists),
             pending,
-            icon,
+            None,
         )
     }
 
@@ -1280,27 +1450,30 @@ impl App {
             let owner = window_info.pid == Some(node.identity.pid);
             let id = process_info_section_id((viewport_id, &window_info.id), node.identity);
             let open = process_info_section_is_open(ctx, id, owner);
+            let version = popup.versions.as_ref().and_then(|cache| {
+                if open {
+                    cache.request_for_application(node, true, || {
+                        process_desktop_candidate(&self.apps, window_info, node)
+                    })
+                } else {
+                    cache.request_header_for_application(node, || {
+                        process_desktop_candidate(&self.apps, window_info, node)
+                    })
+                }
+            });
+            if version
+                .as_ref()
+                .is_some_and(|version| version.application_build.is_some())
+            {
+                // Visible Pi headers refresh local receipts, never ELF or package probes.
+                ctx.request_repaint_after(crate::windows::versions::PI_RECEIPT_REFRESH);
+            }
+            let binary_is_current = version
+                .as_deref()
+                .and_then(|version| version.process_build_is_current());
             let mut metadata_sections = Vec::new();
             let rows = if open {
-                let application_open =
-                    process_info_section_is_open(ctx, id.with("hosted-application"), true);
-                let version = popup.versions.as_ref().and_then(|cache| {
-                    cache.request_for_application(node, application_open, || {
-                        self.info_entry_for_process(window_info, node)
-                    })
-                });
                 details_ready &= version.is_some();
-                if application_open
-                    && version.as_ref().is_some_and(|version| {
-                        version.application.as_ref().is_some_and(|application| {
-                            application.package == "@earendil-works/pi-coding-agent"
-                        })
-                    })
-                {
-                    // Repaint only an expanded Pi section. This schedules bounded receipt reads,
-                    // not ELF, package-manager or whole-SDK probes, and stops when collapsed.
-                    ctx.request_repaint_after(crate::windows::versions::PI_RECEIPT_REFRESH);
-                }
                 metadata_sections = hosted_metadata_sections(ctx, id, node, version.as_deref());
                 let launch = version.as_ref().and_then(|version| {
                     if version.runtime_name.is_some() {
@@ -1309,7 +1482,7 @@ impl App {
                         version.launch.as_ref()
                     }
                 });
-                let versions = if metadata_sections.is_empty() {
+                let mut versions = if metadata_sections.is_empty() {
                     let mut rows = application_version_rows(
                         "Application",
                         version.as_deref(),
@@ -1317,15 +1490,7 @@ impl App {
                     );
                     append_desktop_entry_rows(
                         &mut rows,
-                        Self::process_desktop_rows(
-                            launch,
-                            version.is_none(),
-                            if owner {
-                                window_info.icon_path.as_deref()
-                            } else {
-                                None
-                            },
-                        ),
+                        Self::process_desktop_rows(launch, version.is_none()),
                     );
                     rows
                 } else {
@@ -1334,25 +1499,19 @@ impl App {
                     {
                         append_desktop_entry_rows(
                             &mut application.rows,
-                            Self::process_desktop_rows(
-                                launch,
-                                version.is_none(),
-                                if owner {
-                                    window_info.icon_path.as_deref()
-                                } else {
-                                    None
-                                },
-                            ),
+                            Self::process_desktop_rows(launch, version.is_none()),
                         );
                     }
                     Vec::new()
                 };
+                let mut process = process_info_rows(window_info, node, Vec::new());
+                process.extend(versions);
                 if owner {
                     let mut rows = window_info_rows(window_info, Vec::new());
-                    rows.extend(process_info_rows(window_info, node, versions));
+                    rows.extend(process);
                     rows
                 } else {
-                    process_info_rows(window_info, node, versions)
+                    process
                 }
             } else {
                 Vec::new()
@@ -1361,6 +1520,7 @@ impl App {
                 id,
                 depth: node.depth,
                 header: node.header.clone(),
+                binary_is_current,
                 default_open: owner,
                 rows,
                 metadata_sections,
@@ -1379,6 +1539,7 @@ impl App {
             sections.push(InfoProcessSection {
                 id: process_info_section_id((viewport_id, &window_info.id), identity),
                 depth: 0,
+                binary_is_current: None,
                 header: format!(
                     "{} (window owner; process metadata {})",
                     window_application_key(window_info),
@@ -1395,11 +1556,7 @@ impl App {
                     let mut rows = process_version_rows("Application", None, snapshot.is_none());
                     append_desktop_entry_rows(
                         &mut rows,
-                        Self::process_desktop_rows(
-                            None,
-                            snapshot.is_none(),
-                            window_info.icon_path.as_deref(),
-                        ),
+                        Self::process_desktop_rows(None, snapshot.is_none()),
                     );
                     if let Some(row) = rows.iter_mut().find(|row| row.label == "Desktop file")
                         && Path::new(&desktop_file_path).is_absolute()
@@ -1589,6 +1746,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::windows::versions::PackageVersionSource;
 
     fn app(path: &str) -> InfoTarget {
         InfoTarget::App(AppInfoPopup::new(AppInfo {
@@ -1599,6 +1757,123 @@ mod tests {
             comment: None,
             is_settings_module: false,
         }))
+    }
+
+    fn desktop_process(pid: i32, name: &str) -> ProcessInfoNode {
+        ProcessInfoNode {
+            identity: ProcessIdentity {
+                pid,
+                start_ticks: 42,
+            },
+            parent_pid: 1,
+            depth: 1,
+            name: name.into(),
+            script_name: None,
+            header: name.into(),
+            executable: Some(format!("/not-accessed/{name}").into()),
+            executable_identity: Some((1, 2)),
+            executable_error: None,
+            cwd: None,
+            cwd_error: None,
+            raw_argv0: None,
+            command_line: None,
+        }
+    }
+
+    #[test]
+    fn chrome_children_receive_the_owner_desktop_only_as_an_unverified_candidate() {
+        let InfoTarget::Window(mut popup) = window("chrome-window") else {
+            unreachable!()
+        };
+        popup.window.pid = Some(10);
+        popup.window.desktop_file_name = Some("google-chrome-fast".into());
+        popup.window.title = "A tab title, not an application name".into();
+        popup.window.icon_path = Some("/window-only.png".into());
+        let apps = [AppInfo {
+            name: "Google Chrome".into(),
+            exec: "/not-accessed/google-chrome-fast %U".into(),
+            desktop_file_path: "/not-accessed/google-chrome-fast.desktop".into(),
+            icon_path: Some("/desktop/chrome.png".into()),
+            comment: Some("Web browser".into()),
+            is_settings_module: false,
+        }];
+        let owner = desktop_process(10, "chrome");
+        let child = desktop_process(11, "chrome");
+        let helper = desktop_process(12, "chrome_crashpad_handler");
+        assert_eq!(
+            process_desktop_candidate(&apps, &popup.window, &owner),
+            Some((&apps[0], true))
+        );
+        for node in [&child, &helper] {
+            assert_eq!(
+                process_desktop_candidate(&apps, &popup.window, node),
+                Some((&apps[0], false))
+            );
+            let rows = process_info_rows(&popup.window, node, Vec::new());
+            assert!(
+                !rows
+                    .iter()
+                    .any(|row| matches!(row.label.as_str(), "Raw window title" | "Geometry"))
+            );
+        }
+        let launch = crate::windows::versions::ApplicationLaunch {
+            desktop_entry: Some(apps[0].clone()),
+            desktop_exists: Some(true),
+            published_target_verified: true,
+            ..Default::default()
+        };
+        let rows = App::process_desktop_rows(Some(&launch), false);
+        for (label, value) in [
+            ("Name", "Google Chrome"),
+            ("Comment", "Web browser"),
+            ("Icon path", "/desktop/chrome.png"),
+        ] {
+            assert!(
+                rows.iter()
+                    .any(|row| row.label == label && row.value == value)
+            );
+        }
+        let mut no_icon = launch;
+        no_icon.desktop_entry.as_mut().unwrap().icon_path = None;
+        assert!(
+            App::process_desktop_rows(Some(&no_icon), false)
+                .iter()
+                .any(|row| row.label == "Icon path" && row.value == "-")
+        );
+    }
+
+    #[test]
+    fn ambiguous_desktop_names_or_commands_never_select_the_first_candidate() {
+        let InfoTarget::Window(mut popup) = window("ambiguous-window") else {
+            unreachable!()
+        };
+        popup.window.pid = Some(10);
+        popup.window.desktop_file_name = Some("browser".into());
+        let apps = ["/one/browser.desktop", "/two/browser.desktop"].map(|path| AppInfo {
+            name: "Browser".into(),
+            exec: "/not-accessed/google-chrome-fast".into(),
+            desktop_file_path: path.into(),
+            icon_path: None,
+            comment: None,
+            is_settings_module: false,
+        });
+        for pid in [10, 11] {
+            assert!(
+                process_desktop_candidate(&apps, &popup.window, &desktop_process(pid, "chrome"))
+                    .is_none()
+            );
+        }
+        popup.window.desktop_file_name = None;
+        assert!(
+            process_desktop_candidate(
+                &apps,
+                &popup.window,
+                &desktop_process(11, "google-chrome-fast")
+            )
+            .is_none()
+        );
+        popup.window.class = "Browser".into();
+        assert!(window_desktop_candidate(&apps, &popup.window).is_none());
     }
 
     #[test]
@@ -1671,10 +1946,8 @@ mod tests {
         native.latest_npm_version =
             Some("@openai/codex 0.160.0 (npm latest; upstream reference)".into());
         let rows = process_version_rows("Application", Some(&native), false);
-        assert!(
-            rows.iter()
-                .any(|row| row.label == "Version" && row.value == "codex-cli 0.159.1")
-        );
+        assert!(rows.iter().any(|row| row.label == VERSION_FIELD_LABEL
+            && row.value == "codex-cli 0.159.1 (Unavailable)"));
         let npm_row = rows
             .iter()
             .find(|row| row.label == "Latest package version (npm)")
@@ -1712,7 +1985,7 @@ mod tests {
         assert!(
             runtime
                 .iter()
-                .any(|row| row.label == "Version" && row.value == "v26.4.0")
+                .any(|row| row.label == VERSION_FIELD_LABEL && row.value == "v26.4.0 (Unavailable)")
         );
     }
 
@@ -1795,11 +2068,14 @@ mod tests {
         let rows = application_info_rows(&popup);
         assert!(
             rows.iter()
-                .any(|row| row.label == "Latest package version (Pacman/AUR)"
-                    && row.value == "Checking Pacman/AUR...")
+                .any(|row| row.label == "Latest version (Pacman/AUR)"
+                    && row.value == "Checking available package version...")
         );
         tx.send(ApplicationInfoUpdate::PackageVersion(
-            "extra/browser 2.0 (Last Pacman sync: 2026-10-07)".into(),
+            crate::windows::versions::available_package_fixture(
+                PackageVersionSource::Pacman,
+                "extra/browser 2.0",
+            ),
         ))
         .unwrap();
         drop(tx);
@@ -1808,13 +2084,53 @@ mod tests {
         let rows = application_info_rows(&popup);
         assert!(
             rows.iter()
-                .any(|row| row.label == "Latest version (on disk)" && row.value == "Browser 1.0")
+                .any(|row| row.label == LATEST_VERSION_FIELD_LABEL
+                    && row.value == "Browser 1.0 (Unavailable)")
         );
         assert!(
             rows.iter()
-                .any(|row| row.label == "Latest package version (Pacman/AUR)"
-                    && row.value == "extra/browser 2.0 (Last Pacman sync: 2026-10-07)")
+                .any(|row| row.label == "Latest version (in last Pacman sync)"
+                    && row.value == "extra/browser 2.0 (synced 2 days ago)")
         );
+    }
+
+    #[test]
+    fn application_package_rows_show_their_actual_source_and_its_own_age() {
+        use crate::windows::versions::{ApplicationInfo, PackageTarget};
+        for (source, text, label, value) in [
+            (
+                PackageVersionSource::Pacman,
+                "extra/example 1.2.3-1",
+                "Latest version (in last Pacman sync)",
+                "extra/example 1.2.3-1 (synced 2 days ago)",
+            ),
+            (
+                PackageVersionSource::Aur,
+                "aur/example 1.2.3-1",
+                "Latest version (AUR)",
+                "aur/example 1.2.3-1 (checked 2 minutes ago)",
+            ),
+        ] {
+            let InfoTarget::App(mut popup) = app("/fixture/no-live-query.desktop") else {
+                unreachable!()
+            };
+            popup.metadata = Some(ApplicationInfo {
+                package_target: Some(PackageTarget {
+                    name: "example".into(),
+                    inferred: false,
+                }),
+                latest_package_version: Some(crate::windows::versions::available_package_fixture(
+                    source, text,
+                )),
+                ..Default::default()
+            });
+            let rows = application_info_rows(&popup);
+            let row = rows.iter().find(|row| row.label == label).unwrap();
+            assert_eq!(row.value, value);
+            assert_eq!(row.scope, InfoFieldScope::Installation);
+            assert!(row.binary_is_current.is_none());
+            assert!(!row.searched);
+        }
     }
 
     #[test]
@@ -1890,6 +2206,141 @@ mod tests {
     }
 
     #[test]
+    fn python_build_id_absence_is_independent_of_version_and_process_access() {
+        use crate::windows::versions::ProcessVersion;
+        let mut version = ProcessVersion {
+            runtime_name: Some("Python"),
+            version: Some("Python 3.12.12".into()),
+            latest_version: Some("Python 3.12.12".into()),
+            build_id_reason: Some("Not embedded (no GNU build ID)".into()),
+            latest_build_id_reason: Some("Not embedded (no GNU build ID)".into()),
+            ..Default::default()
+        };
+        let rows = process_version_rows("Runtime", Some(&version), false);
+        for label in [VERSION_FIELD_LABEL, LATEST_VERSION_FIELD_LABEL] {
+            let row = rows.iter().find(|row| row.label == label).unwrap();
+            assert_eq!(row.value, "Python 3.12.12 (Not embedded (no GNU build ID))");
+            assert!(row.binary_is_current.is_none());
+        }
+        version.running_unavailable = Some("permission denied reading process executable");
+        version.version = None;
+        version.on_disk_candidate = Some("/usr/lib/systemd/systemd".into());
+        version.on_disk_candidate_reason =
+            Some("absolute argv[0]; running executable unverified".into());
+        let rows = process_version_rows("Runtime", Some(&version), false);
+        for label in [VERSION_FIELD_LABEL] {
+            assert!(
+                rows.iter()
+                    .find(|row| row.label == label)
+                    .unwrap()
+                    .value
+                    .contains("permission denied")
+            );
+        }
+        let candidate = rows
+            .iter()
+            .find(|row| row.label == "On-disk candidate")
+            .unwrap();
+        assert_eq!(candidate.scope, InfoFieldScope::Installation);
+        assert!(candidate.value.contains("running executable unverified"));
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.label == LATEST_VERSION_FIELD_LABEL)
+                .unwrap()
+                .value,
+            "Python 3.12.12 (Not embedded (no GNU build ID))"
+        );
+    }
+
+    #[test]
+    fn python_source_checkout_does_not_invent_a_loaded_version_or_compilation_status() {
+        use crate::windows::versions::{ProcessVersion, ProgsMetadata, ScriptApplication};
+        let version = ProcessVersion {
+            runtime_name: Some("Python"),
+            script_application: Some(ScriptApplication {
+                name: "whisper_service".into(),
+                target: "whisper_service.py".into(),
+                kind: "Python script",
+                entry_point: Some("/project/whisper_service.py".into()),
+                identification: "Process arguments",
+            }),
+            application_installation: Some("[DEV] Development Checkout (User-managed)".into()),
+            application_progs_metadata: ProgsMetadata {
+                source_checkout: Some("/project".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rows = application_version_rows("Application", Some(&version), false);
+        assert_eq!(
+            rows.iter().find(|row| row.label == "Type").unwrap().value,
+            "DEV"
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.label == "Source directory")
+                .unwrap()
+                .value,
+            "/project"
+        );
+        let changes = rows
+            .iter()
+            .find(|row| row.label == "Source changes since start")
+            .unwrap();
+        assert!(changes.value.contains("no startup source snapshot"));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.label == "Build status" || row.value == "0.1.0")
+        );
+        assert!(
+            rows.iter()
+                .find(|row| row.label == "Running version")
+                .unwrap()
+                .value
+                .starts_with("Unknown")
+        );
+        assert!(
+            rows.iter()
+                .find(|row| row.label == "Installed version")
+                .unwrap()
+                .value
+                .starts_with("Unknown")
+        );
+    }
+
+    #[test]
+    fn inaccessible_process_details_keep_permission_errors_separate_from_candidate_paths() {
+        let InfoTarget::Window(state) = window("systemd") else {
+            unreachable!()
+        };
+        let node = ProcessInfoNode {
+            identity: crate::models::ProcessIdentity {
+                pid: 3140,
+                start_ticks: 30364,
+            },
+            parent_pid: 1,
+            depth: 0,
+            name: "systemd".into(),
+            script_name: None,
+            header: "systemd (pid 3140)".into(),
+            executable: None,
+            executable_identity: None,
+            executable_error: Some("permission denied reading process executable"),
+            cwd: None,
+            cwd_error: Some("permission denied reading process working directory"),
+            raw_argv0: Some("/usr/lib/systemd/systemd".into()),
+            command_line: Some("/usr/lib/systemd/systemd --user".into()),
+        };
+        let rows = process_info_rows(&state.window, &node, Vec::new());
+        for label in ["Executable path", "Working directory"] {
+            let row = rows.iter().find(|row| row.label == label).unwrap();
+            assert!(row.value.contains("permission denied"));
+            assert!(!row.value.contains("/usr/lib/systemd"));
+        }
+    }
+
+    #[test]
     fn native_process_info_matches_the_requested_order_with_package_updates_and_roots() {
         use crate::windows::versions::{
             ApplicationLaunch, NpmTarget, PackageTarget, ProcessVersion, ProgsMetadata,
@@ -1907,6 +2358,9 @@ mod tests {
             name: "bash".into(),
             script_name: None,
             header: "bash (pid 42) - /usr/bin/bash".into(),
+            executable_error: None,
+            cwd_error: None,
+            raw_argv0: None,
             executable: Some("/usr/bin/bash".into()),
             executable_identity: None,
             cwd: Some("/work/cmake".into()),
@@ -1925,9 +2379,10 @@ mod tests {
                 name: "bash".into(),
                 inferred: false,
             }),
-            latest_package_version: Some(
-                "extra/bash 5.3.20-2 (Last Pacman sync: 2026-10-07)".into(),
-            ),
+            latest_package_version: Some(crate::windows::versions::available_package_fixture(
+                PackageVersionSource::Pacman,
+                "extra/bash 5.3.20-2",
+            )),
             progs_metadata: ProgsMetadata {
                 description: Some("The GNU Bourne Again shell".into()),
                 capabilities: Some("CLI".into()),
@@ -1957,18 +2412,16 @@ mod tests {
                     "Process name",
                     "PID",
                     "Parent PID",
-                    "Executable path",
+                    "Process start (ticks since boot)",
                     "Working directory",
                     "Command line",
-                    "Process start (ticks since boot)",
-                    "Version",
-                    "ELF build ID",
-                    "Latest version (on disk)",
-                    "Latest ELF build ID (on disk)",
+                    "Executable path",
+                    VERSION_FIELD_LABEL,
+                    LATEST_VERSION_FIELD_LABEL,
                     "Uncompiled changes",
                     "Type",
                     "Package",
-                    "Latest package version (Pacman/AUR)",
+                    "Latest version (in last Pacman sync)",
                     "Root package",
                     "Launch chain",
                     "Desktop file",
@@ -1979,17 +2432,18 @@ mod tests {
                     "Capabilities",
                 ]
             );
-            assert_eq!(rows[8].binary_is_current, Some(false));
-            assert_eq!(rows[12].value, "PDT");
-            assert_eq!(rows[13].value, "bash 5.3.15-2 [PDP]");
-            assert_eq!(rows[15].value, "base 3-3 [PEP]");
+            assert_eq!(rows[7].binary_is_current, Some(false));
+            assert_eq!(rows[8].binary_is_current, None);
+            assert_eq!(rows[10].value, "PDT");
+            assert_eq!(rows[11].value, "bash 5.3.15-2 [PDP]");
+            assert_eq!(rows[13].value, "base 3-3 [PEP]");
             assert!(
-                rows[..9]
+                rows[..8]
                     .iter()
                     .all(|row| row.scope == InfoFieldScope::RunningInstance)
             );
             assert!(
-                rows[9..]
+                rows[8..]
                     .iter()
                     .all(|row| row.scope == InfoFieldScope::Installation)
             );
@@ -2002,7 +2456,7 @@ mod tests {
         let position = |label: &str| rows.iter().position(|row| row.label == label).unwrap();
         assert_eq!(
             position("Latest package version (npm)"),
-            position("Latest package version (Pacman/AUR)") + 1
+            position("Latest version (in last Pacman sync)") + 1
         );
         assert_eq!(
             position("Root package"),
@@ -2013,6 +2467,141 @@ mod tests {
                 .value
                 .starts_with("Checking")
         );
+    }
+
+    #[test]
+    fn unsupported_version_reasons_reach_info_without_becoming_version_values() {
+        use crate::windows::versions::ProcessVersion;
+        let result = ProcessVersion {
+            version_reason: Some("Pinned ELF has no recognized product banner".into()),
+            latest_version_reason: Some("Selected payload metadata is unsupported".into()),
+            ..Default::default()
+        };
+        let rows = process_version_rows("Application", Some(&result), false);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.label == VERSION_FIELD_LABEL)
+                .unwrap()
+                .value,
+            "Unavailable (Pinned ELF has no recognized product banner) (Unavailable)"
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.label == LATEST_VERSION_FIELD_LABEL)
+                .unwrap()
+                .value,
+            "Unavailable (Selected payload metadata is unsupported) (Unavailable)"
+        );
+        assert!(result.version.is_none() && result.latest_version.is_none());
+    }
+
+    #[test]
+    fn electron_info_distinguishes_running_engine_version_from_installed_product_version() {
+        use crate::windows::versions::ProcessVersion;
+        let result = ProcessVersion {
+            version: Some("Electron 42.0.0".into()),
+            latest_version: Some("2.4.1".into()),
+            running_latest_binary: Some(true),
+            application_installed_metadata: Some(program_metadata::interpreted::InstalledVersion {
+                name: "example-editor".into(),
+                version: "2.4.1".into(),
+                metadata_path: "/opt/editor/resources/app/package.json".into(),
+                kind: "Electron package",
+                identification: "Static installed payload, not loaded assets".into(),
+            }),
+            ..Default::default()
+        };
+        let rows = process_version_rows("Application", Some(&result), false);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.label == VERSION_FIELD_LABEL)
+                .unwrap()
+                .value,
+            "Electron 42.0.0 (running native engine; loaded application version unknown) (Unavailable)"
+        );
+        let installed = &rows
+            .iter()
+            .find(|row| row.label == LATEST_VERSION_FIELD_LABEL)
+            .unwrap()
+            .value;
+        assert!(
+            installed.starts_with("2.4.1 (Electron package;")
+                && installed.contains("not a running-version receipt")
+        );
+        assert_eq!(result.process_build_is_current(), None);
+    }
+
+    #[test]
+    fn python_and_java_installed_versions_never_claim_the_running_loaded_version() {
+        use crate::windows::versions::{ProcessVersion, ScriptApplication};
+        for runtime in ["Python", "Java"] {
+            let version = ProcessVersion {
+                runtime_name: Some(runtime),
+                script_application: Some(ScriptApplication {
+                    name: "tool".into(),
+                    entry_point: Some("/installed/tool".into()),
+                    target: "/installed/tool".into(),
+                    kind: runtime,
+                    identification: "Exact argument",
+                }),
+                application_installed_metadata: Some(
+                    program_metadata::interpreted::InstalledVersion {
+                        name: "tool".into(),
+                        version: "2.4".into(),
+                        metadata_path: "/installed/METADATA".into(),
+                        kind: "Installed application",
+                        identification: "Exact installed ownership, not a running receipt".into(),
+                    },
+                ),
+                ..Default::default()
+            };
+            let rows = application_version_rows("Application", Some(&version), false);
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.label == "Installed version")
+                    .unwrap()
+                    .value,
+                "2.4"
+            );
+            assert!(
+                rows.iter()
+                    .find(|row| row.label == "Running version")
+                    .unwrap()
+                    .value
+                    .starts_with("Unknown")
+            );
+            assert!(
+                rows.iter()
+                    .find(|row| row.label == "Installed metadata")
+                    .unwrap()
+                    .value
+                    .contains("/installed/METADATA")
+            );
+        }
+    }
+
+    #[test]
+    fn completed_application_metadata_is_not_refetched_on_repeated_polls() {
+        let InfoTarget::App(mut popup) = app("/fixture/no-live-query.desktop") else {
+            unreachable!()
+        };
+        popup.app.exec = "/fixture/nonexistent-application".into();
+        popup.metadata = Some(crate::windows::versions::ApplicationInfo {
+            version: Some("retained".into()),
+            ..Default::default()
+        });
+        let previous_cancel = popup.cancelled.clone();
+        let ctx = egui::Context::default();
+        for _ in 0..100 {
+            popup.poll_metadata(&ctx, egui::ViewportId::ROOT);
+            assert!(popup.receiver.is_none());
+            assert!(!previous_cancel.load(Ordering::Acquire));
+            assert!(Arc::ptr_eq(&previous_cancel, &popup.cancelled));
+            assert_eq!(
+                popup.metadata.as_ref().unwrap().version.as_deref(),
+                Some("retained")
+            );
+        }
     }
 
     #[test]
@@ -2052,7 +2641,7 @@ mod tests {
             let positions: Vec<_> = [
                 "Type",
                 "Package",
-                "Latest package version (Pacman/AUR)",
+                "Latest version (Pacman/AUR)",
                 "Launch chain",
                 "Desktop file",
                 "Icon path",
@@ -2118,6 +2707,7 @@ mod tests {
                 identification: details.resolution.clone(),
                 desktop_entry: Some(popup.app.clone()),
                 desktop_exists: details.desktop_exists,
+                published_target_verified: false,
             }),
             ..Default::default()
         };
@@ -2134,14 +2724,13 @@ mod tests {
                 None,
             ),
         );
-        assert_eq!(process_rows[0].value, "tool 1.0");
-        assert_eq!(process_rows[1].value, "old-build");
-        assert_eq!(process_rows[1].binary_is_current, Some(false));
-        assert_eq!(process_rows[8].label, "Launch chain");
+        assert_eq!(process_rows[0].value, "tool 1.0 (old-build)");
+        assert_eq!(process_rows[0].binary_is_current, Some(false));
+        assert_eq!(process_rows[6].label, "Launch chain");
         assert_eq!(
             process_rows
                 .iter()
-                .filter(|row| !matches!(row.label.as_str(), "Version" | "ELF build ID"))
+                .filter(|row| row.label != VERSION_FIELD_LABEL)
                 .map(|row| (&row.label, &row.value))
                 .collect::<Vec<_>>(),
             app_rows
@@ -2153,8 +2742,7 @@ mod tests {
         assert_eq!(
             labels,
             [
-                "Latest version (on disk)",
-                "Latest ELF build ID (on disk)",
+                LATEST_VERSION_FIELD_LABEL,
                 "Uncompiled changes",
                 "Type",
                 "Package",
@@ -2282,9 +2870,8 @@ mod tests {
                 value("Launch chain"),
                 "/not-a-real-directory/browser-fast -> /config/browser-fast -> /opt/browser/browser"
             );
-            assert_eq!(value("Latest version (on disk)"), "Browser 1.0");
+            assert_eq!(value(LATEST_VERSION_FIELD_LABEL), "Browser 1.0 (abcd1234)");
             assert_eq!(value("Package"), "browser 1.0-1");
-            assert_eq!(value("Latest ELF build ID (on disk)"), "abcd1234");
             assert!(!rows.iter().any(|row| row.label.starts_with("Launcher ")
                 || matches!(row.label.as_str(), "Raw Exec" | "Cleaned command")));
             assert_eq!(
@@ -2370,13 +2957,16 @@ mod tests {
         let metadata = popup.metadata.as_ref().unwrap();
         assert_eq!(metadata.version.as_deref(), Some("Browser 1.0"));
         assert_eq!(
-            metadata.latest_package_version.as_deref(),
+            metadata
+                .latest_package_version
+                .as_ref()
+                .map(|version| version.text.as_str()),
             Some("Unavailable (package lookup ended without a result)")
         );
         assert!(popup.receiver.is_none());
     }
 
-    fn window(id: &str) -> InfoTarget {
+    pub(super) fn window(id: &str) -> InfoTarget {
         InfoTarget::Window(WindowInfoPopup {
             window: WindowInfo {
                 id: id.into(),
@@ -2421,6 +3011,9 @@ mod tests {
             name: "test-app".into(),
             script_name: None,
             header: "test-app (pid 1234)".into(),
+            executable_error: None,
+            cwd_error: None,
+            raw_argv0: None,
             executable: popup.window.exe_path.clone(),
             executable_identity: None,
             cwd: None,
@@ -2464,20 +3057,18 @@ mod tests {
                     "Process name",
                     "PID",
                     "Parent PID",
-                    "Executable path",
+                    "Process start (ticks since boot)",
                     "Working directory",
                     "Command line",
-                    "Process start (ticks since boot)",
-                    "Version",
-                    "ELF build ID",
-                    "Latest version (on disk)",
-                    "Latest ELF build ID (on disk)",
+                    "Executable path",
+                    VERSION_FIELD_LABEL,
+                    LATEST_VERSION_FIELD_LABEL,
                     "Uncompiled changes",
                     "Type",
                     "Package",
                 ]);
                 if version.is_some() {
-                    expected.push("Latest package version (Pacman/AUR)");
+                    expected.push("Latest version (Pacman/AUR)");
                 }
                 expected.extend([
                     "Launch chain",

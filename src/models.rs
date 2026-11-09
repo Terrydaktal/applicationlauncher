@@ -402,6 +402,7 @@ pub struct InfoProcessSection {
     pub id: eframe::egui::Id,
     pub depth: usize,
     pub header: Arc<str>,
+    pub binary_is_current: Option<bool>,
     pub default_open: bool,
     pub rows: Vec<InfoPopupRow>,
     pub metadata_sections: Vec<InfoMetadataSection>,
@@ -411,6 +412,7 @@ pub struct InfoProcessSection {
 pub struct InfoMetadataSection {
     pub id: eframe::egui::Id,
     pub header: Arc<str>,
+    pub binary_is_current: Option<bool>,
     pub default_open: bool,
     pub rows: Vec<InfoPopupRow>,
 }
@@ -436,8 +438,12 @@ pub struct ProcessInfoNode {
     pub script_name: Option<String>,
     pub header: Arc<str>,
     pub executable: Option<PathBuf>,
+    pub executable_error: Option<&'static str>,
     pub executable_identity: Option<(u64, u64)>,
     pub cwd: Option<PathBuf>,
+    pub cwd_error: Option<&'static str>,
+    /// Original NUL-delimited argv[0], never reconstructed from display text.
+    pub raw_argv0: Option<PathBuf>,
     pub command_line: Option<String>,
 }
 

@@ -1437,6 +1437,7 @@ mod tests {
         let owner = &mut tree.sections[0];
         owner.header = "xfce4-terminal [PDP]".into();
         owner.metadata_sections.push(InfoMetadataSection {
+            binary_is_current: None,
             id: owner.id.with("metadata"),
             header: "Application [NET]".into(),
             default_open: true,
@@ -1731,6 +1732,7 @@ mod tests {
                 notice: "Snapshot".into(),
                 sections: vec![
                     InfoProcessSection {
+                        binary_is_current: None,
                         id: owner,
                         depth: 0,
                         header: "xfce4-terminal (pid 1) - /usr/bin/xfce4-terminal".into(),
@@ -1746,6 +1748,7 @@ mod tests {
                         }],
                     },
                     InfoProcessSection {
+                        binary_is_current: None,
                         id: fish,
                         depth: 1,
                         header: "fish (pid 2) - /usr/bin/fish".into(),
@@ -2257,6 +2260,7 @@ mod tests {
         ]
         .into_iter()
         .map(|(key, header, label, value)| InfoMetadataSection {
+            binary_is_current: None,
             id: process.id.with(key),
             header: header.into(),
             default_open: true,

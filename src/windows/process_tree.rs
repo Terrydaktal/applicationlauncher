@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fs::File;
 use std::io::Read;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc::Receiver};
@@ -216,9 +217,12 @@ fn single_line(value: &str) -> String {
 struct TreeNode {
     process: Process,
     executable: Option<PathBuf>,
+    executable_error: Option<&'static str>,
     script: Option<String>,
     executable_identity: Option<(u64, u64)>,
     cwd: Option<PathBuf>,
+    cwd_error: Option<&'static str>,
+    raw_argv0: Option<PathBuf>,
     command_line: Option<String>,
 }
 
@@ -248,17 +252,35 @@ fn script_name(root: &Path, process: &Process, arguments: &[String]) -> Option<S
 
 fn read_node(root: &Path, process: &Process) -> Option<TreeNode> {
     let process_root = root.join(process.pid.to_string());
-    let executable = std::fs::read_link(process_root.join("exe")).ok();
+    let executable = std::fs::read_link(process_root.join("exe"));
+    let executable_error = executable.as_ref().err().map(|error| match error.kind() {
+        std::io::ErrorKind::PermissionDenied => "Permission denied reading process executable",
+        std::io::ErrorKind::NotFound => "Process executable is no longer available",
+        _ => "Process executable cannot be inspected",
+    });
     let executable_identity = std::fs::metadata(process_root.join("exe"))
         .ok()
         .map(|metadata| (metadata.dev(), metadata.ino()));
-    let cwd = std::fs::read_link(process_root.join("cwd")).ok();
+    let cwd = std::fs::read_link(process_root.join("cwd"));
+    let cwd_error = cwd.as_ref().err().map(|error| match error.kind() {
+        std::io::ErrorKind::PermissionDenied => {
+            "Permission denied reading process working directory"
+        }
+        std::io::ErrorKind::NotFound => "Process working directory is no longer available",
+        _ => "Process working directory cannot be inspected",
+    });
     let mut bytes = Vec::new();
     let command_read = File::open(process_root.join("cmdline"))
         .ok()
         .and_then(|file| file.take(16_385).read_to_end(&mut bytes).ok());
     let truncated = bytes.len() > 16_384;
     bytes.truncate(16_384);
+    // Only a complete first argument is usable as an on-disk candidate. Keep
+    // its original Unix bytes: spaces/quotes are not shell syntax in cmdline.
+    let raw_argv0 = command_read.and_then(|_| {
+        let end = bytes.iter().position(|byte| *byte == 0)?;
+        (end > 0).then(|| PathBuf::from(std::ffi::OsString::from_vec(bytes[..end].to_vec())))
+    });
     let arguments: Vec<_> = bytes
         .split(|byte| *byte == 0)
         .filter(|part| !part.is_empty())
@@ -275,10 +297,13 @@ fn read_node(root: &Path, process: &Process) -> Option<TreeNode> {
     // Do not attach details read from a reused PID or a newly reparented process.
     (read_process(root, process.pid).as_ref() == Some(process)).then(|| TreeNode {
         process: process.clone(),
-        executable,
+        executable: executable.ok(),
+        executable_error,
         script,
         executable_identity,
-        cwd,
+        cwd: cwd.ok(),
+        cwd_error,
+        raw_argv0,
         command_line,
     })
 }
@@ -335,13 +360,7 @@ fn render_snapshot(
                 output_text.push_str(&format!(" [{label}]"));
             }
         }
-        output_text.push_str(&format!(
-            " - {}\n",
-            node.executable
-                .as_ref()
-                .map(|path| single_line(&path.to_string_lossy()))
-                .unwrap_or_else(|| "Executable path unavailable".into())
-        ));
+        output_text.push('\n');
         #[cfg(test)]
         output.0.push_str(&output_line);
         output.1.push(ProcessInfoNode {
@@ -355,8 +374,11 @@ fn render_snapshot(
             script_name: node.script.clone(),
             header: output_line[header_start..].trim_end().into(),
             executable: node.executable.clone(),
+            executable_error: node.executable_error,
             executable_identity: node.executable_identity,
             cwd: node.cwd.clone(),
+            cwd_error: node.cwd_error,
+            raw_argv0: node.raw_argv0.clone(),
             command_line: node.command_line.clone(),
         });
         let next_prefix = format!(
@@ -504,7 +526,7 @@ fn capture_snapshot(target: &WindowProcessTreeTarget, root: &Path) -> ProcessTre
     if incomplete {
         notice.push_str("Partial snapshot: a process exited, changed, was unreadable, or a collection limit was reached.\n");
     }
-    notice.push_str("Captured when Show Info opened; threads omitted. Ancestors are shown without their unrelated children.");
+    notice.push_str("Process tree captured when Show Info opened; threads omitted. Ancestors are shown without their unrelated children.");
     #[cfg(test)]
     let text = format!("{_document}\n{notice}\n").into();
     ProcessTreeSnapshot {
@@ -577,12 +599,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unreadable_proc_paths_keep_errors_and_raw_argv0_without_fabricating_executable() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let fixture = Fixture::new();
+        fixture.add(7, 0, "systemd");
+        std::fs::remove_file(fixture.0.join("7/exe")).unwrap();
+        std::fs::write(
+            fixture.0.join("7/cmdline"),
+            b"/installed path/with\xffbytes\0--user\0",
+        )
+        .unwrap();
+        let snapshot = capture_snapshot(&target(7, None), &fixture.0);
+        let node = &snapshot.nodes[0];
+        assert!(node.executable.is_none());
+        assert_eq!(
+            node.executable_error,
+            Some("Process executable is no longer available")
+        );
+        assert_eq!(
+            node.cwd_error,
+            Some("Process working directory is no longer available")
+        );
+        assert_eq!(
+            node.raw_argv0.as_ref().unwrap().as_os_str().as_bytes(),
+            b"/installed path/with\xffbytes"
+        );
+        assert!(node.command_line.as_ref().unwrap().contains(" --user"));
+        assert!(node.executable_identity.is_none());
+    }
+
+    #[test]
+    fn truncated_or_empty_argv0_is_not_reconstructed_from_display_command_line() {
+        let fixture = Fixture::new();
+        fixture.add(7, 0, "test");
+        for bytes in [vec![b'x'; 16_385], b"\0/usr/bin/bash\0".to_vec()] {
+            std::fs::write(fixture.0.join("7/cmdline"), bytes).unwrap();
+            let process = read_process(&fixture.0, 7).unwrap();
+            assert!(read_node(&fixture.0, &process).unwrap().raw_argv0.is_none());
+        }
+    }
+
     fn line<'a>(document: &'a str, marker: &str) -> &'a str {
         document.lines().find(|line| line.contains(marker)).unwrap()
     }
 
     #[test]
-    fn process_tree_renders_each_process_and_its_executable_on_one_line() {
+    fn process_tree_headers_only_show_process_names_pids_and_roles() {
         let request = target(3140, Some(2740504));
         let nodes = [
             (3140, 0, "systemd", None),
@@ -601,9 +665,12 @@ mod tests {
                         name: name.into(),
                     },
                     executable: executable.map(PathBuf::from),
+                    executable_error: None,
                     script: None,
                     executable_identity: None,
                     cwd: None,
+                    cwd_error: None,
+                    raw_argv0: None,
                     command_line: None,
                 },
             )
@@ -612,9 +679,9 @@ mod tests {
         assert_eq!(
             render_tree(&request, &nodes),
             format!(
-                "systemd (pid 3140) [window owner] - Executable path unavailable\n\
-                 {BRANCH}ssh (pid 2740397) - /usr/bin/ssh\n\
-                 {LAST_BRANCH}pi (pid 2740504) [active process] - /usr/bin/node\n"
+                "systemd (pid 3140) [window owner]\n\
+                 {BRANCH}ssh (pid 2740397)\n\
+                 {LAST_BRANCH}pi (pid 2740504) [active process]\n"
             )
         );
         let (_, sections) = render_snapshot(&request, &nodes);
@@ -622,8 +689,52 @@ mod tests {
             sections.iter().map(|node| node.depth).collect::<Vec<_>>(),
             [0, 1, 1]
         );
-        assert!(sections[1].header.starts_with("ssh (pid "));
-        assert!(sections[2].header.starts_with("pi (pid "));
+        assert_eq!(sections[1].header.as_ref(), "ssh (pid 2740397)");
+        assert_eq!(
+            sections[2].header.as_ref(),
+            "pi (pid 2740504) [active process]"
+        );
+        assert_eq!(
+            sections[2].executable.as_deref(),
+            Some(Path::new("/usr/bin/node"))
+        );
+    }
+
+    #[test]
+    fn process_tree_headers_omit_executable_paths_without_losing_process_metadata() {
+        for executable in [
+            Some("/home/lewis/repos/fish-shell/target/release/fish (deleted)"),
+            Some("/usr/bin/fish"),
+            None,
+        ] {
+            let pid = 456416;
+            let mut request = target(pid, None);
+            request.owner = None;
+            request.pane = Some(pid);
+            let nodes = BTreeMap::from([(
+                pid,
+                TreeNode {
+                    process: Process {
+                        pid,
+                        parent: 0,
+                        started: 1,
+                        name: "fish".into(),
+                    },
+                    executable: executable.map(PathBuf::from),
+                    executable_error: None,
+                    script: None,
+                    executable_identity: None,
+                    cwd: None,
+                    cwd_error: None,
+                    raw_argv0: None,
+                    command_line: None,
+                },
+            )]);
+            let (text, sections) = render_snapshot(&request, &nodes);
+            assert_eq!(text, "fish (pid 456416) [tmux pane]\n");
+            assert_eq!(sections[0].header.as_ref(), "fish (pid 456416) [tmux pane]");
+            assert_eq!(sections[0].executable.as_deref(), executable.map(Path::new));
+        }
     }
 
     #[test]
@@ -665,17 +776,17 @@ mod tests {
                 .all(|node| node.script_name.is_none())
         );
         let document = snapshot.text;
-        assert!(document.starts_with("systemd (pid 1) - /usr/bin/systemd\n"));
-        assert!(document.contains("bash: pi-remote-qwen-radiance (pid 5) - /usr/bin/bash\n"));
+        assert!(document.starts_with("systemd (pid 1)\n"));
+        assert!(document.contains("bash: pi-remote-qwen-radiance (pid 5)\n"));
         assert_eq!(
             line(&document, "ssh (pid 6)"),
-            format!("                {BRANCH}ssh (pid 6) - /usr/bin/ssh")
+            format!("                {BRANCH}ssh (pid 6)")
         );
         assert_eq!(
             line(&document, "pi (pid 7)"),
-            format!("                {LAST_BRANCH}pi (pid 7) [active process] - /usr/bin/node")
+            format!("                {LAST_BRANCH}pi (pid 7) [active process]")
         );
-        assert!(document.contains("/usr/bin/node\n"));
+        assert!(!document.contains("/usr/bin/"));
         assert!(!document.contains("unrelated-application"));
         assert!(!document.contains("Partial snapshot"));
         assert!(document.contains("[window owner]"));
@@ -695,15 +806,15 @@ mod tests {
         assert!(document.contains("firefox (pid 10) [window owner]"));
         assert_eq!(
             line(&document, "Web Content (pid 11)"),
-            format!("        {BRANCH}Web Content (pid 11) - /usr/bin/Web Content")
+            format!("        {BRANCH}Web Content (pid 11)")
         );
         assert_eq!(
             line(&document, "helper (pid 13)"),
-            format!("        {CONTINUATION}{LAST_BRANCH}helper (pid 13) - /usr/bin/helper")
+            format!("        {CONTINUATION}{LAST_BRANCH}helper (pid 13)")
         );
         assert_eq!(
             line(&document, "Socket Process (pid 12)"),
-            format!("        {LAST_BRANCH}Socket Process (pid 12) - /usr/bin/Socket Process")
+            format!("        {LAST_BRANCH}Socket Process (pid 12)")
         );
         assert!(!document.contains("another-firefox"));
         assert!(!document.contains("Partial snapshot"));
@@ -726,21 +837,21 @@ mod tests {
         let document = capture(&request, &fixture.0);
         assert_eq!(
             line(&document, "xfce4-terminal (pid 3)"),
-            format!("    {BRANCH}xfce4-terminal (pid 3) [window owner] - /usr/bin/xfce4-terminal")
+            format!("    {BRANCH}xfce4-terminal (pid 3) [window owner]")
         );
         assert_eq!(
             line(&document, "tmux-server (pid 20)"),
-            format!("    {LAST_BRANCH}tmux-server (pid 20) - /usr/bin/tmux-server")
+            format!("    {LAST_BRANCH}tmux-server (pid 20)")
         );
         assert!(document.contains("tmux-client (pid 5) [tmux client]"));
         assert!(document.contains("fish (pid 21) [tmux pane]"));
         assert_eq!(
             line(&document, "ssh (pid 23)"),
-            format!("                {BRANCH}ssh (pid 23) - /usr/bin/ssh")
+            format!("                {BRANCH}ssh (pid 23)")
         );
         assert_eq!(
             line(&document, "pi (pid 24)"),
-            format!("                {LAST_BRANCH}pi (pid 24) [active process] - /usr/bin/pi")
+            format!("                {LAST_BRANCH}pi (pid 24) [active process]")
         );
         assert!(!document.contains("other-pane"));
         assert_eq!(document.matches("systemd (pid 1)").count(), 1);
@@ -782,9 +893,12 @@ mod tests {
                     TreeNode {
                         process: index[&pid].clone(),
                         executable: None,
+                        executable_error: None,
                         script: None,
                         executable_identity: None,
                         cwd: None,
+                        cwd_error: None,
+                        raw_argv0: None,
                         command_line: None,
                     },
                 )
@@ -823,9 +937,12 @@ mod tests {
                     TreeNode {
                         process: cycle[&pid].clone(),
                         executable: None,
+                        executable_error: None,
                         script: None,
                         executable_identity: None,
                         cwd: None,
+                        cwd_error: None,
+                        raw_argv0: None,
                         command_line: None,
                     },
                 )
@@ -870,9 +987,13 @@ mod tests {
         );
         fixture.add(20, 0, "app");
         std::fs::remove_file(fixture.0.join("20/exe")).unwrap();
-        let document = capture(&target(20, None), &fixture.0);
-        assert!(document.contains("Executable path unavailable"));
-        assert!(!document.contains("Partial snapshot"));
+        let snapshot = capture_snapshot(&target(20, None), &fixture.0);
+        assert_eq!(
+            snapshot.nodes[0].header.as_ref(),
+            "app (pid 20) [window owner]"
+        );
+        assert!(snapshot.nodes[0].executable.is_none());
+        assert!(!snapshot.text.contains("Partial snapshot"));
     }
 
     #[test]

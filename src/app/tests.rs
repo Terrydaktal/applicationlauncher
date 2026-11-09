@@ -1237,7 +1237,7 @@ mod tests {
             .iter()
             .find(|row| row.label == "Latest package version (Pacman/AUR)")
             .unwrap();
-        assert_eq!(repository.value, version.latest_package_version.unwrap());
+        assert_eq!(repository.value, version.latest_package_version.unwrap().display());
         assert!(repository.binary_is_current.is_none() && !repository.searched);
     }
 
@@ -1290,7 +1290,7 @@ mod tests {
                 None,
                 Some("extra/fish 4.6.0-1 (Last Pacman sync: 2026-10-07)"),
             ] {
-                version.latest_package_version = latest.map(str::to_owned);
+                version.latest_package_version = latest.map(Into::into);
                 for role in ["Application", "Runtime"] {
                     let rows =
                         super::super::popups::process_version_rows(role, Some(&version), false);
@@ -1494,6 +1494,9 @@ mod tests {
 
     fn hosted_process(name: &str, executable: &str) -> ProcessInfoNode {
         ProcessInfoNode {
+            executable_error: None,
+            cwd_error: None,
+            raw_argv0: None,
             identity: ProcessIdentity {
                 pid: 42,
                 start_ticks: 100,
@@ -2193,6 +2196,9 @@ mod tests {
                 Some(PathBuf::from(format!("/own-directory/{name}")))
             };
             let node = ProcessInfoNode {
+                executable_error: None,
+                cwd_error: None,
+                raw_argv0: None,
                 identity: ProcessIdentity {
                     pid,
                     start_ticks: pid as u64,

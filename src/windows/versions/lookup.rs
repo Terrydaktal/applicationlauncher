@@ -1,22 +1,27 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use super::{ProcessVersion, ProcessVersionTarget, probe_version_checked};
+use super::{ProcessVersion, ProcessVersionTarget, probe_header_checked, probe_version_checked};
 use crate::models::{ProcessIdentity, ProcessInfoNode};
 use crate::windows::process_tree::process_identity_is_current;
 
 const MAX_PENDING: usize = 16;
 const MAX_RESULTS: usize = 512;
+const CANDIDATE_REFRESH: Duration = Duration::from_secs(10);
 pub(crate) const PI_RECEIPT_REFRESH: Duration = Duration::from_secs(2);
 
 struct Request {
     generation: u64,
+    revision: u64,
     identity: ProcessIdentity,
     executable_identity: Option<(u64, u64)>,
+    executable_snapshot: ExecutableSnapshot,
     target: ProcessVersionTarget,
+    include_packages: bool,
 }
 
 enum PackageLookup {
@@ -25,22 +30,24 @@ enum PackageLookup {
 }
 
 impl PackageLookup {
-    fn result<'a>(
+    fn set_result(
         &self,
-        version: &'a mut ProcessVersion,
+        version: &mut ProcessVersion,
         application: bool,
-    ) -> &'a mut Option<String> {
+        result: super::AvailablePackageVersion,
+    ) {
         match (self, application) {
-            (Self::System(_), false) => &mut version.latest_package_version,
-            (Self::System(_), true) => &mut version.application_latest_package_version,
-            (Self::Npm(_), false) => &mut version.latest_npm_version,
-            (Self::Npm(_), true) => &mut version.application_latest_npm_version,
+            (Self::System(_), false) => version.latest_package_version = Some(result),
+            (Self::System(_), true) => version.application_latest_package_version = Some(result),
+            (Self::Npm(_), false) => version.latest_npm_version = Some(result.text),
+            (Self::Npm(_), true) => version.application_latest_npm_version = Some(result.text),
         }
     }
 }
 
 struct PackageRequest {
     generation: u64,
+    revision: u64,
     identity: ProcessIdentity,
     target: PackageLookup,
     application: bool,
@@ -48,6 +55,7 @@ struct PackageRequest {
 
 struct ReceiptRequest {
     generation: u64,
+    revision: u64,
     identity: ProcessIdentity,
     executable_identity: Option<(u64, u64)>,
     application: super::NodeApplication,
@@ -55,9 +63,38 @@ struct ReceiptRequest {
     desktop_entry: Option<crate::models::AppInfo>,
 }
 
+#[derive(Clone)]
+struct ExecutableSnapshot {
+    identity: Option<(u64, u64)>,
+    path: Option<PathBuf>,
+    raw_argv0: Option<PathBuf>,
+    executable_error: Option<&'static str>,
+}
+
+impl ExecutableSnapshot {
+    fn of(node: &ProcessInfoNode) -> Self {
+        Self {
+            identity: node.executable_identity,
+            path: node.executable.clone(),
+            raw_argv0: node.raw_argv0.clone(),
+            executable_error: node.executable_error,
+        }
+    }
+
+    fn matches(&self, node: &ProcessInfoNode) -> bool {
+        self.identity == node.executable_identity
+            && self.path == node.executable
+            && self.raw_argv0 == node.raw_argv0
+            && self.executable_error == node.executable_error
+    }
+}
+
 #[derive(Default)]
 struct State {
     generation: u64,
+    next_revision: u64,
+    active_revisions: HashMap<ProcessIdentity, u64>,
+    metadata_checked: HashMap<ProcessIdentity, (Instant, ExecutableSnapshot)>,
     stopped: bool,
     pending: VecDeque<Request>,
     packages: VecDeque<PackageRequest>,
@@ -65,6 +102,7 @@ struct State {
     receipt_pending: HashSet<ProcessIdentity>,
     receipt_checked: HashMap<ProcessIdentity, Instant>,
     results: HashMap<ProcessIdentity, Option<Arc<ProcessVersion>>>,
+    detailed: HashSet<ProcessIdentity>,
 }
 
 pub(crate) struct ProcessVersionCache {
@@ -74,9 +112,13 @@ pub(crate) struct ProcessVersionCache {
 impl ProcessVersionCache {
     pub(crate) fn new(ctx: egui::Context, viewport_id: egui::ViewportId) -> Self {
         Self::start(ctx, viewport_id, |request| {
-            probe_version_checked(&request.target, || {
-                process_identity_is_current(request.identity, request.executable_identity)
-            })
+            let current =
+                || process_identity_is_current(request.identity, request.executable_identity);
+            if request.include_packages {
+                probe_version_checked(&request.target, current)
+            } else {
+                probe_header_checked(&request.target, current)
+            }
         })
     }
 
@@ -89,7 +131,7 @@ impl ProcessVersionCache {
             // A repository version belongs to a package, not the lifetime of its process.
             Some(match &request.target {
                 PackageLookup::System(target) => super::available::query(target),
-                PackageLookup::Npm(target) => super::npm::query(target),
+                PackageLookup::Npm(target) => super::npm::query(target).into(),
             })
         })
     }
@@ -98,7 +140,9 @@ impl ProcessVersionCache {
         ctx: egui::Context,
         viewport_id: egui::ViewportId,
         probe: impl Fn(&Request) -> ProcessVersion + Send + 'static,
-        package_probe: impl Fn(&PackageRequest) -> Option<String> + Send + 'static,
+        package_probe: impl Fn(&PackageRequest) -> Option<super::AvailablePackageVersion>
+        + Send
+        + 'static,
     ) -> Self {
         Self::start_with_receipts(ctx, viewport_id, probe, package_probe, |request| {
             if !process_identity_is_current(request.identity, request.executable_identity) {
@@ -131,7 +175,9 @@ impl ProcessVersionCache {
         ctx: egui::Context,
         viewport_id: egui::ViewportId,
         probe: impl Fn(&Request) -> ProcessVersion + Send + 'static,
-        package_probe: impl Fn(&PackageRequest) -> Option<String> + Send + 'static,
+        package_probe: impl Fn(&PackageRequest) -> Option<super::AvailablePackageVersion>
+        + Send
+        + 'static,
         receipt_probe: impl Fn(&ReceiptRequest) -> (super::NodeApplication, super::PiBuildEvidence)
         + Send
         + 'static,
@@ -182,7 +228,10 @@ impl ProcessVersionCache {
                         if state.stopped {
                             break;
                         }
-                        if state.generation != request.generation {
+                        if state.generation != request.generation
+                            || state.active_revisions.get(&request.identity)
+                                != Some(&request.revision)
+                        {
                             continue;
                         }
                         state.receipt_pending.remove(&request.identity);
@@ -236,12 +285,17 @@ impl ProcessVersionCache {
                         if state.stopped {
                             break;
                         }
-                        if state.generation != request.generation {
+                        if state.generation != request.generation
+                            || state.active_revisions.get(&request.identity)
+                                != Some(&request.revision)
+                        {
                             continue;
                         }
                         if let Some(Some(version)) = state.results.get_mut(&request.identity) {
                             let version = Arc::make_mut(version);
-                            *request.target.result(version, request.application) = Some(result);
+                            request
+                                .target
+                                .set_result(version, request.application, result);
                             true
                         } else {
                             false
@@ -255,9 +309,9 @@ impl ProcessVersionCache {
             },
         );
         applicationlauncher::observability::spawn_named("process-info-versions", move |worker| {
-            // One worker consumes bounded, explicit expansion requests; an empty queue sleeps.
+            // Header checks and expanded metadata share a bounded worker; idle queues sleep.
             loop {
-                worker.set_state("waiting-for-expanded-section");
+                worker.set_state("waiting-for-process-info-request");
                 let request = {
                     let (mutex, wake) = &*worker_shared;
                     let mut state = mutex.lock().unwrap_or_else(|error| error.into_inner());
@@ -269,7 +323,7 @@ impl ProcessVersionCache {
                     }
                     state.pending.pop_front().unwrap()
                 };
-                worker.set_state("probing-expanded-process");
+                worker.set_state("probing-process-info");
                 let mut version = probe(&request);
                 let publish = {
                     let mut state = worker_shared
@@ -279,7 +333,9 @@ impl ProcessVersionCache {
                     if state.stopped {
                         break;
                     }
-                    if state.generation == request.generation {
+                    if state.generation == request.generation
+                        && state.active_revisions.get(&request.identity) == Some(&request.revision)
+                    {
                         if version
                             .application
                             .as_ref()
@@ -289,44 +345,52 @@ impl ProcessVersionCache {
                                 .receipt_checked
                                 .insert(request.identity, Instant::now());
                         }
-                        for (target, application) in [
-                            (
-                                version.package_target.clone().map(PackageLookup::System),
-                                false,
-                            ),
-                            (
-                                version
-                                    .application_package_target
-                                    .clone()
-                                    .map(PackageLookup::System),
-                                true,
-                            ),
-                            (version.npm_target.clone().map(PackageLookup::Npm), false),
-                            (
-                                version
-                                    .application_npm_target
-                                    .clone()
-                                    .map(PackageLookup::Npm),
-                                true,
-                            ),
-                        ] {
-                            if let Some(target) = target {
-                                if state.packages.len() < MAX_PENDING {
-                                    state.packages.push_back(PackageRequest {
-                                        generation: request.generation,
-                                        identity: request.identity,
-                                        target,
-                                        application,
-                                    });
-                                } else {
-                                    let result = Some("Unavailable (package lookup queue full; close and reopen Show Info to retry)".into());
-                                    *target.result(&mut version, application) = result;
+                        if request.include_packages {
+                            state.detailed.insert(request.identity);
+                            for (target, application) in [
+                                (
+                                    version.package_target.clone().map(PackageLookup::System),
+                                    false,
+                                ),
+                                (
+                                    version
+                                        .application_package_target
+                                        .clone()
+                                        .map(PackageLookup::System),
+                                    true,
+                                ),
+                                (version.npm_target.clone().map(PackageLookup::Npm), false),
+                                (
+                                    version
+                                        .application_npm_target
+                                        .clone()
+                                        .map(PackageLookup::Npm),
+                                    true,
+                                ),
+                            ] {
+                                if let Some(target) = target {
+                                    if state.packages.len() < MAX_PENDING {
+                                        state.packages.push_back(PackageRequest {
+                                            generation: request.generation,
+                                            revision: request.revision,
+                                            identity: request.identity,
+                                            target,
+                                            application,
+                                        });
+                                    } else {
+                                        let result = "Unavailable (package lookup queue full; close and reopen Show Info to retry)".into();
+                                        target.set_result(&mut version, application, result);
+                                    }
                                 }
                             }
                         }
                         state
                             .results
                             .insert(request.identity, Some(Arc::new(version)));
+                        state.metadata_checked.insert(
+                            request.identity,
+                            (Instant::now(), request.executable_snapshot.clone()),
+                        );
                         worker_shared.1.notify_all();
                         true
                     } else {
@@ -355,6 +419,9 @@ impl ProcessVersionCache {
         state.receipt_pending.clear();
         state.receipt_checked.clear();
         state.results.clear();
+        state.active_revisions.clear();
+        state.metadata_checked.clear();
+        state.detailed.clear();
     }
 
     #[cfg(test)]
@@ -377,11 +444,83 @@ impl ProcessVersionCache {
         refresh_receipt: bool,
         application: impl FnOnce() -> Option<(&'a crate::models::AppInfo, bool)>,
     ) -> Option<Arc<ProcessVersion>> {
+        self.request_scoped(node, refresh_receipt, true, application)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_for_header(&self, node: &ProcessInfoNode) -> Option<Arc<ProcessVersion>> {
+        self.request_header_for_application(node, || None)
+    }
+
+    pub(crate) fn request_header_for_application<'a>(
+        &self,
+        node: &ProcessInfoNode,
+        application: impl FnOnce() -> Option<(&'a crate::models::AppInfo, bool)>,
+    ) -> Option<Arc<ProcessVersion>> {
+        self.request_scoped(node, true, false, application)
+    }
+
+    fn request_scoped<'a>(
+        &self,
+        node: &ProcessInfoNode,
+        refresh_receipt: bool,
+        include_packages: bool,
+        application: impl FnOnce() -> Option<(&'a crate::models::AppInfo, bool)>,
+    ) -> Option<Arc<ProcessVersion>> {
         let mut state = self
             .shared
             .0
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        if state
+            .metadata_checked
+            .get(&node.identity)
+            .is_some_and(|(checked, executable)| {
+                !executable.matches(node) || checked.elapsed() >= Duration::from_secs(15)
+                    || (node.executable.is_none()
+                        && checked.elapsed() >= CANDIDATE_REFRESH
+                        && state
+                            .results
+                            .get(&node.identity)
+                            .is_some_and(Option::is_some))
+            })
+        {
+            state.results.remove(&node.identity);
+            state.detailed.remove(&node.identity);
+            state.metadata_checked.remove(&node.identity);
+            state.active_revisions.remove(&node.identity);
+            state
+                .pending
+                .retain(|request| request.identity != node.identity);
+            state
+                .receipts
+                .retain(|request| request.identity != node.identity);
+            state.receipt_pending.remove(&node.identity);
+            state.receipt_checked.remove(&node.identity);
+            state
+                .packages
+                .retain(|request| request.identity != node.identity);
+        }
+        if include_packages && !state.detailed.contains(&node.identity) {
+            if state
+                .results
+                .get(&node.identity)
+                .is_some_and(Option::is_some)
+            {
+                state.results.remove(&node.identity);
+            } else if let Some(request) = state
+                .pending
+                .iter_mut()
+                .find(|request| request.identity == node.identity && !request.include_packages)
+            {
+                let application = application();
+                request.include_packages = true;
+                request.target.application_entry = application.map(|(entry, _)| entry.clone());
+                request.target.window_declared_entry =
+                    application.is_some_and(|(_, declared)| declared);
+                return None;
+            }
+        }
         if let Some(result) = state.results.get(&node.identity).cloned() {
             if refresh_receipt
                 && let Some(application) = result
@@ -396,8 +535,14 @@ impl ProcessVersionCache {
                     .is_none_or(|checked| checked.elapsed() >= PI_RECEIPT_REFRESH)
             {
                 let generation = state.generation;
+                let revision = state
+                    .active_revisions
+                    .get(&node.identity)
+                    .copied()
+                    .unwrap_or_default();
                 state.receipts.push_back(ReceiptRequest {
                     generation,
+                    revision,
                     identity: node.identity,
                     executable_identity: node.executable_identity,
                     application: application.clone(),
@@ -413,21 +558,50 @@ impl ProcessVersionCache {
             }
             return result;
         }
-        let Some(executable) = node.executable.as_ref() else {
-            return Some(Arc::new(ProcessVersion::default()));
+        let Some(executable) = node
+            .executable
+            .as_ref()
+            .or_else(|| node.raw_argv0.as_ref().filter(|path| path.is_absolute()))
+        else {
+            return Some(Arc::new(ProcessVersion {
+                running_unavailable: node
+                    .executable_error
+                    .or(Some("process executable unavailable")),
+                ..Default::default()
+            }));
         };
         if state.results.len() >= MAX_RESULTS || state.pending.len() >= MAX_PENDING {
             return None;
         }
         let generation = state.generation;
+        state.next_revision = state.next_revision.wrapping_add(1);
+        let revision = state.next_revision;
+        state.active_revisions.insert(node.identity, revision);
+        // Record queued/in-flight snapshots as well as completed probes. A
+        // renamed or unlinked executable retains its inode, but its observed
+        // path changes and must retire all results from the previous snapshot.
+        state.metadata_checked.insert(
+            node.identity,
+            (Instant::now(), ExecutableSnapshot::of(node)),
+        );
         let application = application();
         state.pending.push_back(Request {
             generation,
+            revision,
             identity: node.identity,
             executable_identity: node.executable_identity,
+            executable_snapshot: ExecutableSnapshot::of(node),
+            include_packages,
             target: ProcessVersionTarget {
                 pid: node.identity.pid,
                 executable: executable.clone(),
+                launch_context: super::ProcessLaunchContext {
+                    raw_argv0: node.raw_argv0.clone(),
+                    executable_unavailable: node.executable.is_none().then_some(
+                        node.executable_error
+                            .unwrap_or("process executable unavailable"),
+                    ),
+                },
                 program: Some(node.name.clone()),
                 application_entry: application.map(|(entry, _)| entry.clone()),
                 window_declared_entry: application.is_some_and(|(_, declared)| declared),
@@ -473,8 +647,11 @@ mod tests {
             script_name: None,
             header: "test".into(),
             executable: Some("/not-executed/test".into()),
+            executable_error: None,
             executable_identity: None,
             cwd: None,
+            cwd_error: None,
+            raw_argv0: None,
             command_line: None,
         }
     }
@@ -575,6 +752,101 @@ mod tests {
         missing.executable = None;
         assert!(cache.request(&missing).unwrap().version.is_none());
         assert!(cache.shared.0.lock().unwrap().pending.is_empty());
+    }
+
+    #[test]
+    fn absolute_raw_argv0_candidates_are_background_bounded_and_never_use_display_text() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let cache = ProcessVersionCache::start(
+            egui::Context::default(),
+            egui::ViewportId::ROOT,
+            move |request| {
+                started_tx.send(request.target.clone()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                ProcessVersion {
+                    running_unavailable: request.target.launch_context.executable_unavailable,
+                    on_disk_candidate: Some(request.target.executable.clone()),
+                    ..Default::default()
+                }
+            },
+        );
+        let mut missing = node(1);
+        missing.executable = None;
+        missing.executable_error = Some("Permission denied reading process executable");
+        missing.command_line = Some("/untrusted/display path --user".into());
+        assert!(cache.request(&missing).unwrap().on_disk_candidate.is_none());
+        missing.raw_argv0 = Some("relative-command".into());
+        assert!(cache.request(&missing).unwrap().on_disk_candidate.is_none());
+        missing.raw_argv0 = Some("/exact argv0/with spaces".into());
+        let started = Instant::now();
+        assert!(cache.request(&missing).is_none());
+        assert!(started.elapsed() < Duration::from_millis(100));
+        let request = started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            request.executable,
+            PathBuf::from("/exact argv0/with spaces")
+        );
+        assert_eq!(
+            request.launch_context.executable_unavailable,
+            missing.executable_error
+        );
+        for _ in 0..100 {
+            assert!(cache.request(&missing).is_none());
+        }
+        assert!(cache.shared.0.lock().unwrap().pending.is_empty());
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(result) = cache.request(&missing) {
+                assert!(result.version.is_none() && result.build_id.is_none());
+                assert!(result.running_latest_binary.is_none());
+                assert_eq!(result.on_disk_candidate, missing.raw_argv0);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn inferred_candidate_refresh_is_worker_only_and_does_not_stale_verified_metadata() {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let count = probes.clone();
+        let cache = ProcessVersionCache::start(
+            egui::Context::default(),
+            egui::ViewportId::ROOT,
+            move |_| ProcessVersion {
+                latest_version: Some(format!("revision {}", count.fetch_add(1, Ordering::SeqCst))),
+                ..Default::default()
+            },
+        );
+        let mut missing = node(1);
+        missing.executable = None;
+        missing.raw_argv0 = Some("/candidate/not-statted-by-renderer".into());
+        let wait = |process: &ProcessInfoNode| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(result) = cache.request(process) {
+                    break result;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        };
+        assert_eq!(wait(&missing).latest_version.as_deref(), Some("revision 0"));
+        cache
+            .shared
+            .0
+            .lock()
+            .unwrap()
+            .metadata_checked
+            .get_mut(&missing.identity)
+            .unwrap()
+            .0 = Instant::now() - CANDIDATE_REFRESH;
+        assert_eq!(wait(&missing).latest_version.as_deref(), Some("revision 1"));
+        missing.raw_argv0 = Some("/different/candidate".into());
+        assert_eq!(wait(&missing).latest_version.as_deref(), Some("revision 2"));
     }
 
     #[test]
@@ -706,6 +978,75 @@ mod tests {
     }
 
     #[test]
+    fn child_desktop_candidates_remain_unverified_and_results_stay_per_process() {
+        let entry = crate::models::AppInfo {
+            name: "Browser".into(),
+            exec: "/fixture/google-chrome-fast".into(),
+            icon_path: None,
+            comment: None,
+            desktop_file_path: "/fixture/browser.desktop".into(),
+            is_settings_module: false,
+        };
+        let count = Arc::new(AtomicUsize::new(0));
+        let probes = count.clone();
+        let cache = ProcessVersionCache::start(
+            egui::Context::default(),
+            egui::ViewportId::ROOT,
+            move |request| {
+                assert!(!request.target.window_declared_entry);
+                assert_eq!(
+                    request.target.application_entry.as_ref().unwrap().exec,
+                    "/fixture/google-chrome-fast"
+                );
+                assert_eq!(request.target.pid, request.identity.pid);
+                assert_eq!(
+                    request.target.executable,
+                    PathBuf::from(format!("/fixture/child-{}", request.identity.pid))
+                );
+                probes.fetch_add(1, Ordering::SeqCst);
+                ProcessVersion {
+                    running_latest_binary: match request.identity.pid {
+                        1 => Some(true),
+                        2 => Some(false),
+                        _ => None,
+                    },
+                    ..Default::default()
+                }
+            },
+        );
+        for pid in [1, 2, 3] {
+            let mut child = node(pid);
+            child.executable = Some(format!("/fixture/child-{pid}").into());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(version) =
+                    cache.request_header_for_application(&child, || Some((&entry, false)))
+                {
+                    assert_eq!(
+                        version.process_build_is_current(),
+                        match pid {
+                            1 => Some(true),
+                            2 => Some(false),
+                            _ => None,
+                        }
+                    );
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            assert!(
+                cache
+                    .request_header_for_application(&child, || panic!(
+                        "candidate should only be snapshotted once"
+                    ))
+                    .is_some()
+            );
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
     fn cached_process_metadata_does_not_resolve_desktop_candidates_again_each_frame() {
         let cache =
             ProcessVersionCache::start(egui::Context::default(), egui::ViewportId::ROOT, |_| {
@@ -737,6 +1078,141 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_header_checks_are_cached_without_package_lookups_and_expand_on_demand() {
+        let entry = crate::models::AppInfo {
+            name: "Browser".into(),
+            exec: "/fixture/browser-wrapper".into(),
+            icon_path: None,
+            comment: None,
+            desktop_file_path: "/fixture/browser.desktop".into(),
+            is_settings_module: false,
+        };
+        let probes = Arc::new(AtomicUsize::new(0));
+        let packages = Arc::new(AtomicUsize::new(0));
+        let count = probes.clone();
+        let package_count = packages.clone();
+        let cache = ProcessVersionCache::start_with_packages(
+            egui::Context::default(),
+            egui::ViewportId::ROOT,
+            move |request| {
+                if !request.include_packages {
+                    assert_eq!(
+                        request
+                            .target
+                            .application_entry
+                            .as_ref()
+                            .map(|entry| entry.exec.as_str()),
+                        Some("/fixture/browser-wrapper")
+                    );
+                    assert!(request.target.window_declared_entry);
+                }
+                count.fetch_add(1, Ordering::SeqCst);
+                ProcessVersion {
+                    running_latest_binary: Some(true),
+                    package_target: Some(super::super::PackageTarget {
+                        name: "fixture".into(),
+                        inferred: false,
+                    }),
+                    ..Default::default()
+                }
+            },
+            move |_| {
+                package_count.fetch_add(1, Ordering::SeqCst);
+                Some("fixture 2.0".to_string().into())
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(version) =
+                cache.request_header_for_application(&node(1), || Some((&entry, true)))
+            {
+                assert_eq!(version.process_build_is_current(), Some(true));
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        for _ in 0..100 {
+            assert!(
+                cache
+                    .request_header_for_application(&node(1), || panic!(
+                        "cached headers must not rescan desktop entries"
+                    ))
+                    .is_some()
+            );
+        }
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        assert_eq!(packages.load(Ordering::SeqCst), 0);
+        assert!(cache.shared.0.lock().unwrap().packages.is_empty());
+        loop {
+            if let Some(version) = cache.request(&node(1))
+                && version.latest_package_version.is_some()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+        assert_eq!(packages.load(Ordering::SeqCst), 1);
+        assert!(cache.request_for_header(&node(1)).is_some());
+        cache.reset();
+        assert!(cache.shared.0.lock().unwrap().detailed.is_empty());
+    }
+
+    #[test]
+    fn expanding_a_queued_header_keeps_its_desktop_entry_and_resolves_it_only_once() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let cache = ProcessVersionCache::start(
+            egui::Context::default(),
+            egui::ViewportId::ROOT,
+            move |request| {
+                if request.identity.pid == 1 {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                ProcessVersion::default()
+            },
+        );
+        cache.request_for_header(&node(1));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        cache.request_for_header(&node(2));
+        let entry = crate::models::AppInfo {
+            name: "Fixture".into(),
+            exec: "/fixture/app".into(),
+            icon_path: None,
+            comment: None,
+            desktop_file_path: "/fixture/app.desktop".into(),
+            is_settings_module: false,
+        };
+        let resolutions = std::cell::Cell::new(0);
+        for _ in 0..10 {
+            assert!(
+                cache
+                    .request_for_application(&node(2), false, || {
+                        resolutions.set(resolutions.get() + 1);
+                        Some((&entry, true))
+                    })
+                    .is_none()
+            );
+        }
+        {
+            let state = cache.shared.0.lock().unwrap();
+            let request = state
+                .pending
+                .iter()
+                .find(|request| request.identity.pid == 2)
+                .unwrap();
+            assert!(request.include_packages && request.target.window_declared_entry);
+            assert_eq!(request.target.application_entry.as_ref(), Some(&entry));
+        }
+        assert_eq!(resolutions.get(), 1);
+        drop(cache);
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
     fn npm_and_system_queries_publish_to_separate_application_and_runtime_fields() {
         let cache = ProcessVersionCache::start_with_packages(
             egui::Context::default(),
@@ -757,8 +1233,13 @@ mod tests {
             },
             |request| {
                 Some(match &request.target {
-                    PackageLookup::System(target) => format!("system {}", target.name),
-                    PackageLookup::Npm(target) => format!("npm {}", target.name),
+                    PackageLookup::System(target) => {
+                        crate::windows::versions::available_package_fixture(
+                            super::super::PackageVersionSource::Pacman,
+                            &format!("system {}", target.name),
+                        )
+                    }
+                    PackageLookup::Npm(target) => format!("npm {}", target.name).into(),
                 })
             },
         );
@@ -769,11 +1250,17 @@ mod tests {
             {
                 assert_eq!(version.version.as_deref(), Some("node running"));
                 assert_eq!(
-                    version.latest_package_version.as_deref(),
+                    version
+                        .latest_package_version
+                        .as_ref()
+                        .map(|version| version.text.as_str()),
                     Some("system nodejs")
                 );
                 assert_eq!(
-                    version.application_latest_package_version.as_deref(),
+                    version
+                        .application_latest_package_version
+                        .as_ref()
+                        .map(|version| version.text.as_str()),
                     Some("system packaged-script")
                 );
                 assert_eq!(
@@ -850,7 +1337,7 @@ mod tests {
                     .send((request.identity.pid, request.generation))
                     .unwrap();
                 release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                Some(format!("repository generation {}", request.generation))
+                Some(format!("repository generation {}", request.generation).into())
             },
         );
         cache.request(&node(1));
@@ -869,6 +1356,7 @@ mod tests {
                                 .latest_package_version
                                 .as_ref()
                                 .unwrap()
+                                .text
                                 .contains("queue full")
                         );
                     }
@@ -909,7 +1397,10 @@ mod tests {
                 && version.latest_package_version.is_some()
             {
                 assert_eq!(
-                    version.latest_package_version.as_deref(),
+                    version
+                        .latest_package_version
+                        .as_ref()
+                        .map(|version| version.text.as_str()),
                     Some("repository generation 1")
                 );
                 break;
