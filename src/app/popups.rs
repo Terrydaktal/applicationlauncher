@@ -2863,6 +2863,82 @@ mod tests {
     }
 
     #[test]
+    fn not_applicable_uncompiled_changes_use_dash_in_application_process_and_runtime_rows() {
+        use crate::windows::versions::{ApplicationInfo, ProcessVersion};
+        for (status, expected) in [
+            ("Not applicable", "-"),
+            ("Not applicable (package-managed installation)", "-"),
+            ("Not applicable (prebuilt uv-managed runtime)", "-"),
+            (
+                "Not applicable (Interpreted script; no compiled artifact to compare)",
+                "-",
+            ),
+            (
+                "Unknown (no supported local build metadata)",
+                "Unknown (no supported local build metadata)",
+            ),
+            ("Loading...", "Loading..."),
+            (
+                "No newer recorded inputs detected",
+                "No newer recorded inputs detected",
+            ),
+            (
+                "Yes (recorded build inputs changed)",
+                "Yes (recorded build inputs changed)",
+            ),
+            (
+                "Yes · 25 inputs checked · 3 newer · 2 missing · added: unknown",
+                "Yes · 25 inputs checked · 3 newer · 2 missing · added: unknown",
+            ),
+            (
+                "No newer recorded inputs detected · 25 inputs checked · 0 newer · 0 missing · added: unknown · full build status unknown",
+                "No newer recorded inputs detected · 25 inputs checked · 0 newer · 0 missing · added: unknown · full build status unknown",
+            ),
+            ("Unknown · scan incomplete", "Unknown · scan incomplete"),
+        ] {
+            let InfoTarget::App(mut popup) = app("/test/tool.desktop") else {
+                unreachable!()
+            };
+            popup.metadata = Some(ApplicationInfo {
+                uncompiled_changes: Some(status.into()),
+                ..Default::default()
+            });
+            let version = ProcessVersion {
+                uncompiled_changes: Some(status.into()),
+                ..Default::default()
+            };
+            let row_value = |rows: Vec<InfoPopupRow>| {
+                rows.into_iter()
+                    .find(|row| row.label == "Uncompiled changes")
+                    .unwrap()
+                    .value
+            };
+            assert_eq!(
+                row_value(application_info_rows(&popup)),
+                expected,
+                "{status}"
+            );
+            for scope in ["Application", "Runtime"] {
+                assert_eq!(
+                    row_value(process_version_rows(scope, Some(&version), false)),
+                    expected,
+                    "{scope}: {status}"
+                );
+            }
+            assert_eq!(
+                popup
+                    .metadata
+                    .as_ref()
+                    .unwrap()
+                    .uncompiled_changes
+                    .as_deref(),
+                Some(status)
+            );
+            assert_eq!(version.uncompiled_changes.as_deref(), Some(status));
+        }
+    }
+
+    #[test]
     fn application_info_omits_settings_module_field_for_both_entry_types() {
         for is_settings_module in [false, true] {
             let InfoTarget::App(mut popup) = app("/test/tool.desktop") else {
@@ -2908,9 +2984,46 @@ mod tests {
         assert!(
             application_info_rows(&popup)
                 .iter()
-                .any(|row| row.label == "Desktop file"
-                    && row.value == "Unavailable (no associated desktop entry)")
+                .any(|row| row.label == "Desktop file" && row.value == "None")
         );
+    }
+
+    #[test]
+    fn absent_desktop_entries_use_none_and_dashes_for_apps_and_processes() {
+        let InfoTarget::App(mut popup) = app("") else {
+            unreachable!();
+        };
+        popup.app.icon_path = Some("/test/fallback.png".into());
+        popup.app.comment = Some("Not desktop-entry metadata".into());
+        for rows in [
+            application_info_rows(&popup),
+            desktop_entry_rows(None, None, false, Some(Path::new("/test/fallback.png"))),
+        ] {
+            for (label, expected) in [
+                ("Desktop file", "None"),
+                ("Icon path", "-"),
+                ("Name", "-"),
+                ("Comment", "-"),
+            ] {
+                let row = rows.iter().find(|row| row.label == label).unwrap();
+                assert_eq!(row.value, expected, "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn pending_desktop_entries_are_not_reported_as_absent() {
+        let rows = desktop_entry_rows(None, None, true, Some(Path::new("/test/pending.png")));
+        for row in &rows {
+            assert_eq!(
+                row.value,
+                if row.label == "Icon path" {
+                    "/test/pending.png"
+                } else {
+                    "Loading..."
+                }
+            );
+        }
     }
 
     #[test]

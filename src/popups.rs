@@ -253,11 +253,32 @@ fn info_popup_layout(
             &label,
             format(body_font.clone(), label_color),
         );
+        let value = format!("{}\n", row.value);
+        let caveat_start = if row.label == "Uncompiled changes" {
+            [
+                "added: unknown",
+                "full build status unknown",
+                "scan incomplete",
+            ]
+            .into_iter()
+            .filter_map(|caveat| row.value.find(caveat))
+            .min()
+        } else {
+            None
+        };
+        let (observation, caveat) = value.split_at(caveat_start.unwrap_or(value.len()));
         append_info_text(
             &mut layout_job,
-            &format!("{}\n", row.value),
+            observation,
             format(body_font.clone(), value_color),
         );
+        if !caveat.is_empty() {
+            append_info_text(
+                &mut layout_job,
+                caveat,
+                format(body_font.clone(), egui::Color32::from_rgb(255, 220, 100)),
+            );
+        }
     }
 
     (layout_job, divider_cursors)
@@ -1701,6 +1722,136 @@ mod tests {
                     .unwrap();
                 assert_eq!(other.format.color, egui::Color32::WHITE);
                 assert!(copy_shown_info(&data).contains(hash));
+            }
+        }
+    }
+
+    #[test]
+    fn uncompiled_changes_values_use_status_colours_in_application_and_process_info() {
+        let green = binary_current_color(Some(true)).unwrap();
+        let red = binary_current_color(Some(false)).unwrap();
+        let yellow = egui::Color32::from_rgb(255, 220, 100);
+        for tree in [false, true] {
+            for (value, color, uncertainty) in [
+                ("No", green, None),
+                ("No newer recorded inputs detected", green, None),
+                (
+                    "No newer recorded inputs detected (qualified timestamp evidence)",
+                    green,
+                    None,
+                ),
+                (
+                    "No newer recorded inputs detected (977 checked; full build status unknown)",
+                    green,
+                    Some("full build status unknown"),
+                ),
+                (
+                    "No newer recorded inputs detected · 977 inputs checked · 0 newer · 0 missing · added: unknown · full build status unknown",
+                    green,
+                    Some("added: unknown"),
+                ),
+                (
+                    "No newer recorded inputs detected · 1 inputs checked · 0 newer · 0 missing · added: unknown",
+                    green,
+                    Some("added: unknown"),
+                ),
+                ("Yes", red, None),
+                ("Yes (recorded build inputs changed; source.c)", red, None),
+                (
+                    "Yes · 40 inputs checked · 2 newer · 3 missing · added: unknown",
+                    red,
+                    Some("added: unknown"),
+                ),
+                (
+                    "Yes · 40 inputs checked · 0 newer · 1 missing · scan incomplete",
+                    red,
+                    Some("scan incomplete"),
+                ),
+                (
+                    "Yes · 40 inputs checked · 2 newer · 0 missing · full build status unknown",
+                    red,
+                    Some("full build status unknown"),
+                ),
+                ("Unknown", yellow, None),
+                ("Unknown (build evidence incomplete)", yellow, None),
+                ("Unknown · scan incomplete", yellow, Some("scan incomplete")),
+                ("unknown", yellow, None),
+                (
+                    "Not applicable (package-managed binary)",
+                    egui::Color32::WHITE,
+                    None,
+                ),
+                ("Loading...", egui::Color32::WHITE, None),
+                ("Unavailable", egui::Color32::WHITE, None),
+                ("-", egui::Color32::WHITE, None),
+            ] {
+                let ctx = egui::Context::default();
+                let row = InfoPopupRow {
+                    label: "Uncompiled changes".into(),
+                    scope: InfoFieldScope::Installation,
+                    value: value.into(),
+                    searched: false,
+                    separator_before: false,
+                    binary_is_current: None,
+                };
+                let mut data = if tree { tree_info() } else { window_info() };
+                let editor = if let Some(tree) = &mut data.process_tree {
+                    tree.sections[0].rows.push(row);
+                    tree_frame(&ctx, &data, Vec::new()).1.remove(0)
+                } else {
+                    data.rows.push(row);
+                    frame(&ctx, &data, Vec::new()).1
+                };
+                let layout = &editor.galley.job;
+                let value_start = layout.text.rfind(&format!("{value}\n")).unwrap();
+                let caveat_start = uncertainty.map(|text| value_start + value.find(text).unwrap());
+                for index in value_start..value_start + value.len() + 1 {
+                    let section = layout
+                        .sections
+                        .iter()
+                        .find(|section| section.byte_range.contains(&index))
+                        .unwrap();
+                    let expected = if caveat_start.is_some_and(|start| index >= start) {
+                        yellow
+                    } else {
+                        color
+                    };
+                    assert_eq!(
+                        section.format.color, expected,
+                        "{value}, byte={index}, tree={tree}"
+                    );
+                }
+                let label = layout
+                    .sections
+                    .iter()
+                    .find(|section| {
+                        layout.text[section.byte_range.clone()].starts_with("Uncompiled changes")
+                    })
+                    .unwrap();
+                assert_eq!(
+                    label.format.color,
+                    info_field_label_color(InfoFieldScope::Installation)
+                );
+                assert!(copy_shown_info(&data).contains(value));
+                let start = layout.text[..value_start].chars().count();
+                let end = start + value.chars().count();
+                let mut state = editor.state;
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(start),
+                        egui::text::CCursor::new(end),
+                    )));
+                state.store(&ctx, editor.response.id);
+                ctx.memory_mut(|memory| memory.request_focus(editor.response.id));
+                let output = if tree {
+                    tree_frame(&ctx, &data, vec![egui::Event::Copy]).0
+                } else {
+                    frame(&ctx, &data, vec![egui::Event::Copy]).0
+                };
+                assert!(output.platform_output.commands.iter().any(
+                    |command| matches!(command, egui::OutputCommand::CopyText(copied) if copied == value)
+                ), "copied bytes differ: {value}, tree={tree}");
             }
         }
     }
