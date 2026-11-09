@@ -223,6 +223,43 @@ fn metadata_issue_value(reason: &str) -> String {
 const VERSION_FIELD_LABEL: &str = "Version (ELF build ID)";
 const LATEST_VERSION_FIELD_LABEL: &str = "Latest version on disk (ELF build ID)";
 
+fn combine_version_build_id_rows(rows: &mut Vec<InfoPopupRow>, role: &str, latest: bool) {
+    let (version_label, build_label, combined_label) = if latest {
+        (
+            "latest version (on disk)",
+            "latest ELF build ID (on disk)",
+            LATEST_VERSION_FIELD_LABEL,
+        )
+    } else {
+        ("version", "ELF build ID", VERSION_FIELD_LABEL)
+    };
+    let version_label = info_metadata_label(role, version_label);
+    let build_label = info_metadata_label(role, build_label);
+    if !rows.iter().any(|row| row.label == version_label) {
+        return;
+    }
+    let Some(index) = rows.iter().position(|row| row.label == build_label) else {
+        return;
+    };
+    let build = rows.remove(index);
+    let version = rows
+        .iter_mut()
+        .find(|row| row.label == version_label)
+        .unwrap();
+    version.label = info_metadata_label(role, combined_label);
+    let build_value = if build.value.trim().is_empty() {
+        "Unavailable"
+    } else {
+        &build.value
+    };
+    let same_failure = version.value == build_value
+        && (version.value == "Loading..." || version.value.starts_with("Unavailable"));
+    if !same_failure {
+        version.value = format!("{} ({build_value})", version.value);
+    }
+    version.binary_is_current = build.binary_is_current;
+}
+
 fn installed_application_rows(
     role: &str,
     fields: InstalledApplicationFields<'_>,
@@ -351,7 +388,7 @@ fn installed_application_rows(
         binary_is_current: None,
     })
     .collect();
-
+    combine_version_build_id_rows(&mut rows, role, true);
     rows
 }
 
@@ -632,7 +669,7 @@ pub(super) fn process_version_rows(
         },
     })
     .collect();
-
+    combine_version_build_id_rows(&mut rows, role, false);
     let launch = version.and_then(|version| version.launch.as_ref());
     if let Some(candidate) = version.and_then(|version| version.on_disk_candidate.as_ref()) {
         rows.push(InfoPopupRow {
@@ -1913,6 +1950,76 @@ mod tests {
             assert_eq!(popup.metadata, Some(Default::default()));
             assert!(popup.receiver.is_none());
         }
+    }
+
+    #[test]
+    fn combined_version_fields_use_the_requested_format_and_preserve_scope_and_freshness() {
+        use crate::windows::versions::ProcessVersion;
+        let name = "Xfce Terminal 1.2.0-fork0.4.9-46";
+        let installed = "4fcbbefb36addaaee2f2948a22e2b808698149fa";
+        for role in ["Application", "Runtime"] {
+            for status in [Some(true), Some(false), None] {
+                let running = if status == Some(false) {
+                    "7f0240905d72a3925acf2afe975ab383042ebd2a"
+                } else {
+                    installed
+                };
+                let version = ProcessVersion {
+                    version: Some(name.into()),
+                    build_id: Some(running.into()),
+                    latest_version: Some(name.into()),
+                    latest_build_id: Some(installed.into()),
+                    running_latest_binary: status,
+                    ..Default::default()
+                };
+                let rows = process_version_rows(role, Some(&version), false);
+                assert_eq!(rows[0].label, VERSION_FIELD_LABEL);
+                assert_eq!(rows[0].value, format!("{name} ({running})"));
+                assert_eq!(rows[0].scope, InfoFieldScope::RunningInstance);
+                assert_eq!(rows[0].binary_is_current, status);
+                assert_eq!(rows[1].label, LATEST_VERSION_FIELD_LABEL);
+                assert_eq!(
+                    rows[1].value,
+                    "Xfce Terminal 1.2.0-fork0.4.9-46 (4fcbbefb36addaaee2f2948a22e2b808698149fa)"
+                );
+                assert_eq!(rows[1].scope, InfoFieldScope::Installation);
+                assert_eq!(rows[1].binary_is_current, None);
+                assert!(!rows.iter().any(|row| matches!(
+                    row.label.as_str(),
+                    "Version"
+                        | "ELF build ID"
+                        | "Latest version (on disk)"
+                        | "Latest ELF build ID (on disk)"
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn combined_version_fields_keep_loading_and_missing_builds_neutral_without_duplicates() {
+        for pending in [true, false] {
+            let rows = process_version_rows("Application", None, pending);
+            for row in &rows[..2] {
+                assert_eq!(
+                    row.value,
+                    if pending { "Loading..." } else { "Unavailable" }
+                );
+                assert!(row.binary_is_current.is_none());
+            }
+        }
+        let InfoTarget::App(mut popup) = app("/test/terminal.desktop") else {
+            unreachable!()
+        };
+        popup.metadata = Some(crate::windows::versions::ApplicationInfo {
+            version: Some("Xfce Terminal 1.2.0".into()),
+            build_id: Some("installed-id".into()),
+            ..Default::default()
+        });
+        let rows = application_info_rows(&popup);
+        assert_eq!(rows[0].label, LATEST_VERSION_FIELD_LABEL);
+        assert_eq!(rows[0].value, "Xfce Terminal 1.2.0 (installed-id)");
+        assert_eq!(rows[0].scope, InfoFieldScope::Installation);
+        assert!(rows[0].binary_is_current.is_none());
     }
 
     #[test]

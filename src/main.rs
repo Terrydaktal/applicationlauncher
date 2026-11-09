@@ -4,6 +4,16 @@ use std::time::Instant;
 use applicationlauncher::diagnostic_capture::{CaptureOptions, capture_auto, run_debug_doctor};
 use applicationlauncher::observability::{self, Component};
 
+const PRODUCT_METADATA_TEXT: &str = concat!(
+    "PROGRAM-METADATA-V1\napplicationlauncher\n",
+    env!("CARGO_PKG_VERSION"),
+    "\ngui\n"
+);
+#[used]
+#[unsafe(link_section = ".program_metadata")]
+static PRODUCT_METADATA: [u8; PRODUCT_METADATA_TEXT.len()] =
+    applicationlauncher::metadata_bytes(PRODUCT_METADATA_TEXT);
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -175,6 +185,9 @@ AUTHORS
 }
 
 fn main() -> eframe::Result {
+    // Keep the producer section in optimized links without running a metadata
+    // probe, and without making diagnostic switches enter the GUI lifecycle.
+    std::hint::black_box(&PRODUCT_METADATA);
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|argument| argument == "--build-id") {

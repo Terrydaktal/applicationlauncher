@@ -1,4 +1,15 @@
+const PRODUCT_METADATA_TEXT: &str = concat!(
+    "PROGRAM-METADATA-V1\napplicationlauncherd\n",
+    env!("CARGO_PKG_VERSION"),
+    "\nservice\n"
+);
+#[used]
+#[unsafe(link_section = ".program_metadata")]
+static PRODUCT_METADATA: [u8; PRODUCT_METADATA_TEXT.len()] =
+    applicationlauncher::metadata_bytes(PRODUCT_METADATA_TEXT);
+
 fn main() {
+    std::hint::black_box(&PRODUCT_METADATA);
     if std::env::args().any(|argument| argument == "--build-id") {
         println!("{}", applicationlauncher::BUILD_ID);
         return;

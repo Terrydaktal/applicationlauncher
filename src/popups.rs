@@ -131,6 +131,52 @@ fn info_text_layout(
     job
 }
 
+fn binary_current_color(current: Option<bool>) -> Option<egui::Color32> {
+    match current {
+        Some(true) => Some(egui::Color32::from_rgb(130, 225, 145)),
+        Some(false) => Some(egui::Color32::from_rgb(255, 110, 110)),
+        None => None,
+    }
+}
+
+fn uncompiled_changes_color(value: &str) -> Option<egui::Color32> {
+    let status = value
+        .trim()
+        .split(|character: char| !character.is_ascii_alphabetic())
+        .next()?;
+    if status.eq_ignore_ascii_case("Unknown") {
+        Some(egui::Color32::from_rgb(255, 220, 100))
+    } else if status.eq_ignore_ascii_case("No") {
+        binary_current_color(Some(true))
+    } else if status.eq_ignore_ascii_case("Yes") {
+        binary_current_color(Some(false))
+    } else {
+        None
+    }
+}
+
+fn info_process_header_layout(
+    header: &str,
+    current: Option<bool>,
+    font: egui::FontId,
+    base: egui::Color32,
+) -> egui::text::LayoutJob {
+    let name = header
+        .rsplit_once(" (pid ")
+        .map_or(header, |(name, _)| name);
+    let mut job = info_text_layout(
+        name,
+        font.clone(),
+        binary_current_color(current).unwrap_or(base),
+    );
+    append_info_text(
+        &mut job,
+        &header[name.len()..],
+        egui::TextFormat::simple(font, base),
+    );
+    job
+}
+
 fn info_field_label_color(scope: InfoFieldScope) -> egui::Color32 {
     match scope {
         InfoFieldScope::Neutral => egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170),
@@ -191,15 +237,17 @@ fn info_popup_layout(
         }
         let label = format!("{:<label_width$}  ", row.label);
         let label_color = info_field_label_color(row.scope);
-        let value_color = match row.binary_is_current {
-            Some(true) => egui::Color32::from_rgb(130, 225, 145),
-            Some(false) => egui::Color32::from_rgb(255, 110, 110),
-            None if row.label == "Type" => {
-                installation_type_color(&row.value).unwrap_or(egui::Color32::WHITE)
+        let value_color = binary_current_color(row.binary_is_current).unwrap_or_else(|| match row
+            .label
+            .as_str()
+        {
+            "Type" => installation_type_color(&row.value).unwrap_or(egui::Color32::WHITE),
+            "Uncompiled changes" => {
+                uncompiled_changes_color(&row.value).unwrap_or(egui::Color32::WHITE)
             }
-            None if row.searched => searchable_value_color,
-            None => egui::Color32::WHITE,
-        };
+            _ if row.searched => searchable_value_color,
+            _ => egui::Color32::WHITE,
+        });
         append_info_text(
             &mut layout_job,
             &label,

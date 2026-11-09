@@ -647,6 +647,7 @@ fn probe_process_checked(
             .as_ref()
             .is_some_and(|installed| installed.is_published())
             || launch.is_some_and(|launch| launch.published_target_verified)
+            || captured_launch_is_current()
     };
     let running_latest_binary = latest_info.as_ref().and_then(|latest| {
         running.as_ref().ok()?;
@@ -938,6 +939,206 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn native_process_metadata_survives_an_unresolved_same_name_wrapper() {
+        use std::io::Write;
+        use std::process::Stdio;
+        const CHILD: &str = "APPLICATIONLAUNCHER_WRAPPER_IDENTITY_FIXTURE";
+        if let Some(directory) = std::env::var_os(CHILD).map(PathBuf::from) {
+            let executable = directory.join("checkout/target/release/tool");
+            let mut child = Command::new(&executable)
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            wait_for_fixture_argv0(&mut child, &executable);
+            struct OwnedChild(std::process::Child);
+            impl Drop for OwnedChild {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let child = OwnedChild(child);
+            let mut target = ProcessVersionTarget {
+                pid: child.0.id() as i32,
+                executable: executable.clone(),
+                launch_context: ProcessLaunchContext::default(),
+                program: Some("tool".into()),
+                application_entry: None,
+                window_declared_entry: false,
+            };
+            let result = probe_version(&target);
+            assert!(result.build_id.is_some(), "{result:?}");
+            assert_eq!(result.latest_build_id, result.build_id, "{result:?}");
+            assert_eq!(result.version.as_deref(), Some("tool 2.3.4"), "{result:?}");
+            assert_eq!(result.latest_version, result.version, "{result:?}");
+            assert_eq!(
+                result.progs_metadata.capabilities.as_deref(),
+                Some("GUI  •  Primary role: GUI application"),
+                "{result:?}"
+            );
+            assert!(
+                result
+                    .uncompiled_changes
+                    .as_deref()
+                    .is_some_and(|status| { !status.contains("on-disk binary unavailable") }),
+                "{result:?}"
+            );
+            assert_eq!(
+                result.process_build_is_current(),
+                None,
+                "an unresolved wrapper alone does not prove the current installation"
+            );
+            let launch = result.launch.unwrap();
+            assert_eq!(launch.executable.as_ref(), Some(&executable));
+            assert_eq!(launch.chain, vec![executable.clone()]);
+            assert!(!launch.published_target_verified);
+            target.launch_context.raw_argv0 = Some(executable.clone());
+            for expected_current in [true, false] {
+                if !expected_current {
+                    std::fs::rename(directory.join("tool-next"), &executable).unwrap();
+                }
+                let details = probe_version_checked(&target, || true);
+                assert_eq!(details.version.as_deref(), Some("tool 2.3.4"));
+                assert_eq!(details.latest_version, details.version);
+                assert_eq!(
+                    details.build_id == details.latest_build_id,
+                    expected_current,
+                    "{details:?}"
+                );
+                assert_eq!(
+                    details.running_latest_binary,
+                    Some(expected_current),
+                    "an independently verified absolute launch path identifies the disk image: {details:?}"
+                );
+                assert_eq!(details.process_build_is_current(), Some(expected_current));
+                let header = probe_header_checked(&target, || true);
+                assert_eq!(header.process_build_is_current(), Some(expected_current));
+                assert!(header.version.is_none() && header.latest_version.is_none());
+
+                let mut unverified = target.clone();
+                for argv0 in [
+                    PathBuf::from("tool"),
+                    directory.join("checkout/scripts/tool"),
+                ] {
+                    unverified.launch_context.raw_argv0 = Some(argv0);
+                    assert_eq!(probe_version(&unverified).running_latest_binary, None);
+                    assert_eq!(
+                        probe_header_checked(&unverified, || true).process_build_is_current(),
+                        None
+                    );
+                }
+                assert_eq!(
+                    probe_version_checked(&target, || false).process_build_is_current(),
+                    None
+                );
+            }
+            assert!(!directory.join("SHOULD_NOT_RUN").exists());
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "launcher-wrapper-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let fixture = Fixture(directory);
+        let checkout = fixture.0.join("checkout");
+        let executable = checkout.join("target/release/tool");
+        let wrapper = checkout.join("scripts/tool");
+        let alias = fixture.0.join("bin/tool");
+        let cache = fixture.0.join("cache/progs/scan-v1.json");
+        for path in [&executable, &wrapper, &alias, &cache] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        // An owned native fixture publishes metadata and only waits. Neither
+        // the user's application nor its deployment wrapper is executed.
+        let source = r#"#include <unistd.h>
+#define RECORD "PROGRAM-METADATA-V1\ntool\n2.3.4\ngui\n"
+__attribute__((section(".program_metadata"), used))
+const char metadata[sizeof(RECORD)-1] = RECORD;
+__attribute__((used)) const int image_revision = IMAGE_REVISION;
+int main(void) { for (;;) pause(); }
+"#;
+        for (path, revision) in [(&executable, 1), (&fixture.0.join("tool-next"), 2)] {
+            let mut compiler = Command::new("cc")
+                .args(["-x", "c", "-O2", "-Wl,--build-id", "-o"])
+                .arg(path)
+                .arg(format!("-DIMAGE_REVISION={revision}"))
+                .arg("-")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("the wrapper regression requires the configured C compiler");
+            compiler
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(source.as_bytes())
+                .unwrap();
+            let compiled = compiler.wait_with_output().unwrap();
+            assert!(
+                compiled.status.success(),
+                "{}",
+                String::from_utf8_lossy(&compiled.stderr)
+            );
+        }
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nexec \"$binary\" \"$@\"\n",
+                fixture.0.join("SHOULD_NOT_RUN").display(),
+            ),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&wrapper, &alias).unwrap();
+        std::fs::write(
+            &cache,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 4, "scan": {"apps": [{
+                    "name": "tool", "origin": "Local", "install_role": "Standalone",
+                    "state": {"dev": true},
+                    "desc": "Local custom tool sitting at an indexed wrapper",
+                    "capabilities": {"has_cli": true}, "binaries": [
+                        {"name":"tool", "path":alias, "target":wrapper},
+                        {"name":"tool", "path":executable}
+                    ]
+                }]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "windows::versions::tests::native_process_metadata_survives_an_unresolved_same_name_wrapper", "--nocapture"])
+            .env(CHILD, &fixture.0)
+            .env("HOME", &fixture.0)
+            .env("XDG_CACHE_HOME", fixture.0.join("cache"))
+            .env("XDG_CONFIG_HOME", fixture.0.join("config"))
+            .env("PATH", "/usr/bin:/bin")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 
     #[test]
