@@ -476,7 +476,7 @@ impl ProcessVersionCache {
             .metadata_checked
             .get(&node.identity)
             .is_some_and(|(checked, executable)| {
-                !executable.matches(node) || checked.elapsed() >= Duration::from_secs(15)
+                !executable.matches(node)
                     || (node.executable.is_none()
                         && checked.elapsed() >= CANDIDATE_REFRESH
                         && state
@@ -675,6 +675,152 @@ mod tests {
                 break;
             }
             assert!(Instant::now() < deadline, "path metadata did not complete");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn completed_metadata_survives_elapsed_time_and_refreshes_only_for_identity_changes() {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let count = probes.clone();
+        let cache = ProcessVersionCache::start(
+            egui::Context::default(),
+            egui::ViewportId::ROOT,
+            move |_| ProcessVersion {
+                version: Some(format!("revision {}", count.fetch_add(1, Ordering::SeqCst))),
+                ..Default::default()
+            },
+        );
+        let mut process = node(42);
+        process.executable_identity = Some((1, 1));
+        let wait = |process: &ProcessInfoNode| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(result) = cache.request(process) {
+                    break result;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        assert_eq!(wait(&process).version.as_deref(), Some("revision 0"));
+        assert_eq!(wait(&process).version.as_deref(), Some("revision 0"));
+        cache
+            .shared
+            .0
+            .lock()
+            .unwrap()
+            .metadata_checked
+            .get_mut(&process.identity)
+            .unwrap()
+            .0 = Instant::now() - Duration::from_secs(3600);
+        for _ in 0..100 {
+            assert_eq!(
+                cache.request(&process).unwrap().version.as_deref(),
+                Some("revision 0")
+            );
+        }
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        process.executable_identity = Some((1, 2));
+        assert_eq!(wait(&process).version.as_deref(), Some("revision 1"));
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn completed_metadata_refreshes_for_renamed_or_deleted_path_with_same_running_inode() {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let count = probes.clone();
+        let cache = ProcessVersionCache::start(
+            egui::Context::default(),
+            egui::ViewportId::ROOT,
+            move |request| {
+                count.fetch_add(1, Ordering::SeqCst);
+                ProcessVersion {
+                    version: Some(request.target.executable.display().to_string()),
+                    ..Default::default()
+                }
+            },
+        );
+        let mut process = node(42);
+        process.executable_identity = Some((1, 1));
+        for path in [
+            "/fixture/program",
+            "/fixture/retained-old-image",
+            "/fixture/retained-old-image (deleted)",
+        ] {
+            process.executable = Some(path.into());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(result) = cache.request(&process) {
+                    assert_eq!(result.version.as_deref(), Some(path));
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        for _ in 0..100 {
+            assert!(cache.request(&process).is_some());
+        }
+        assert_eq!(probes.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn renamed_running_path_cancels_queued_requests_and_rejects_in_flight_results() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let cache = ProcessVersionCache::start(
+            egui::Context::default(),
+            egui::ViewportId::ROOT,
+            move |request| {
+                started_tx.send(request.target.executable.clone()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                ProcessVersion {
+                    version: Some(request.target.executable.display().to_string()),
+                    ..Default::default()
+                }
+            },
+        );
+        let mut process = node(42);
+        process.executable_identity = Some((1, 1));
+        process.executable = Some("/fixture/program".into());
+        assert!(cache.request(&process).is_none());
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            PathBuf::from("/fixture/program")
+        );
+        process.executable = Some("/fixture/retained-image".into());
+        assert!(cache.request(&process).is_none());
+        process.executable = Some("/fixture/retained-image (deleted)".into());
+        assert!(cache.request(&process).is_none());
+        {
+            let state = cache.shared.0.lock().unwrap();
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(
+                state.pending[0].target.executable,
+                process.executable.clone().unwrap()
+            );
+        }
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            process.executable.clone().unwrap()
+        );
+        assert!(
+            cache.request(&process).is_none(),
+            "obsolete in-flight result was published"
+        );
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(result) = cache.request(&process) {
+                assert_eq!(
+                    result.version.as_deref(),
+                    Some("/fixture/retained-image (deleted)")
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(1));
         }
     }
