@@ -461,7 +461,7 @@ fn main() -> eframe::Result {
 
     let (width, height) = load_window_size();
 
-    let title = "Open Application Windows";
+    let title = LAUNCHER_WINDOW_TITLE;
 
     let options = launcher_native_options(width, height, title);
 

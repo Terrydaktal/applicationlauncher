@@ -241,12 +241,23 @@ impl App {
                 .strong()
                 .size(13.0),
         );
-        ui.add_space(6.0);
+        ui.add_space(4.0);
 
         egui::Grid::new("win_settings_grid")
             .num_columns(2)
-            .spacing([12.0, 10.0])
+            .spacing(crate::settings::SETTINGS_GRID_SPACING)
             .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Show Launcher Window:")
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                );
+                let mut show_launcher_window = self.show_launcher_window;
+                if ui.checkbox(&mut show_launcher_window, "").changed() {
+                    self.set_show_launcher_window(show_launcher_window);
+                    self.save_settings();
+                }
+                ui.end_row();
+
                 ui.label(
                     egui::RichText::new("Icon Size:")
                         .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),

@@ -237,6 +237,7 @@ pub struct FilteredSearchCacheKey {
 #[derive(Clone, Copy)]
 pub struct LauncherSettings {
     pub show_system_settings_modules: bool,
+    pub show_launcher_window: bool,
     pub app_icon_mode: bool,
     pub win_icon_size: f32,
     pub win_top_padding: f32,
@@ -272,6 +273,7 @@ impl Default for LauncherSettings {
     fn default() -> Self {
         Self {
             show_system_settings_modules: true,
+            show_launcher_window: false,
             app_icon_mode: false,
             win_icon_size: 32.0,
             win_top_padding: 6.0,

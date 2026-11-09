@@ -200,11 +200,16 @@ pub(crate) fn render_deferred_settings_panel(
             .strong()
             .size(13.0),
     );
-    ui.add_space(6.0);
+    ui.add_space(4.0);
     egui::Grid::new("deferred_window_settings_grid")
         .num_columns(2)
-        .spacing([12.0, 10.0])
+        .spacing(SETTINGS_GRID_SPACING)
         .show(ui, |ui| {
+            settings_changed |= settings_checkbox_row(
+                ui,
+                "Show Launcher Window:",
+                &mut state.settings.show_launcher_window,
+            );
             settings_changed |= settings_slider_row(
                 ui,
                 "Icon Size:",
@@ -360,6 +365,11 @@ fn load_launcher_settings_from_path(path: Option<PathBuf>) -> LauncherSettings {
                             settings.show_system_settings_modules = value
                                 .parse::<bool>()
                                 .unwrap_or(settings.show_system_settings_modules);
+                        }
+                        "show_launcher_window" => {
+                            settings.show_launcher_window = value
+                                .parse::<bool>()
+                                .unwrap_or(settings.show_launcher_window);
                         }
                         "app_icon_mode" => {
                             settings.app_icon_mode =
@@ -580,8 +590,9 @@ pub(crate) fn save_launcher_settings(settings: LauncherSettings) {
 
 fn format_launcher_settings(settings: LauncherSettings) -> String {
     format!(
-        "show_system_settings_modules={}\napp_icon_mode={}\nwin_icon_size={:.1}\nwin_top_padding={:.1}\nwin_bottom_padding={:.1}\nwin_left_padding={:.1}\nwin_right_padding={:.1}\nwin_row_height={:.1}\nwin_text_spacing={:.1}\nwin_line_height={:.1}\nwin_show_path={}\nwin_show_last_activation={}\nshow_run_in_terminal={}\nshow_cd_in_terminal={}\nauto_send_enter_on_attention={}\nwin_title_size={:.1}\nwin_path_size={:.1}\napp_icon_size={:.1}\napp_icon_tile_size={:.1}\napp_top_padding={:.1}\napp_bottom_padding={:.1}\napp_left_padding={:.1}\napp_right_padding={:.1}\napp_icon_show_name={}\napp_icon_name_size={:.1}\ndisable_ibeam={}\napp_scroll_sensitivity={:.2}\nwin_scroll_sensitivity={:.2}\ninfo_scroll_sensitivity={:.2}\nui_scale={:.2}\n",
+        "show_system_settings_modules={}\nshow_launcher_window={}\napp_icon_mode={}\nwin_icon_size={:.1}\nwin_top_padding={:.1}\nwin_bottom_padding={:.1}\nwin_left_padding={:.1}\nwin_right_padding={:.1}\nwin_row_height={:.1}\nwin_text_spacing={:.1}\nwin_line_height={:.1}\nwin_show_path={}\nwin_show_last_activation={}\nshow_run_in_terminal={}\nshow_cd_in_terminal={}\nauto_send_enter_on_attention={}\nwin_title_size={:.1}\nwin_path_size={:.1}\napp_icon_size={:.1}\napp_icon_tile_size={:.1}\napp_top_padding={:.1}\napp_bottom_padding={:.1}\napp_left_padding={:.1}\napp_right_padding={:.1}\napp_icon_show_name={}\napp_icon_name_size={:.1}\ndisable_ibeam={}\napp_scroll_sensitivity={:.2}\nwin_scroll_sensitivity={:.2}\ninfo_scroll_sensitivity={:.2}\nui_scale={:.2}\n",
         settings.show_system_settings_modules,
+        settings.show_launcher_window,
         settings.app_icon_mode,
         settings.win_icon_size,
         settings.win_top_padding,
@@ -786,6 +797,54 @@ pub(crate) fn settings_slider_row(
 #[cfg(test)]
 mod info_settings_tests {
     use super::*;
+
+    #[test]
+    fn launcher_window_visibility_persists_and_legacy_or_invalid_settings_keep_it_hidden() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = Fixture(std::env::temp_dir().join(format!(
+            "launcher-window-visibility-{}-{nonce}.txt",
+            std::process::id(),
+        )));
+        assert!(!load_launcher_settings_from_path(None).show_launcher_window);
+        assert!(!load_launcher_settings_from_path(Some(fixture.0.clone())).show_launcher_window);
+        for show in [true, false] {
+            let settings = LauncherSettings {
+                show_launcher_window: show,
+                ..LauncherSettings::default()
+            };
+            let content = format_launcher_settings(settings);
+            assert!(
+                content
+                    .lines()
+                    .any(|line| line == format!("show_launcher_window={show}"))
+            );
+            std::fs::write(&fixture.0, content).unwrap();
+            assert_eq!(
+                load_launcher_settings_from_path(Some(fixture.0.clone())).show_launcher_window,
+                show
+            );
+        }
+        for content in [
+            "",
+            "win_show_path=false\n",
+            "show_launcher_window=invalid\n",
+        ] {
+            std::fs::write(&fixture.0, content).unwrap();
+            assert!(
+                !load_launcher_settings_from_path(Some(fixture.0.clone())).show_launcher_window,
+                "{content}"
+            );
+        }
+    }
 
     #[test]
     fn info_scroll_sensitivity_persists_independently_and_loads_safe_legacy_defaults() {

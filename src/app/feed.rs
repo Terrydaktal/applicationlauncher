@@ -3,6 +3,35 @@ use crate::search::normalize_window_identity_title;
 
 const PROCESS_TREE_CACHE_MAX_AGE: Duration = Duration::from_millis(500);
 
+fn include_window_in_list(
+    window: &WindowInfo,
+    show_launcher_window: bool,
+    launcher_window: &mut Option<WindowInfo>,
+) -> bool {
+    if window.raw_title == LAUNCHER_WINDOW_TITLE {
+        // Keep the latest live entry so changing the setting needs no new poll.
+        *launcher_window = Some(window.clone());
+        show_launcher_window
+    } else {
+        true
+    }
+}
+
+fn with_launcher_window_visibility(
+    mut windows: Vec<WindowInfo>,
+    show: bool,
+    launcher_window: &mut Option<WindowInfo>,
+) -> Vec<WindowInfo> {
+    if show
+        && let Some(window) = launcher_window
+        && !windows.iter().any(|existing| existing.id == window.id)
+    {
+        windows.push(window.clone());
+    }
+    windows.retain(|window| include_window_in_list(window, show, launcher_window));
+    windows
+}
+
 fn enrichment_reusable(checked_at: Option<Instant>, now: Instant) -> bool {
     checked_at.is_some_and(|checked_at| {
         now.saturating_duration_since(checked_at) < PROCESS_TREE_CACHE_MAX_AGE
@@ -105,6 +134,58 @@ mod optimization_tests {
             checked_at + Duration::from_secs(5)
         ));
     }
+
+    #[test]
+    fn launcher_visibility_toggles_immediately_without_duplicates_or_other_window_changes() {
+        let payload: KWinWindowPayload = serde_json::from_str(
+            r#"{"id":"launcher","class":"applicationlauncher","title":"Applicationlauncher","width":900,"height":700}"#,
+        ).unwrap();
+        let launcher = window_info_from_kwin_payload(
+            payload,
+            "breeze-dark",
+            &mut HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        )
+        .unwrap();
+        let other = WindowInfo {
+            id: "other".into(),
+            title: "Another window".into(),
+            raw_title: "Another window".into(),
+            class: "editor".into(),
+            ..launcher.clone()
+        };
+        let mut cached = None;
+        let windows = with_launcher_window_visibility(
+            vec![other.clone(), launcher.clone()],
+            false,
+            &mut cached,
+        );
+        assert_eq!(windows, [other.clone()]);
+        assert_eq!(cached, Some(launcher.clone()));
+
+        let visible = with_launcher_window_visibility(windows, true, &mut cached);
+        assert_eq!(visible, [other.clone(), launcher.clone()]);
+        let visible = with_launcher_window_visibility(visible, true, &mut cached);
+        assert_eq!(visible, [other.clone(), launcher.clone()]);
+
+        let hidden = with_launcher_window_visibility(visible, false, &mut cached);
+        assert_eq!(hidden, [other.clone()]);
+        let mut updated = launcher;
+        updated.geometry = Some((100, 200, 1000, 800));
+        updated.activation_sequence = 42;
+        assert!(!include_window_in_list(&updated, false, &mut cached));
+        let visible = with_launcher_window_visibility(hidden, true, &mut cached);
+        assert_eq!(visible, [other.clone(), updated.clone()]);
+
+        cached = None; // A removed window or a feed reset must not be resurrected.
+        assert_eq!(
+            with_launcher_window_visibility(vec![other.clone()], true, &mut cached),
+            [other]
+        );
+    }
 }
 
 pub(super) fn terminal_metadata_refresh_due(
@@ -128,6 +209,17 @@ pub(super) fn process_tree_cache_refresh_due(
 }
 
 impl App {
+    pub(super) fn set_show_launcher_window(&mut self, show: bool) {
+        if self.show_launcher_window == show {
+            return;
+        }
+        self.show_launcher_window = show;
+        let windows =
+            with_launcher_window_visibility(self.windows.clone(), show, &mut self.launcher_window);
+        self.apply_window_snapshot(windows);
+        self.flush_pending_window_search_refresh();
+    }
+
     pub(super) fn rebuild_window_search_documents(&mut self) {
         crate::search::update_window_search_documents(
             &self.windows,
@@ -333,6 +425,9 @@ impl App {
     }
 
     pub(super) fn apply_window_snapshot(&mut self, mut new_windows: Vec<WindowInfo>) {
+        new_windows.retain(|window| {
+            include_window_in_list(window, self.show_launcher_window, &mut self.launcher_window)
+        });
         self.overlay_tmux_metadata(&mut new_windows);
         if self.windows.is_empty() {
             self.windows = new_windows;
@@ -368,6 +463,9 @@ impl App {
         let mut merged = Vec::new();
 
         for old_window in &old_windows {
+            if !self.show_launcher_window && old_window.raw_title == LAUNCHER_WINDOW_TITLE {
+                continue;
+            }
             if let Some(new_window) = new_by_id.remove(&old_window.id) {
                 self.missing_window_counts.remove(&old_window.id);
                 merged.push(merge_reconciled_window(old_window, new_window));
@@ -549,6 +647,7 @@ impl App {
                     changed |= !self.windows.is_empty();
                     search_changed |= !self.windows.is_empty();
                     self.windows.clear();
+                    self.launcher_window = None;
                     self.window_enrichment_checked_at.clear();
                     self.dirty_window_search_documents.clear();
                     self.missing_window_counts.clear();
@@ -616,6 +715,13 @@ impl App {
                         &pid_to_ppid,
                         &terminal_records,
                     ) {
+                        if !include_window_in_list(
+                            &window,
+                            self.show_launcher_window,
+                            &mut self.launcher_window,
+                        ) {
+                            continue;
+                        }
                         // Reused frames must not postpone the next process refresh.
                         self.window_enrichment_checked_at.insert(
                             window.id.clone(),
@@ -661,6 +767,13 @@ impl App {
                     }
                 }
                 WindowFeedEvent::Remove(id) => {
+                    if self
+                        .launcher_window
+                        .as_ref()
+                        .is_some_and(|window| window.id == id)
+                    {
+                        self.launcher_window = None;
+                    }
                     self.missing_window_counts.remove(&id);
                     self.window_enrichment_checked_at.remove(&id);
                     self.dirty_window_search_documents.remove(&id);
@@ -771,6 +884,9 @@ impl App {
     }
 
     pub(super) fn apply_window_reconciliation(&mut self, mut discovered: Vec<WindowInfo>) {
+        discovered.retain(|window| {
+            include_window_in_list(window, self.show_launcher_window, &mut self.launcher_window)
+        });
         self.overlay_tmux_metadata(&mut discovered);
         let mut audio_changed = false;
         for window in &discovered {

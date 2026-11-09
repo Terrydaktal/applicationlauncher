@@ -74,7 +74,10 @@ fn set_reopen_shortcut_active(active: bool) -> Result<(), String> {
 #[derive(Default)]
 struct State {
     windows: HashMap<String, TrackedWindow>,
+    // Listing-only surfaces must never enter persistence or recovery accounting.
+    live_only_windows: HashMap<String, TrackedWindow>,
     snapshot_buffer: Option<HashMap<String, TrackedWindow>>,
+    live_only_snapshot_buffer: Option<HashMap<String, TrackedWindow>>,
     snapshot_deadline: Option<Instant>,
     snapshot_durable_changed: bool,
     generation: u64,
@@ -126,12 +129,19 @@ fn window_changes_since(state: &State, since: u64, run_id: &str) -> super::Windo
     };
     if reset {
         changes.windows.extend(state.windows.values().cloned());
+        changes
+            .windows
+            .extend(state.live_only_windows.values().cloned());
     } else {
         for (id, revision) in &state.window_changes {
             if *revision <= since {
                 continue;
             }
-            match state.windows.get(id) {
+            match state
+                .windows
+                .get(id)
+                .or_else(|| state.live_only_windows.get(id))
+            {
                 Some(window) => changes.windows.push(window.clone()),
                 None => changes.removed.push(id.clone()),
             }
@@ -479,7 +489,7 @@ impl Runtime {
         TrackerStatus {
             generation: state.generation,
             history_generation: state.history_generation,
-            window_count: state.windows.len(),
+            window_count: state.windows.len() + state.live_only_windows.len(),
             recovery_pending: state.recovery_pending,
             database_path,
             run_id: state.run_id.clone(),
@@ -489,7 +499,12 @@ impl Runtime {
 
     fn windows(&self) -> Vec<TrackedWindow> {
         let state = self.0.state.lock().unwrap();
-        let mut windows = state.windows.values().cloned().collect::<Vec<_>>();
+        let mut windows = state
+            .windows
+            .values()
+            .chain(state.live_only_windows.values())
+            .cloned()
+            .collect::<Vec<_>>();
         windows.sort_by_key(|window| window.activation_sequence);
         windows
     }
@@ -792,11 +807,16 @@ impl Runtime {
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
             state.snapshot_buffer = None;
+            state.live_only_snapshot_buffer = None;
             state.snapshot_deadline = None;
         }
     }
 
     fn upsert(&self, mut incoming: TrackedWindow, activated: bool) {
+        if is_live_only_window(&incoming) {
+            self.upsert_live_only(incoming, activated);
+            return;
+        }
         if !is_history_worthy(&incoming) {
             return;
         }
@@ -890,11 +910,59 @@ impl Runtime {
         }
         crate::observability::set_gauge(
             crate::observability::Gauge::TrackedWindows,
-            state.windows.len(),
+            state.windows.len() + state.live_only_windows.len(),
         );
         crate::observability::set_gauge(
             crate::observability::Gauge::AttentionPending,
             state.attention.len(),
+        );
+    }
+
+    fn upsert_live_only(&self, mut incoming: TrackedWindow, activated: bool) {
+        let timestamp = now_ms();
+        let mut state = self.0.state.lock().unwrap();
+        Self::expire_snapshot_if_needed(&mut state);
+        let previous = state
+            .live_only_snapshot_buffer
+            .as_ref()
+            .and_then(|buffer| buffer.get(&incoming.id))
+            .or_else(|| state.live_only_windows.get(&incoming.id))
+            .cloned();
+        incoming.opened_at_ms = previous
+            .as_ref()
+            .map_or(timestamp, |window| window.opened_at_ms);
+        incoming.updated_at_ms = timestamp;
+        if activated
+            || (incoming.active
+                && previous
+                    .as_ref()
+                    .is_none_or(|window| window.last_activated_at_ms.is_none()))
+        {
+            state.activation_sequence += 1;
+            incoming.activation_sequence = state.activation_sequence;
+            incoming.last_activated_at_ms = Some(timestamp);
+        } else if let Some(previous) = &previous {
+            incoming.activation_sequence = previous.activation_sequence;
+            incoming.last_activated_at_ms = previous.last_activated_at_ms;
+        }
+        let changed = previous
+            .as_ref()
+            .is_none_or(|previous| tracked_window_state_changed(previous, &incoming));
+        let id = incoming.id.clone();
+        if state.snapshot_buffer.is_some() {
+            state
+                .live_only_snapshot_buffer
+                .get_or_insert_with(HashMap::new)
+                .insert(id, incoming);
+        } else {
+            state.live_only_windows.insert(id.clone(), incoming);
+            if changed {
+                Self::publish_change(&mut state, Some(&id));
+            }
+        }
+        crate::observability::set_gauge(
+            crate::observability::Gauge::TrackedWindows,
+            state.windows.len() + state.live_only_windows.len(),
         );
     }
 
@@ -904,6 +972,17 @@ impl Runtime {
         Self::expire_snapshot_if_needed(&mut state);
         if let Some(buffer) = state.snapshot_buffer.as_mut() {
             buffer.remove(id);
+            if let Some(buffer) = state.live_only_snapshot_buffer.as_mut() {
+                buffer.remove(id);
+            }
+            return;
+        }
+        if state.live_only_windows.remove(id).is_some() {
+            Self::publish_change(&mut state, Some(id));
+            crate::observability::set_gauge(
+                crate::observability::Gauge::TrackedWindows,
+                state.windows.len() + state.live_only_windows.len(),
+            );
             return;
         }
         let now = Instant::now();
@@ -943,7 +1022,7 @@ impl Runtime {
         }
         crate::observability::set_gauge(
             crate::observability::Gauge::TrackedWindows,
-            state.windows.len(),
+            state.windows.len() + state.live_only_windows.len(),
         );
         crate::observability::set_gauge(
             crate::observability::Gauge::AttentionPending,
@@ -976,11 +1055,19 @@ impl Runtime {
         let Some(buffer) = state.snapshot_buffer.take() else {
             return;
         };
+        let live_only_buffer = state.live_only_snapshot_buffer.take().unwrap_or_default();
         state.snapshot_deadline = None;
         let display_changed = state.windows.len() != buffer.len()
             || buffer.iter().any(|(id, window)| {
                 state
                     .windows
+                    .get(id)
+                    .is_none_or(|old| tracked_window_state_changed(old, window))
+            })
+            || state.live_only_windows.len() != live_only_buffer.len()
+            || live_only_buffer.iter().any(|(id, window)| {
+                state
+                    .live_only_windows
                     .get(id)
                     .is_none_or(|old| tracked_window_state_changed(old, window))
             });
@@ -1013,6 +1100,7 @@ impl Runtime {
             }
         }
         state.windows = buffer;
+        state.live_only_windows = live_only_buffer;
         let live_ids = state.windows.keys().cloned().collect::<HashSet<_>>();
         state
             .terminal_upgrade_windows
@@ -1052,7 +1140,7 @@ impl Runtime {
         }
         crate::observability::set_gauge(
             crate::observability::Gauge::TrackedWindows,
-            state.windows.len(),
+            state.windows.len() + state.live_only_windows.len(),
         );
         crate::observability::set_gauge(
             crate::observability::Gauge::AttentionPending,
@@ -1358,7 +1446,12 @@ impl Runtime {
     fn reconcile_stale_kwin_windows(&self) -> Result<usize, String> {
         let ids = {
             let state = self.0.state.lock().unwrap();
-            state.windows.keys().cloned().collect::<Vec<_>>()
+            state
+                .windows
+                .keys()
+                .chain(state.live_only_windows.keys())
+                .cloned()
+                .collect::<Vec<_>>()
         };
         if ids.is_empty() {
             return Ok(0);
@@ -1716,6 +1809,13 @@ fn attention_signature(window: &TrackedWindow) -> String {
         .join(" ")
 }
 
+fn is_live_only_window(window: &TrackedWindow) -> bool {
+    window.class.eq_ignore_ascii_case("applicationlauncher")
+        && window.title == super::LAUNCHER_WINDOW_TITLE
+        && !window.skip_taskbar
+        && !window.skip_switcher
+}
+
 fn is_history_worthy(window: &TrackedWindow) -> bool {
     let class = window.class.to_lowercase();
     !window.title.trim().is_empty()
@@ -1906,6 +2006,7 @@ impl WindowFeed {
     fn begin_snapshot(&self) {
         let mut state = self.0.0.state.lock().unwrap();
         state.snapshot_buffer = Some(HashMap::new());
+        state.live_only_snapshot_buffer = Some(HashMap::new());
         state.snapshot_durable_changed = false;
         state.snapshot_deadline = Some(Instant::now() + SNAPSHOT_TRANSACTION_TIMEOUT);
     }
@@ -2669,7 +2770,9 @@ pub fn run_tracker_daemon() -> Result<(), String> {
         lifecycle_directory: database.path().parent().unwrap().join("lifecycle"),
         state: Mutex::new(State {
             windows: persisted_windows,
+            live_only_windows: HashMap::new(),
             snapshot_buffer: None,
+            live_only_snapshot_buffer: None,
             snapshot_deadline: None,
             snapshot_durable_changed: false,
             generation: 0,
@@ -3088,6 +3191,170 @@ mod tests {
             })),
             directory,
         )
+    }
+
+    #[test]
+    fn launcher_window_is_published_live_without_persistence_recovery_or_closed_history() {
+        let (runtime, _directory) = optimization_runtime();
+        let mut window = TrackedWindow {
+            id: "launcher-fixture".into(),
+            title: super::super::LAUNCHER_WINDOW_TITLE.into(),
+            class: "applicationlauncher".into(),
+            pid: -1,
+            x: 2026,
+            y: 636,
+            width: 1068,
+            height: 843,
+            ..Default::default()
+        };
+        runtime.upsert(window.clone(), true);
+        assert_eq!(runtime.status().window_count, 1);
+        assert_eq!(runtime.windows()[0].id, window.id);
+        assert!(runtime.restorable_windows().is_empty());
+        let added = runtime.window_changes(0, "optimization-test");
+        assert!(!added.reset);
+        assert_eq!(added.windows.len(), 1);
+        assert_eq!(added.windows[0].title, window.title);
+        assert!(added.windows[0].last_activated_at_ms.is_some());
+        let activation = added.windows[0].activation_sequence;
+        window.x += 100;
+        runtime.upsert(window.clone(), false);
+        let updated = runtime.window_changes(added.generation, "optimization-test");
+        assert_eq!(updated.windows.len(), 1);
+        assert_eq!(updated.windows[0].x, window.x);
+        assert_eq!(updated.windows[0].activation_sequence, activation);
+        assert!(runtime.window_changes(u64::MAX, "").reset);
+        assert_eq!(runtime.window_changes(u64::MAX, "").windows.len(), 1);
+        {
+            let state = runtime.0.state.lock().unwrap();
+            assert!(state.windows.is_empty());
+            assert!(state.restore_specs.is_empty());
+            assert!(state.attention.is_empty());
+            assert!(super::state_snapshot_entries(&state).is_empty());
+            assert_eq!(state.durable_generation, 0);
+            assert_eq!(state.history_generation, 0);
+            assert!(!state.current_dirty && !state.recovery_dirty);
+        }
+        runtime.persist_current_if_due(true).unwrap();
+        runtime.remove(&window.id);
+        let removed = runtime.window_changes(updated.generation, "optimization-test");
+        assert_eq!(removed.removed, [window.id]);
+        assert!(runtime.windows().is_empty());
+        let state = runtime.0.state.lock().unwrap();
+        assert_eq!(state.durable_generation, 0);
+        assert_eq!(state.history_generation, 0);
+        assert!(state.removal_burst.is_none() && state.mass_disappearance.is_none());
+        assert!(!state.current_dirty && !state.recovery_dirty);
+        drop(state);
+        let database = runtime.0.database.lock().unwrap();
+        assert!(database.current_window_entries().unwrap().is_empty());
+        assert!(database.history(100).unwrap().is_empty());
+        assert!(database.snapshots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn launcher_full_feed_resync_is_atomic_and_never_marks_session_state_dirty() {
+        let (runtime, _directory) = optimization_runtime();
+        let feed = super::WindowFeed(runtime.clone());
+        let window = TrackedWindow {
+            id: "launcher-fixture".into(),
+            title: super::super::LAUNCHER_WINDOW_TITLE.into(),
+            class: "applicationlauncher".into(),
+            ..Default::default()
+        };
+        feed.begin_snapshot();
+        feed.upsert_window(&serde_json::to_string(&window).unwrap());
+        assert!(runtime.windows().is_empty());
+        feed.end_snapshot();
+        assert_eq!(runtime.windows().len(), 1);
+        let reset = runtime.window_changes(0, "optimization-test");
+        assert!(reset.reset);
+        assert_eq!(reset.windows[0].id, window.id);
+        feed.replace_snapshot("[]");
+        assert!(runtime.windows().is_empty());
+        assert!(
+            runtime
+                .window_changes(reset.generation, "optimization-test")
+                .reset
+        );
+        let state = runtime.0.state.lock().unwrap();
+        assert_eq!(state.durable_generation, 0);
+        assert_eq!(state.history_generation, 0);
+        assert!(!state.current_dirty && !state.recovery_dirty);
+        assert!(state.mass_disappearance.is_none());
+        drop(state);
+        assert!(
+            runtime
+                .0
+                .database
+                .lock()
+                .unwrap()
+                .history(100)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn launcher_popups_are_not_admitted_and_incomplete_feed_resync_is_discarded() {
+        let (runtime, _directory) = optimization_runtime();
+        let window = TrackedWindow {
+            id: "launcher-fixture".into(),
+            title: super::super::LAUNCHER_WINDOW_TITLE.into(),
+            class: "applicationlauncher".into(),
+            ..Default::default()
+        };
+        for title in [
+            "Launcher Settings",
+            "Window Info: editor",
+            "Window History and Sessions",
+        ] {
+            runtime.upsert(
+                TrackedWindow {
+                    title: title.into(),
+                    ..window.clone()
+                },
+                true,
+            );
+        }
+        assert!(runtime.windows().is_empty());
+        assert!(super::is_live_only_window(&window));
+        assert!(!super::is_live_only_window(&TrackedWindow {
+            skip_taskbar: true,
+            ..window.clone()
+        }));
+        assert!(!super::is_live_only_window(&TrackedWindow {
+            skip_switcher: true,
+            ..window.clone()
+        }));
+        assert!(!super::is_live_only_window(&TrackedWindow {
+            class: "editor".into(),
+            ..window.clone()
+        }));
+        runtime.upsert(window.clone(), false);
+        let feed = super::WindowFeed(runtime.clone());
+        feed.begin_snapshot();
+        runtime.upsert(
+            TrackedWindow {
+                x: 123,
+                ..window.clone()
+            },
+            false,
+        );
+        {
+            let mut state = runtime.0.state.lock().unwrap();
+            state.snapshot_deadline = Some(Instant::now() - Duration::from_secs(1));
+            Runtime::expire_snapshot_if_needed(&mut state);
+            assert!(state.snapshot_buffer.is_none());
+            assert!(state.live_only_snapshot_buffer.is_none());
+        }
+        feed.end_snapshot();
+        assert_eq!(runtime.windows()[0].x, 0);
+        feed.begin_snapshot();
+        runtime.upsert(window.clone(), false);
+        runtime.remove(&window.id);
+        feed.end_snapshot();
+        assert!(runtime.windows().is_empty());
     }
 
     #[test]

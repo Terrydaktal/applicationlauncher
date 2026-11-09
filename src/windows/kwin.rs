@@ -14,6 +14,7 @@ use crate::*;
 const TRACKER_WINDOW_FEED_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TRACKER_WINDOW_FEED_RECONNECT_DELAY: Duration = Duration::from_millis(500);
 const TRACKER_BUILD_RESTART_LIMIT: usize = 2;
+pub(crate) use applicationlauncher::tracker::LAUNCHER_WINDOW_TITLE;
 
 pub(crate) fn get_kdotool_path() -> PathBuf {
     applicationlauncher::process::kdotool_path()
@@ -49,9 +50,8 @@ pub(crate) fn build_window_info(
         || class_lower == "kwin_wayland"
         || class_lower.is_empty()
         || title.trim().is_empty()
-        || class_lower == "applicationlauncher"
-        || title == "Open Application Windows"
-        || pid == Some(my_pid)
+        || ((class_lower == "applicationlauncher" || pid == Some(my_pid))
+            && title != LAUNCHER_WINDOW_TITLE)
     {
         return None;
     }
@@ -895,6 +895,75 @@ pub(crate) fn get_snapshot_window_details(id: &str) -> SnapshotWindowDetails {
 #[cfg(test)]
 mod tests {
     use super::tracker_status_matches_build;
+
+    #[test]
+    fn main_launcher_window_is_discoverable_but_own_popups_and_system_surfaces_are_not() {
+        use super::*;
+        let own_pid = std::process::id() as i32;
+        for (class, title, pid, expected) in [
+            ("applicationlauncher", LAUNCHER_WINDOW_TITLE, own_pid, true),
+            (
+                "open-application-windows",
+                LAUNCHER_WINDOW_TITLE,
+                own_pid,
+                true,
+            ),
+            ("applicationlauncher", LAUNCHER_WINDOW_TITLE, 0, true),
+            ("applicationlauncher", "Settings", own_pid, false),
+            (
+                "open-application-windows",
+                "Window Info: editor",
+                own_pid,
+                false,
+            ),
+            (
+                "applicationlauncher",
+                "Window History and Sessions",
+                0,
+                false,
+            ),
+            ("plasmashell", "Desktop", 0, false),
+            ("kwin_wayland", "KWin", 0, false),
+            ("", LAUNCHER_WINDOW_TITLE, own_pid, false),
+            ("editor", "", 0, false),
+            ("editor", "Document", 0, true),
+        ] {
+            let payload: KWinWindowPayload = serde_json::from_value(serde_json::json!({
+                "id": "test", "class": class, "title": title, "pid": pid,
+            }))
+            .unwrap();
+            let result = window_info_from_kwin_payload(
+                payload,
+                "breeze-dark",
+                &mut HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &[],
+            );
+            assert_eq!(result.is_some(), expected, "{class}: {title}");
+        }
+        for flag in ["skipTaskbar", "skipSwitcher"] {
+            let payload = serde_json::from_value(serde_json::json!({
+                "id": "test", "class": "applicationlauncher", "title": LAUNCHER_WINDOW_TITLE,
+                (flag): true,
+            }))
+            .unwrap();
+            assert!(
+                window_info_from_kwin_payload(
+                    payload,
+                    "breeze-dark",
+                    &mut HashMap::new(),
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &[],
+                )
+                .is_none(),
+                "{flag}"
+            );
+        }
+    }
 
     #[test]
     fn inactive_ui_backlog_overflow_replaces_tombstones_with_authoritative_latest_state() {

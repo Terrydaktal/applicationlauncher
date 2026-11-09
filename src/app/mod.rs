@@ -305,6 +305,7 @@ fn run_history_action(
 pub(crate) struct App {
     mode: LauncherMode,
     windows: Vec<WindowInfo>,
+    launcher_window: Option<WindowInfo>,
     window_search_documents: Vec<PreparedSearchDocument>,
     dirty_window_search_documents: HashSet<String>,
     window_enrichment_checked_at: HashMap<String, Instant>,
@@ -352,6 +353,7 @@ pub(crate) struct App {
     tracker_status_receiver: Receiver<applicationlauncher::tracker::TrackerStatus>,
     recovery_prompt: bool,
     show_system_settings_modules: bool,
+    show_launcher_window: bool,
     win_icon_size: f32,
     win_top_padding: f32,
     win_bottom_padding: f32,
@@ -846,6 +848,7 @@ impl App {
         let mut app = Self {
             mode,
             windows: Vec::new(),
+            launcher_window: None,
             window_search_documents: Vec::new(),
             dirty_window_search_documents: HashSet::new(),
             window_enrichment_checked_at: HashMap::new(),
@@ -897,6 +900,7 @@ impl App {
             tracker_status_receiver: tracker_status_rx,
             recovery_prompt: false,
             show_system_settings_modules: settings.show_system_settings_modules,
+            show_launcher_window: settings.show_launcher_window,
             win_icon_size: settings.win_icon_size,
             win_top_padding: settings.win_top_padding,
             win_bottom_padding: settings.win_bottom_padding,
@@ -1007,6 +1011,7 @@ impl App {
     fn launcher_settings_snapshot(&self) -> LauncherSettings {
         LauncherSettings {
             show_system_settings_modules: self.show_system_settings_modules,
+            show_launcher_window: self.show_launcher_window,
             app_icon_mode: self.icon_only,
             win_icon_size: self.win_icon_size,
             win_top_padding: self.win_top_padding,
@@ -1065,6 +1070,7 @@ impl App {
         let auto_enter_changed =
             self.auto_send_enter_on_attention != settings.auto_send_enter_on_attention;
         self.show_system_settings_modules = settings.show_system_settings_modules;
+        self.set_show_launcher_window(settings.show_launcher_window);
         self.icon_only = settings.app_icon_mode;
         self.win_icon_size = settings.win_icon_size;
         self.win_top_padding = settings.win_top_padding;

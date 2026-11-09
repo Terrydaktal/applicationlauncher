@@ -161,6 +161,15 @@ impl App {
     }
 
     pub(super) fn activate_and_exit(&self, id: String, ctx: &egui::Context) {
+        if self.windows.iter().any(|window| {
+            window.id == id
+                && window.pid == Some(std::process::id() as i32)
+                && window.raw_title == LAUNCHER_WINDOW_TITLE
+        }) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            return;
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         if let Some(ref kpath) = self.kdotool_path {
             let kpath = kpath.clone();
