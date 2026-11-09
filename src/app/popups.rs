@@ -834,6 +834,11 @@ pub(super) fn application_version_rows(
     {
         installed_rows.push(row("installation", installation_type_value(installation)));
     }
+    if let Some(root) =
+        version.and_then(|version| version.application_progs_metadata.source_checkout.as_ref())
+    {
+        installed_rows.push(row("source directory", root.display().to_string()));
+    }
     installed_rows.extend(package_rows);
     installed_rows.extend(launch_rows);
     installed_rows.push(row(
@@ -921,16 +926,18 @@ pub(super) fn hosted_metadata_sections(
     };
     vec![
         InfoMetadataSection {
-            binary_is_current: None,
             id: app_id,
             header: format!("Application: {name}").into(),
+            binary_is_current: version.and_then(|version| version.process_build_is_current()),
             default_open: true,
             rows: application_rows,
         },
         InfoMetadataSection {
-            binary_is_current: None,
             id: runtime_id,
             header: format!("Runtime: {runtime}").into(),
+            binary_is_current: version
+                .filter(|version| version.running_unavailable.is_none())
+                .and_then(|version| version.running_latest_binary),
             default_open: true,
             rows: runtime_rows,
         },
@@ -945,24 +952,26 @@ fn append_pi_build_rows(
 ) {
     let empty = crate::windows::versions::PiBuildEvidence::default();
     let build = build.unwrap_or(&empty);
+    let compare = |running: Option<&str>, latest: Option<&str>| {
+        if build.status == crate::windows::versions::PiBuildStatus::Unknown {
+            return None;
+        }
+        let valid =
+            |hash: &&str| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit());
+        let running = running.filter(valid)?;
+        let latest = latest.filter(valid)?;
+        Some(running.eq_ignore_ascii_case(latest))
+    };
     let row = |scope, (label, value): (&str, Option<String>)| {
-        let binary_is_current = if matches!(
-            label,
-            "running code fingerprint" | "latest extensions fingerprint"
-        ) && value
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-        {
-            match build.status {
-                crate::windows::versions::PiBuildStatus::Current => Some(true),
-                crate::windows::versions::PiBuildStatus::RestartRequired
-                | crate::windows::versions::PiBuildStatus::InstallationUpdateRequired => {
-                    Some(false)
-                }
-                crate::windows::versions::PiBuildStatus::Unknown => None,
+        let binary_is_current = match label {
+            "running code fingerprint" => {
+                compare(build.running_sdk.as_deref(), build.latest_sdk.as_deref())
             }
-        } else {
-            None
+            "running extensions fingerprint" => compare(
+                build.running_extensions.as_deref(),
+                build.latest_extensions.as_deref(),
+            ),
+            _ => None,
         };
         InfoPopupRow {
             label: info_metadata_label(role, label),
@@ -1005,25 +1014,6 @@ fn append_pi_build_rows(
                 "latest extensions fingerprint",
                 build.latest_extensions.clone(),
             ),
-            ("installed patch verification", build.patches.clone()),
-            (
-                "build comparison checked",
-                build.checked_at_ms.map(|when| {
-                    format!(
-                        "Unix {when} ms ({} s old)",
-                        build.check_age_seconds.unwrap_or(0)
-                    )
-                }),
-            ),
-            (
-                "build comparison reason",
-                Some(if build.reason.is_empty() {
-                    "No startup build receipt available".into()
-                } else {
-                    build.reason.clone()
-                }),
-            ),
-            ("fingerprint coverage", build.scope.clone()),
             (
                 "installed build manifest",
                 build

@@ -1513,6 +1513,78 @@ mod tests {
     }
 
     #[test]
+    fn pi_identity_rows_render_independent_colours_and_neutral_installed_hashes() {
+        let green = egui::Color32::from_rgb(130, 225, 145);
+        let red = egui::Color32::from_rgb(255, 110, 110);
+        for scale in [1.0, 2.0] {
+            let mut data = window_info();
+            let fields = [
+                (
+                    "Running code fingerprint",
+                    'a',
+                    InfoFieldScope::RunningInstance,
+                    Some(true),
+                    green,
+                ),
+                (
+                    "Running extensions fingerprint",
+                    'b',
+                    InfoFieldScope::RunningInstance,
+                    Some(false),
+                    red,
+                ),
+                (
+                    "Latest installed code fingerprint",
+                    'c',
+                    InfoFieldScope::Installation,
+                    None,
+                    egui::Color32::WHITE,
+                ),
+                (
+                    "Latest extensions fingerprint",
+                    'd',
+                    InfoFieldScope::Installation,
+                    None,
+                    egui::Color32::WHITE,
+                ),
+            ];
+            for (label, digit, scope, status, _) in fields {
+                data.rows.push(InfoPopupRow {
+                    label: label.into(),
+                    scope,
+                    value: digit.to_string().repeat(64),
+                    searched: false,
+                    separator_before: false,
+                    binary_is_current: status,
+                });
+            }
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            let (_, editor) = frame(&ctx, &data, Vec::new());
+            let layout = &editor.galley.job;
+            for (label, digit, scope, _, colour) in fields {
+                let value = format!("{}\n", digit.to_string().repeat(64));
+                let section = layout
+                    .sections
+                    .iter()
+                    .find(|section| layout.text[section.byte_range.clone()] == value)
+                    .unwrap();
+                assert_eq!(section.format.color, colour, "{label}");
+                let section = layout
+                    .sections
+                    .iter()
+                    .find(|section| layout.text[section.byte_range.clone()].starts_with(label))
+                    .unwrap();
+                assert_eq!(
+                    section.format.color,
+                    info_field_label_color(scope),
+                    "{label}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn identity_values_are_red_or_green_without_colouring_labels_or_other_values() {
         let hash = "6e689278f21a31797320afd5269395c09d75e390";
         let labels = [
