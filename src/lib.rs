@@ -1,5 +1,6 @@
 pub mod diagnostic_capture;
 pub mod freshness;
+pub mod lifecycle;
 pub mod observability;
 pub mod process;
 pub mod replay;

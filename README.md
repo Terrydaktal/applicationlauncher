@@ -213,9 +213,17 @@ version cache; opening a new Info snapshot inspects current installation state.
 - `src/models.rs`: Shared window, application, feed, and audio data types.
 - `src/tracker/`: Daemon client, private SQLite persistence, restore policy, service installation, and D-Bus service.
 - `src/tracker/tmux.rs`: Bounded tmux client and active-pane discovery, exact-session reattachment, and named-session recreation. It saves the pane directory and a restricted program kind, not pane contents or arbitrary commands.
+- `src/popups/updates.rs` and `src/app/terminal_maintenance.rs`: Show Info's terminal-update scope chooser, direct single-window updates and reviewed bulk updates.
+- `src/lifecycle/mod.rs`: Headless lifecycle D-Bus API, independently managed worker launch, durable reports and cross-process restart/restore locking. Runs inside `applicationlauncherd`, not a separate permanent daemon.
+- `src/lifecycle/application_update.rs` and `worker.py`: Shared application adapters and guarded program/tmux restart plans. Codex conversation detection and restart policy have one implementation for individual-program and whole-terminal updates.
+- `src/lifecycle/window.py` and `runner.py`: Durable terminal-update orchestration and supervised job entry. Coordinate native terminal mechanics, retain recovery builds, gracefully stop non-tmux applications and verify replacements before authorizing the original window to close. Python 3 and system PyGObject/Gio are required only for these operations.
+- `src/lifecycle/external.py` and `placement.js`: Daemon-owned compatibility replacement, compositor capture/placement/close, optional read-only tab discovery, bounded `/proc` mapping and PID-bound application startup gates. No updater API is required in the original terminal.
 - `src/bin/applicationlauncherd.rs`: Persistent background tracker entry point.
+- `src/freshness.rs`: Passive, cached native-process build comparison served by the daemon. Consumers identify a process and render the status themselves; this service never rewrites titles, launches programs or requests updates.
 - `src/windows/`: KWin snapshot consumption, process metadata, terminal integration, and icon resolution.
 - `src/windows/process_tree.rs`: On-demand background process-tree snapshots for Show Info, with real ancestry, application descendants, sibling helpers and detached tmux pane branches.
+- `src/windows/tmux_info.rs`: One-shot background `tmux-mosh` JSON collection with server/socket and PID/start-time guards, shared in-flight requests and bounded read-only subprocesses.
+- `src/app/popups/tmux.rs`: Server/session/attached-client groups and merged selected-client fields in Show Info; `tmux/client.rs` normalizes socket aliases and omits frontend details already represented in the process tree.
 - `src/windows/terminal/tmux.rs`: Background per-client active-pane monitoring and latest-state window metadata overlays, independent of tmux's desktop-title forwarding setting.
 - `src/windows/versions.rs`: On-demand, bounded running/on-disk executable version and build-ID probes for Show Info. `versions/freshness.rs` checks local build status without compiling.
 - `src/windows/versions/application.rs`: Read-only application-tile inspection. Separates desktop launch wrappers from installed application binaries, with bounded launch-chain resolution and no script execution.

@@ -1,3 +1,4 @@
+pub(crate) use crate::lifecycle::application_update;
 mod client;
 mod database;
 mod install;
@@ -7,6 +8,10 @@ mod service;
 mod terminal_upgrade;
 mod tmux;
 
+pub use application_update::{
+    ApplicationUpdateAction, ApplicationUpdateReport, ProgramRestartScope, ProgramUpdateIdentity,
+    TmuxRestartPane, TmuxRestartRemoteClient, TmuxServerIdentity, TmuxServerRestartScope,
+};
 pub use client::TrackerClient;
 pub use install::{ensure_tracker_installed, restart_tracker_service, tracker_binary_path};
 pub use model::*;

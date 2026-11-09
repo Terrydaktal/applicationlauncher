@@ -106,6 +106,7 @@ struct State {
     restore_specs: HashMap<String, RestoreSpec>,
     restore_spec_checked_at: HashMap<String, Instant>,
     restore_claims: HashSet<String>,
+    restore_lifecycle_lock: Option<crate::lifecycle::OperationLock>,
     history_restore_retry_after: HashMap<i64, Instant>,
     restore_sequence: u64,
     restore_reports: HashMap<String, RestoreReport>,
@@ -302,6 +303,7 @@ fn reconcile_attention_states(
 
 struct RuntimeInner {
     state: Mutex<State>,
+    lifecycle_directory: std::path::PathBuf,
     database: Mutex<TrackerDatabase>,
     terminal_upgrades: Mutex<super::terminal_upgrade::UpgradeRegistry>,
 }
@@ -310,25 +312,45 @@ struct RuntimeInner {
 struct Runtime(Arc<RuntimeInner>);
 
 impl Runtime {
+    fn lifecycle_directory(&self) -> std::path::PathBuf {
+        self.0.lifecycle_directory.clone()
+    }
+
+    fn lifecycle_busy(&self) -> bool {
+        crate::lifecycle::OperationLock::busy_in(&self.lifecycle_directory()).unwrap_or(true)
+    }
+
     fn history_generation(&self) -> u64 {
         self.0.state.lock().unwrap().history_generation
     }
 
     fn claim_restore(&self, key: String) -> Result<(), String> {
+        let directory = self.lifecycle_directory();
         let mut state = self.0.state.lock().unwrap();
-        if state.restore_claims.contains("terminal-upgrade") {
+        if state.restore_claims.contains("terminal-upgrade")
+            || state.restore_claims.contains("application-update")
+        {
             return Err(
                 "Terminal maintenance is running; wait before restoring another session".into(),
             );
         }
-        if !state.restore_claims.insert(key.clone()) {
+        if state.restore_claims.contains(&key) {
             return Err(format!("restore operation {key} is already in progress"));
         }
+        if state.restore_lifecycle_lock.is_none() {
+            state.restore_lifecycle_lock =
+                Some(crate::lifecycle::OperationLock::acquire_in(&directory)?);
+        }
+        state.restore_claims.insert(key);
         Ok(())
     }
 
     fn release_restore(&self, key: &str) {
-        self.0.state.lock().unwrap().restore_claims.remove(key);
+        let mut state = self.0.state.lock().unwrap();
+        state.restore_claims.remove(key);
+        if state.restore_claims.is_empty() {
+            state.restore_lifecycle_lock = None;
+        }
     }
 
     fn register_restore_report(&self, mut report: RestoreReport) -> RestoreReport {
@@ -1096,6 +1118,9 @@ impl Runtime {
     }
 
     fn write_recovery_if_due(&self, force: bool) -> Result<(), String> {
+        if self.lifecycle_busy() {
+            return Ok(());
+        }
         let (mut windows, boot_id, generation) = {
             let mut state = self.0.state.lock().unwrap();
             if state.recovery_pending || state.checkpoint_guarded {
@@ -1140,6 +1165,9 @@ impl Runtime {
     }
 
     fn write_periodic_if_due(&self, now: Instant, timestamp_ms: i64) -> Result<(), String> {
+        if self.lifecycle_busy() {
+            return Ok(());
+        }
         let (mut windows, boot_id) = {
             let mut state = self.0.state.lock().unwrap();
             if state.periodic_write_in_flight || state.periodic_due.is_some_and(|due| now < due) {
@@ -1189,6 +1217,9 @@ impl Runtime {
     }
 
     fn persist_current_if_due(&self, force: bool) -> Result<(), String> {
+        if self.lifecycle_busy() {
+            return Ok(());
+        }
         let (generation, full, entries, removed) = {
             let mut state = self.0.state.lock().unwrap();
             if state.current_write_in_flight
@@ -1947,6 +1978,20 @@ impl WindowFeed {
 #[derive(Clone)]
 struct TrackerApi(Runtime);
 
+struct ApplicationUpdateProtection(Runtime);
+
+impl Drop for ApplicationUpdateProtection {
+    fn drop(&mut self) {
+        self.0
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .restore_claims
+            .remove("application-update");
+    }
+}
+
 struct TerminalUpgradeProtection(Runtime);
 
 impl Drop for TerminalUpgradeProtection {
@@ -1964,6 +2009,121 @@ impl Drop for TerminalUpgradeProtection {
 
 #[interface(name = "com.terrydaktal.ApplicationLauncher.Tracker1", spawn = false)]
 impl TrackerApi {
+    #[zbus(name = "BeginApplicationUpdatePreview")]
+    fn begin_application_update_preview(&self, window_id: &str) -> String {
+        let result = (|| {
+            let windows = self.0.windows();
+            if !windows.iter().any(|window| {
+                window.id == window_id
+                    && matches!(
+                        window.class.to_ascii_lowercase().as_str(),
+                        "xfce4-terminal" | "org.xfce.terminal"
+                    )
+            }) {
+                return Err("Select an existing xfce4-terminal window".to_owned());
+            }
+            let (id, preparation) = super::application_update::registry()
+                .lock()
+                .unwrap()
+                .begin(window_id)?;
+            std::thread::Builder::new()
+                .name("application-update-preview".into())
+                .spawn(move || preparation.prepare(windows))
+                .map_err(|error| error.to_string())?;
+            Ok(id)
+        })();
+        serde_json::to_string(&result).unwrap()
+    }
+
+    #[zbus(name = "BeginProcessUpdatePreview")]
+    fn begin_process_update_preview(
+        &self,
+        window_id: &str,
+        pid: i32,
+        start_ticks: u64,
+        application: &str,
+    ) -> String {
+        let result = (|| {
+            let process = super::ProgramUpdateIdentity {
+                pid,
+                start_ticks,
+                application: application.into(),
+            };
+            process.validate()?;
+            let windows = self.0.windows();
+            if !windows.iter().any(|window| {
+                window.id == window_id
+                    && matches!(
+                        window.class.to_ascii_lowercase().as_str(),
+                        "xfce4-terminal" | "org.xfce.terminal"
+                    )
+            }) {
+                return Err("Select an existing xfce4-terminal window".to_owned());
+            }
+            let (id, preparation) = super::application_update::registry()
+                .lock()
+                .unwrap()
+                .begin(window_id)?;
+            std::thread::Builder::new()
+                .name("program-update-preview".into())
+                .spawn(move || preparation.prepare_process(windows, process))
+                .map_err(|error| error.to_string())?;
+            Ok(id)
+        })();
+        serde_json::to_string(&result).unwrap()
+    }
+
+    #[zbus(name = "GetApplicationUpdateReport")]
+    fn get_application_update_report(&self, id: &str) -> String {
+        serde_json::to_string(
+            &super::application_update::registry()
+                .lock()
+                .unwrap()
+                .report(id),
+        )
+        .unwrap()
+    }
+
+    #[zbus(name = "StartApplicationUpdate")]
+    fn start_application_update(&self, id: &str, action: &str, confirmed: bool) -> String {
+        let result = (|| {
+            let work = {
+                let registry = super::application_update::registry().lock().unwrap();
+                let mut state = self.0.0.state.lock().unwrap();
+                if state
+                    .restore_claims
+                    .iter()
+                    .any(|claim| claim != "application-update")
+                {
+                    return Err("Another restore or terminal update is in progress".to_owned());
+                }
+                let work = registry.start(id, action, confirmed)?;
+                if work.is_some() {
+                    state.restore_claims.insert("application-update".into());
+                }
+                work
+            };
+            if let Some(work) = work {
+                let runtime = self.0.clone();
+                let protection = ApplicationUpdateProtection(runtime);
+                std::thread::Builder::new()
+                    .name("application-update".into())
+                    .spawn(move || {
+                        let _protection = protection;
+                        let worker = crate::observability::register_worker("application-update");
+                        worker.set_state("backing-up-and-restarting-selected-programs");
+                        work.run();
+                    })
+                    .map_err(|error| error.to_string())?;
+            }
+            super::application_update::registry()
+                .lock()
+                .unwrap()
+                .report(id)
+        })();
+        serde_json::to_string(&result).unwrap()
+    }
+
     #[zbus(name = "BeginTerminalUpgradePreview")]
     fn begin_terminal_upgrade_preview(&self) -> String {
         let (id, preparation) = self.0.0.terminal_upgrades.lock().unwrap().begin();
@@ -2506,6 +2666,7 @@ pub fn run_tracker_daemon() -> Result<(), String> {
         + periodic_snapshot_delay(database.last_periodic_snapshot_at_ms()?, now_ms());
 
     let runtime = Runtime(Arc::new(RuntimeInner {
+        lifecycle_directory: database.path().parent().unwrap().join("lifecycle"),
         state: Mutex::new(State {
             windows: persisted_windows,
             snapshot_buffer: None,
@@ -2540,6 +2701,7 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             restore_specs,
             restore_spec_checked_at: HashMap::new(),
             restore_claims: HashSet::new(),
+            restore_lifecycle_lock: None,
             history_restore_retry_after: HashMap::new(),
             restore_sequence: 0,
             restore_reports: HashMap::new(),
@@ -2674,6 +2836,8 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             .serve_at(TRACKER_PATH, TrackerApi(runtime))
             .map_err(|err| err.to_string())?
             .serve_at(crate::freshness::PATH, freshness.clone())
+            .map_err(|err| err.to_string())?
+            .serve_at(crate::lifecycle::PATH, crate::lifecycle::Service)
             .map_err(|err| err.to_string())?
             .build()
             .await
@@ -2911,6 +3075,7 @@ mod tests {
         let (database, directory) = super::super::database::test_database();
         (
             Runtime(std::sync::Arc::new(RuntimeInner {
+                lifecycle_directory: database.path().parent().unwrap().join("lifecycle"),
                 database: std::sync::Mutex::new(database),
                 terminal_upgrades: std::sync::Mutex::new(
                     super::super::terminal_upgrade::UpgradeRegistry::default(),
@@ -3191,6 +3356,7 @@ mod tests {
                 .map(|window| (window.id.clone(), window))
                 .collect::<HashMap<_, _>>();
             let runtime = Runtime(std::sync::Arc::new(RuntimeInner {
+                lifecycle_directory: database.path().parent().unwrap().join("lifecycle"),
                 database: std::sync::Mutex::new(database),
                 terminal_upgrades: std::sync::Mutex::new(
                     crate::tracker::terminal_upgrade::UpgradeRegistry::default(),
@@ -3229,6 +3395,39 @@ mod tests {
     }
 
     #[test]
+    fn native_lifecycle_jobs_exclude_restores_and_transient_snapshot_persistence() {
+        let (database, _directory) = super::super::database::test_database();
+        let runtime = Runtime(std::sync::Arc::new(RuntimeInner {
+            lifecycle_directory: database.path().parent().unwrap().join("lifecycle"),
+            database: std::sync::Mutex::new(database),
+            terminal_upgrades: std::sync::Mutex::new(Default::default()),
+            state: std::sync::Mutex::new(State {
+                durable_generation: 1,
+                current_dirty: true,
+                recovery_dirty: true,
+                ..Default::default()
+            }),
+        }));
+        let lock =
+            crate::lifecycle::OperationLock::acquire_in(&runtime.lifecycle_directory()).unwrap();
+        assert!(runtime.claim_restore("ordinary".into()).is_err());
+        runtime.write_recovery_if_due(true).unwrap();
+        runtime.write_periodic_if_due(Instant::now(), 0).unwrap();
+        runtime.persist_current_if_due(true).unwrap();
+        assert!(runtime.0.state.lock().unwrap().current_dirty);
+        assert!(runtime.0.state.lock().unwrap().recovery_dirty);
+        drop(lock);
+        runtime.claim_restore("ordinary".into()).unwrap();
+        assert!(
+            crate::lifecycle::OperationLock::acquire_in(&runtime.lifecycle_directory()).is_err()
+        );
+        runtime.release_restore("ordinary");
+        assert!(
+            crate::lifecycle::OperationLock::acquire_in(&runtime.lifecycle_directory()).is_ok()
+        );
+    }
+
+    #[test]
     fn terminal_maintenance_releases_the_claim_but_protects_a_late_removed_event() {
         let (database, _directory) = super::super::database::test_database();
         let retired = TrackedWindow {
@@ -3237,6 +3436,7 @@ mod tests {
             ..Default::default()
         };
         let runtime = Runtime(std::sync::Arc::new(RuntimeInner {
+            lifecycle_directory: database.path().parent().unwrap().join("lifecycle"),
             database: std::sync::Mutex::new(database),
             terminal_upgrades: std::sync::Mutex::new(
                 crate::tracker::terminal_upgrade::UpgradeRegistry::default(),
@@ -3304,6 +3504,7 @@ mod tests {
             .create_snapshot_with_entries(None, "recovery", "old-boot", &entries, 1)
             .unwrap();
         let runtime = Runtime(std::sync::Arc::new(RuntimeInner {
+            lifecycle_directory: database.path().parent().unwrap().join("lifecycle"),
             database: std::sync::Mutex::new(database),
             terminal_upgrades: std::sync::Mutex::new(
                 crate::tracker::terminal_upgrade::UpgradeRegistry::default(),

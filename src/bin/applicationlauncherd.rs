@@ -10,6 +10,38 @@ static PRODUCT_METADATA: [u8; PRODUCT_METADATA_TEXT.len()] =
 
 fn main() {
     std::hint::black_box(&PRODUCT_METADATA);
+    if std::env::args().nth(1).as_deref() == Some("--lifecycle-gate") {
+        use std::os::unix::process::CommandExt;
+        let arguments: Vec<_> = std::env::args_os().skip(2).collect();
+        let result = if let [path] = arguments.as_slice() {
+            applicationlauncher::lifecycle::worker_command("gate", std::path::Path::new(path))
+                .map(|mut command| command.exec().to_string())
+        } else {
+            Err("The private startup gate requires one prepared request".into())
+        };
+        eprintln!(
+            "applicationlauncherd startup gate: {}",
+            result.unwrap_or_else(|e| e)
+        );
+        std::process::exit(125);
+    }
+    if std::env::args().nth(1).as_deref() == Some("--lifecycle-worker") {
+        use std::os::unix::process::CommandExt;
+        let args: Vec<_> = std::env::args_os().skip(2).collect();
+        let result: Result<(), String> = if args.len() == 2 {
+            applicationlauncher::lifecycle::worker_command(
+                &args[0].to_string_lossy(),
+                std::path::Path::new(&args[1]),
+            )
+            .and_then(|mut command| Err(command.exec().to_string()))
+        } else {
+            Err("The private lifecycle worker needs a mode and a private request".into())
+        };
+        if let Err(error) = result {
+            eprintln!("applicationlauncherd: {error}");
+        }
+        std::process::exit(1);
+    }
     if std::env::args().any(|argument| argument == "--build-id") {
         println!("{}", applicationlauncher::BUILD_ID);
         return;
