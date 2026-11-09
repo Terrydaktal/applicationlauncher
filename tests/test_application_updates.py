@@ -160,6 +160,26 @@ class CodexSessions(unittest.TestCase):
         self.assertEqual(plan["argv"], ["/fixture/new-codex", "resume", self.root])
         self.assertNotIn("--last", plan["argv"])
 
+    def test_server_preview_accepts_codex_with_child_agents_without_stopping_any_sessions(self):
+        rows = [self.metadata(self.root), *[self.metadata(identity, self.root) for identity in self.children]]
+        server = dict(process=dict(pid=456, start=789), socket="/fixture/tmux.sock", binary="/fixture/tmux")
+        replies = {"list-sessions": "$1\tdental\t1\t\t@1\n",
+                   "list-windows": "$1\t@1\t0\tcodex\tlayout\t80\t24\t0\n",
+                   "list-panes": "@1\t%2\t0\t1\n", "list-clients": "",
+                   "display-message": "%2\t123\t0\n", "show-options": "off\n", "show-environment": ""}
+        root = dict(pid=123, foreground=123)
+        with self.opened_rollouts(rows) as saved:
+            saved.update(cwd=tempfile.gettempdir(), executable="/fixture/codex")
+            with patch.object(worker, "run_tmux", side_effect=lambda server, command, *args: replies[command]), \
+                    patch.object(worker, "process", return_value=root), \
+                    patch.object(worker, "foreground", return_value=(root, saved)), \
+                    patch.object(worker, "require_dedicated_tree"), \
+                    patch.object(worker, "latest_binary", return_value="/fixture/new-codex"), \
+                    patch.object(worker, "file_identity", return_value=[1, 2, 3, 4]), \
+                    patch.object(worker, "stop_codex", side_effect=AssertionError("preview interrupted Codex")):
+                plan = worker.server_plan(server, [])
+        self.assertEqual(plan["programs"]["%2"]["program"]["argv"], ["/fixture/new-codex", "resume", self.root])
+        self.assertEqual(worker.server_restart_scope(plan)["sessions"], ["dental"])
 
 
 class PiSessions(unittest.TestCase):
@@ -379,6 +399,17 @@ class PiSessions(unittest.TestCase):
                 worker.stop_program(plan)
         signal.assert_called_once_with(999, worker.signal.SIGTERM)
 
+    def test_server_preview_includes_pi_and_its_exact_session_without_executing_any_action(self):
+        server = dict(process=dict(pid=500, start=789), socket="/fixture/tmux.sock", binary="/fixture/tmux")
+        replies = {"list-sessions": "$1\tgirls\t1\t\t@1\n",
+                   "list-windows": "$1\t@1\t0\tbash\tlayout\t80\t24\t0\n",
+                   "list-panes": "@1\t%3\t0\t1\n", "list-clients": "",
+                   "display-message": "%3\t100\t0\n", "show-options": "off\n", "show-environment": ""}
+        with patch.object(worker, "run_tmux", side_effect=lambda server, command, *args: replies[command]) as tmux:
+            plan = worker.server_plan(server, [])
+        self.assertEqual(plan["programs"]["%3"]["program"]["session_id"], self.session_id)
+        self.assertEqual(worker.server_restart_scope(plan)["panes"][0]["application"], "pi")
+        self.assertEqual({call.args[1] for call in tmux.call_args_list}, set(replies))
 
 
 class ProgramUpdates(unittest.TestCase):
@@ -459,6 +490,15 @@ class ProgramUpdates(unittest.TestCase):
 
 
 class Guards(unittest.TestCase):
+    def test_server_preview_names_the_session_whose_terminal_cannot_be_replaced(self):
+        replies = {"list-sessions": "$1\tdiet\t1\t\t@1\n",
+                   "list-windows": "$1\t@1\t0\tfish\tlayout\t80\t24\t0\n",
+                   "list-panes": "@1\t%0\t0\t1\n", "list-clients": "123\t$1\tdiet\n"}
+        with patch.object(worker, "run_tmux", side_effect=lambda server, command, *args: replies[command]), \
+                patch.object(worker, "pane_plan", return_value={}), patch.object(worker, "process", return_value={}), \
+                patch.object(worker, "tab_for_client", side_effect=worker.Refused("Update this xfce4-terminal window first; it lacks the safe tab-replacement API")):
+            with self.assertRaisesRegex(worker.Refused, "Session 'diet' .*123.*window first.*no sessions were stopped"):
+                worker.server_plan({}, [])
 
     def test_exact_codex_session_is_required_and_conflicting_ids_are_refused(self):
         first = "12345678-1234-5678-9abc-123456789abc"
@@ -510,6 +550,15 @@ class Guards(unittest.TestCase):
             with self.assertRaises(worker.Refused):
                 worker.execute({"input":{}, "kind":"terminal_program"}, Untouched(), "/not-used")
 
+    def test_tmux_automatic_window_names_do_not_invalidate_a_preview_but_topology_does(self):
+        plan = dict(kind="tmux_server", windows=[["$1", "@1", "0", "tmux", "layout", "80", "24", "0"]])
+        renamed = copy.deepcopy(plan)
+        renamed["windows"][0][3] = "fish"
+        self.assertEqual(worker.signature(plan), worker.signature(renamed))
+        for index in (0, 1, 2, 4, 5, 6, 7):
+            changed = copy.deepcopy(plan)
+            changed["windows"][0][index] = "changed"
+            self.assertNotEqual(worker.signature(plan), worker.signature(changed))
 
     def test_unsupported_terminal_and_shell_jobs_are_refused(self):
         with self.assertRaisesRegex(worker.Refused, "Update this xfce4-terminal"):
@@ -518,6 +567,19 @@ class Guards(unittest.TestCase):
             with self.assertRaisesRegex(worker.Refused, "background jobs"):
                 worker.program_plan({"pid":1, "cwd":"/tmp", "executable":"/bin/fish", "arguments":["fish"]})
 
+    def test_server_scope_lists_every_pane_and_detached_session_with_exact_identity(self):
+        plan = dict(server=dict(process=dict(pid=123, start=456), socket="/fixture/tmux.sock", binary="/fixture/tmux"),
+                    sessions=[["$1", "work", "1", "", "@1"], ["$2", "detached", "2", "", "@2"]],
+                    windows=[["$1", "@1", "3", "ignored", "layout", "80", "24", "0"],
+                             ["$2", "@2", "1", "ignored", "layout", "80", "24", "0"]],
+                    panes=[["@1", "%1", "0", "1"], ["@2", "%2", "2", "1"]],
+                    programs={"%1": dict(program=dict(kind="codex", cwd="/one")), "%2": dict(program=dict(kind="fish", cwd="/two"))},
+                    bindings=[dict(session="$1")])
+        self.assertEqual(worker.server_restart_scope(plan), dict(
+            identity=dict(pid=123, start_ticks=456, socket_path="/fixture/tmux.sock"), executable="/fixture/tmux",
+            sessions=["work", "detached"], windows=2, terminal_tabs=1, remote_clients=[],
+            panes=[dict(session="work", window_index="3", pane_index="0", application="codex", cwd="/one"),
+                   dict(session="detached", window_index="1", pane_index="2", application="fish", cwd="/two")]))
 
 
 class RemoteMoshClients(unittest.TestCase):
@@ -533,8 +595,73 @@ class RemoteMoshClients(unittest.TestCase):
                            ancestry=[{key: row[key] for key in ("pid", "start", "parent", "group", "tty", "image", "executable")}
                                      for row in [self.client, self.shell, self.mosh]])
 
+    def test_remote_client_requires_real_mosh_executable_ancestry_and_not_a_local_terminal(self):
+        with patch.object(worker, "process", side_effect=self.processes.__getitem__):
+            route = worker.remote_mosh_client(self.client)
+            self.assertEqual(route, {key: self.remote[key] for key in ("transport", "ancestry")})
+            for records in [[dict(child_pid=20)], [dict(owner_pid=30)]]:
+                self.assertIsNone(worker.remote_mosh_client(self.client, records))
+            for invalid in ["name-only", "different-tty", "local-terminal", "control-client", "broken-parent"]:
+                changed = copy.deepcopy(self.processes)
+                if invalid == "name-only":
+                    changed[10].update(executable="/fixture/python", arguments=["mosh-server"])
+                elif invalid == "different-tty":
+                    changed[20]["tty"] += 1
+                elif invalid == "local-terminal":
+                    changed[20]["executable"] = "/fixture/xfce4-terminal"
+                elif invalid == "control-client":
+                    changed[30]["tty"] = 0
+                else:
+                    changed[20]["parent"] = 99
+                with self.subTest(invalid=invalid), patch.object(worker, "process", side_effect=changed.__getitem__):
+                    self.assertIsNone(worker.remote_mosh_client(changed[30]))
+            with patch.object(worker, "process", side_effect=worker.Refused("not a same-user process")):
+                self.assertIsNone(worker.remote_mosh_client(self.client))
 
+    def test_server_preview_lists_mosh_disconnects_without_requiring_a_native_tab_or_stopping_work(self):
+        replies = {"list-sessions": "$1\tnetmgr\t1\t\t@1\n",
+                   "list-windows": "$1\t@1\t0\tfish\tlayout\t80\t24\t0\n",
+                   "list-panes": "@1\t%0\t0\t1\n", "list-clients": "30\t$1\tnetmgr\n", "show-environment": ""}
+        program = dict(program=dict(kind="fish", cwd="/fixture"))
+        server = dict(process=dict(pid=100, start=123), socket="/fixture/server.sock", binary="/fixture/tmux")
+        with patch.object(worker, "process", side_effect=self.processes.__getitem__), \
+                patch.object(worker, "run_tmux", side_effect=lambda server, command, *args: replies[command]) as tmux, \
+                patch.object(worker, "pane_plan", return_value=program), \
+                patch.object(worker, "stop_program", side_effect=AssertionError("preview interrupted a program")):
+            plan = worker.server_plan(server, [])
+        self.assertEqual(plan["bindings"], [])
+        self.assertEqual(plan["remote_clients"], [self.remote])
+        scope = worker.server_restart_scope(plan)
+        self.assertEqual(scope["remote_clients"], [dict(pid=30, session="netmgr", transport="mosh")])
+        self.assertEqual(scope["terminal_tabs"], 0)
+        self.assertEqual({call.args[1] for call in tmux.call_args_list}, set(replies))
+        for key in ["start", "image", "parent"]:
+            changed = copy.deepcopy(plan)
+            changed["remote_clients"][0]["ancestry"][-1][key] = "changed"
+            self.assertNotEqual(worker.signature(plan), worker.signature(changed))
 
+    def test_remote_disconnect_revalidation_includes_all_clients_and_rejects_changed_ancestry(self):
+        local = dict(client=dict(pid=40), session="$2", session_name="local", binding=dict(tab_uuid="local"))
+        plan = dict(server={}, bindings=[local], remote_clients=[self.remote])
+        with patch.object(worker, "same_process", return_value=True), \
+                patch.object(worker, "process", side_effect=self.processes.__getitem__), \
+                patch.object(worker, "run_tmux", return_value="30\t$1\tnetmgr\n40\t$2\tlocal\n") as tmux:
+            worker.require_server_clients(plan)
+            self.assertEqual(tmux.call_args.args[1], "list-clients")
+            for current in ["40\t$2\tlocal\n", "30\t$1\tnetmgr\n40\t$2\tlocal\n50\t$3\tnew\n",
+                            "30\t$1\tother\n40\t$2\tlocal\n"]:
+                with self.subTest(current=current), patch.object(worker, "run_tmux", return_value=current):
+                    with self.assertRaisesRegex(worker.Refused, "client bindings changed"):
+                        worker.require_server_clients(plan)
+            for key in ["start", "parent", "image"]:
+                changed = copy.deepcopy(self.processes)
+                changed[10][key] = 999 if key != "image" else [9, 9, 9, 9]
+                with self.subTest(key=key), patch.object(worker, "process", side_effect=changed.__getitem__):
+                    with self.assertRaisesRegex(worker.Refused, "ancestry changed"):
+                        worker.require_server_clients(plan)
+            with patch.object(worker, "same_process", return_value=False):
+                with self.assertRaisesRegex(worker.Refused, "client bindings changed"):
+                    worker.require_server_clients(plan)
 
 
 class PrivateTmux(unittest.TestCase):
@@ -584,18 +711,257 @@ class PrivateTmux(unittest.TestCase):
         self.environment.stop()
         self.directory.cleanup()
 
+    def test_actual_server_recreation_preserves_sessions_windows_panes_layouts_and_directories(self):
+        self.tmux("new-session", "-d", "-s", "two", "-n", "second", "-c", str(self.root), "/usr/bin/bash", "--noprofile", "--norc")
+        self.tmux("new-window", "-d", "-t", "one:3", "-n", "quoted ' window", "-c", str(self.root), "/usr/bin/bash", "--noprofile", "--norc")
+        self.tmux("split-window", "-h", "-t", "one:3", "-c", str(self.root), "/usr/bin/bash", "--noprofile", "--norc")
+        plan = self.wait_shells()
+        original_pid = plan["server"]["process"]["pid"]
+        before = self.tmux("list-windows", "-a", "-F", "#{session_name}:#{window_index}:#{window_name}:#{window_panes}")
+        geometry_format = "#{session_name}:#{window_index}:#{pane_index}:#{pane_left}:#{pane_top}:#{pane_width}:#{pane_height}"
+        geometry = self.tmux("list-panes", "-a", "-F", geometry_format)
+        self.stop_server(plan["server"])
+        gates, _ = worker.recreate_server(plan, self.root)
+        for gate in gates:
+            gate.touch(mode=0o600, exist_ok=False)
+        self.assertNotEqual(int(self.tmux("display-message", "-p", "#{pid}")), original_pid)
+        self.assertEqual(self.tmux("list-windows", "-a", "-F", "#{session_name}:#{window_index}:#{window_name}:#{window_panes}"), before)
+        self.assertEqual(self.tmux("list-panes", "-a", "-F", geometry_format), geometry)
+        self.assertEqual(len(gates), 4)
+        self.assertEqual(set(self.tmux("list-panes", "-a", "-F", "#{pane_current_path}").splitlines()), {str(self.root)})
 
+    def test_server_recreation_does_not_inherit_the_updaters_no_color_override(self):
+        self.tmux("set-environment", "-g", "-u", "NO_COLOR")
+        self.tmux("set-environment", "-g", "COLORTERM", "truecolor")
+        plan = self.wait_shells()
+        self.stop_server(plan["server"])
+        with patch.dict(os.environ, NO_COLOR="1", COLORTERM="", FORCE_COLOR="0"):
+            gates, _ = worker.recreate_server(plan, self.root)
+        environment = [line for line in self.tmux("show-environment", "-g").splitlines()
+                       if line.partition("=")[0] in {"NO_COLOR", "FORCE_COLOR", "COLORTERM"}]
+        self.assertNotIn("NO_COLOR=1", environment)
+        self.assertNotIn("FORCE_COLOR=0", environment)
+        self.assertIn("COLORTERM=truecolor", environment)
+        for gate in gates:
+            gate.touch(mode=0o600, exist_ok=False)
+        pid = int(self.tmux("display-message", "-p", "#{pane_pid}"))
+        inherited = [line for line in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+                     if line.partition(b"=")[0] in {b"NO_COLOR", b"COLORTERM"}]
+        self.assertNotIn(b"NO_COLOR=1", inherited)
+        self.assertIn(b"COLORTERM=truecolor", inherited)
 
+    def test_server_recreation_preserves_intentional_original_colour_preferences(self):
+        self.tmux("set-environment", "-g", "NO_COLOR", "1")
+        self.tmux("set-environment", "-g", "CLICOLOR", "0")
+        self.tmux("set-environment", "-g", "PRIVATE_TEST_TOKEN", "not-for-restart-plan")
+        plan = self.wait_shells()
+        self.assertNotIn("PRIVATE_TEST_TOKEN", plan["server"]["colour_environment"])
+        self.stop_server(plan["server"])
+        with patch.dict(os.environ, NO_COLOR="", CLICOLOR="1", FORCE_COLOR="1"):
+            worker.recreate_server(plan, self.root)
+        environment = [line for line in self.tmux("show-environment", "-g").splitlines()
+                       if line.partition("=")[0] in {"NO_COLOR", "CLICOLOR", "FORCE_COLOR"}]
+        self.assertIn("NO_COLOR=1", environment)
+        self.assertIn("CLICOLOR=0", environment)
+        self.assertNotIn("FORCE_COLOR=1", environment)
 
+    def test_one_pane_restart_does_not_restart_server_or_other_pane(self):
+        self.tmux("split-window", "-h", "-t", "one", "/usr/bin/bash", "--noprofile", "--norc")
+        plan = self.wait_shells()
+        pane_ids = list(plan["programs"])
+        server_pid = plan["server"]["process"]["pid"]
+        other_pid = self.tmux("display-message", "-p", "-t", pane_ids[1], "#{pane_pid}")
+        selected = dict(kind="tmux_pane", server=plan["server"], **plan["programs"][pane_ids[0]])
+        previous = selected["root"]["pid"]
+        worker.restart_pane(selected)
+        self.assertEqual(int(self.tmux("display-message", "-p", "#{pid}")), server_pid)
+        self.assertEqual(self.tmux("display-message", "-p", "-t", pane_ids[1], "#{pane_pid}"), other_pid)
+        self.assertNotEqual(int(self.tmux("display-message", "-p", "-t", pane_ids[0], "#{pane_pid}")), previous)
 
+    def test_server_startup_exit_after_shutdown_retries_without_losing_the_saved_sessions(self):
+        self.tmux("new-session", "-d", "-s", "detached", "/usr/bin/bash", "--noprofile", "--norc")
+        plan = dict(self.wait_shells(), input={})
+        original = worker.run_tmux
+        failed = []
+        def crash_first_replacement(server, *arguments, **options):
+            if (server["socket"] == self.socket and arguments[0] == "new-session" and options.get("create")
+                    and not failed and not worker.same_process(plan["server"]["process"])):
+                failed.append(True)
+                original(server, *arguments, **options)
+                subprocess.run([self.binary, "-N", "-S", self.socket, "kill-server"],
+                               stdin=subprocess.DEVNULL, capture_output=True, check=True, timeout=5)
+                raise worker.Refused("tmux command failed: server exited unexpectedly")
+            return original(server, *arguments, **options)
+        with patch.object(worker, "inspect", return_value={"plans": {"tmux_server": plan}}), \
+                patch.object(worker, "run_tmux", side_effect=crash_first_replacement):
+            result = worker.execute(plan, object(), self.root)
+        self.assertEqual(len(failed), 1, "The fault must occur after the original server stops")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.tmux("list-sessions", "-F", "#{session_name}:#{session_attached}"), "detached:0\none:0")
+        self.assertEqual(len(self.tmux("list-panes", "-a", "-F", "#{pane_pid}").splitlines()), 2)
+        events = [json.loads(line) for line in (self.root / "restart-events.jsonl").read_text().splitlines()]
+        self.assertEqual([event["attempt"] for event in events if event["phase"] == "startup_failed"], [1])
+        self.assertEqual([event["attempt"] for event in events if event["phase"] == "starting_server"], [1, 2])
 
+    def test_shutdown_acknowledgement_loss_still_restores_sessions_after_the_old_server_exits(self):
+        plan = dict(self.wait_shells(), input={})
+        original = worker.run_tmux
+        original_same_process = worker.same_process
+        lost = []
+        pending_exit_checks = [2]
+        def delayed_exit(saved):
+            if lost and saved["pid"] == plan["server"]["process"]["pid"] and pending_exit_checks[0]:
+                pending_exit_checks[0] -= 1
+                return True
+            return original_same_process(saved)
+        def lost_shutdown_reply(server, *arguments, **options):
+            result = original(server, *arguments, **options)
+            if (server["socket"] == self.socket and arguments[0] == "kill-server"
+                    and server["process"]["pid"] == plan["server"]["process"]["pid"] and not lost):
+                lost.append(True)
+                raise worker.Refused("tmux command failed: server exited unexpectedly")
+            return result
+        with patch.object(worker, "inspect", return_value={"plans": {"tmux_server": plan}}), \
+                patch.object(worker, "run_tmux", side_effect=lost_shutdown_reply), \
+                patch.object(worker, "same_process", side_effect=delayed_exit):
+            result = worker.execute(plan, object(), self.root)
+        self.assertEqual(len(lost), 1)
+        self.assertEqual(pending_exit_checks[0], 0, "Shutdown must tolerate a live identity briefly after acknowledgement loss")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.tmux("list-sessions", "-F", "#{session_name}:#{session_attached}"), "one:0")
+        self.assertNotEqual(int(self.tmux("display-message", "-p", "#{pid}")), plan["server"]["process"]["pid"])
 
+    def test_private_startup_check_never_opens_program_gates_or_changes_the_original_server(self):
+        plan = self.wait_shells()
+        original_pid = plan["server"]["process"]["pid"]
+        before = self.tmux("list-panes", "-a", "-F", "#{pane_id}:#{pane_pid}")
+        marker = self.root / "must-not-start"
+        for value in plan["programs"].values():
+            value["program"]["argv"] = ["/usr/bin/touch", str(marker)]
+        worker.preflight_server(plan, self.root)
+        self.assertFalse(marker.exists(), "A startup check executed a captured application")
+        self.assertTrue(worker.same_process(plan["server"]["process"]))
+        self.assertEqual(int(self.tmux("display-message", "-p", "#{pid}")), original_pid)
+        self.assertEqual(self.tmux("list-panes", "-a", "-F", "#{pane_id}:#{pane_pid}"), before)
 
+    def test_permanent_startup_failure_is_refused_before_tabs_or_applications_are_interrupted(self):
+        plan = dict(self.wait_shells(), input={})
+        before = self.tmux("list-panes", "-a", "-F", "#{pane_id}:#{pane_pid}")
+        original = worker.run_tmux
+        failures = []
+        def fail_startup(server, *arguments, **options):
+            if options.get("create"):
+                self.assertNotEqual(server["socket"], self.socket)
+                self.assertTrue(worker.same_process(plan["server"]["process"]))
+                failures.append(server["socket"])
+                raise worker.Refused("tmux new-session failed: server exited unexpectedly")
+            return original(server, *arguments, **options)
+        with patch.object(worker, "inspect", return_value={"plans": {"tmux_server": plan}}), \
+                patch.object(worker, "run_tmux", side_effect=fail_startup), \
+                patch.object(worker, "stop_program", side_effect=AssertionError("startup check stopped an application")):
+            result = worker.execute(plan, object(), self.root)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("original sessions were not stopped", result["message"])
+        self.assertEqual(len(failures), 3, "Startup retries must be bounded")
+        self.assertTrue(worker.same_process(plan["server"]["process"]))
+        self.assertEqual(self.tmux("list-panes", "-a", "-F", "#{pane_id}:#{pane_pid}"), before)
+        events = [json.loads(line) for line in (self.root / "restart-events.jsonl").read_text().splitlines()]
+        self.assertIn("startup_check_failed", [event["phase"] for event in events])
+        self.assertNotIn("stopping_server", [event["phase"] for event in events])
 
+    def test_recreation_never_adopts_or_kills_an_already_running_server(self):
+        plan = self.wait_shells()
+        with self.assertRaisesRegex(worker.Refused, "already owns this socket"):
+            worker.recreate_server(plan, self.root)
+        self.assertTrue(worker.same_process(plan["server"]["process"]))
+        self.assertEqual(self.tmux("list-sessions", "-F", "#{session_name}"), "one")
 
+    def test_gated_server_loss_between_sessions_does_not_start_another_server(self):
+        self.tmux("new-session", "-d", "-s", "two", "/usr/bin/bash", "--noprofile", "--norc")
+        plan = self.wait_shells()
+        self.tmux("kill-server")
+        original = worker.run_tmux
+        starts = []
+        killed = []
+        def exit_after_first_session(server, *arguments, **options):
+            if options.get("create"):
+                starts.append(arguments[0])
+            result = original(server, *arguments, **options)
+            if arguments[0] == "select-window" and not killed:
+                killed.append(True)
+                original(server, "kill-server")
+            return result
+        with patch.object(worker, "run_tmux", side_effect=exit_after_first_session), \
+                self.assertRaisesRegex(worker.Refused, "disappeared or changed"):
+            worker.recreate_server(plan, self.root)
+        self.assertEqual(starts, ["new-session"])
+        self.assertFalse(worker.server_listening(plan["server"]))
+        self.assertFalse(list(self.root.glob("gate-*")))
 
+    def test_restart_journal_retains_stages_and_exact_rebuilt_pane_mapping(self):
+        plan = dict(self.wait_shells(), input={})
+        with patch.object(worker, "inspect", return_value={"plans": {"tmux_server": plan}}):
+            result = worker.execute(plan, object(), self.root)
+        self.assertTrue(result["ok"], result)
+        path = self.root / "restart-events.jsonl"
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        events = [json.loads(line) for line in path.read_text().splitlines()]
+        phases = [event["phase"] for event in events]
+        self.assertLess(phases.index("startup_check_complete"), phases.index("stopping_server"))
+        self.assertLess(phases.index("clients_reattached"), phases.index("programs_released"))
+        self.assertEqual(phases[-1], "complete")
+        gated = next(event for event in events if event["phase"] == "session_gated")
+        self.assertEqual(gated["session"], "one")
+        self.assertEqual(set(gated["pane_map"]), set(plan["programs"]))
+        target = self.root / "keep-private"
+        target.write_text("unchanged")
+        path.unlink()
+        path.symlink_to(target)
+        with self.assertRaises(OSError):
+            worker.restart_event(self.root, "must-not-overwrite")
+        self.assertEqual(target.read_text(), "unchanged")
 
+    def test_confirmed_server_restart_disconnects_the_remote_client_and_recreates_its_detached_session(self):
+        self.wait_shells()
+        client = subprocess.Popen([self.binary, "-N", "-S", self.socket, "-C", "attach-session", "-t", "one"],
+                                  stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+        try:
+            deadline = time.monotonic() + 5
+            while str(client.pid) not in self.tmux("list-clients", "-F", "#{client_pid}").splitlines():
+                self.assertIsNone(client.poll(), "the private client failed to attach")
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.02)
+            # Real mosh ancestry is tested above; this private control-mode client exercises disconnection.
+            def route(saved, records=()):
+                self.assertEqual(saved["pid"], client.pid)
+                return dict(transport="mosh", ancestry=[dict(pid=client.pid, start=saved["start"], image=saved["image"])])
+            def preview(payload, system):
+                value = worker.server_plan(self.server(), [])
+                value["input"] = {}
+                return dict(plans={"tmux_server": value})
+            with patch.object(worker, "remote_mosh_client", side_effect=route), patch.object(worker, "inspect", side_effect=preview):
+                plan = preview({}, None)["plans"]["tmux_server"]
+                self.assertIsNone(client.poll(), "preview must not close a remote client")
+                self.assertEqual(len(plan["remote_clients"]), 1)
+                result = worker.execute(plan, object(), self.root)
+            self.assertTrue(result["ok"], result)
+            self.assertIn("remote mosh tmux client(s) were disconnected", result["message"])
+            client.wait(timeout=5)
+            self.assertNotEqual(int(self.tmux("display-message", "-p", "#{pid}")), plan["server"]["process"]["pid"])
+            self.assertEqual(self.tmux("list-sessions", "-F", "#{session_name}:#{session_attached}"), "one:0")
+        finally:
+            if client.poll() is None:
+                client.terminate()
+                client.wait(timeout=5)
+            client.stdin.close()
 
+    def test_linked_windows_are_rejected_without_stopping_a_session(self):
+        self.tmux("new-session", "-d", "-s", "two", "/usr/bin/bash", "--noprofile", "--norc")
+        self.tmux("link-window", "-s", "one:0", "-t", "two:2")
+        with self.assertRaisesRegex(worker.Refused, "Linked tmux windows"):
+            worker.server_plan(self.server(), [])
+        self.assertEqual(len(self.tmux("list-sessions", "-F", "#{session_name}").splitlines()), 2)
 
 
 if __name__ == "__main__":

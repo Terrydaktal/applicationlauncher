@@ -593,10 +593,28 @@ def restart_event(directory, phase, **details):
         os.close(descriptor)
 
 
+def server_listening(server):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(1)
+        try:
+            connection.connect(server["socket"])
+        except OSError as error:
+            if error.errno in (errno.ENOENT, errno.ECONNREFUSED):
+                return False
+            raise Refused("Cannot prove the tmux listener is unused; no replacement will be started") from error
+    return True
 
 
-
-
+def replacement_server(server):
+    before = os.stat(server["socket"], follow_symlinks=False)
+    if not stat.S_ISSOCK(before.st_mode) or before.st_uid != os.getuid():
+        raise Refused("The replacement tmux socket is not owned by this user")
+    pid = int(run_tmux(server, "display-message", "-p", "#{pid}", installed=True).strip())
+    saved = process(pid)
+    after = os.stat(server["socket"], follow_symlinks=False)
+    if (saved["image"] != server["installed"] or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)):
+        raise Refused("The replacement tmux server or socket changed; no other server will be modified")
+    return dict(server, process=saved, socket_identity=[after.st_dev, after.st_ino])
 
 
 def tmux_client(saved):
@@ -698,18 +716,99 @@ def tab_for_client(client, records):
     return candidates[0]
 
 
-
+def remote_mosh_client(client, records=()):
+    """Only verified mosh descendants may be disconnected without a local tab handoff."""
+    local_pids = {str(record.get(key)) for record in records for key in ("owner_pid", "child_pid")}
+    cursor, ancestry = client, []
+    try:
+        if kind(client) != "tmux" or not client["tty"]:
+            return None
+        for _ in range(32):
+            if str(cursor["pid"]) in local_pids or kind(cursor) == "xfce4-terminal":
+                return None
+            ancestry.append({key: cursor[key] for key in ("pid", "start", "parent", "group", "tty", "image", "executable")})
+            if kind(cursor) == "mosh-server":
+                return dict(transport="mosh", ancestry=ancestry)
+            if cursor["parent"] <= 1 or cursor["tty"] != client["tty"]:
+                return None
+            cursor = process(cursor["parent"])
+    except (OSError, ValueError, KeyError, Refused):
+        return None
+    return None
 
 
 def server_plan(server, records):
-    raise Refused("Whole-server restart is not enabled")
+    sessions = rows(run_tmux(server, "list-sessions", "-F",
+        "#{session_id}\t#{session_name}\t#{session_created}\t#{session_group}\t#{window_id}"), 5)
+    if not sessions or any(row[3] for row in sessions):
+        raise Refused("Empty or grouped tmux sessions are not supported for server replacement")
+    windows = rows(run_tmux(server, "list-windows", "-a", "-F",
+        "#{session_id}\t#{window_id}\t#{window_index}\t#{window_name}\t#{window_layout}\t#{window_width}\t#{window_height}\t#{window_zoomed_flag}"), 8)
+    if len({row[1] for row in windows}) != len(windows):
+        raise Refused("Linked tmux windows are not supported for server replacement; no sessions were stopped")
+    panes = rows(run_tmux(server, "list-panes", "-a", "-F",
+        "#{window_id}\t#{pane_id}\t#{pane_index}\t#{pane_active}"), 4)
+    if len(panes) > 128:
+        raise Refused("More than 128 tmux panes exceed the bounded server-replacement limit")
+    clients = rows(run_tmux(server, "list-clients", "-F", "#{client_pid}\t#{session_id}\t#{session_name}"), 3)
+    unique_panes = {}
+    for _, pane, _, _ in panes:
+        if pane not in unique_panes:
+            try:
+                unique_panes[pane] = pane_plan(server, pane)
+            except Refused as error:
+                raise Refused(f"Pane {pane}: {error}; no sessions were stopped") from error
+    bindings, remote_clients = [], []
+    for pid, session, name in clients:
+        client = process(int(pid))
+        try:
+            binding = tab_for_client(client, records)
+        except Refused as error:
+            remote = remote_mosh_client(client, records)
+            if remote is not None:
+                remote_clients.append(dict(remote, client=client, session=session, session_name=name))
+                continue
+            raise Refused(f"Session {name!r} (tmux client PID {pid}): {error}; no sessions were stopped") from error
+        bindings.append(dict(binding=binding, client=client, session=session, session_name=name))
+    if len({row["binding"]["tab_uuid"] for row in bindings}) != len(bindings):
+        raise Refused("Multiple tmux clients share one terminal tab; server replacement refused")
+    colours = {}
+    for line in run_tmux(server, "show-environment", "-g").splitlines():
+        name, separator, value = line.partition("=")
+        if separator and name in COLOUR_ENVIRONMENT:
+            colours[name] = value
+    server = dict(server, colour_environment=colours)
+    return dict(kind="tmux_server", server=server, sessions=sessions, windows=windows, panes=panes,
+                programs=unique_panes, bindings=bindings, remote_clients=remote_clients)
 
 
+def server_restart_scope(plan):
+    server = plan["server"]
+    sessions = {row[0]: row[1] for row in plan["sessions"]}
+    windows = {row[1]: row for row in plan["windows"]}
+    panes = []
+    for window, pane, index, _ in plan["panes"]:
+        program = plan["programs"][pane]["program"]
+        panes.append(dict(session=sessions[windows[window][0]], window_index=windows[window][2],
+                          pane_index=index, application=program["kind"], cwd=program["cwd"]))
+    return dict(identity=dict(pid=server["process"]["pid"], start_ticks=server["process"]["start"],
+                              socket_path=server["socket"]), executable=server["binary"],
+                sessions=list(sessions.values()), windows=len(windows),
+                terminal_tabs=len(plan["bindings"]), panes=panes,
+                remote_clients=[dict(pid=row["client"]["pid"], session=row["session_name"], transport=row["transport"])
+                                for row in plan.get("remote_clients", [])])
 
 
-
-
-
+def require_server_clients(plan):
+    clients = plan["bindings"] + plan.get("remote_clients", [])
+    current = rows(run_tmux(plan["server"], "list-clients", "-F", "#{client_pid}\t#{session_id}\t#{session_name}"), 3)
+    expected = [[str(row["client"]["pid"]), row["session"], row["session_name"]] for row in clients]
+    if sorted(current) != sorted(expected) or any(not same_process(row["client"]) for row in clients):
+        raise Refused("The tmux client bindings changed before shutdown")
+    for row in plan.get("remote_clients", []):
+        current = remote_mosh_client(process(row["client"]["pid"]))
+        if current != {key: row[key] for key in ("transport", "ancestry")}:
+            raise Refused("A remote mosh client identity or ancestry changed before shutdown")
 
 
 def inspect(payload, system):
@@ -935,10 +1034,117 @@ def restart_pane(plan):
             run_tmux(server, "set-option", "-p", "-t", pane, "-u", "remain-on-exit")
 
 
+def recreate_server(plan, directory):
+    server = plan["server"]
+    replacement = None
+    session_map, window_map, pane_map, gates = {}, {}, {}, []
+    def creation(*arguments):
+        nonlocal replacement
+        if replacement is not None:
+            metadata = os.stat(server["socket"], follow_symlinks=False)
+            if (not same_process(replacement["process"])
+                    or [metadata.st_dev, metadata.st_ino] != replacement["socket_identity"]):
+                raise Refused("The gated replacement server disappeared or changed; no new server will be started")
+            return run_tmux(replacement, *arguments).strip()
+        if arguments[0] != "new-session":
+            raise Refused("A replacement must start with the first captured session")
+        for attempt in range(1, 4):
+            if file_identity(server["binary"]) != server["installed"] or server_listening(server):
+                raise Refused("The installed tmux binary changed or a server already owns this socket")
+            restart_event(directory, "starting_server", attempt=attempt, session=arguments[arguments.index("-s") + 1])
+            try:
+                result = run_tmux(server, *arguments, create=True).strip()
+            except Refused as error:
+                restart_event(directory, "startup_failed", attempt=attempt, command=arguments[0], error=str(error))
+                # Only a confirmed startup exit with no listener is safe to retry. Gates
+                # are still closed, so no application/conversation has been started.
+                if "server exited unexpectedly" not in str(error) or server_listening(server) or attempt == 3:
+                    raise
+                continue
+            replacement = replacement_server(server)
+            restart_event(directory, "server_started", pid=replacement["process"]["pid"],
+                          start=replacement["process"]["start"], socket_identity=replacement["socket_identity"])
+            return result
+    def gated(pane):
+        program = plan["programs"][pane]["program"]
+        gate = Path(directory) / ("gate-" + pane.removeprefix("%"))
+        if gate.exists() or gate.is_symlink():
+            raise Refused("A program startup gate already exists; the old operation cannot be replayed blindly")
+        gates.append(gate)
+        # A closed gate ensures no duplicate Codex session starts before every binding is rebuilt.
+        command = 'while [ ! -f "$1" ]; do sleep 0.05; done; shift; exec "$@"'
+        return ["/bin/sh", "-c", command, "application-update-gate", str(gate), *pane_command(program)]
+    for old_session, name, _, _, active_window in plan["sessions"]:
+        session_windows = [row for row in plan["windows"] if row[0] == old_session]
+        if not session_windows:
+            raise Refused("A captured tmux session has no windows")
+        for ordinal, row in enumerate(session_windows):
+            _, old_window, index, title, layout, width, height, zoomed = row
+            members = sorted([pane for pane in plan["panes"] if pane[0] == old_window], key=lambda value: int(value[2]))
+            if not members:
+                raise Refused("A captured tmux window has no panes")
+            first = members[0][1]
+            cwd = plan["programs"][first]["program"]["cwd"]
+            if ordinal == 0:
+                returned = creation("new-session", "-d", "-P", "-F", "#{session_id}\t#{window_id}\t#{pane_id}",
+                                    "-s", name, "-n", title, "-x", width, "-y", height, "-c", cwd, *gated(first))
+                new_session, new_window, new_pane = returned.split("\t")
+                session_map[old_session] = new_session
+                actual_index = creation("display-message", "-p", "-t", new_window, "#{window_index}")
+                if actual_index != index:
+                    creation("move-window", "-s", new_window, "-t", f"{new_session}:{index}")
+            elif old_window in window_map:
+                creation("link-window", "-s", window_map[old_window], "-t", f"{session_map[old_session]}:{index}")
+                continue
+            else:
+                returned = creation("new-window", "-d", "-P", "-F", "#{window_id}\t#{pane_id}",
+                                    "-t", f"{session_map[old_session]}:{index}", "-n", title, "-c", cwd, *gated(first))
+                new_window, new_pane = returned.split("\t")
+            window_map[old_window], pane_map[first] = new_window, new_pane
+            for _, old_pane, _, _ in members[1:]:
+                program = plan["programs"][old_pane]["program"]
+                new_pane = creation("split-window", "-d", "-P", "-F", "#{pane_id}", "-t", new_window,
+                                    "-c", program["cwd"], *gated(old_pane))
+                pane_map[old_pane] = new_pane
+            creation("select-layout", "-t", new_window, layout)
+            for _, old_pane, _, _ in members:
+                previous_remain = plan["programs"][old_pane].get("remain_on_exit", "")
+                if previous_remain:
+                    creation("set-option", "-p", "-t", pane_map[old_pane], "remain-on-exit", previous_remain)
+            active = next((pane[1] for pane in members if pane[3] == "1"), first)
+            creation("select-pane", "-t", pane_map[active])
+            if zoomed == "1":
+                creation("resize-pane", "-Z", "-t", pane_map[active])
+        creation("select-window", "-t", window_map[active_window])
+        restart_event(directory, "session_gated", session=name, pane_map=pane_map, gates=[str(path) for path in gates])
+    return gates, pane_map
 
 
-
-
+def preflight_server(plan, directory):
+    restart_event(directory, "startup_check")
+    # A short private path also stays within the AF_UNIX socket-path limit.
+    with tempfile.TemporaryDirectory(prefix="launcher-tmux-startup-") as temporary:
+        probe = dict(plan, server=dict(plan["server"], socket=str(Path(temporary) / "server.sock")))
+        try:
+            gates, pane_map = recreate_server(probe, temporary)
+            checked = replacement_server(probe["server"])
+            sessions = run_tmux(checked, "list-sessions", "-F", "#{session_name}").splitlines()
+            if (sorted(sessions) != sorted(row[1] for row in plan["sessions"])
+                    or len(pane_map) != len(plan["programs"]) or any(gate.exists() for gate in gates)):
+                raise Refused("The replacement tmux startup check did not preserve all gated sessions and panes")
+        except Exception as error:
+            restart_event(directory, "startup_check_failed", error=str(error))
+            raise Refused(f"Replacement tmux startup check failed; original sessions were not stopped: {error}") from error
+        finally:
+            if server_listening(probe["server"]):
+                checked = replacement_server(probe["server"])
+                run_tmux(checked, "kill-server")
+                deadline = time.monotonic() + 5
+                while same_process(checked["process"]) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                if same_process(checked["process"]):
+                    raise Refused("The private tmux startup check did not stop; original sessions were not stopped")
+    restart_event(directory, "startup_check_complete")
 
 
 def execute(plan, system, directory):
