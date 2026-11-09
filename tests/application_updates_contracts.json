@@ -1,271 +1,31 @@
 {
   "schema_version": 1,
   "scope": "Direct window-owner and Show Info terminal and exact-program updates using guarded backends, with obsolete application-update popup and settings entry points removed",
-  "artifacts": [
-    "target/release/applicationlauncher",
-    "target/release/applicationlauncherd",
-    "~/repos/xfce4-terminal/build/terminal/xfce4-terminal"
-  ],
+  "artifacts": ["target/release/applicationlauncher", "target/release/applicationlauncherd", "~/repos/xfce4-terminal/build/terminal/xfce4-terminal"],
   "requirements": [
-    {
-      "id": "AU-CODEX-RETURN-SHELL",
-      "contract": "Restarted Codex retains an interactive Fish parent so success, failure and Ctrl+C return to a usable prompt without closing the tab. Exact conversation, literal argv including argv[0], cwd and the window-only running application build are preserved. A running Fish ancestor is pinned rather than upgraded; otherwise a verified installed Fish is prepared before interruption. Both native images and a portable continuation command are saved in the private recovery plan; shell build changes invalidate the preview. The old release must fail the normal-quit window regression, while native, compatibility, no-tab-API and daemon-restart cases keep the same restored window and tab alive.",
-      "owner": "src/lifecycle/window.py and src/lifecycle/worker.py",
-      "tests": [
-        "tests/test_lifecycle_return_shell.py::ReturnShell",
-        "tests/application_update_native.py",
-        "terminal-update-wayland-codex",
-        "terminal-update-wayland-confirmed-daemon-restart",
-        "terminal-update-wayland-external-codex",
-        "terminal-update-wayland-external-without-tab-api"
-      ]
-    },
-    {
-      "id": "AU-MENU",
-      "contract": "The old Update application menu and standalone popup are removed; both settings layouts omit terminal maintenance and idle-Codex controls without invoking or deleting their backends",
-      "owner": "src/app/maintenance_ui_tests.rs",
-      "tests": [
-        "maintenance_actions_are_absent_from_menu_settings_and_popup_wiring",
-        "deferred_settings_hide_maintenance_controls_without_touching_retained_jobs",
-        "maintenance_backend_apis_remain_available_without_invoking_them"
-      ]
-    },
-    {
-      "id": "AU-WINDOW-MENU",
-      "contract": "Update window appears immediately above Open window in the window-list context menu. It targets only the exact supported main window owner, never a foreground Codex/Pi/shell or tmux server, and opens the shared Show Info scope/confirmation modal without starting work. Only explicit This window or All outdated windows choices emit their respective scoped requests. Cancellation, Escape and default Enter never update anything; unsupported/invalid owners cannot open the chooser. Launcher navigation and search refocusing stay suspended while the chooser is open. Open window remains independently usable, and direct progress/errors use the launcher inline status.",
-      "owner": "src/app/view.rs",
-      "tests": [
-        "update_window_targets_the_terminal_owner_not_its_foreground_application_or_tmux_server",
-        "update_window_is_unavailable_for_unsupported_owners_and_invalid_window_identities",
-        "update_window_menu_item_precedes_open_window_and_requires_the_shared_confirmation",
-        "inline_terminal_update_status_preserves_scroll_selection_and_expanded_sections",
-        "automatic_single_window_update_never_falls_back_to_another_window",
-        "up_to_date_terminal_cannot_be_selected_or_restarted_even_with_stale_selection"
-      ]
-    },
-    {
-      "id": "AU-INFO-SERVER",
-      "contract": "The tmux-server popup offers only whole-server replacement, lists all sessions and pane applications including detached sessions, requires explicit interruption consent and matches PID/start/socket to the captured header; stale, missing or unsupported scope and cancellation cannot start a restart",
-      "owner": "src/popups/updates/tmux.rs",
-      "tests": [
-        "server_popup_only_offers_server_restart_and_requires_explicit_consent",
-        "server_popup_refuses_stale_missing_ambiguous_and_unsupported_scope",
-        "server_popup_cancel_escape_and_default_enter_never_start_an_update",
-        "opening_server_update_is_read_only_and_isolated_from_other_info_windows",
-        "native_info_server_link_opens_the_server_modal_without_terminal_update_events",
-        "server_popup_controls_remain_visible_in_a_small_info_window",
-        "tests/test_application_updates.py::Guards.test_server_scope_lists_every_pane_and_detached_session_with_exact_identity",
-        "tests/application_update_native.py"
-      ]
-    },
-    {
-      "id": "AU-INFO-PROGRAM",
-      "contract": "Verified outdated Fish and Codex headers offer an inline Update link and per-info-window confirmation for only that exact PID/start-time/application. Read-only scoped previews do not scan or restart the entire tmux server. Explicit consent restarts the program in its existing native tab or pane, preserving terminal/server/other-pane identities and Codex's exact conversation. Foreground applications, jobs, stale process IDs and ambiguous or missing scope refuse the restart, never retargeting another application. Cancellation, opening clicks, default Enter, duplicate requests and completed jobs cannot start an update; controls remain reachable in small windows.",
-      "owner": "src/popups/updates/program.rs",
-      "tests": [
-        "program_update_target_requires_an_outdated_exact_fish_or_codex_in_a_terminal",
-        "fish_and_codex_update_links_emit_only_the_exact_program_without_toggling_sections",
-        "program_confirmation_restarts_only_the_verified_fish_or_codex_after_consent",
-        "program_cancel_escape_backdrop_and_default_enter_never_start_an_update",
-        "program_scope_rejects_changed_pid_start_kind_window_missing_and_ambiguous_metadata",
-        "program_dialog_opening_is_read_only_independent_and_does_not_retarget_running_work",
-        "program_dialog_controls_remain_visible_and_usable_in_a_small_info_window",
-        "busy_failed_and_completed_program_jobs_cannot_be_started_again",
-        "program_identities_require_exact_supported_processes_and_scope_survives_serialization",
-        "tests/test_application_updates.py::ProgramUpdates",
-        "tests/application_update_native.py"
-      ]
-    },
-    {
-      "id": "AU-INFO-SCOPE",
-      "contract": "Show Info asks for this exact window or all outdated terminal windows and explains in-place placement, tmux reattachment and non-tmux application restart; This window confirms a direct update after fresh validation, while All outdated windows retains preview and confirmation. The opening click cannot choose a scope, cancellation never starts work, Escape leaves Show Info open and independent Info windows keep independent dialogs",
-      "owner": "src/popups/updates.rs",
-      "tests": [
-        "native_info_update_link_opens_a_cancellable_scope_dialog_and_emits_scoped_update_events",
-        "terminal_update_popup_explains_in_place_reattachment_and_application_restart",
-        "terminal_maintenance_preview_explains_tmux_reattachment_vs_application_restart",
-        "update_scope_choices_only_emit_a_scoped_request_after_an_explicit_choice",
-        "update_scope_cancel_escape_and_backdrop_discard_the_request",
-        "update_scope_dialog_is_isolated_to_its_info_window",
-        "opening_from_info_resets_consent_and_only_single_window_choices_start_automatically",
-        "opening_from_info_does_not_change_an_already_running_update"
-      ]
-    },
-    {
-      "id": "AU-CONSENT",
-      "contract": "Retained restart APIs require an eligible scope from a fresh preview and explicit confirmation; stale or unconfirmed requests cannot start a restart and structured server scope remains compatible with older report readers",
-      "owner": "src/lifecycle/application_update.rs",
-      "tests": [
-        "update_registry_requires_fresh_explicit_scope_and_is_idempotent",
-        "changed_or_expired_restart_preview_cannot_be_committed",
-        "restart_actions_preserve_structured_server_scope_and_read_older_reports"
-      ]
-    },
-    {
-      "id": "AU-ONE-WINDOW",
-      "contract": "This-window updates start once after background validation of that exact window, without another launcher confirmation or the maintenance viewport. Progress and blocking errors appear inline in the originating Show Info window, preserving scrolling, text selection and expanded sections. Completed direct requests release the background UI while retaining their inline result. Missing APIs and unsupported windows never fall back to bulk review, forced restarts or another window; busy/pending work cannot be retargeted or queued. Bulk actions retain their separate reviewed workflow",
-      "owner": "src/app/terminal_maintenance.rs",
-      "tests": [
-        "direct_info_updates_start_once_without_a_review_viewport",
-        "direct_info_updates_never_fall_back_to_a_review_window_on_failure_or_completion",
-        "direct_info_updates_do_not_retarget_pending_or_running_work",
-        "completed_direct_requests_stop_background_ui_and_keep_the_inline_result",
-        "direct_terminal_update_status_is_inline_and_does_not_open_another_viewport_or_confirmation",
-        "unsupported_direct_terminal_update_shows_a_dismissible_error_without_arming_a_restart",
-        "inline_terminal_update_status_preserves_scroll_selection_and_expanded_sections",
-        "confirmed_single_window_starts_once_without_bulk_selection_or_another_confirmation",
-        "automatic_single_window_update_waits_for_a_ready_preview",
-        "automatic_single_window_update_never_falls_back_to_another_window",
-        "automatic_single_window_update_respects_cancellation_errors_and_bulk_review",
-        "this_window_preview_never_includes_another_preselected_terminal_in_the_request"
-      ]
-    },
-    {
-      "id": "AU-BACKUP",
-      "contract": "A private fsynced recovery plan must be created before disruption and cannot overwrite existing files or follow symlinks",
-      "owner": "src/lifecycle/application_update.rs",
-      "tests": [
-        "backup_is_private_durable_and_never_overwrites_an_existing_file_or_symlink"
-      ]
-    },
-    {
-      "id": "AU-GUARDS",
-      "contract": "Changed process/binary/session identities, stale previews, unsupported recipes, shell sibling jobs, grouped/linked tmux sessions and unknown Codex session IDs are refused",
-      "owner": "src/lifecycle/worker.py",
-      "tests": [
-        "tests/test_application_updates.py::Guards",
-        "tests/test_application_updates.py::PrivateTmux.test_linked_windows_are_rejected_without_stopping_a_session"
-      ]
-    },
-    {
-      "id": "AU-CODEX",
-      "contract": "Only the selected Codex main conversation is restarted, with its exact UUID and supported launch/permission options, never --last. Open child-agent rollouts are excluded only after verifying their parent chain reaches that main conversation; conflicting roots, invalid metadata and unknown lineage still refuse the restart",
-      "owner": "src/lifecycle/worker.py",
-      "tests": [
-        "tests/application_update_native.py",
-        "tests/test_application_updates.py::CodexSessions",
-        "tests/test_application_updates.py::Guards.test_codex_preserves_permissions_and_configuration_without_replaying_prompts"
-      ]
-    },
-    {
-      "id": "AU-PI",
-      "contract": "Pi Radiance panes are recognized as applications separately from their Bash launcher and SSH helper. A sealed launcher and PID/start-bound activity fingerprint must identify one exact project session header, with inode-verified history migration identities; no --session last fallback, prompt replay or unknown jobs are allowed. Execution revalidates session/launch identities, waits for graceful launcher/tunnel exit and verifies the restored session and installed application, not merely Node's binary. Whole-server previews retain the native terminal handoff requirement and identify the session whose terminal must be updated first",
-      "owner": "src/lifecycle/worker.py",
-      "tests": [
-        "tests/test_application_updates.py::PiSessions",
-        "tests/test_application_updates.py::Guards.test_server_preview_names_the_session_whose_terminal_cannot_be_replaced"
-      ]
-    },
-    {
-      "id": "AU-PLACEMENT",
-      "contract": "Native replacement preserves terminal process, window/tab UUIDs, window coordinates and size",
-      "owner": "~/repos/xfce4-terminal/terminal/terminal-restart.c",
-      "tests": [
-        "tests/application_update_native.py (Xvfb)",
-        "tests/application_update_native.py --wayland (isolated software KWin)"
-      ]
-    },
-    {
-      "id": "AU-TMUX",
-      "contract": "Whole-server restart recreates supported sessions, windows, panes, layouts and cwd, and reconnects local clients in their original native tabs before releasing program startup gates",
-      "owner": "src/lifecycle/worker.py",
-      "tests": [
-        "tests/test_application_updates.py::PrivateTmux.test_actual_server_recreation_preserves_sessions_windows_panes_layouts_and_directories",
-        "tests/application_update_native.py"
-      ]
-    },
-    {
-      "id": "AU-TMUX-STARTUP",
-      "contract": "Before disruption, the installed replacement rehearses all sessions and layouts behind closed application gates on a short private socket, then stops without changing the original server. Persistent startup failure is refused before preparing tabs or stopping programs. A confirmed unexpected first-start exit with no listener is retried at most three times; occupied listeners are never adopted or killed. Later commands use the pinned replacement process/socket with auto-start disabled. Verified old-server exit survives a lost shutdown acknowledgement. A private durable stage journal retains startup errors, server identity and rebuilt pane/client mappings, and uncommitted tab holds are released on all failures. A replacement startup exit must still restore the exact Codex conversation and both original native window/tab identities and geometries without duplicate clients.",
-      "owner": "src/lifecycle/worker.py",
-      "tests": [
-        "tests/test_application_updates.py::PrivateTmux.test_server_startup_exit_after_shutdown_retries_without_losing_the_saved_sessions",
-        "tests/test_application_updates.py::PrivateTmux.test_shutdown_acknowledgement_loss_still_restores_sessions_after_the_old_server_exits",
-        "tests/test_application_updates.py::PrivateTmux.test_private_startup_check_never_opens_program_gates_or_changes_the_original_server",
-        "tests/test_application_updates.py::PrivateTmux.test_permanent_startup_failure_is_refused_before_tabs_or_applications_are_interrupted",
-        "tests/test_application_updates.py::PrivateTmux.test_recreation_never_adopts_or_kills_an_already_running_server",
-        "tests/test_application_updates.py::PrivateTmux.test_gated_server_loss_between_sessions_does_not_start_another_server",
-        "tests/test_application_updates.py::PrivateTmux.test_restart_journal_retains_stages_and_exact_rebuilt_pane_mapping",
-        "tests/application_update_native.py"
-      ]
-    },
-    {
-      "id": "AU-MOSH-DISCONNECT",
-      "contract": "Verified same-user mosh-backed tmux clients do not require a native terminal-tab handoff. The read-only preview lists each remote client PID/session and requires explicit acceptance of disconnection. The confirmed whole-server shutdown disconnects them without directly killing mosh, while recreating their sessions detached unless a local client reconnects. Remote client PID/start/build/ancestry and the complete attached-client list are revalidated before interruption and again before shutdown; missing or changed clients, unproven transports and unsupported local tabs remain blocked. Remote scope metadata survives report serialization and older reports still parse.",
-      "owner": "src/lifecycle/worker.py",
-      "tests": [
-        "tests/test_application_updates.py::RemoteMoshClients",
-        "tests/test_application_updates.py::PrivateTmux.test_confirmed_server_restart_disconnects_the_remote_client_and_recreates_its_detached_session",
-        "server_popup_lists_remote_disconnects_before_accepting_the_server_restart",
-        "server_popup_refuses_invalid_or_ambiguous_remote_disconnect_scopes",
-        "restart_actions_preserve_structured_server_scope_and_read_older_reports"
-      ]
-    },
-    {
-      "id": "AU-TMUX-COLOUR",
-      "contract": "Whole-server replacement captures the original server's allowlisted global colour preferences, including absent overrides. Startup must not leak the updater's NO_COLOR, FORCE_COLOR or other colour overrides into the replacement server or panes, while preserving intentional original no-colour settings. The snapshot excludes other environment values.",
-      "owner": "src/lifecycle/worker.py",
-      "tests": [
-        "tests/test_application_updates.py::PrivateTmux.test_server_recreation_does_not_inherit_the_updaters_no_color_override",
-        "tests/test_application_updates.py::PrivateTmux.test_server_recreation_preserves_intentional_original_colour_preferences"
-      ]
-    },
-    {
-      "id": "AU-PANE-SCOPE",
-      "contract": "One-pane restart leaves the server and other panes running",
-      "owner": "src/lifecycle/worker.py",
-      "tests": [
-        "tests/test_application_updates.py::PrivateTmux.test_one_pane_restart_does_not_restart_server_or_other_pane",
-        "tests/application_update_native.py"
-      ]
-    },
-    {
-      "id": "AU-LIFECYCLE",
-      "contract": "Confirmed jobs run as independent transient user services and survive GUI/daemon replacement; private durable results are available to an empty registry, interrupted workers fail without automatic replay, and a cross-process lock excludes overlapping restarts and session restores",
-      "owner": "src/lifecycle/mod.rs",
-      "tests": [
-        "update_registry_requires_fresh_explicit_scope_and_is_idempotent",
-        "changed_or_expired_restart_preview_cannot_be_committed",
-        "inspection_workers_are_bounded_without_evicting_running_jobs",
-        "completed_or_interrupted_program_reports_survive_an_empty_registry",
-        "native_restore_locks_share_the_lifecycle_worker_exclusion_boundary",
-        "native_lifecycle_jobs_exclude_restores_and_transient_snapshot_persistence",
-        "embedded_worker_publishes_a_minimal_identity_and_a_durable_failure_without_a_session_bus",
-        "terminal-update-wayland-confirmed-daemon-restart"
-      ]
-    },
-    {
-      "id": "AU-WINDOW-COORDINATOR",
-      "contract": "Whole-window updates use the same application adapters as standalone program/server updates. All commands and the placed, gated replacement are prepared before interruption. Native holds keep enhanced terminals open through application verification; older terminals may close normally when their child exits, with recovery records already persisted. Non-tmux shutdown is graceful and cancellation or failure never silently retries or retargets another conversation. The terminal helper has no application-specific resume policy",
-      "owner": "src/lifecycle/window.py",
-      "tests": [
-        "tests/test_lifecycle_windows.py::Coordinator",
-        "tests/test_lifecycle_windows.py::SharedAdapters.test_terminal_source_contains_no_application_detection_or_resume_policy",
-        "terminal-update-wayland-codex",
-        "private_bus_update_requests_are_delegated_once_and_ambiguous_windows_are_refused"
-      ]
-    },
-    {
-      "id": "AU-WINDOW-COMPAT",
-      "contract": "Missing old-terminal update/hold APIs select daemon-owned CLI startup and exact KWin placement/closure. Read-only native tab metadata is optional; without it require one actual window per process and one verified controlling PTY. No process-kill, arbitrary command replay, ambiguous window mapping or unsupported job shutdown is allowed. Startup gates retain PTY stdin and literal argv, wait for asynchronous tab PID publication, authenticate every peer, and verify all replacement tabs before interruption. Confirmed external workers survive daemon termination.",
-      "owner": "src/lifecycle/external.py",
-      "tests": [
-        "tests/test_lifecycle_external.py",
-        "terminal-update-wayland-external-shell",
-        "terminal-update-wayland-external-tmux",
-        "terminal-update-wayland-external-codex",
-        "terminal-update-wayland-external-without-tab-api"
-      ]
-    },
-    {
-      "id": "AU-WINDOW-BUILD",
-      "contract": "Terminal-only updates retain the original native application image even if deleted, and save content-addressed recovery images with literal durable argv before disruption; latest installed application builds are used only by explicit application updates. Only allowlisted terminal colour/locale environment metadata is persisted",
-      "owner": "src/lifecycle/window.py",
-      "tests": [
-        "tests/test_lifecycle_windows.py::SharedAdapters.test_window_planning_uses_the_shared_adapter_and_pins_the_running_build",
-        "tests/test_lifecycle_windows.py::SharedAdapters.test_terminal_environment_preserves_only_allowlisted_values_and_absence",
-        "terminal-update-wayland-codex"
-      ]
-    }
+    {"id": "AU-CODEX-RETURN-SHELL", "contract": "Restarted Codex retains an interactive Fish parent so success, failure and Ctrl+C return to a usable prompt without closing the tab. Exact conversation, literal argv including argv[0], cwd and the window-only running application build are preserved. A running Fish ancestor is pinned rather than upgraded; otherwise a verified installed Fish is prepared before interruption. Both native images and a portable continuation command are saved in the private recovery plan; shell build changes invalidate the preview. The old release must fail the normal-quit window regression, while native, compatibility, no-tab-API and daemon-restart cases keep the same restored window and tab alive.", "owner": "src/lifecycle/window.py and src/lifecycle/worker.py", "tests": ["tests/test_lifecycle_return_shell.py::ReturnShell", "tests/application_update_native.py", "terminal-update-wayland-codex", "terminal-update-wayland-confirmed-daemon-restart", "terminal-update-wayland-external-codex", "terminal-update-wayland-external-without-tab-api"]},
+    {"id": "AU-MENU", "contract": "The old Update application menu and standalone popup are removed; both settings layouts omit terminal maintenance and idle-Codex controls without invoking or deleting their backends", "owner": "src/app/maintenance_ui_tests.rs", "tests": ["maintenance_actions_are_absent_from_menu_settings_and_popup_wiring", "deferred_settings_hide_maintenance_controls_without_touching_retained_jobs", "maintenance_backend_apis_remain_available_without_invoking_them"]},
+    {"id": "AU-WINDOW-MENU", "contract": "Update window appears immediately above Open window in the window-list context menu. It targets only the exact supported main window owner, never a foreground Codex/Pi/shell or tmux server, and opens the shared Show Info scope/confirmation modal without starting work. Only explicit This window or All outdated windows choices emit their respective scoped requests. Cancellation, Escape and default Enter never update anything; unsupported/invalid owners cannot open the chooser. Launcher navigation and search refocusing stay suspended while the chooser is open. Open window remains independently usable, and direct progress/errors use the launcher inline status.", "owner": "src/app/view.rs", "tests": ["update_window_targets_the_terminal_owner_not_its_foreground_application_or_tmux_server", "update_window_is_unavailable_for_unsupported_owners_and_invalid_window_identities", "update_window_menu_item_precedes_open_window_and_requires_the_shared_confirmation", "inline_terminal_update_status_preserves_scroll_selection_and_expanded_sections", "automatic_single_window_update_never_falls_back_to_another_window", "up_to_date_terminal_cannot_be_selected_or_restarted_even_with_stale_selection"]},
+    {"id": "AU-INFO-LINK", "contract": "Verified outdated xfce4-terminal window owners and associated tmux servers have a text-height inline Update hyperlink; main CopyQ window owners also have a service-restart link independent of build status. Normal/high DPI and collapsed/expanded headers retain their layout and independent dropdown behavior", "owner": "src/popups/tree.rs", "tests": ["terminal_update_target_requires_a_verified_outdated_terminal_window_owner", "only_the_verified_outdated_tmux_server_has_a_server_update_target", "outdated_terminal_update_link_is_inline_text_height_and_does_not_toggle_the_tree", "update_link_is_absent_for_current_unknown_and_unsupported_processes", "copyq_update_link_remains_inline_for_current_outdated_and_unknown_builds"]},
+    {"id": "AU-INFO-COPYQ", "contract": "The main CopyQ process opens a per-info-window confirmation modal; only explicit Restart CopyQ invokes the exact fixed user autostart service restart, asynchronously and without duplicate requests, automatic retries or shell execution. Cancel, Escape, backdrop, default Enter and stale identities cannot restart it. Tests inject an executor and never restart live CopyQ", "owner": "src/popups/updates/copyq.rs", "tests": ["copyq_update_target_is_only_the_main_window_owner_independent_of_build_status", "copyq_dialog_requires_confirmation_and_explains_the_exact_service_restart", "copyq_cancel_escape_backdrop_and_default_enter_never_confirm_a_restart", "copyq_busy_success_and_failure_disable_repeated_restarts", "copyq_opening_is_read_only_and_modal_state_belongs_to_its_info_window", "copyq_restart_uses_only_the_requested_user_service_without_a_shell", "copyq_restart_worker_runs_once_and_never_queues_another_window_or_retries"]},
+    {"id": "AU-INFO-SERVER", "contract": "The tmux-server popup offers only whole-server replacement, lists all sessions and pane applications including detached sessions, requires explicit interruption consent and matches PID/start/socket to the captured header; stale, missing or unsupported scope and cancellation cannot start a restart", "owner": "src/popups/updates/tmux.rs", "tests": ["server_popup_only_offers_server_restart_and_requires_explicit_consent", "server_popup_refuses_stale_missing_ambiguous_and_unsupported_scope", "server_popup_cancel_escape_and_default_enter_never_start_an_update", "opening_server_update_is_read_only_and_isolated_from_other_info_windows", "native_info_server_link_opens_the_server_modal_without_terminal_update_events", "server_popup_controls_remain_visible_in_a_small_info_window", "tests/test_application_updates.py::Guards.test_server_scope_lists_every_pane_and_detached_session_with_exact_identity", "tests/application_update_native.py"]},
+    {"id": "AU-INFO-PROGRAM", "contract": "Verified outdated Fish and Codex headers offer an inline Update link and per-info-window confirmation for only that exact PID/start-time/application. Read-only scoped previews do not scan or restart the entire tmux server. Explicit consent restarts the program in its existing native tab or pane, preserving terminal/server/other-pane identities and Codex's exact conversation. Foreground applications, jobs, stale process IDs and ambiguous or missing scope refuse the restart, never retargeting another application. Cancellation, opening clicks, default Enter, duplicate requests and completed jobs cannot start an update; controls remain reachable in small windows.", "owner": "src/popups/updates/program.rs", "tests": ["program_update_target_requires_an_outdated_exact_fish_or_codex_in_a_terminal", "fish_and_codex_update_links_emit_only_the_exact_program_without_toggling_sections", "program_confirmation_restarts_only_the_verified_fish_or_codex_after_consent", "program_cancel_escape_backdrop_and_default_enter_never_start_an_update", "program_scope_rejects_changed_pid_start_kind_window_missing_and_ambiguous_metadata", "program_dialog_opening_is_read_only_independent_and_does_not_retarget_running_work", "program_dialog_controls_remain_visible_and_usable_in_a_small_info_window", "busy_failed_and_completed_program_jobs_cannot_be_started_again", "program_identities_require_exact_supported_processes_and_scope_survives_serialization", "tests/test_application_updates.py::ProgramUpdates", "tests/application_update_native.py"]},
+    {"id": "AU-INFO-SCOPE", "contract": "Show Info asks for this exact window or all outdated terminal windows and explains in-place placement, tmux reattachment and non-tmux application restart; This window confirms a direct update after fresh validation, while All outdated windows retains preview and confirmation. The opening click cannot choose a scope, cancellation never starts work, Escape leaves Show Info open and independent Info windows keep independent dialogs", "owner": "src/popups/updates.rs", "tests": ["native_info_update_link_opens_a_cancellable_scope_dialog_and_emits_scoped_update_events", "terminal_update_popup_explains_in_place_reattachment_and_application_restart", "terminal_maintenance_preview_explains_tmux_reattachment_vs_application_restart", "update_scope_choices_only_emit_a_scoped_request_after_an_explicit_choice", "update_scope_cancel_escape_and_backdrop_discard_the_request", "update_scope_dialog_is_isolated_to_its_info_window", "opening_from_info_resets_consent_and_only_single_window_choices_start_automatically", "opening_from_info_does_not_change_an_already_running_update"]},
+    {"id": "AU-CONSENT", "contract": "Retained restart APIs require an eligible scope from a fresh preview and explicit confirmation; stale or unconfirmed requests cannot start a restart and structured server scope remains compatible with older report readers", "owner": "src/lifecycle/application_update.rs", "tests": ["update_registry_requires_fresh_explicit_scope_and_is_idempotent", "changed_or_expired_restart_preview_cannot_be_committed", "restart_actions_preserve_structured_server_scope_and_read_older_reports"]},
+    {"id": "AU-ONE-WINDOW", "contract": "This-window updates start once after background validation of that exact window, without another launcher confirmation or the maintenance viewport. Progress and blocking errors appear inline in the originating Show Info window, preserving scrolling, text selection and expanded sections. Completed direct requests release the background UI while retaining their inline result. Missing APIs and unsupported windows never fall back to bulk review, forced restarts or another window; busy/pending work cannot be retargeted or queued. Bulk actions retain their separate reviewed workflow", "owner": "src/app/terminal_maintenance.rs", "tests": ["direct_info_updates_start_once_without_a_review_viewport", "direct_info_updates_never_fall_back_to_a_review_window_on_failure_or_completion", "direct_info_updates_do_not_retarget_pending_or_running_work", "completed_direct_requests_stop_background_ui_and_keep_the_inline_result", "direct_terminal_update_status_is_inline_and_does_not_open_another_viewport_or_confirmation", "unsupported_direct_terminal_update_shows_a_dismissible_error_without_arming_a_restart", "inline_terminal_update_status_preserves_scroll_selection_and_expanded_sections", "confirmed_single_window_starts_once_without_bulk_selection_or_another_confirmation", "automatic_single_window_update_waits_for_a_ready_preview", "automatic_single_window_update_never_falls_back_to_another_window", "automatic_single_window_update_respects_cancellation_errors_and_bulk_review", "this_window_preview_never_includes_another_preselected_terminal_in_the_request"]},
+    {"id": "AU-BACKUP", "contract": "A private fsynced recovery plan must be created before disruption and cannot overwrite existing files or follow symlinks", "owner": "src/lifecycle/application_update.rs", "tests": ["backup_is_private_durable_and_never_overwrites_an_existing_file_or_symlink"]},
+    {"id": "AU-GUARDS", "contract": "Changed process/binary/session identities, stale previews, unsupported recipes, shell sibling jobs, grouped/linked tmux sessions and unknown Codex session IDs are refused", "owner": "src/lifecycle/worker.py", "tests": ["tests/test_application_updates.py::Guards", "tests/test_application_updates.py::PrivateTmux.test_linked_windows_are_rejected_without_stopping_a_session"]},
+    {"id": "AU-CODEX", "contract": "Only the selected Codex main conversation is restarted, with its exact UUID and supported launch/permission options, never --last. Open child-agent rollouts are excluded only after verifying their parent chain reaches that main conversation; conflicting roots, invalid metadata and unknown lineage still refuse the restart", "owner": "src/lifecycle/worker.py", "tests": ["tests/application_update_native.py", "tests/test_application_updates.py::CodexSessions", "tests/test_application_updates.py::Guards.test_codex_preserves_permissions_and_configuration_without_replaying_prompts"]},
+    {"id": "AU-PI", "contract": "Pi Radiance panes are recognized as applications separately from their Bash launcher and SSH helper. A sealed launcher and PID/start-bound activity fingerprint must identify one exact project session header, with inode-verified history migration identities; no --session last fallback, prompt replay or unknown jobs are allowed. Execution revalidates session/launch identities, waits for graceful launcher/tunnel exit and verifies the restored session and installed application, not merely Node's binary. Whole-server previews retain the native terminal handoff requirement and identify the session whose terminal must be updated first", "owner": "src/lifecycle/worker.py", "tests": ["tests/test_application_updates.py::PiSessions", "tests/test_application_updates.py::Guards.test_server_preview_names_the_session_whose_terminal_cannot_be_replaced"]},
+    {"id": "AU-PLACEMENT", "contract": "Native replacement preserves terminal process, window/tab UUIDs, window coordinates and size", "owner": "~/repos/xfce4-terminal/terminal/terminal-restart.c", "tests": ["tests/application_update_native.py (Xvfb)", "tests/application_update_native.py --wayland (isolated software KWin)"]},
+    {"id": "AU-TMUX", "contract": "Whole-server restart recreates supported sessions, windows, panes, layouts and cwd, and reconnects local clients in their original native tabs before releasing program startup gates", "owner": "src/lifecycle/worker.py", "tests": ["tests/test_application_updates.py::PrivateTmux.test_actual_server_recreation_preserves_sessions_windows_panes_layouts_and_directories", "tests/application_update_native.py"]},
+    {"id": "AU-TMUX-STARTUP", "contract": "Before disruption, the installed replacement rehearses all sessions and layouts behind closed application gates on a short private socket, then stops without changing the original server. Persistent startup failure is refused before preparing tabs or stopping programs. A confirmed unexpected first-start exit with no listener is retried at most three times; occupied listeners are never adopted or killed. Later commands use the pinned replacement process/socket with auto-start disabled. Verified old-server exit survives a lost shutdown acknowledgement. A private durable stage journal retains startup errors, server identity and rebuilt pane/client mappings, and uncommitted tab holds are released on all failures. A replacement startup exit must still restore the exact Codex conversation and both original native window/tab identities and geometries without duplicate clients.", "owner": "src/lifecycle/worker.py", "tests": ["tests/test_application_updates.py::PrivateTmux.test_server_startup_exit_after_shutdown_retries_without_losing_the_saved_sessions", "tests/test_application_updates.py::PrivateTmux.test_shutdown_acknowledgement_loss_still_restores_sessions_after_the_old_server_exits", "tests/test_application_updates.py::PrivateTmux.test_private_startup_check_never_opens_program_gates_or_changes_the_original_server", "tests/test_application_updates.py::PrivateTmux.test_permanent_startup_failure_is_refused_before_tabs_or_applications_are_interrupted", "tests/test_application_updates.py::PrivateTmux.test_recreation_never_adopts_or_kills_an_already_running_server", "tests/test_application_updates.py::PrivateTmux.test_gated_server_loss_between_sessions_does_not_start_another_server", "tests/test_application_updates.py::PrivateTmux.test_restart_journal_retains_stages_and_exact_rebuilt_pane_mapping", "tests/application_update_native.py"]},
+    {"id": "AU-MOSH-DISCONNECT", "contract": "Verified same-user mosh-backed tmux clients do not require a native terminal-tab handoff. The read-only preview lists each remote client PID/session and requires explicit acceptance of disconnection. The confirmed whole-server shutdown disconnects them without directly killing mosh, while recreating their sessions detached unless a local client reconnects. Remote client PID/start/build/ancestry and the complete attached-client list are revalidated before interruption and again before shutdown; missing or changed clients, unproven transports and unsupported local tabs remain blocked. Remote scope metadata survives report serialization and older reports still parse.", "owner": "src/lifecycle/worker.py", "tests": ["tests/test_application_updates.py::RemoteMoshClients", "tests/test_application_updates.py::PrivateTmux.test_confirmed_server_restart_disconnects_the_remote_client_and_recreates_its_detached_session", "server_popup_lists_remote_disconnects_before_accepting_the_server_restart", "server_popup_refuses_invalid_or_ambiguous_remote_disconnect_scopes", "restart_actions_preserve_structured_server_scope_and_read_older_reports"]},
+    {"id": "AU-TMUX-COLOUR", "contract": "Whole-server replacement captures the original server's allowlisted global colour preferences, including absent overrides. Startup must not leak the updater's NO_COLOR, FORCE_COLOR or other colour overrides into the replacement server or panes, while preserving intentional original no-colour settings. The snapshot excludes other environment values.", "owner": "src/lifecycle/worker.py", "tests": ["tests/test_application_updates.py::PrivateTmux.test_server_recreation_does_not_inherit_the_updaters_no_color_override", "tests/test_application_updates.py::PrivateTmux.test_server_recreation_preserves_intentional_original_colour_preferences"]},
+    {"id": "AU-PANE-SCOPE", "contract": "One-pane restart leaves the server and other panes running", "owner": "src/lifecycle/worker.py", "tests": ["tests/test_application_updates.py::PrivateTmux.test_one_pane_restart_does_not_restart_server_or_other_pane", "tests/application_update_native.py"]},
+    {"id": "AU-LIFECYCLE", "contract": "Confirmed jobs run as independent transient user services and survive GUI/daemon replacement; private durable results are available to an empty registry, interrupted workers fail without automatic replay, and a cross-process lock excludes overlapping restarts and session restores", "owner": "src/lifecycle/mod.rs", "tests": ["update_registry_requires_fresh_explicit_scope_and_is_idempotent", "changed_or_expired_restart_preview_cannot_be_committed", "inspection_workers_are_bounded_without_evicting_running_jobs", "completed_or_interrupted_program_reports_survive_an_empty_registry", "native_restore_locks_share_the_lifecycle_worker_exclusion_boundary", "native_lifecycle_jobs_exclude_restores_and_transient_snapshot_persistence", "embedded_worker_publishes_a_minimal_identity_and_a_durable_failure_without_a_session_bus", "terminal-update-wayland-confirmed-daemon-restart"]},
+    {"id": "AU-WINDOW-COORDINATOR", "contract": "Whole-window updates use the same application adapters as standalone program/server updates. All commands and the placed, gated replacement are prepared before interruption. Native holds keep enhanced terminals open through application verification; older terminals may close normally when their child exits, with recovery records already persisted. Non-tmux shutdown is graceful and cancellation or failure never silently retries or retargets another conversation. The terminal helper has no application-specific resume policy", "owner": "src/lifecycle/window.py", "tests": ["tests/test_lifecycle_windows.py::Coordinator", "tests/test_lifecycle_windows.py::SharedAdapters.test_terminal_source_contains_no_application_detection_or_resume_policy", "terminal-update-wayland-codex", "private_bus_update_requests_are_delegated_once_and_ambiguous_windows_are_refused"]},
+    {"id": "AU-WINDOW-COMPAT", "contract": "Missing old-terminal update/hold APIs select daemon-owned CLI startup and exact KWin placement/closure. Read-only native tab metadata is optional; without it require one actual window per process and one verified controlling PTY. No process-kill, arbitrary command replay, ambiguous window mapping or unsupported job shutdown is allowed. Startup gates retain PTY stdin and literal argv, wait for asynchronous tab PID publication, authenticate every peer, and verify all replacement tabs before interruption. Confirmed external workers survive daemon termination.", "owner": "src/lifecycle/external.py", "tests": ["tests/test_lifecycle_external.py", "terminal-update-wayland-external-shell", "terminal-update-wayland-external-tmux", "terminal-update-wayland-external-codex", "terminal-update-wayland-external-without-tab-api"]},
+    {"id": "AU-WINDOW-BUILD", "contract": "Terminal-only updates retain the original native application image even if deleted, and save content-addressed recovery images with literal durable argv before disruption; latest installed application builds are used only by explicit application updates. Only allowlisted terminal colour/locale environment metadata is persisted", "owner": "src/lifecycle/window.py", "tests": ["tests/test_lifecycle_windows.py::SharedAdapters.test_window_planning_uses_the_shared_adapter_and_pins_the_running_build", "tests/test_lifecycle_windows.py::SharedAdapters.test_terminal_environment_preserves_only_allowlisted_values_and_absence", "terminal-update-wayland-codex"]}
   ]
 }

@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::models::{InfoUpdateTarget, PopupEvent, TerminalMaintenanceState};
 
+mod copyq;
 mod program;
 mod tmux;
 
@@ -124,6 +125,14 @@ pub(super) fn show(
         return None;
     }
     if program::show(ctx, popup_id) {
+        return None;
+    }
+    if let Some(InfoUpdateTarget::CopyQ(process)) = clicked_target.as_ref() {
+        ctx.data_mut(|data| data.remove::<String>(id));
+        copyq::open(ctx, popup_id, *process);
+        return None;
+    }
+    if copyq::show(ctx, popup_id) {
         return None;
     }
     if let Some(InfoUpdateTarget::TmuxServer { window, server }) = clicked_target.as_ref() {

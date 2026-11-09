@@ -29,6 +29,16 @@ fn process_update_target(
     if let Some(window) = terminal_update_window(window, node, binary_is_current) {
         return Some(InfoUpdateTarget::TerminalWindow(window));
     }
+    if window.pid == Some(node.identity.pid)
+        && node.identity.pid > 1
+        && node.identity.start_ticks > 0
+        && node.executable.as_ref().is_some_and(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "copyq" || name == "copyq (deleted)")
+        })
+    {
+        return Some(InfoUpdateTarget::CopyQ(node.identity));
+    }
     if binary_is_current == Some(false)
         && !window.id.is_empty()
         && window.pid.is_some_and(|pid| pid > 1)
@@ -3440,6 +3450,55 @@ mod tests {
                 _ => node.identity.start_ticks = 0,
             }
             assert!(process_update_target(&window, &node, Some(false)).is_none());
+        }
+    }
+
+    #[test]
+    fn copyq_update_target_is_only_the_main_window_owner_independent_of_build_status() {
+        let InfoTarget::Window(mut popup) = window("copyq-window") else {
+            unreachable!();
+        };
+        popup.window.pid = Some(123);
+        let mut node = ProcessInfoNode {
+            identity: ProcessIdentity {
+                pid: 123,
+                start_ticks: 456,
+            },
+            parent_pid: 3140,
+            depth: 2,
+            name: "copyq".into(),
+            script_name: None,
+            header: "copyq (pid 123) [window owner]".into(),
+            executable_error: None,
+            cwd_error: None,
+            raw_argv0: None,
+            executable: Some("/fixture/copyq".into()),
+            executable_identity: None,
+            cwd: None,
+            command_line: None,
+        };
+        for status in [None, Some(true), Some(false)] {
+            for executable in ["/fixture/copyq", "/fixture/copyq (deleted)"] {
+                node.executable = Some(executable.into());
+                assert_eq!(
+                    process_update_target(&popup.window, &node, status),
+                    Some(InfoUpdateTarget::CopyQ(node.identity))
+                );
+            }
+        }
+        node.identity.pid += 1;
+        assert!(process_update_target(&popup.window, &node, Some(false)).is_none());
+        node.identity.pid -= 1;
+        node.identity.start_ticks = 0;
+        assert!(process_update_target(&popup.window, &node, Some(false)).is_none());
+        node.identity.start_ticks = 456;
+        for executable in [
+            None,
+            Some("/usr/bin/bash".into()),
+            Some("/usr/bin/not-copyq".into()),
+        ] {
+            node.executable = executable;
+            assert!(process_update_target(&popup.window, &node, Some(false)).is_none());
         }
     }
 

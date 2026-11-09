@@ -2810,6 +2810,43 @@ mod tests {
     }
 
     #[test]
+    fn copyq_update_link_remains_inline_for_current_outdated_and_unknown_builds() {
+        for scale in [1.0, 2.0] {
+            for status in [None, Some(true), Some(false)] {
+                for open in [false, true] {
+                    let ctx = egui::Context::default();
+                    ctx.set_pixels_per_point(scale);
+                    let mut data = tree_info();
+                    let owner = &mut data.process_tree.as_mut().unwrap().sections[0];
+                    owner.header = "copyq (pid 123) [window owner]".into();
+                    owner.binary_is_current = status;
+                    owner.default_open = open;
+                    owner.update_target =
+                        Some(InfoUpdateTarget::CopyQ(crate::models::ProcessIdentity {
+                            pid: 123,
+                            start_ticks: 456,
+                        }));
+                    let id = owner.id;
+                    let (_, editors) = tree_frame(&ctx, &data, vec![]);
+                    assert!(
+                        editors[0]
+                            .galley
+                            .job
+                            .text
+                            .contains("copyq (pid 123) [window owner]  Update\n")
+                    );
+                    let link = ctx.read_response(id.with("terminal-update-link")).unwrap();
+                    let height =
+                        ctx.fonts_mut(|fonts| fonts.row_height(&egui::FontId::monospace(13.0)));
+                    assert!((link.rect.height() - height).abs() <= 1.0);
+                    tree_frame(&ctx, &data, pointer_events(link.rect.center()));
+                    assert_eq!(process_info_section_is_open(&ctx, id, !open), open);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn update_link_is_absent_for_current_unknown_and_unsupported_processes() {
         for (status, target) in [
             (Some(true), Some("window")),
