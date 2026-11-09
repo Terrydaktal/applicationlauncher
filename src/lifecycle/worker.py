@@ -174,16 +174,109 @@ def latest_binary(name):
     return executable
 
 
+def session_uuid(value):
+    if not isinstance(value, str):
+        raise ValueError("A session ID must be a UUID string")
+    return str(uuid.UUID(value))
 
 
+def rollout_session_identity(row):
+    if not isinstance(row, dict) or row.get("type") != "session_meta":
+        raise ValueError("The rollout header is not session metadata")
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("The rollout session metadata is invalid")
+    identity = session_uuid(payload.get("id"))
+    parent_values = [payload.get("parent_thread_id")]
+    source = payload.get("source")
+    subagent = isinstance(source, dict) and "subagent" in source
+    if subagent and isinstance(source["subagent"], dict) and "thread_spawn" in source["subagent"]:
+        spawn = source["subagent"]["thread_spawn"]
+        if not isinstance(spawn, dict):
+            raise ValueError("The child-agent origin is invalid")
+        parent_values.append(spawn.get("parent_thread_id"))
+    subagent = subagent or payload.get("thread_source") == "subagent"
+    parents = {session_uuid(parent) for parent in parent_values if parent is not None}
+    if len(parents) > 1 or (subagent and not parents):
+        raise ValueError("The child-agent parent is conflicting or unavailable")
+    return identity, next(iter(parents), None)
 
 
+def session_id(saved):
+    found = set()
+    parents = {}
+    arguments = saved["arguments"]
+    for before, value in zip(arguments, arguments[1:]):
+        if before == "resume":
+            try:
+                found.add(session_uuid(value))
+            except ValueError:
+                pass
+    for index, entry in enumerate(Path(f"/proc/{saved['pid']}/fd").iterdir()):
+        if index >= 512:
+            raise Refused("Too many descriptors to identify the exact Codex session")
+        try:
+            target = Path(os.readlink(entry).removesuffix(" (deleted)"))
+            if not target.name.startswith("rollout-") or target.suffix != ".jsonl":
+                continue
+            descriptor = os.open(entry, os.O_RDONLY | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise Refused(CODEX_SESSION_ERROR + "; rollout metadata is not a regular file")
+                line = stream.readline(1024 * 1024 + 1)
+            if len(line) > 1024 * 1024:
+                raise Refused(CODEX_SESSION_ERROR + "; rollout metadata exceeds its safety limit")
+            identity, parent = rollout_session_identity(json.loads(line))
+            if identity in parents and parents[identity] != parent:
+                raise Refused(CODEX_SESSION_ERROR + "; conflicting rollout lineage")
+            parents[identity] = parent
+            if parent is None:
+                found.add(identity)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise Refused(CODEX_SESSION_ERROR + "; rollout metadata could not be verified") from error
+    if len(found) != 1:
+        raise Refused(CODEX_SESSION_ERROR)
+    root = found.pop()
+    if parents.get(root) is not None:
+        raise Refused(CODEX_SESSION_ERROR + "; the requested session is a child agent")
+    # Ignore child logs only after their complete observed lineage reaches this main conversation.
+    for identity in parents:
+        seen = set()
+        while identity != root:
+            if identity in seen or parents.get(identity) is None:
+                raise Refused(CODEX_SESSION_ERROR + "; child-agent lineage is incomplete or unrelated")
+            seen.add(identity)
+            identity = parents[identity]
+    return root
 
 
-
-
-
-
+def codex_options(arguments):
+    result, index = [], 1
+    values = {"-m", "--model", "-p", "--profile", "-c", "--config", "--sandbox", "-a", "--ask-for-approval"}
+    switches = {"--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-all-permissions",
+                "--yolo", "--full-auto", "--search", "--no-alt-screen"}
+    while index < len(arguments):
+        value = arguments[index]
+        index += 1
+        if value in ("resume", "--last"):
+            continue
+        try:
+            uuid.UUID(value)
+            continue
+        except ValueError:
+            pass
+        if value in switches:
+            result.append(value)
+        elif value in values and index < len(arguments):
+            result.extend([value, arguments[index]])
+            index += 1
+        elif any(value.startswith(option + "=") for option in values if option.startswith("--")):
+            result.append(value)
+        else:
+            raise Refused(f"Codex launch option cannot be replayed safely: {value[:80]}")
+    return result
 
 
 def owned_directory(path):
@@ -192,25 +285,178 @@ def owned_directory(path):
         raise Refused(f"Unsafe Pi metadata directory: {path}")
 
 
+def owned_json(path, header=False):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as stream:
+        metadata = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1 or metadata.st_mode & 0o022):
+            raise Refused("Unsafe Pi session/activity metadata")
+        limit = 16384 if header else 512 * 1024
+        data = stream.readline(limit + 1) if header else stream.read(limit + 1)
+        if len(data) > limit:
+            raise Refused("Pi session/activity metadata exceeds its safety limit")
+    value = json.loads(data)
+    if not isinstance(value, dict):
+        raise Refused("Invalid Pi session/activity metadata")
+    return value, [metadata.st_dev, metadata.st_ino]
 
 
+def pi_activity(saved):
+    root = Path.home() / ".local/state/qwen-r9700/pi-remote/radiance-public-clean-candidate"
+    owned_directory(root)
+    matches = []
+    for index, agent in enumerate(root.iterdir()):
+        if index >= 256:
+            raise Refused("Pi activity directory exceeds its safety limit")
+        if not agent.name.startswith("agent-") or not agent.name[6:].isdigit():
+            continue
+        directory = agent / "radiance-active"
+        path = directory / f"{saved['pid']}.json"
+        try:
+            owned_directory(agent)
+            owned_directory(directory)
+            record, _ = owned_json(path)
+        except FileNotFoundError:
+            continue
+        if (record.get("schema") != "urn:qwen-r9700:radiance-active-pi:v1"
+                or record.get("pid") != saved["pid"]
+                or record.get("process_start_ticks") != str(saved["start"])
+                or type(record.get("port")) is not int
+                or not 1 <= record["port"] <= 65535
+                or agent.name != f"agent-{record['port']}"
+                or not isinstance(record.get("chat_id"), str)
+                or len(record["chat_id"]) != 64):
+            raise Refused(PI_SESSION_ERROR + "; activity identity does not match the live process")
+        matches.append(record)
+    if len(matches) != 1:
+        raise Refused(PI_SESSION_ERROR + "; one process-bound activity record is required")
+    return matches[0]
 
 
+def pi_session(saved, activity):
+    directory = Path(saved["cwd"]) / ".pi/sessions"
+    owned_directory(directory.parent)
+    owned_directory(directory)
+    try:
+        index, _ = owned_json(directory / ".identity.json")
+        if (index.get("schema") != "urn:qwen-r9700:pi-project-history:v1"
+                or not isinstance(index.get("sessions"), dict)):
+            raise Refused("Invalid Pi project history identity index")
+        identities = index["sessions"]
+    except FileNotFoundError:
+        identities = {}
+    matches = []
+    for ordinal, path in enumerate(directory.iterdir()):
+        if ordinal >= 512:
+            raise Refused("Pi project session directory exceeds its safety limit")
+        if path.suffix != ".jsonl":
+            continue
+        header, inode = owned_json(path, header=True)
+        if header.get("type") != "session":
+            raise Refused("Invalid Pi session header")
+        identity = session_uuid(header.get("id"))
+        original = str(path)
+        if path.name in identities:
+            record = identities[path.name]
+            if (not isinstance(record, dict) or [record.get("device"), record.get("inode")] != inode
+                    or not isinstance(record.get("identity_path"), str)
+                    or not Path(record["identity_path"]).is_absolute()):
+                raise Refused("Pi project history identity no longer matches the session file")
+            original = os.path.normpath(record["identity_path"])
+        digest = hashlib.sha256(json.dumps([original, identity], ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+        if digest == activity["chat_id"]:
+            matches.append(dict(session_file=str(path), session_id=identity, session_inode=inode))
+    if len(matches) != 1:
+        raise Refused(PI_SESSION_ERROR + "; the live chat fingerprint has no unique session-header match")
+    return matches[0]
 
 
+def pi_options(arguments):
+    result, index, seen = ["--reuse-existing", "--no-install"], 0, set()
+    while index < len(arguments):
+        option = arguments[index]
+        index += 1
+        if option in seen:
+            raise Refused("Duplicate Pi launcher option")
+        seen.add(option)
+        if option in {"--reuse-existing", "--no-install"}:
+            continue
+        if option.startswith("--session="):
+            if index != len(arguments) or not option.partition("=")[2]:
+                raise Refused("Unsupported Pi session launch arguments")
+            break
+        if option not in {"--thinking", "--remote", "--local-port", "--session"} or index >= len(arguments):
+            raise Refused(f"Pi launch option cannot be replayed safely: {option[:80]}")
+        value = arguments[index]
+        index += 1
+        if option == "--session":
+            if index != len(arguments) or not value:
+                raise Refused("Unsupported Pi session launch arguments")
+            break
+        if ((option == "--thinking" and value not in {"off", "low", "medium", "xhigh"})
+                or (option == "--local-port" and (not value.isdigit() or not 1 <= int(value) <= 65535))
+                or (option == "--remote" and (not value or value.startswith("-")
+                    or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._@:-" for character in value)))):
+            raise Refused("Unsupported Pi launcher configuration")
+        result.extend([option, value])
+    return result
 
 
-
-
-
-
-
+def pi_plan(saved):
+    launcher = process(saved["parent"])
+    arguments = launcher["arguments"]
+    if (kind(launcher) != "bash" or len(arguments) < 2
+            or not arguments[1].startswith("/proc/self/fd/")
+            or not arguments[1].removeprefix("/proc/self/fd/").isdigit()
+            or any(launcher[key] != saved[key] for key in ("group", "tty", "cwd"))):
+        raise Refused("Pi requires its verified Radiance launcher; the Node process title alone is not a restart recipe")
+    script = f"/proc/{launcher['pid']}/fd/{arguments[1].rsplit('/', 1)[1]}"
+    if os.readlink(script) != f"/memfd:{PI_LAUNCHER} (deleted)":
+        raise Refused("Pi's original launcher script is unavailable or unsupported")
+    descriptor = os.open(script, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        seals = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL
+        if fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) & seals != seals:
+            raise Refused("Pi's original launcher source is not sealed")
+    finally:
+        os.close(descriptor)
+    activity = pi_activity(saved)
+    session = pi_session(saved, activity)
+    published = shutil.which(PI_LAUNCHER)
+    if not published:
+        raise Refused("No installed Pi Radiance launcher is available")
+    executable = str(Path(published).resolve(strict=True))
+    metadata = os.stat(executable)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+        raise Refused("The installed Pi launcher is unsafe")
+    helpers = []
+    for pid in children(launcher["pid"]):
+        if pid == saved["pid"]:
+            continue
+        helper = process(pid)
+        argv = helper["arguments"]
+        if (kind(helper) != "ssh" or helper["parent"] != launcher["pid"]
+                or any(helper[key] != launcher[key] for key in ("group", "tty"))
+                or argv[1:7] != ["-N", "-T", "-o", "ExitOnForwardFailure=yes", "-L", f"127.0.0.1:{activity['port']}:127.0.0.1:8080"]
+                or len(argv) != 8 or argv[7] != next((value for option, value in zip(arguments, arguments[1:]) if option == "--remote"), "lewis@ai")
+                or children(pid)):
+            raise Refused("The Pi launcher has unrelated background jobs; only its verified SSH tunnel may be restarted")
+        helpers.append(helper)
+    if len(helpers) > 1 or children(saved["pid"]):
+        raise Refused("Pi has active tool/background jobs; wait for it to become idle before restarting")
+    entry = str((Path.home() / ".local/bin/pi").resolve(strict=True))
+    result = dict(kind="pi", process=saved, launcher=launcher, helpers=helpers, cwd=saved["cwd"],
+                  argv=[executable, *pi_options(arguments[2:]), "--session", session["session_file"]],
+                  installed=file_identity(latest_binary("node")), launcher_image=file_identity(script),
+                  installed_launcher=file_identity(executable), entry_point=entry, installed_entry=file_identity(entry), **session)
+    if not same_process(saved) or not same_process(launcher):
+        raise Refused("The Pi process or launcher changed during inspection")
+    return result
 
 
 def program_plan(saved, executable=None):
     name = kind(saved)
-    if name in {"codex", "pi"}:
-        raise Refused("This application restart adapter is not enabled")
     if not os.path.isdir(saved["cwd"]):
         raise Refused("The program working directory is unavailable")
     if name == "pi":
@@ -564,7 +810,25 @@ def signature(plan):
     return hashlib.sha256(json.dumps(strip(plan), sort_keys=True).encode()).hexdigest()
 
 
-
+def stop_codex(saved):
+    if kind(saved) != "codex":
+        return
+    if not same_process(saved):
+        raise Refused("Codex process identity changed before interruption")
+    descriptor = os.pidfd_open(saved["pid"])
+    try:
+        if not same_process(saved):
+            raise Refused("Codex process identity changed before interruption")
+        for _ in range(2):
+            signal.pidfd_send_signal(descriptor, signal.SIGINT)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if not same_process(saved):
+                    return
+                time.sleep(0.05)
+        raise Refused("Codex did not exit after two graceful interrupts; no force-kill was attempted")
+    finally:
+        os.close(descriptor)
 
 
 def wait_tabs(system, leases):
@@ -586,14 +850,23 @@ def wait_tabs(system, leases):
     return completed
 
 
-
+def fish_command(executable, arguments, shell):
+    # A short exec shim preserves argv[0] independently of a pinned image path.
+    # Fish remains the interactive parent, including after an interrupt/failed exit.
+    command = ["/usr/bin/python3", "-I", "-c", "import os,sys;os.execv(sys.argv[1],sys.argv[2:])",
+               executable, *arguments]
+    return [shell, "--interactive", "--init-command", shlex.join(command)]
 
 
 def pane_command(program):
-    if program["kind"] in {"codex", "pi"}:
-        raise Refused("This application restart adapter is not enabled")
-    return program["argv"]
-
+    arguments = program["argv"]
+    if program["kind"] == "codex":
+        argv0 = program["process"]["arguments"][0]
+        return fish_command(arguments[0], [argv0, *arguments[1:]], latest_binary("fish"))
+    if program["kind"] == "pi":
+        shell = latest_binary("fish")
+        return [shell, "-lc", shlex.join(arguments) + "; exec " + shlex.quote(shell)]
+    return arguments
 
 
 def verify_program(program, root_pid):
