@@ -1000,42 +1000,16 @@ fn is_ssh_restore(restore: &RestoreSpec) -> bool {
 }
 
 fn validate_desktop_file(path: &Path) -> Result<(), LaunchUnavailable> {
-    let contents = std::fs::read_to_string(path).map_err(|err| LaunchUnavailable {
+    let entry = program_metadata::desktop::read(
+        path,
+        None,
+        std::time::Instant::now() + std::time::Duration::from_millis(100),
+    )
+    .map_err(|err| LaunchUnavailable {
         code: LaunchUnavailableCode::NonLaunchableDesktopEntry,
         detail: format!("Could not read desktop entry {}: {err}", path.display()),
     })?;
-    let mut in_desktop_entry = false;
-    let mut application_type = false;
-    let mut hidden = false;
-    let mut no_display = false;
-    let mut has_exec = false;
-    let mut dbus_activatable = false;
-    let mut try_exec = None;
-    for raw_line in contents.lines() {
-        let line = raw_line.trim();
-        if line.starts_with('[') && line.ends_with(']') {
-            in_desktop_entry = line == "[Desktop Entry]";
-            continue;
-        }
-        if !in_desktop_entry || line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        match key.trim() {
-            "Type" => application_type = value.trim() == "Application",
-            "Hidden" => hidden = value.trim().eq_ignore_ascii_case("true"),
-            "NoDisplay" => no_display = value.trim().eq_ignore_ascii_case("true"),
-            "Exec" => has_exec = !value.trim().is_empty(),
-            "TryExec" => try_exec = Some(value.trim().to_string()),
-            "DBusActivatable" => {
-                dbus_activatable = value.trim().eq_ignore_ascii_case("true");
-            }
-            _ => {}
-        }
-    }
-    if let Some(try_exec) = try_exec.filter(|value| !value.is_empty())
+    if let Some(try_exec) = entry.try_exec.filter(|value| !value.is_empty())
         && crate::process::executable_path(&try_exec).is_none()
     {
         return Err(LaunchUnavailable {
@@ -1046,7 +1020,11 @@ fn validate_desktop_file(path: &Path) -> Result<(), LaunchUnavailable> {
             ),
         });
     }
-    if application_type && !hidden && !no_display && (has_exec || dbus_activatable) {
+    if entry.entry_type.as_deref() == Some("Application")
+        && !entry.hidden
+        && !entry.no_display
+        && (entry.exec.is_some_and(|value| !value.trim().is_empty()) || entry.dbus_activatable)
+    {
         return Ok(());
     }
     Err(LaunchUnavailable {

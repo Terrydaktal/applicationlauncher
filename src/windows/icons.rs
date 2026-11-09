@@ -107,27 +107,7 @@ struct DesktopEntryMetadata {
 }
 
 fn application_dirs() -> Vec<PathBuf> {
-    let mut directories = Vec::new();
-    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
-        directories.push(PathBuf::from(data_home).join("applications"));
-    } else if let Some(home) = std::env::var_os("HOME") {
-        directories.push(PathBuf::from(home).join(".local/share/applications"));
-    }
-    let data_dirs = std::env::var_os("XDG_DATA_DIRS")
-        .map(|dirs| std::env::split_paths(&dirs).collect::<Vec<_>>())
-        .unwrap_or_else(|| {
-            vec![
-                PathBuf::from("/usr/local/share"),
-                PathBuf::from("/usr/share"),
-            ]
-        });
-    for directory in data_dirs {
-        let directory = directory.join("applications");
-        if !directories.contains(&directory) {
-            directories.push(directory);
-        }
-    }
-    directories
+    program_metadata::desktop::application_dirs()
 }
 
 fn find_terminal_child_icon(
@@ -168,28 +148,26 @@ fn find_terminal_child_icon(
 }
 
 fn parse_desktop_entry(path: &Path) -> Option<DesktopEntryMetadata> {
-    let content = std::fs::read_to_string(path).ok()?;
-    Some(parse_desktop_entry_content(&content))
+    let entry = program_metadata::desktop::read(
+        path,
+        None,
+        std::time::Instant::now() + std::time::Duration::from_millis(100),
+    )
+    .ok()?;
+    Some(DesktopEntryMetadata {
+        icon: entry.icon,
+        runs_in_terminal: entry.terminal,
+    })
 }
 
+#[cfg(test)]
 fn parse_desktop_entry_content(content: &str) -> DesktopEntryMetadata {
-    let mut metadata = DesktopEntryMetadata::default();
-    let mut in_desktop_entry = false;
-    for line in content.lines().map(str::trim) {
-        if line.starts_with('[') && line.ends_with(']') {
-            in_desktop_entry = line.eq_ignore_ascii_case("[Desktop Entry]");
-            continue;
-        }
-        if !in_desktop_entry || line.starts_with('#') {
-            continue;
-        }
-        if let Some(value) = line.strip_prefix("Icon=") {
-            metadata.icon = Some(value.trim().to_string());
-        } else if let Some(value) = line.strip_prefix("Terminal=") {
-            metadata.runs_in_terminal = value.trim().eq_ignore_ascii_case("true");
-        }
-    }
-    metadata
+    program_metadata::desktop::parse(content, None)
+        .map(|entry| DesktopEntryMetadata {
+            icon: entry.icon,
+            runs_in_terminal: entry.terminal,
+        })
+        .unwrap_or_default()
 }
 
 fn parse_icon_from_desktop(path: &Path) -> Option<String> {

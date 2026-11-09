@@ -8,6 +8,7 @@ repo_dir="$(cd -- "$(dirname -- "$script_path")/.." && pwd -P)"
 binary="$repo_dir/target/release/applicationlauncher"
 daemon_binary="$repo_dir/target/release/applicationlauncherd"
 fuzzy_rank_dir="$(cd -- "$repo_dir/../fuzzy-rank" 2>/dev/null && pwd -P || true)"
+program_metadata_dir="$(cd -- "$repo_dir/../program-metadata" 2>/dev/null && pwd -P || true)"
 state_root="${XDG_STATE_HOME:-${HOME}/.local/state}"
 state_dir="$state_root/applicationlauncher"
 build_archive="${APPLICATIONLAUNCHER_BUILD_ARCHIVE:-$state_dir/builds}"
@@ -21,7 +22,7 @@ socket_path="$runtime_dir/applicationlauncher-windows.sock"
 source "$repo_dir/scripts/lib/release-compatibility.sh"
 
 source_inputs_are_newer() {
-	local input
+	local input dependency_dir
 
 	[[ -x "$binary" && -x "$daemon_binary" ]] || return 1
 
@@ -48,19 +49,20 @@ source_inputs_are_newer() {
 		fi
 	done
 
-	if [[ -n "$fuzzy_rank_dir" ]]; then
+	for dependency_dir in "$fuzzy_rank_dir" "$program_metadata_dir"; do
+		[[ -n "$dependency_dir" ]] || continue
 		for input in \
-			"$fuzzy_rank_dir/Cargo.toml" \
-			"$fuzzy_rank_dir/Cargo.lock" \
-			"$fuzzy_rank_dir/build.rs" \
-			"$fuzzy_rank_dir/rust-toolchain" \
-			"$fuzzy_rank_dir/rust-toolchain.toml"; do
+			"$dependency_dir/Cargo.toml" \
+			"$dependency_dir/Cargo.lock" \
+			"$dependency_dir/build.rs" \
+			"$dependency_dir/rust-toolchain" \
+			"$dependency_dir/rust-toolchain.toml"; do
 			if [[ -f "$input" && ("$input" -nt "$binary" || "$input" -nt "$daemon_binary") ]]; then
 				return 0
 			fi
 		done
 
-		for input in "$fuzzy_rank_dir/src" "$fuzzy_rank_dir/.cargo"; do
+		for input in "$dependency_dir/src" "$dependency_dir/.cargo"; do
 			if [[ -d "$input" ]] && {
 				find "$input" -type f -newer "$binary" -print -quit | grep -q . ||
 					find "$input" -type f -newer "$daemon_binary" -print -quit | grep -q .
@@ -68,7 +70,7 @@ source_inputs_are_newer() {
 				return 0
 			fi
 		done
-	fi
+	done
 
 	return 1
 }

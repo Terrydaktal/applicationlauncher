@@ -1933,6 +1933,7 @@ mod tests {
                 capabilities: Some("CLI".into()),
                 package_type: Some("[PDP] Pacman Dependency (Package-managed)".into()),
                 root_packages: Some("base 3-3 [PEP]".into()),
+                source_checkout: None,
             },
             launch: Some(ApplicationLaunch {
                 executable: Some("/usr/bin/bash".into()),

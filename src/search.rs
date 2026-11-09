@@ -398,69 +398,11 @@ pub(crate) fn clean_exec_cmd(exec: &str) -> String {
 }
 
 pub(crate) fn executable_path_from_exec(exec: &str) -> Option<PathBuf> {
-    let executable = desktop_exec_argv(exec)?.into_iter().next()?;
-    if executable.is_empty() {
-        None
-    } else if executable.contains('/') {
-        Some(PathBuf::from(executable))
-    } else {
-        let path_value = std::env::var_os("PATH")?;
-        std::env::split_paths(&path_value)
-            .map(|directory| directory.join(&executable))
-            .find(|path| path.is_file())
-            .or_else(|| Some(PathBuf::from(&executable)))
-    }
+    program_metadata::launch::executable_path_from_exec(exec)
 }
 
 pub(crate) fn desktop_exec_argv(exec: &str) -> Option<Vec<String>> {
-    let mut argv = Vec::new();
-    let mut token = String::new();
-    let mut quote = None;
-    let mut escaped = false;
-
-    for character in exec.chars() {
-        if escaped {
-            token.push(character);
-            escaped = false;
-            continue;
-        }
-        match quote {
-            Some(current_quote) if character == current_quote => quote = None,
-            Some(_) => token.push(character),
-            None if character == '\\' => escaped = true,
-            None if character == '"' || character == '\'' => quote = Some(character),
-            None if character.is_whitespace() => {
-                if !token.is_empty() {
-                    argv.push(std::mem::take(&mut token));
-                }
-            }
-            None => token.push(character),
-        }
-    }
-
-    if escaped || quote.is_some() {
-        return None;
-    }
-    if !token.is_empty() {
-        argv.push(token);
-    }
-
-    let field_codes = [
-        "%f", "%F", "%u", "%U", "%d", "%D", "%n", "%N", "%i", "%c", "%k", "%v",
-    ];
-    let mut cleaned = Vec::new();
-    for mut argument in argv {
-        if field_codes.contains(&argument.as_str()) {
-            continue;
-        }
-        for field_code in field_codes {
-            argument = argument.replace(field_code, "");
-        }
-        if !argument.is_empty() {
-            cleaned.push(argument);
-        }
-    }
-    (!cleaned.is_empty()).then_some(cleaned)
+    program_metadata::launch::desktop_exec_argv(exec)
 }
 
 pub(crate) fn is_dolphin_app(app: &AppInfo) -> bool {

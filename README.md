@@ -2,6 +2,151 @@
 
 `applicationlauncher` is a Rust GUI launcher and persistent window-session tracker for KDE Plasma on Wayland. The GUI combines searchable open windows and installed applications. The companion `applicationlauncherd` process records window activation and closure history, maintains crash-recovery, five-minute, hourly and named snapshots, and can restore missing windows without closing unrelated work.
 
+## Shared program metadata
+
+Keep `../program-metadata` alongside this checkout, just like `../fuzzy-rank`.
+Progs and Application Launcher link that headless Rust library directly; the
+Progs GUI does not need to run. It owns inventory/provenance classifications,
+exact installation and launch-file resolution, pinned ELF versions/build IDs,
+installed Node/Python/JAR/Electron metadata, package availability, Pi startup
+receipt validation and recorded-input build checks. Launcher modules under
+`src/windows/versions/` retain process-identity guards, background scheduling
+and presentation adapters, not independent discovery algorithms.
+
+Installed versions are not running-loaded versions. Show Info captures a process
+snapshot when opened and reuses metadata while its observed executable path and
+identity stay unchanged; reopen it to inspect later updates. An inaccessible
+running executable retains its actual permission error. An exact absolute raw
+argv[0] can supply a separately labelled, passively validated on-disk candidate,
+never a running version or build ID. Only these inferred candidates receive a
+bounded worker refresh (at most once per ten seconds); rendering does not read
+their files. Unsupported or
+ambiguous evidence includes a reason rather than a guessed version. Source/user programs are never executed
+just because their name matches an allowlist. Native version execution requires
+the shared backend's fresh trusted-system checks or an explicit exact-path local
+grant in `$XDG_CONFIG_HOME/program-metadata/version-probes.toml` (default
+`~/.config/program-metadata/version-probes.toml`). Granted local probes are a
+targeted fallback after passive evidence, not inventory scans or inferred argv0
+queries. Fish uses `--no-config --version` against separately pinned running and
+installed images, including authorized retained/deleted images. No open shell
+is restarted. Removing a grant applies to the next worker query; reopen Show Info
+to refresh its existing snapshot. See
+[`program-metadata/README.md`](../program-metadata/README.md) for supported
+evidence, safety limits and the separate shared-crate test commands.
+
+The GUI and daemon publish their own version and GUI/service role in immutable
+ELF product records, read passively from separately pinned running/on-disk images.
+Older binaries without that record remain explanatory Unknown when no other
+verified version evidence exists. An unresolved deployment wrapper cannot hide a
+known native image or prove that it is the current published installation.
+
+For package-installed native processes, build colouring can be verified from
+fresh exact package/file evidence without a PATH alias or desktop launcher.
+Each subprocess still compares its own pinned running and disk images; it does
+not inherit the parent's build status. The window owner's desktop entry may be
+passed as an unverified candidate, but only a worker-verified current desktop
+record and static launch chain matching that child's exact image can associate
+its name/comment/icon. Runtime binaries alone never identify interpreted app
+payloads. Window titles, geometry and activation history remain owner-only.
+Verified package-managed native installations do not search for local build
+metadata. Not-applicable Uncompiled changes results display and copy as `-`;
+detailed reasons remain in the backend, while unknown results stay distinct.
+
+Renamed native `uv-bin` installations use the shared passive uv version decoder;
+neither uv nor uvx is launched to read this metadata. Recognising the product does
+not turn an unmanaged uv executable into a uv-managed Python runtime or package.
+Python source helpers can display their own docstring description, proven CLI
+entry-point role and local development project directory even without Git. The
+interpreted application calls this a **Source directory**. A nearby pyproject's
+version is not a helper version without an exact supported entry-point binding,
+and no running version or source-since-start claim is invented from current files.
+
+Codex's code-mode host uses the shared passive native constructor decoder, so a
+retained deleted image keeps its own compiled helper version rather than the
+parent CLI's release or today's Cargo manifest version. Exact native Cargo target
+metadata can associate a separately named helper with an indexed source checkout;
+the main command's description and GUI capabilities are not copied to it.
+
+SSH's native version comes from its exact portable OpenSSH release evidence or
+the trusted fixed client `-V` recipe, independently of the owning package release
+and OpenSSL library version. Executable capabilities use exact command/service/
+desktop targets rather than the entire package's roles. SSH can retain SERVICE
+when a real local unit launches it, without inheriting ssh-keygen's JOB role or
+claiming that the inspected tunnel process belongs to that unit.
+
+Shared discovery is not limited to per-application version recipes. Supported
+same-product ELF version accessors and loader-bound product libraries can supply
+compiled release evidence without launching the application. Mutable-pointer
+defaults are visibly labelled `(compiled release initializer)`, not claimed as
+observed runtime values. Current XDG launch routes also correct GUI roles for
+source builds whose desktop files remain owned by a distro package. Upstream
+package comparisons use that exact association without changing FRK/CLO ownership
+or authorizing inferred AUR requests. Large Ninja graphs are inspected in bounded
+batches under child-only filesystem-write denial, rather than failing at 512
+targets. A deleted, inaccessible loaded library remains an explicit unknown;
+the replacement's version is shown only as the separate on-disk version.
+
+Desktop metadata can also belong to a retained running image rather than the
+newer published build. Show Info validates that exact pinned-image association
+and reads the current desktop fields without changing the independently resolved
+installation or claiming the old image is current. Missing installed icons stay
+missing; unrelated source-tree images are not guessed as application icons.
+
+The shared Qt 6/KDE reader follows supported compiled QStringLiteral arguments to
+loader-validated Qt metadata calls. It recovers complete fork suffixes without
+launching GUI applications or reading today's source version into an older image.
+These values retain the `(compiled Qt application version)` qualifier; unsupported
+code layouts or ambiguous identities remain explanatory unavailable results.
+
+Shared native version support includes the audited GNU coreutils `--version`
+recipes, so tools such as `cat` report their exact executable product banner
+separately from the owning package release. Passive inventories still never
+execute these probes. Ninja freshness distinguishes a revalidated observation of
+no newer recorded inputs from an unverified full build result. The confirmed
+observation and checked-input counts are green. The main row uses a compact
+summary such as `Yes · 25 inputs checked · 3 newer · 2 missing · added: unknown`;
+newer and missing recorded inputs are counted separately, without verbose
+backend reasons or example paths. Newly added, unrecorded inputs remain unknown.
+Only uncertainty suffixes (`added: unknown`, `full build status unknown` or
+`scan incomplete`) are yellow; known No/Yes observations and their counts stay
+green/red. This includes an always-run generator that can change a version
+header without a source edit. Incomplete scans cannot become successful no-newer
+observations; invalidated inspection stays Unknown without false zero counts.
+No project build code runs.
+
+Pacman and positively identified AUR lookups use one shared backend. Pacman reads
+its existing sync snapshot; AUR may request the current version of one package.
+Concurrent identical requests share unfinished work, with no retained AUR result
+cache or new disk cache. Reopening Info can therefore perform a new online check;
+the loading text describes a version lookup, not a database refresh.
+
+The launcher wrapper and build fingerprint include the shared library's inputs,
+so backend changes are picked up on rebuild. No new daemon is introduced.
+
+Self-updated executables may remain running after their old image is renamed or
+deleted. The shared resolver can recover the current installation from the
+identity-checked process launch name and the same publishing directory, without
+depending on an updater's backup filename format. Such a launch chain is labelled
+inferred: its installed version/build ID never replaces the pinned running image's
+evidence. Ambiguous or uncorroborated matches remain unresolved.
+
+Python runtime metadata is separate from the script's metadata. Validated uv
+interpreters are identified as `UVR`; their prebuilt-runtime compilation status
+is not applicable. A validated `.venv` route is retained in the current launch
+chain without claiming it records the historical launch. Local scripts can show
+their known source checkout and DEV/FRK/CLO provenance without borrowing another
+tool's version or capabilities. Source changes since start remain unknown unless
+the application published a startup source snapshot. A missing GNU build ID is
+reported as not embedded, independently of whether the version was found.
+
+CopyQ's local-build version is read from its pinned Qt ELF constant without
+starting another CopyQ instance. Mousepad's version is read from its private
+library: running inspection binds the actual mapped library, while installed
+inspection follows supported loader metadata. The main executable's build ID
+remains separate, and a changed or unproven library cannot be hidden by equality
+of the main build IDs. Component-aware worker queries bypass the main-only inner
+version cache; opening a new Info snapshot inspects current installation state.
+
 ## Project Structure
 
 ```text

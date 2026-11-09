@@ -15,6 +15,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
 fuzzy-rank = { path = "../fuzzy-rank" }
+program-metadata = { version = "0.1.0", path = "../program-metadata" }
 zbus = "5.16.0"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 signal-hook = "0.3.18"

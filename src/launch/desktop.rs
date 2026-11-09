@@ -49,8 +49,16 @@ impl DesktopCache {
         {
             return entry.clone();
         }
-        let content = std::fs::read_to_string(path).ok()?;
-        let entry = parse_desktop_content(path, &content, language);
+        let raw = program_metadata::desktop::read(
+            path,
+            language.as_deref(),
+            std::time::Instant::now() + std::time::Duration::from_millis(100),
+        )
+        .ok()?;
+        let entry = launcher_entry(path, raw);
+        if desktop_stamp(&std::fs::metadata(path).ok()?, language) != stamp {
+            return None;
+        }
         if self.entries.len() >= 4096 {
             self.entries.clear();
         }
@@ -60,114 +68,19 @@ impl DesktopCache {
     }
 }
 
-fn parse_desktop_content(path: &Path, content: &str, lang: Option<String>) -> Option<DesktopEntry> {
-    let mut in_desktop_entry = false;
-    let mut name = None;
-    let mut exec = None;
-    let mut icon = None;
-    let mut comment = None;
-    let mut no_display = false;
-    let mut hidden = false;
-    let mut is_application = false;
-    let mut is_settings_module = false;
-    let mut exec_command = None;
-    let mut x_kde_alias_for = None;
-    let mut try_exec = None;
-    let mut only_show_in = Vec::new();
-    let mut not_show_in = Vec::new();
-
-    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-        let name_lower = file_name.to_lowercase();
-        if name_lower.starts_with("kcm_") {
-            is_settings_module = true;
-        }
-    }
-
-    let name_key = lang.as_ref().map(|l| format!("Name[{}]", l));
-    let comment_key = lang.as_ref().map(|l| format!("Comment[{}]", l));
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            if line == "[Desktop Entry]" {
-                in_desktop_entry = true;
-            } else {
-                in_desktop_entry = false;
-            }
-            continue;
-        }
-
-        if !in_desktop_entry {
-            continue;
-        }
-
-        if let Some(pos) = line.find('=') {
-            let key = line[..pos].trim();
-            let val = line[pos + 1..].trim();
-
-            if key == "Name" && name.is_none() {
-                name = Some(val.to_string());
-            } else if let Some(ref nk) = name_key {
-                if key == nk {
-                    name = Some(val.to_string());
-                }
-            }
-
-            if key == "Comment" && comment.is_none() {
-                comment = Some(val.to_string());
-            } else if let Some(ref ck) = comment_key {
-                if key == ck {
-                    comment = Some(val.to_string());
-                }
-            }
-
-            if key == "Exec" {
-                exec = Some(val.to_string());
-                exec_command = Some(val.to_string());
-            }
-            if key == "Icon" {
-                icon = Some(val.to_string());
-            }
-            if key == "NoDisplay" && val.to_lowercase() == "true" {
-                no_display = true;
-            }
-            if key == "Hidden" && val.eq_ignore_ascii_case("true") {
-                hidden = true;
-            }
-            if key == "Type" && val == "Application" {
-                is_application = true;
-            }
-            if key == "Categories" && val.split(';').any(|c| c == "SettingsPanel") {
-                is_settings_module = true;
-            }
-            if key == "X-KDE-AliasFor" {
-                x_kde_alias_for = Some(val.to_string());
-            }
-            if key == "TryExec" {
-                try_exec = Some(val.to_string());
-            }
-            if key == "OnlyShowIn" {
-                only_show_in = val
-                    .split(';')
-                    .filter(|desktop| !desktop.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect();
-            }
-            if key == "NotShowIn" {
-                not_show_in = val
-                    .split(';')
-                    .filter(|desktop| !desktop.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect();
-            }
-        }
-    }
-
-    if x_kde_alias_for.as_deref() == Some("systemsettings") && no_display {
-        is_settings_module = true;
-    }
-
-    if let Some(exec_cmd) = exec_command.as_deref() {
+fn launcher_entry(path: &Path, entry: program_metadata::desktop::Entry) -> Option<DesktopEntry> {
+    // KDE settings-module inclusion is launcher presentation policy, not a
+    // reason for the shared raw parser to discard other invisible entries.
+    let mut is_settings_module = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.to_lowercase().starts_with("kcm_"))
+        || entry
+            .categories
+            .iter()
+            .any(|category| category == "SettingsPanel")
+        || entry.kde_alias_for.as_deref() == Some("systemsettings") && entry.no_display;
+    if let Some(exec_cmd) = entry.exec.as_deref() {
         let exec_lower = exec_cmd.to_lowercase();
         if exec_lower.starts_with("kcmshell")
             || exec_lower.contains(" kcm_")
@@ -177,19 +90,22 @@ fn parse_desktop_content(path: &Path, content: &str, lang: Option<String>) -> Op
         }
     }
 
-    if hidden || (no_display && !is_settings_module) || !is_application {
+    if entry.hidden
+        || (entry.no_display && !is_settings_module)
+        || entry.entry_type.as_deref() != Some("Application")
+    {
         return None;
     }
 
     Some(DesktopEntry {
-        name: name?,
-        exec: exec?,
-        icon,
-        comment,
+        name: entry.name?,
+        exec: entry.exec?,
+        icon: entry.icon,
+        comment: entry.comment,
         is_settings_module,
-        try_exec,
-        only_show_in,
-        not_show_in,
+        try_exec: entry.try_exec,
+        only_show_in: entry.only_show_in,
+        not_show_in: entry.not_show_in,
     })
 }
 
@@ -202,10 +118,7 @@ fn parse_desktop_file_with_icons(
     icon_lookup: &mut impl FnMut(&str) -> Option<PathBuf>,
 ) -> Option<AppInfo> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<DesktopCache>> = std::sync::OnceLock::new();
-    let lang = std::env::var("LANG")
-        .ok()
-        .and_then(|l| l.split('.').next().map(str::to_owned))
-        .and_then(|l| l.split('_').next().map(str::to_owned));
+    let lang = program_metadata::desktop::current_locale();
     let entry = CACHE
         .get_or_init(Default::default)
         .lock()
@@ -279,59 +192,17 @@ fn parse_desktop_file_with_icons(
 
 pub(crate) fn get_installed_apps(theme: &str) -> Vec<AppInfo> {
     let mut apps = Vec::new();
-    let mut app_dirs = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
-        app_dirs.push(PathBuf::from(format!("{}/.local/share/applications", home)));
-    }
-    app_dirs.extend(
-        xdg_data_dirs()
-            .into_iter()
-            .map(|dir| dir.join("applications")),
-    );
-    let flatpak_dir = PathBuf::from("/var/lib/flatpak/exports/share/applications");
-    if flatpak_dir.exists() {
-        app_dirs.push(flatpak_dir);
-    }
-    let user_flatpak_dir = if let Ok(home) = std::env::var("HOME") {
-        Some(PathBuf::from(format!(
-            "{}/.local/share/flatpak/exports/share/applications",
-            home
-        )))
-    } else {
-        None
-    };
-    if let Some(dir) = user_flatpak_dir {
-        if dir.exists() {
-            app_dirs.push(dir);
-        }
-    }
-
-    let mut seen_entries = std::collections::HashSet::new();
     // Per-scan negatives expire immediately; newly installed icons never stay hidden.
     let mut icons = std::collections::HashMap::new();
 
-    for dir in app_dirs {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() && path.extension().map_or(false, |ext| ext == "desktop") {
-                    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                        if seen_entries.contains(file_name) {
-                            continue;
-                        }
-                        seen_entries.insert(file_name.to_string());
-                    }
-
-                    if let Some(app) = parse_desktop_file_with_icons(&path, &mut |name| {
-                        icons
-                            .entry(name.to_string())
-                            .or_insert_with(|| lookup_theme_icon_exact(theme, name))
-                            .clone()
-                    }) {
-                        apps.push(app);
-                    }
-                }
-            }
+    for path in program_metadata::desktop::discover(&desktop_entry_search_dirs(), 16_384) {
+        if let Some(app) = parse_desktop_file_with_icons(&path, &mut |name| {
+            icons
+                .entry(name.to_string())
+                .or_insert_with(|| lookup_theme_icon_exact(theme, name))
+                .clone()
+        }) {
+            apps.push(app);
         }
     }
 
@@ -414,37 +285,69 @@ mod optimization_tests {
         std::fs::remove_file(&program).unwrap();
         assert!(parse_desktop_file_with_icons(&path, &mut |_| None).is_none());
     }
+
+    #[test]
+    fn xdg_data_home_is_the_primary_desktop_discovery_directory() {
+        const CHILD: &str = "APPLICATIONLAUNCHER_DESKTOP_XDG_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let expected =
+                PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap()).join("applications");
+            assert_eq!(desktop_entry_search_dirs().first(), Some(&expected));
+            let found = get_installed_apps("test-theme");
+            assert!(
+                found
+                    .iter()
+                    .any(|app| app.name == "Shared desktop XDG fixture"
+                        && app.desktop_file_path == expected.join("shared-xdg-fixture.desktop"))
+            );
+            assert_eq!(
+                resolve_desktop_file_path("shared-xdg-fixture"),
+                Some(expected.join("shared-xdg-fixture.desktop"))
+            );
+            return;
+        }
+        let fixture = directory();
+        let apps = fixture.0.join("custom-data/applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        std::fs::write(apps.join("shared-xdg-fixture.desktop"), "[Desktop Entry]\nType=Application\nName=Shared desktop XDG fixture\nExec=/must/not/execute\n").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "launch::desktop::optimization_tests::xdg_data_home_is_the_primary_desktop_discovery_directory", "--nocapture"])
+            .env(CHILD, "1")
+            .env("HOME", fixture.0.join("home"))
+            .env("XDG_DATA_HOME", fixture.0.join("custom-data"))
+            .env("XDG_DATA_DIRS", fixture.0.join("system-data"))
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "The isolated child must execute the assertion, not an empty test collection"
+        );
+    }
+
+    #[test]
+    fn shared_desktop_fields_preserve_launcher_settings_and_localization_policy() {
+        let content = "[Desktop Entry]\nType=Application\nName=Settings\nName[fr]=Réglages\\sde test\nComment=Line\\nTwo\nExec=systemsettings kcm_example\nNoDisplay=true\n";
+        let raw = program_metadata::desktop::parse(content, Some("fr_CA.UTF-8")).unwrap();
+        let entry = launcher_entry(Path::new("/tmp/kcm_example.desktop"), raw).unwrap();
+        assert_eq!(entry.name, "Réglages de test");
+        assert_eq!(entry.comment.as_deref(), Some("Line\nTwo"));
+        assert!(entry.is_settings_module);
+        let raw = program_metadata::desktop::parse(
+            "[Desktop Entry]\nType=Application\nName=Hidden\nExec=no-run\nNoDisplay=true",
+            None,
+        )
+        .unwrap();
+        assert!(launcher_entry(Path::new("/tmp/ordinary.desktop"), raw).is_none());
+    }
 }
 
 pub(crate) fn desktop_entry_search_dirs() -> Vec<PathBuf> {
-    let mut app_dirs = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
-        app_dirs.push(PathBuf::from(format!("{}/.local/share/applications", home)));
-        let user_flatpak_dir = PathBuf::from(format!(
-            "{}/.local/share/flatpak/exports/share/applications",
-            home
-        ));
-        if user_flatpak_dir.exists() {
-            app_dirs.push(user_flatpak_dir);
-        }
-    }
-    app_dirs.extend(
-        xdg_data_dirs()
-            .into_iter()
-            .map(|dir| dir.join("applications")),
-    );
-    app_dirs
-}
-
-fn xdg_data_dirs() -> Vec<PathBuf> {
-    std::env::var_os("XDG_DATA_DIRS")
-        .map(|dirs| std::env::split_paths(&dirs).collect())
-        .unwrap_or_else(|| {
-            vec![
-                PathBuf::from("/usr/local/share"),
-                PathBuf::from("/usr/share"),
-            ]
-        })
+    program_metadata::desktop::application_dirs()
 }
 
 fn executable_is_available(value: &str) -> bool {
