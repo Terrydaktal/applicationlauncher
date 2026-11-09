@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "scope": "Show Info read-only tmux-mosh inventory and separate server/client ownership",
+  "profile": "release",
+  "behaviors": [
+    {
+      "id": "TMUX-INFO-OWNERSHIP",
+      "contract": "The tmux server has merged server/listener properties, not the selected client's session/pane; sessions and all attached clients have separately labelled metadata groups, while the selected client's connection fields are merged into its main process fields and match its exact PID and start time",
+      "tests": ["process_sections_use_their_own_metadata_and_keep_tmux_fields_under_tmux", "tmux_server_information_does_not_borrow_the_selected_clients_pane_or_session", "tmux_client_information_contains_only_its_own_verified_connection", "tmux_client_inventory_never_matches_a_reused_ambiguous_or_missing_identity"]
+    },
+    {
+      "id": "TMUX-INFO-COVERAGE",
+      "contract": "Server builds, detached sessions, frontend identities, local/Mosh/SSH transport, sizing ownership, input idle versus packet ages, all four verified socket columns and extra guest fields retain their own meaning and displayed dates use DD-MM-YYYY",
+      "tests": ["tmux_server_connected_client_groups_preserve_remote_sockets_builds_sizing_and_packet_age", "tmux_metadata_preserves_extra_guest_fields_unknown_values_and_day_month_year_dates", "tmux_inventory_failures_are_visible_and_cannot_leave_loading_or_borrow_another_frontend_build"]
+    },
+    {
+      "id": "TMUX-INFO-DEDUP",
+      "contract": "Canonical tmux/network socket fields replace legacy socket/address/port/inode aliases, session and pane identity fields appear once and frontend metadata is omitted only when its exact PID/start-time pair is already represented; unrelated equal or unknown values and distinct states are preserved",
+      "tests": ["tmux_client_information_contains_only_its_own_verified_connection", "tmux_socket_aliases_fold_into_four_endpoints_without_losing_ipv6_or_unknowns", "tmux_frontend_details_are_only_omitted_for_the_exact_process_already_shown", "tmux_client_pruning_keeps_distinct_state_and_equal_but_unrelated_values"]
+    },
+    {
+      "id": "TMUX-INFO-SERVER-MERGE",
+      "contract": "Server metadata is merged into the main process fields, not a nested Tmux server group; versions and outdated status are not repeated, distinct running/installed SHA256 hashes sit beside their ELF build IDs, existing comparison colours and future fields survive and failures or stale identities cannot supply another server's data",
+      "tests": ["tmux_server_inventory_merges_into_one_version_and_fingerprint_sequence", "tmux_server_merge_keeps_failures_flat_and_rejects_stale_inventory", "tmux_server_information_does_not_borrow_the_selected_clients_pane_or_session"]
+    },
+    {
+      "id": "TMUX-INFO-LIFECYCLE",
+      "contract": "Collection is lazy, background, one-shot and bounded; concurrent requests share work, complete snapshots do not expire on a render timer, new Info captures are fresh and dropdown state is independent",
+      "tests": ["tmux_inventory_collection_is_lazy_and_groups_keep_independent_ids", "tmux_inventory_lookup_coalesces_pending_requests_and_never_expires_completed_info"]
+    },
+    {
+      "id": "TMUX-INFO-SAFETY",
+      "contract": "Only clients --json is invoked for the exact owned socket and captured server identity; changed servers, malformed/oversized metadata and ambiguous identities are rejected, failures stay visible and no update/cleanup/attach/sizing operation runs",
+      "tests": ["tmux_inventory_rejects_wrong_servers_sockets_malformed_and_oversized_records", "tmux_inventory_command_only_requests_json_for_the_exact_socket", "../tmux-mosh/tests/test_launcher_metadata.py::test_private_inventory_publishes_client_identity_flags_and_socket_pairs_without_changing_tmux"]
+    }
+  ]
+}

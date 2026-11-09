@@ -1,0 +1,35 @@
+{
+  "snapshot_at": 1793232000,
+  "socket": "/fixture/server.sock",
+  "hostname": "fixture-host",
+  "server_running": true,
+  "server_identity": [20, 200],
+  "monitor_running": true,
+  "server_binary_mtime": 1793232000,
+  "servers": {
+    "tmux": {"pid": 20, "started_ticks": 200, "socket": "unix:/fixture/server.sock", "version": "tmux 3.7c-old", "sha256": "running-server-sha", "outdated": true},
+    "tmux_latest": {"version": "tmux 3.7c-new", "sha256": "installed-tmux-sha"},
+    "xfce4-terminal_latest": {"version": "Xfce Terminal new", "sha256": "installed-terminal-sha"},
+    "xfce4-terminal": [{"pid": 3, "started_ticks": 300, "version": "Xfce Terminal old", "sha256": "running-terminal-sha"}],
+    "mosh_latest": {"mosh-server": {"version": "mosh-server new", "sha256": "installed-mosh-server-sha"}},
+    "mosh": [{"pid": 80, "started_ticks": 80, "version": "mosh-server old", "sha256": "running-mosh-server-sha"}],
+    "mosh_client_latest": {"version": "mosh-client new", "sha256": "installed-mosh-client-sha"}
+  },
+  "clients": [
+    {"pid": 5, "started_ticks": 500, "session": "work", "session_id": "$1", "pane_pid": 6, "app": "node", "app_label": "pi", "app_pid": 7, "command": "pi", "app_outdated": false, "app_build_unknown": false,
+      "tty": "/dev/pts/1", "transport": "LOCAL", "state": "ATTACHED", "attachment": "ATTACHED", "reachability": null, "frontend": "xfce4-terminal", "frontend_pid": 3, "frontend_started_ticks": 300, "frontend_version": "Xfce Terminal old", "frontend_outdated": true, "frontend_binary_mtime": 1793232000,
+      "created_at": 1793232000, "last_activity_at": 1793232010, "activity_idle_seconds": 12, "idle_seconds": null, "network_last_seen_at": null, "flags": ["focused"], "width": 126, "height": 41, "window_id": "@1", "sizing_policy": "latest", "sizing_client_pid": 5, "active_sizing": true, "sizing": "participating",
+      "socket": "socket:[2101]", "socket_protocol": "unix", "local_address": null, "local_port": null, "peer": "socket:[3101]", "peer_port": null,
+      "socket_inode": 2101, "peer_inode": 3101, "tmux_client_socket": "socket:[2101]", "tmux_server_socket": "socket:[3101]", "network_local_socket": null, "network_peer_socket": null},
+    {"pid": 8, "started_ticks": 800, "session": "work", "session_id": "$1", "pane_pid": 6, "app": "node", "app_label": "pi", "app_pid": 7, "command": "pi", "transport": "MOSH", "state": "UNREACHABLE", "attachment": "ATTACHED", "reachability": "UNREACHABLE", "frontend": "mosh-server", "frontend_pid": 80, "frontend_started_ticks": 80, "frontend_version": "mosh-server old", "frontend_outdated": true,
+      "mosh_client_version": "mosh-client old", "mosh_client_build": {"sha256": "running-mosh-client-sha"}, "mosh_client_outdated": true,
+      "tty": "/dev/pts/2", "flags": ["ignore-size"], "width": 81, "height": 85, "window_id": "@2", "sizing_policy": "latest", "sizing_client_pid": 5, "active_sizing": false, "sizing": "ignored-auto", "idle_seconds": 45, "network_last_rx_monotonic_ms": 123456,
+      "socket": "udp:0.0.0.0:60001", "socket_protocol": "udp", "local_address": "0.0.0.0", "local_port": 60001, "peer": "192.0.2.1", "peer_port": 54321, "socket_inode": 2102, "peer_inode": 3102,
+      "tmux_client_socket": "socket:[2102]", "tmux_server_socket": "socket:[3102]", "network_local_socket": "udp:0.0.0.0:60001", "network_peer_socket": "192.0.2.1:54321"}
+  ],
+  "sessions": [
+    {"id": "$1", "name": "work", "attached_clients": 2, "created_at": 1793232000, "last_activity_at": 1793232010, "activity_idle_seconds": 12, "idle_seconds": null, "pane_pid": 6, "app": "node", "app_label": "pi", "app_pid": 7, "command": "pi", "app_outdated": false},
+    {"id": "$2", "name": "quiet", "attached_clients": 0, "app": "fish", "app_pid": 70, "pane_pid": 70, "command": "fish", "app_outdated": null, "idle_seconds": null}
+  ],
+  "note": "Fixture: unknown packet age is not proof of reachability"
+}

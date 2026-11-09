@@ -2455,9 +2455,6 @@ mod tests {
                 Some(PathBuf::from(format!("/own-directory/{name}")))
             };
             let node = ProcessInfoNode {
-                executable_error: None,
-                cwd_error: None,
-                raw_argv0: None,
                 identity: ProcessIdentity {
                     pid,
                     start_ticks: pid as u64,
@@ -2468,8 +2465,11 @@ mod tests {
                 script_name: None,
                 header: name.into(),
                 executable: Some(executable.into()),
+                executable_error: None,
                 executable_identity: None,
                 cwd: cwd.clone(),
+                cwd_error: None,
+                raw_argv0: None,
                 command_line: Some(name.into()),
             };
             let rows = super::super::popups::process_info_rows(
@@ -2477,12 +2477,52 @@ mod tests {
                 &node,
                 super::super::popups::process_version_rows("Application", None, true),
             );
+            assert_eq!(
+                rows.iter()
+                    .take(7)
+                    .map(|row| row.label.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "Process name",
+                    "PID",
+                    "Parent PID",
+                    "Process start (ticks since boot)",
+                    "Working directory",
+                    "Command line",
+                    "Executable path",
+                ],
+                "process identity order for {name} (pid {pid})"
+            );
             let position = |label: &str| rows.iter().position(|row| row.label == label).unwrap();
-            assert!(position("Process start (ticks since boot)") < position("Version"));
-            assert!(position("ELF build ID") < position("Latest version (on disk)"));
+            assert!(
+                position("Process start (ticks since boot)") < position("Version (ELF build ID)")
+            );
+            assert!(
+                position("Version (ELF build ID)")
+                    < position("Latest version on disk (ELF build ID)")
+            );
             assert!(!rows.iter().any(|row| row.label == "Process desktop file"));
-            if [5, 20].contains(&pid) {
-                assert!(position("Tmux pane directory") < position("Version"));
+            if pid == 5 {
+                assert!(position("Tmux pane directory") < position("Version (ELF build ID)"));
+            }
+            if pid == 20 {
+                for client_only in [
+                    "Tmux session",
+                    "Tmux client PID",
+                    "Tmux active pane",
+                    "Tmux pane title",
+                    "Tmux pane PID",
+                    "Tmux pane directory",
+                ] {
+                    assert!(
+                        !rows.iter().any(|row| row.label == client_only),
+                        "Client-only field {client_only} leaked into the server"
+                    );
+                }
+                assert!(
+                    rows.iter()
+                        .any(|row| row.label == "Tmux role" && row.value == "Server")
+                );
             }
             let value = |label: &str| {
                 rows.iter()
@@ -2501,10 +2541,7 @@ mod tests {
             assert!(!rows.iter().any(|row| row.label.starts_with("Window ")
                 || row.label == "Geometry"
                 || row.label == "Applicationlauncher title"));
-            assert_eq!(
-                rows.iter().any(|row| row.label == "Tmux session"),
-                [5, 20].contains(&pid)
-            );
+            assert_eq!(rows.iter().any(|row| row.label == "Tmux session"), pid == 5);
             if !active {
                 assert!(
                     rows.iter()

@@ -3,6 +3,7 @@ pub(crate) mod kwin;
 pub(crate) mod process;
 pub(crate) mod process_tree;
 pub(crate) mod terminal;
+pub(crate) mod tmux_info;
 pub(crate) mod versions;
 
 pub(crate) use icons::*;

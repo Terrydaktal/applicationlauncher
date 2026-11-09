@@ -1,4 +1,5 @@
 use super::*;
+mod tmux;
 use crate::models::InfoMetadataSection;
 use std::sync::atomic::AtomicBool;
 
@@ -512,6 +513,7 @@ struct WindowInfoPopup {
     window: WindowInfo,
     lookup: Option<WindowProcessTreeLookup>,
     versions: Option<ProcessVersionCache>,
+    tmux: Option<crate::windows::tmux_info::Lookup>,
 }
 
 impl InfoTarget {
@@ -1181,6 +1183,7 @@ pub(super) fn process_info_rows(
     if let Some(script) = &node.script_name {
         rows.insert(1, row("Script name", script.clone(), false));
     }
+    rows.extend(tmux::process_rows(window, node));
     rows.extend(version_rows);
     rows
 }
@@ -1318,6 +1321,7 @@ impl App {
                 window,
                 lookup: None,
                 versions: None,
+                tmux: None,
             }),
         );
     }
@@ -1532,6 +1536,16 @@ impl App {
                     Vec::new()
                 };
                 let mut process = process_info_rows(window_info, node, Vec::new());
+                tmux::merge_process_rows(
+                    &mut process,
+                    &mut versions,
+                    window_info,
+                    node,
+                    popup.tmux.as_ref(),
+                    snapshot
+                        .map(|snapshot| snapshot.nodes.as_ref())
+                        .unwrap_or_default(),
+                );
                 process.extend(versions);
                 if owner {
                     let mut rows = window_info_rows(window_info, Vec::new());
@@ -1543,6 +1557,18 @@ impl App {
             } else {
                 Vec::new()
             };
+            if open {
+                metadata_sections.extend(tmux::sections(
+                    ctx,
+                    id,
+                    window_info,
+                    node,
+                    popup.tmux.as_ref(),
+                    snapshot
+                        .map(|snapshot| snapshot.nodes.as_ref())
+                        .unwrap_or_default(),
+                ));
+            }
             sections.push(InfoProcessSection {
                 id,
                 depth: node.depth,
@@ -1710,6 +1736,7 @@ impl App {
                             popup.id,
                         ));
                     }
+                    state.poll_tmux(ctx, popup.id);
                     let (data, details_ready) = self.window_info_popup_data(ctx, popup.id, state);
                     let size = popup.window_initial_size(ctx, &data, details_ready);
                     let min_size = [520.0_f32.min(size[0]), 360.0_f32.min(size[1])];
@@ -3178,6 +3205,7 @@ mod tests {
 
     pub(super) fn window(id: &str) -> InfoTarget {
         InfoTarget::Window(WindowInfoPopup {
+            tmux: None,
             window: WindowInfo {
                 id: id.into(),
                 title: "Same window title".into(),
