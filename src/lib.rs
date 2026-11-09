@@ -7,6 +7,7 @@ pub mod replay;
 pub mod tracker;
 
 pub const BUILD_ID: &str = env!("APPLICATIONLAUNCHER_BUILD_ID");
+
 /// Copy a compile-time producer record into an immutable ELF byte-array section.
 pub const fn metadata_bytes<const N: usize>(text: &str) -> [u8; N] {
     assert!(text.len() == N);

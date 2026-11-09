@@ -278,6 +278,8 @@ The project builds a native `eframe` / `egui` GUI and a separate user-session da
 
 - Window loading:
   Uses the KWin event feed for incremental updates, with bounded reconciliation through `kdotool`, then resolves metadata such as title, class, PID, icon, executable path, and terminal child processes.
+- Terminal launch quoting:
+  Cloning and terminal run/CD actions pass Fish and its script as separate `--execute` arguments, without a second command-string parse by xfce4-terminal. Quoted title escape sequences and commands stay intact; titles and directories remain environment data rather than shell source.
 - Terminal titles:
   Fish's `fish ~/repos/xfce4-terminal` command-plus-directory captions are normalized to `fish - ~/repos/xfce4-terminal - Terminal` without repeating the command. Matching foreground-command captions such as `htop ~` use the same handling, while older directory-only titles remain supported. Spaces and separator characters inside directories stay intact; known local process/pane directories replace abbreviations, but SSH keeps its remote directory and explicit shell label. Tmux session prefixes, strikethrough and spinner markers are preserved, and raw window/pane titles are unchanged. Parsing adds no subprocess, polling or filesystem lookup.
 - Live tmux windows:

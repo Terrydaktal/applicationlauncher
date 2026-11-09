@@ -52,9 +52,13 @@ pub(crate) fn launch_terminal_command(command: &str) {
     let command = command.to_string();
     std::thread::spawn(move || {
         let mut cmd = Command::new("xfce4-terminal");
-        cmd.arg("--command")
-            .arg(r#"fish -ic 'eval "$APPLICATIONLAUNCHER_TERMINAL_COMMAND"; exec fish'"#)
-            .env("APPLICATIONLAUNCHER_TERMINAL_COMMAND", command);
+        cmd.args([
+            "--execute",
+            "fish",
+            "-ic",
+            r#"eval "$APPLICATIONLAUNCHER_TERMINAL_COMMAND"; exec fish"#,
+        ])
+        .env("APPLICATIONLAUNCHER_TERMINAL_COMMAND", command);
         scrub_command_env(&mut cmd);
         let _ = applicationlauncher::process::spawn_and_reap(cmd);
     });
@@ -66,46 +70,47 @@ pub(crate) fn launch_fish_terminal(
     terminal_title: Option<String>,
 ) {
     std::thread::spawn(move || {
-        let title_command = if terminal_title.is_some() {
-            r#"printf '\e]0;%s\a' "$APPLICATIONLAUNCHER_TERMINAL_TITLE"; "#
-        } else {
-            ""
-        };
-        let fish_command = match command_after_cd {
-            Some(command) => format!(
-                r#"{title_command}if test -n "$APPLICATIONLAUNCHER_CD_TARGET"; cd "$APPLICATIONLAUNCHER_CD_TARGET"; end; {command}; exec fish"#
-            ),
-            None => {
-                format!(
-                    r#"{title_command}if test -n "$APPLICATIONLAUNCHER_CD_TARGET"; cd "$APPLICATIONLAUNCHER_CD_TARGET"; end; exec fish"#
-                )
-            }
-        };
-
-        let mut cmd = Command::new("xfce4-terminal");
-        if let Some(title) = terminal_title {
-            cmd.arg("--title")
-                .arg(&title)
-                .env("APPLICATIONLAUNCHER_TERMINAL_TITLE", title);
-        } else {
-            cmd.env("APPLICATIONLAUNCHER_TERMINAL_TITLE", "");
-        }
-        cmd.arg("--command")
-            .arg(format!("fish -ic '{}'", fish_command));
-
-        if let Some(target) = cd_target {
-            cmd.env("APPLICATIONLAUNCHER_CD_TARGET", target);
-        } else {
-            cmd.env("APPLICATIONLAUNCHER_CD_TARGET", "");
-        }
-
-        cmd.env_remove("PYTHONPATH");
-        cmd.env_remove("PYTHONHOME");
-        cmd.env_remove("VIRTUAL_ENV");
-        cmd.env_remove("UV_ACTIVE");
-
+        let cmd = fish_terminal_command(
+            cd_target.as_deref(),
+            command_after_cd.as_deref(),
+            terminal_title.as_deref(),
+        );
         let _ = applicationlauncher::process::spawn_and_reap(cmd);
     });
+}
+
+fn fish_terminal_command(
+    cd_target: Option<&str>,
+    command_after_cd: Option<&str>,
+    terminal_title: Option<&str>,
+) -> Command {
+    let title_command = if terminal_title.is_some() {
+        r#"printf '\e]0;%s\a' "$APPLICATIONLAUNCHER_TERMINAL_TITLE"; "#
+    } else {
+        ""
+    };
+    let mut fish_command = format!(
+        r#"{title_command}if test -n "$APPLICATIONLAUNCHER_CD_TARGET"; cd "$APPLICATIONLAUNCHER_CD_TARGET"; end; "#
+    );
+    if let Some(command) = command_after_cd {
+        fish_command.push_str(command);
+        fish_command.push_str("; ");
+    }
+    fish_command.push_str("exec fish");
+
+    let mut cmd = Command::new("xfce4-terminal");
+    if let Some(title) = terminal_title {
+        cmd.arg("--title").arg(title);
+    }
+    // --execute preserves argv; --command would parse and strip the Fish quotes again.
+    cmd.args(["--execute", "fish", "-ic", &fish_command])
+        .env(
+            "APPLICATIONLAUNCHER_TERMINAL_TITLE",
+            terminal_title.unwrap_or(""),
+        )
+        .env("APPLICATIONLAUNCHER_CD_TARGET", cd_target.unwrap_or(""));
+    scrub_command_env(&mut cmd);
+    cmd
 }
 
 pub(crate) fn launch_terminal_window() {
@@ -573,5 +578,138 @@ mod codex_clone_tests {
                 codex_clone_arguments(&chain, pid, |_| panic!("unidentified terminal")).is_empty()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fish_launch_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    fn environment<'a>(command: &'a Command, name: &str) -> Option<Option<&'a OsStr>> {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new(name))
+            .map(|(_, value)| value)
+    }
+
+    #[test]
+    fn fish_clone_preserves_script_quotes_in_separate_terminal_arguments() {
+        let directory = "/tmp/girl's \"notes\"; (printf not-code)";
+        for title in [None, Some("tmux: girls - girl's \"terminal\"; (not-code)")] {
+            for after in [None, Some("printf '%s\\n' 'quoted value'")] {
+                let command = fish_terminal_command(Some(directory), after, title);
+                let arguments: Vec<_> = command.get_args().collect();
+                assert_eq!(command.get_program(), "xfce4-terminal");
+                assert!(!arguments.contains(&OsStr::new("--command")));
+                let execute = arguments
+                    .iter()
+                    .position(|arg| *arg == "--execute")
+                    .unwrap();
+                assert_eq!(
+                    &arguments[execute..execute + 3],
+                    ["--execute", "fish", "-ic"]
+                );
+                assert_eq!(arguments.len(), execute + 4);
+                let script = arguments[execute + 3].to_str().unwrap();
+                assert!(script.ends_with("; exec fish"));
+                if let Some(title) = title {
+                    assert_eq!(&arguments[..execute], ["--title", title]);
+                    assert!(script.starts_with(
+                        r#"printf '\e]0;%s\a' "$APPLICATIONLAUNCHER_TERMINAL_TITLE"; "#
+                    ));
+                    assert!(!script.contains(title));
+                } else {
+                    assert_eq!(execute, 0);
+                    assert!(!script.starts_with("printf "));
+                }
+                if let Some(after) = after {
+                    assert!(script.ends_with(&format!("{after}; exec fish")));
+                }
+                assert!(!script.contains(directory));
+                assert_eq!(
+                    environment(&command, "APPLICATIONLAUNCHER_CD_TARGET"),
+                    Some(Some(OsStr::new(directory)))
+                );
+                assert_eq!(
+                    environment(&command, "APPLICATIONLAUNCHER_TERMINAL_TITLE"),
+                    Some(Some(OsStr::new(title.unwrap_or(""))))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fish_terminal_defaults_keep_empty_data_and_scrub_the_parent_runtime_environment() {
+        let command = fish_terminal_command(None, None, None);
+        for name in [
+            "APPLICATIONLAUNCHER_CD_TARGET",
+            "APPLICATIONLAUNCHER_TERMINAL_TITLE",
+        ] {
+            assert_eq!(environment(&command, name), Some(Some(OsStr::new(""))));
+        }
+        for name in ["PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "UV_ACTIVE"] {
+            assert_eq!(environment(&command, name), Some(None));
+        }
+    }
+
+    #[test]
+    fn fish_clone_title_and_directory_work_in_real_fish_without_command_reparsing() {
+        struct Directory(PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = Directory(std::env::temp_dir().join(format!(
+            "al-fish-clone-{}-{nonce}-girl's \"notes\"; (not-code)",
+            std::process::id()
+        )));
+        std::fs::create_dir(&directory.0).unwrap();
+        let path = directory.0.to_str().unwrap();
+        let title = "tmux: girls - \u{03c0} - girl's \"terminal\"; (not-code)";
+        let command = fish_terminal_command(
+            Some(path),
+            Some(r#"printf '%s\n' "$PWD" "quoted 'value'""#),
+            Some(title),
+        );
+        let script = command.get_args().last().unwrap().to_str().unwrap();
+        // Exercise the real prefix and command, without starting an interactive shell.
+        let script = script.strip_suffix("; exec fish").unwrap();
+        let mut fish = Command::new("fish");
+        fish.args(["--no-config", "-c", script]);
+        for (key, value) in command.get_envs() {
+            match value {
+                Some(value) => {
+                    fish.env(key, value);
+                }
+                None => {
+                    fish.env_remove(key);
+                }
+            }
+        }
+        let output = applicationlauncher::process::output_with_timeout(
+            fish,
+            std::time::Duration::from_secs(5),
+        )
+        .expect("Fish is required to verify terminal launch scripts");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("\x1b]0;{title}\x07{path}\nquoted 'value'\n")
+        );
     }
 }
