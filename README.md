@@ -91,9 +91,10 @@ system, and language/version fields are unchanged.
 Renamed native `uv-bin` installations use the shared passive uv version decoder;
 neither uv nor uvx is launched to read this metadata. Recognising the product does
 not turn an unmanaged uv executable into a uv-managed Python runtime or package.
-Python source helpers can display their own docstring description, proven CLI
-entry-point role and local development project directory even without Git. The
-interpreted application calls this a **Source directory**. A nearby pyproject's
+Python source helpers can display their own docstring description and proven CLI
+entry-point role, and retain local development project attribution even without
+Git. The project root is used internally, not shown as a Source directory field.
+A nearby pyproject's
 version is not a helper version without an exact supported entry-point binding,
 and no running version or source-since-start claim is invented from current files.
 
@@ -478,10 +479,47 @@ reloads. Pi's lightweight startup-receipt updates remain separate.
 Pi's Unicode program marker is normalized to `pi` in launcher titles, carrying
 any strikethrough onto both letters. Raw window and tmux pane titles are unchanged.
 
-Application and Runtime are independently expandable metadata sections under one
-PID, not extra process-tree nodes. Python scripts/modules and Java JARs, source
-files, modules and main classes use the same layout. Uncertain application
-identities and versions remain unknown rather than borrowing runtime metadata.
+Process and runtime executable details share the PID section; Application (or a
+Python Script/Module section) is a separate expandable metadata child, not an
+extra process-tree node. Its Interpreter field identifies Python or the captured
+shell implementation; Python is named CPython only when the running image's
+validated CPython version-object evidence establishes that implementation, not
+from its filename, configured environment or current installation. Node.js,
+Java and Electron retain Runtime (for example, Pi's runtime is Node.js), not a
+runtime hosting Node.js itself. This relationship uses the
+application-specific context label colour. Application colours remain independent
+of the runtime's version colour, and collapsing Application does not hide the
+process or runtime executable/version details. Python scripts/modules, Java JARs,
+source files, modules and main classes, and identified Electron applications use
+the same layout. Uncertain application identities and versions remain unknown
+rather than borrowing runtime metadata.
+Python files use `Script name: filename.py`, preserving the filename extension,
+instead of repeating a Script name field on the interpreter process. Python
+`-m` launches use `Module name: package.module` without inventing a script path.
+These headings use the same application-specific context colour as script fields,
+not an outdated-build status colour. Script sections show the resolved script
+path and a different original launch target, meaningful symlink chains, and
+source/package metadata when known. Exact source-project versions are labelled
+`Version (on disk)`; installed distributions use `Installed version`. Neither is
+presented as the running script's version. Unsupported running-version,
+source-change and compilation placeholders are omitted. Desktop-entry fields
+appear only for an actual association with the script, never borrowed from the
+Python interpreter. Empty package, description and capability placeholders are
+omitted too. Discovery remains passive; inspecting a script never executes or
+imports it.
+Script details include the original argument vector, interpreter options and
+virtual/Conda environment when the recorded interpreter launch path can be
+verified against the running executable. An inherited `VIRTUAL_ENV` alone is
+shown only as an unverified hint; inaccessible environment data or `PYTHONHOME`
+overrides are reported rather than guessed. Environment configuration, configured
+base interpreter, installer, installed entry point and package directories are
+on-disk metadata. Declared dependencies have their own expandable section showing
+installed availability, not imported modules or evaluated requirement markers.
+The entry-file SHA256 refers to disk, not a loaded-code fingerprint. Git repository,
+revision and branch metadata are not displayed in Show Info. Inspection is bounded
+and cached, selects only
+environment-path markers rather than exposing other environment variables, and
+never invokes Python, a build backend, Git hooks or worktree clean filters.
 Collapsing Pi's Application section stops its periodic build-receipt refreshes.
 Window Info defaults to 1200 points wide and fits its opening height to the
 visible content plus 8 extra points, within the monitor bounds. Initial

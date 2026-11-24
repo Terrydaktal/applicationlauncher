@@ -2502,22 +2502,47 @@ mod tests {
                 &node,
                 Some(&version),
             );
+            assert_eq!(groups.len(), 1);
+            let application = &groups[0];
+            assert!(application.children.is_empty());
             assert!(
                 groups
                     .iter()
                     .flat_map(|section| &section.rows)
                     .all(|row| row.label != "Identification")
             );
-            assert_eq!(groups[0].header.as_ref(), format!("Application: {name}"));
-            assert_eq!(groups[1].header.as_ref(), format!("Runtime: {runtime}"));
             assert_eq!(
-                groups[0]
+                application.header.as_ref(),
+                if runtime == "Python" {
+                    format!(
+                        "Script  {}",
+                        Path::new(entry).file_name().unwrap().to_str().unwrap()
+                    )
+                } else {
+                    format!("Application: {name}")
+                }
+            );
+            let path_field = if runtime == "Python" {
+                "Script path"
+            } else {
+                "Launch target"
+            };
+            assert_eq!(
+                application
+                    .rows
+                    .iter()
+                    .find(|row| row.label == path_field)
+                    .unwrap()
+                    .scope,
+                InfoFieldScope::InstanceContext
+            );
+            assert_eq!(
+                application
                     .rows
                     .iter()
                     .find(|row| row.label == "Package")
-                    .unwrap()
-                    .value,
-                "-"
+                    .map(|row| row.value.as_str()),
+                None
             );
             assert!(
                 groups
@@ -2526,50 +2551,58 @@ mod tests {
                     .all(|row| { row.label != "Executable path (on disk)" })
             );
             assert!(
-                groups[0]
+                application
                     .rows
                     .iter()
-                    .any(|row| row.label == "Launch target" && row.value == entry)
+                    .any(|row| row.label == path_field && row.value == entry)
             );
             assert!(
-                groups[0]
+                application
                     .rows
                     .iter()
                     .all(|row| !row.value.contains("runtime 99")
                         && !row.value.contains("runtime-package"))
             );
             assert!(
-                groups[0]
+                super::super::popups::process_version_rows("Runtime", Some(&version), false)
+                    .iter()
+                    .any(|row| row.label == "Executable Version (ELF build ID)"
+                        && row.value == "runtime 99 (Unavailable)")
+            );
+            if runtime == "Python" {
+                assert_eq!(application.rows.len(), 3);
+                assert!(
+                    application
+                        .rows
+                        .iter()
+                        .all(|row| row.label != "Running version")
+                );
+                continue;
+            }
+            assert!(
+                application
                     .rows
                     .iter()
                     .any(|row| row.label == "Running version" && row.value.starts_with("Unknown"))
             );
             assert_eq!(
-                groups[0]
+                application
                     .rows
                     .iter()
-                    .take(6)
+                    .take(9)
                     .map(|row| row.label.as_str())
                     .collect::<Vec<_>>(),
                 [
+                    "Runtime",
                     "Kind",
                     "Launch target",
                     "Running version",
-                    if runtime == "Python" {
-                        "Source changes since start"
-                    } else {
-                        "Build status"
-                    },
+                    "Build status",
+                    "Capabilities",
+                    "Description",
+                    "Application languages (on disk)",
                     "Installed version",
-                    "Package",
                 ]
-            );
-            assert!(
-                groups[1]
-                    .rows
-                    .iter()
-                    .any(|row| row.label == "Version (ELF build ID)"
-                        && row.value == "runtime 99 (Unavailable)")
             );
         }
     }
@@ -2648,8 +2681,9 @@ mod tests {
             let labels: Vec<_> = rows.iter().map(|row| row.label.as_str()).collect();
             assert_eq!(labels.iter().collect::<HashSet<_>>().len(), labels.len());
             assert_eq!(
-                &labels[..6],
+                &labels[..7],
                 [
+                    "Runtime",
                     "Running version",
                     "Running entry point",
                     "Running code fingerprint",
@@ -2669,7 +2703,7 @@ mod tests {
                 "Description",
             ] {
                 assert!(
-                    labels.iter().position(|label| *label == installed).unwrap() >= 6,
+                    labels.iter().position(|label| *label == installed).unwrap() >= 7,
                     "{installed}"
                 );
             }

@@ -225,6 +225,8 @@ impl ProcessVersion {
         self.running_latest_binary = None;
         self.application = None;
         self.script_application = None;
+        self.python_context = None;
+        self.python_context_error = None;
         if self
             .application_installed_metadata
             .as_ref()
@@ -1162,6 +1164,7 @@ fn probe_process_with_source_policy(
         if let Some(entry) = result
             .script_application
             .as_ref()
+            .filter(|application| application.unchanged())
             .and_then(|app| app.entry_point.as_ref())
         {
             result.application_installed_metadata =
