@@ -709,6 +709,134 @@ def rows(text, width):
     return result
 
 
+def client_connection(server, pid, installed=False):
+    values = rows(run_tmux(server, "list-clients", "-F",
+        "#{client_pid}\t#{pid}\t#{session_id}\t#{session_name}\t#{session_created}\t#{client_tty}\t#{client_control_mode}\t#{client_readonly}\t#{client_flags}",
+        installed=installed), 9)
+    matches = [row for row in values if row[0] == str(pid)]
+    if len(matches) != 1:
+        raise Refused("The exact tmux client is no longer attached; reopen Show Info")
+    _, server_pid, session, name, created, tty, control, readonly, flags = matches[0]
+    flags = set(filter(None, flags.split(",")))
+    supported = {"attached", "focused", "UTF-8", "read-only", "ignore-size", "no-detach-on-destroy"}
+    if (server_pid != str(server["process"]["pid"]) or not session.startswith("$")
+            or not session[1:].isascii() or not session[1:].isdigit()
+            or not created.isascii() or not created.isdigit() or int(created) <= 0
+            or not name or not tty.startswith("/dev/") or control != "0"
+            or readonly not in {"0", "1"} or flags - supported
+            or (readonly == "1") != ("read-only" in flags) or "attached" not in flags):
+        raise Refused("Unsupported tmux client mode or incomplete connection identity; no client was detached")
+    return dict(session_id=session, session_name=name, session_created=int(created), tty=tty,
+                read_only=readonly == "1", flags=sorted(flags - {"attached", "focused"}))
+
+
+def require_client_server(plan, installed=False):
+    server, client = plan["server"], plan["client"]
+    metadata = os.stat(server["socket"], follow_symlinks=False)
+    if (not same_process(server["process"]) or not stat.S_ISSOCK(metadata.st_mode)
+            or metadata.st_uid != os.getuid() or [metadata.st_dev, metadata.st_ino] != server["socket_identity"]
+            or file_identity(server["binary"]) != server["installed"]):
+        raise Refused("The tmux server, socket or installed client binary changed; no other server will be used")
+    identity = run_tmux(server, "display-message", "-p", "-t", client["session_id"],
+                        "#{pid}\t#{session_id}\t#{session_created}", installed=installed).strip()
+    if identity != f"{server['process']['pid']}\t{client['session_id']}\t{client['session_created']}":
+        raise Refused("The exact tmux session changed; no replacement session will be created")
+    # Never alter session policy just to make a reconnect possible. Refuse even
+    # with other clients present: they could disappear during the handover.
+    for arguments in [("show-options", "-sv", "exit-unattached"),
+                      ("show-options", "-Av", "-t", client["session_id"], "destroy-unattached")]:
+        if run_tmux(server, *arguments, installed=installed).strip() not in {"off", "0"}:
+            raise Refused("tmux exit-unattached and destroy-unattached must be off before updating a client; no options were changed")
+
+
+def client_plan(server, binding, root, active):
+    require_handoff(binding)
+    require_dedicated_tree(root, active)
+    if root["pid"] != active["pid"] and kind(root) not in {"fish", "bash"}:
+        raise Refused("The tmux client has an unsupported terminal launcher; no process was stopped")
+    client = client_connection(server, active["pid"])
+    plan = dict(kind="tmux_client", server=server, binding=binding, root=root, client=client)
+    # A real read-only command from the installed binary checks protocol
+    # compatibility while the original client is still connected.
+    require_client_server(plan, installed=True)
+    if client_connection(server, active["pid"], installed=True) != client:
+        raise Refused("The tmux client changed during its compatibility check; refresh the preview")
+    plan["program"] = dict(kind="tmux", process=active, argv=client_attach_arguments(server, client),
+                           cwd=active["cwd"], installed=server["installed"])
+    return plan
+
+
+def client_attach_arguments(server, client):
+    attach = ["attach-session", "-E", "-t", client["session_id"]]
+    flags = [flag for flag in client["flags"] if flag != "UTF-8"]
+    if flags:
+        attach += ["-f", ",".join(flags)]
+    # -N forbids server creation. The server-side guard also rejects a different
+    # server/session appearing at the same socket between validation and exec.
+    condition = "#{&&:#{==:#{pid},%d},#{&&:#{==:#{session_id},%s},#{==:#{session_created},%d}}}" % (
+        server["process"]["pid"], client["session_id"], client["session_created"])
+    return [server["binary"], *(["-u"] if "UTF-8" in client["flags"] else []), "-N", "-S", server["socket"],
+            "if-shell", "-F", "-t", client["session_id"], condition, shlex.join(attach),
+            "display-message -p 'Original tmux server/session changed; client not attached'"]
+
+
+def require_client_plan(plan):
+    require_client_server(plan, installed=True)
+    root, active = foreground(plan["binding"]["child_pid"], plan["binding"]["foreground_pgid"])
+    if (not same_process(plan["root"]) or not same_process(plan["program"]["process"])
+            or active["pid"] != plan["program"]["process"]["pid"]
+            or client_connection(plan["server"], active["pid"], installed=True) != plan["client"]):
+        raise Refused("The selected tmux client or terminal process chain changed; no client was detached")
+    require_dedicated_tree(root, active)
+
+
+def client_tab_command(plan, descriptors, directory):
+    root, arguments = plan["root"], plan["program"]["argv"]
+    if root["pid"] == plan["program"]["process"]["pid"]:
+        return arguments
+    descriptor = os.open(f"/proc/{root['pid']}/exe", os.O_RDONLY | os.O_CLOEXEC)
+    descriptors.append(descriptor)
+    shell = f"/proc/{os.getpid()}/fd/{descriptor}"
+    if file_identity(shell) != root["image"]:
+        raise Refused("The terminal's return shell changed before client replacement")
+    aliases = Path(directory) / "return-shell"
+    aliases.mkdir(mode=0o700)
+    alias = aliases / kind(root)
+    alias.symlink_to(shell)
+    shell = str(alias)
+    # Preserve the launcher's running shell image, not a newer installed shell.
+    # The pinned descriptor survives its graceful exit until the new shell loads.
+    if kind(root) == "fish":
+        return fish_command(arguments[0], arguments, shell)
+    startup = aliases / "bashrc"
+    descriptor = os.open(startup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w") as stream:
+        stream.write('if [[ -f "$HOME/.bashrc" ]]; then . "$HOME/.bashrc"; fi\n' + shlex.join(arguments) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    return [shell, "--noprofile", "--rcfile", str(startup), "-i"]
+
+
+def verify_client(plan, root_pid):
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        require_client_server(plan, installed=True)
+        try:
+            root = process(root_pid)
+            _, active = foreground(root_pid, root["foreground"])
+            connection = client_connection(plan["server"], active["pid"], installed=True)
+            expected = dict(plan["client"], tty=connection["tty"])
+            if (active["image"] == plan["server"]["installed"] and kind(active) == "tmux"
+                    and connection == expected
+                    and str(plan["program"]["process"]["pid"]) not in run_tmux(
+                        plan["server"], "list-clients", "-F", "#{client_pid}", installed=True).splitlines()):
+                return active["pid"]
+        except (OSError, ProcessLookupError, ValueError, Refused):
+            pass
+        time.sleep(0.05)
+    raise Refused("The updated tmux client did not reattach to the exact original session; use the retained recovery plan")
+
+
 def require_requested_process(saved, requested):
     if requested is None:
         return

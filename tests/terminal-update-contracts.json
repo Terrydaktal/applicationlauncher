@@ -46,7 +46,7 @@
     },
     {
       "id": "TERMUPDATE-COMPAT-01",
-      "contract": "Absence of native update/hold APIs selects daemon-owned replacement rather than requiring a manual restart. Optional read-only tab metadata identifies ordered tabs; without it only one actual window and one verified PTY session are accepted. Ambiguous, changed and unsupported sessions are refused before interruption; terminal-only updates preserve the running application build and exact conversation.",
+      "contract": "Absence of native update/hold APIs selects daemon-owned replacement rather than requiring a manual restart. Optional read-only tab metadata identifies ordered tabs; without it only one actual window and one verified PTY session are accepted. Ambiguous, changed and unsupported sessions are refused before interruption; window updates select the latest installed supported application builds and preserve the exact conversation or surviving tmux session.",
       "tests": ["test_daemon_owned_compatibility_update_needs_no_native_hold", "test_missing_updater_and_tab_apis_use_only_an_unambiguous_proc_session", "test_multiple_windows_without_tab_metadata_are_refused_without_guessing", "test_identical_captions_with_native_tab_metadata_are_still_ambiguous", "test_proc_mapping_uses_the_real_controlling_pty_and_refuses_multiple_tabs", "test_tab_api_errors_are_not_all_treated_as_absent_capabilities", "terminal-update-wayland-external-codex", "terminal-update-wayland-external-without-tab-api", "terminal-update-wayland-external-shell"]
     },
     {

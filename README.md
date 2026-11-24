@@ -903,12 +903,18 @@ to report the outcome; interrupted work is never blindly replayed. One shared
 cross-process lock excludes overlapping window/program/server restarts and
 session restores. Automatic snapshots wait while replacements are staged.
 
-A terminal-only update pins each native application's running executable,
-including deleted/replaced files, rather than implicitly upgrading it. A
-content-addressed recovery copy and literal recovery arguments are retained in
-`$XDG_STATE_HOME/applicationlauncher/lifecycle/builds/`; per-window plans and
-reports live in `lifecycle/<operation-id>/`. Backups remain until manually removed.
-The native image limit is 1 GiB per captured binary. These are restart recipes,
+Update in Place selects the latest installed native builds for the terminal and
+its supported applications: Fish/Bash/Zsh, Codex, htop, nvtop and tmux clients.
+Codex resumes its exact conversation and returns to the latest installed Fish.
+Tmux clients are checked for protocol compatibility before interruption and retain
+their attachment options while reconnecting to the exact surviving server/session;
+the server and pane applications are not updated or restarted by a window update.
+Selected executable paths and file identities are bound to the preview and checked
+again before interruption. Open descriptors pin both the selected images and
+original native images, including deleted builds, during handover. No executable
+copies or content hashes are made. Private plans and reports contain metadata under
+`$XDG_STATE_HOME/applicationlauncher/lifecycle/<operation-id>/`, not persistent
+binary backups. These are restart recipes,
 not snapshots of loaded libraries, process memory, unsaved shell state or scrollback.
 Individual Fish/Codex updates deliberately select the latest installed build.
 
@@ -926,9 +932,10 @@ launches retain the bounded observable baseline.
 Restarted Codex runs under an interactive Fish parent. Normal exit, failed exit
 and Ctrl+C return to Fish instead of closing the terminal tab. Its exact
 conversation, literal arguments (including argv[0]) and working directory remain
-unchanged. Window-only updates pin an existing Fish ancestor's running image;
-without one they prepare a verified installed Fish before interrupting anything.
-Both Fish and Codex get durable recovery images and a return-to-shell command.
+unchanged. Window updates prepare the latest installed Fish and Codex before
+interrupting anything, retaining their original images through open descriptors
+during handover. Both selected build identities and the return-to-shell recipe
+are recorded in the private recovery metadata.
 This is shared daemon-side policy for native and compatibility window updates,
 not application detection in the terminal helper. It applies to new restarts;
 existing Codex processes launched by earlier updates are not modified in place.

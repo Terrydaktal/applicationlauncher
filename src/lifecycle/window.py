@@ -35,6 +35,7 @@ def scope_fingerprint(tabs):
         program["argv"][0] = "captured-running-image"
         values.append(dict(program=program, record=worker.binding_identity(tab["record"]),
                            active=tab["active"], cwd=tab["cwd"], environment=tab.get("environment", {}),
+                           application_target=tab.get("application_target"),
                            return_shell={key: tab["return_shell"][key] for key in ("source", "image", "argv0")}
                                if "return_shell" in tab else None))
     return worker.plan_identity(values)
@@ -102,10 +103,21 @@ class WindowUpdate:
 
     def return_shell(self, ancestors):
         saved = next((process for process in ancestors if worker.kind(process) == "fish"), None)
-        source = f"/proc/{saved['pid']}/exe" if saved else worker.latest_binary("fish")
-        image = saved["image"] if saved else worker.file_identity(source)
-        return dict(source=source, image=image, argv0=saved["arguments"][0] if saved else source,
-                    executable=self.pin_image(source, image))
+        target, pinned = self.latest_image("fish")
+        result = dict(target, argv0=saved["arguments"][0] if saved else target["source"], executable=pinned)
+        if saved:
+            result["original_executable"] = self.pin(saved)
+        return result
+
+    def latest_image(self, name):
+        source = worker.latest_binary(name)
+        image = worker.file_identity(source)
+        return dict(name=name, source=source, image=image), self.pin_image(source, image)
+
+    def require_target(self, target):
+        if (worker.latest_binary(target["name"]) != target["source"]
+                or worker.file_identity(target["source"]) != target["image"]):
+            raise worker.Refused("An installed application changed after preview; nothing further was stopped")
 
     def capture_tabs(self, snapshot):
         records = snapshot["records"]
@@ -114,16 +126,23 @@ class WindowUpdate:
         tabs = []
         for record in records:
             root, active = worker.foreground(record["child_pid"], record["foreground_pgid"])
-            pinned = self.pin(active)
+            if worker.kind(active) == "pi":
+                raise worker.Refused("A non-tmux Pi restart cannot yet preserve the complete loaded runtime/extensions build; no application was stopped")
+            original = self.pin(active)
+            target, pinned = self.latest_image(worker.kind(active))
             if worker.kind(active) == "tmux":
+                worker.require_dedicated_tree(root, active)
                 server, session, name = worker.tmux_client(active)
-                created = worker.run_tmux(server, "display-message", "-p", "-t", session, "#{session_created}").strip()
-                program = dict(kind="tmux", process=active, installed=active["image"], cwd=active["cwd"],
-                    argv=[pinned, "-N", "-S", server["socket"], "attach-session", "-t", session],
-                    server=server, session=session, session_name=name, created=created)
+                if server["binary"] != target["source"] or server["installed"] != target["image"]:
+                    raise worker.Refused("The installed tmux client changed during planning; no application was stopped")
+                client = worker.client_connection(server, active["pid"])
+                worker.require_client_server(dict(server=server, client=client), installed=True)
+                if worker.client_connection(server, active["pid"], installed=True) != client:
+                    raise worker.Refused("The tmux client changed during its compatibility check; no client was detached")
+                program = dict(kind="tmux", process=active, installed=target["image"], cwd=active["cwd"],
+                    argv=[pinned, *worker.client_attach_arguments(server, client)[1:]],
+                    server=server, session=session, session_name=name, created=str(client["session_created"]), client=client)
             else:
-                if worker.kind(active) == "pi":
-                    raise worker.Refused("A non-tmux Pi restart cannot yet preserve the complete loaded runtime/extensions build; no application was stopped")
                 program = worker.program_plan(active, executable=pinned)
                 if program["kind"] == "codex" and worker.children(active["pid"]):
                     raise worker.Refused("Codex has running child processes; finish or cancel its tools before updating this terminal")
@@ -141,6 +160,7 @@ class WindowUpdate:
             arguments = [active["arguments"][0], *program["argv"][1:]]
             tab = dict(argv=arguments, executable=pinned, cwd=program["cwd"], active=record["active"],
                        program=program, record=record, ancestors=ancestors,
+                       application_target=target, original_executable=original,
                        environment=worker.terminal_environment(active["pid"]))
             if program["kind"] == "codex":
                 shell = tab["return_shell"] = self.return_shell(ancestors)
@@ -161,6 +181,8 @@ class WindowUpdate:
     def revalidate(self):
         self.remote("Preflight")
         for tab in self.tabs:
+            if "application_target" in tab:
+                self.require_target(tab["application_target"])
             saved = tab["program"]["process"]
             if not worker.same_process(saved):
                 raise worker.Refused("An application changed after preview; nothing further was stopped")
@@ -179,8 +201,7 @@ class WindowUpdate:
             worker.require_dedicated_tree(root, active, tab["program"])
             if "return_shell" in tab:
                 shell = tab["return_shell"]
-                if worker.file_identity(shell["source"]) != shell["image"]:
-                    raise worker.Refused("The return-to-Fish executable changed after preview")
+                self.require_target(dict(shell, name="fish"))
 
     def verify_tmux(self, program, active):
         server, session, _ = worker.tmux_client(active)
@@ -189,6 +210,11 @@ class WindowUpdate:
             raise worker.Refused("The tmux client did not attach to the exact existing server/session")
         if worker.run_tmux(server, "display-message", "-p", "-t", session, "#{session_created}").strip() != program["created"]:
             raise worker.Refused("The tmux session identity changed")
+        if "client" in program:
+            worker.require_client_server(program, installed=True)
+            connection = worker.client_connection(server, active["pid"], installed=True)
+            if connection != dict(program["client"], tty=connection["tty"]):
+                raise worker.Refused("The tmux client attachment options changed")
 
     def stop_tab(self, tab, retire_tmux=False):
         program = tab["program"]
@@ -205,18 +231,24 @@ class WindowUpdate:
         self.event("stopping_application", pid=program["process"]["pid"], application=program["kind"])
         self.interrupted = True
         worker.stop_program(program)
-        # Stop only the captured, dedicated shell ancestry. An exec into an idle
-        # shell after Codex exits is expected; a new job is not safe to terminate.
+        # Keep dedicated return shells until the verified terminal handover.
+        # Fish can be waiting for terminal replies with input held; signalling it
+        # here can time out after Codex has already exited and destroy recovery.
+        tab["retained_shells"] = []
         for saved in tab["ancestors"]:
             try:
                 current = worker.process(saved["pid"])
-            except (OSError, ProcessLookupError):
+            except (FileNotFoundError, ProcessLookupError):
                 continue
             if current["start"] != saved["start"] or current["tty"] != saved["tty"]:
                 raise worker.Refused("A captured process identity changed during graceful shutdown")
             allowed = worker.SHELLS | {"htop", "nvtop"} | ({"tmux"} if retire_tmux else set())
-            if (worker.kind(current) not in allowed
-                    or worker.children(current["pid"])):
+            returning = worker.kind(current) in worker.SHELLS and (
+                saved["pid"] != program["process"]["pid"] or program["kind"] in {"codex", "pi", "tmux"})
+            if returning:
+                tab["retained_shells"].append(current)
+                continue
+            if worker.kind(current) not in allowed or worker.children(current["pid"]):
                 raise worker.Refused("A shell started another job; the original window was retained")
             descriptor = os.pidfd_open(current["pid"])
             try:
@@ -235,6 +267,27 @@ class WindowUpdate:
                 time.sleep(0.05)
             else:
                 raise worker.Refused("The application/shell did not exit gracefully; no force-kill was attempted")
+        self.verify_return_shells(tab)
+
+    def verify_return_shells(self, tab):
+        remaining = []
+        for saved in tab.get("retained_shells", []):
+            try:
+                current = worker.process(saved["pid"])
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            if (any(current[key] != saved[key] for key in ("start", "image", "tty", "parent", "group"))
+                    or worker.kind(current) not in worker.SHELLS):
+                raise worker.Refused("A return shell changed before terminal handover; the original was retained")
+            remaining.append(current)
+        for current in remaining:
+            allowed = {other["pid"] for other in remaining if other["parent"] == current["pid"]}
+            for child in set(worker.children(current["pid"])) - allowed:
+                try:
+                    worker.process(child)
+                except (FileNotFoundError, ProcessLookupError):
+                    continue  # The stopped application can await its shell's waitpid.
+                raise worker.Refused(f"A return shell started another job (shell pid {current['pid']}, child pid {child}); the original window was retained")
 
     def verify_replacement(self):
         result = self.remote("Records")
@@ -246,6 +299,8 @@ class WindowUpdate:
             if program["kind"] == "tmux":
                 root = worker.process(record["child_pid"])
                 _, active = worker.foreground(root["pid"], root["foreground"])
+                if active["image"] != program["installed"]:
+                    raise worker.Refused("The replacement tmux client is not running the selected installed build")
                 self.verify_tmux(program, active)
             else:
                 worker.verify_program(program, record["child_pid"])
@@ -273,8 +328,8 @@ class WindowUpdate:
                     and scope_fingerprint(self.tabs) != self.request["scope_fingerprint"]):
                 raise worker.Refused("The exact application/session scope changed after preview; nothing was stopped")
             descriptions = [f"{tab['program']['kind']}: {tab['cwd']}" + (
-                f"; conversation {tab['argv'][2]}" if tab["program"]["kind"] == "codex" else "") for tab in self.tabs]
-            self.publish("ready", "\n".join(descriptions) + "\nOnly the terminal build is updated; application builds are preserved.",
+                f"; conversation {tab['program']['argv'][2]}" if tab["program"]["kind"] == "codex" else "") for tab in self.tabs]
+            self.publish("ready", "\n".join(descriptions) + "\nThe terminal and supported applications use the latest installed builds. tmux servers and pane applications stay running.",
                          preserves_processes=all(tab["program"]["kind"] == "tmux" for tab in self.tabs))
             with self.timings.span("confirmation_wait"):
                 self.remote("AwaitConfirmation", timeout=310000)
@@ -309,11 +364,13 @@ class WindowUpdate:
                     # is verified. The server and its pane applications stay live.
                     for tab in self.tabs:
                         if tab["program"]["kind"] == "tmux": self.stop_tab(tab, retire_tmux=True)
+                for tab in self.tabs:
+                    self.verify_return_shells(tab)
                 self.publish("closing", "Applications verified; handing over to the replacement window")
                 with self.timings.span("commit"):
                     committed = self.remote("Commit")
                 self.original_closed = bool(committed.get("original_closed"))
-                self.publish("complete", "Terminal updated in place; exact application sessions and running builds preserved", **committed)
+                self.publish("complete", "Terminal and applications updated in place; exact application sessions preserved", **committed)
                 self.event("complete")
                 return dict(ok=True, message="Terminal update completed and verified")
         except Exception as error:

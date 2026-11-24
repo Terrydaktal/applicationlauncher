@@ -24,7 +24,7 @@ def wait_for(check):
 
 
 class ReturnShell(unittest.TestCase):
-    def test_window_codex_preserves_parent_fish_and_binds_its_build_to_preview(self):
+    def test_window_codex_updates_parent_fish_and_binds_both_builds_to_preview(self):
         app = dict(pid=60, parent=50, executable="/fixture/codex", arguments=["original-codex", "resume", "exact"],
             cwd="/fixture", image=[1, 2, 3, 4])
         shell = dict(pid=50, executable="/fixture/fish", arguments=["original-fish"], image=[5, 6, 7, 8])
@@ -35,13 +35,17 @@ class ReturnShell(unittest.TestCase):
                 patch.object(worker, "program_plan", return_value=program), \
                 patch.object(worker, "require_dedicated_tree"), \
                 patch.object(worker, "terminal_environment", return_value={}), \
-                patch.object(worker, "latest_binary", side_effect=AssertionError("A terminal-only update upgraded a running Fish")), \
+                patch.object(worker, "latest_binary", side_effect=lambda name: f"/fixture/latest-{name}"), \
+                patch.object(worker, "file_identity", return_value=[9, 10, 11, 12]), \
                 patch.object(window.WindowUpdate, "pin", return_value="/fixture/pinned-codex"), \
-                patch.object(window.WindowUpdate, "pin_image", return_value="/fixture/pinned-fish") as pin:
+                patch.object(window.WindowUpdate, "pin_image", side_effect=lambda source, image: source + "-pinned") as pin:
             job = window.WindowUpdate({}, object(), "/not-used")
             tab = job.capture_tabs(dict(records=[dict(child_pid=50, foreground_pgid=60, active=True)]))[0]
-        pin.assert_called_once_with("/proc/50/exe", shell["image"])
-        self.assertEqual(tab["executable"], "/fixture/pinned-fish")
+        self.assertEqual([call.args for call in pin.call_args_list], [
+            ("/fixture/latest-codex", [9, 10, 11, 12]), ("/fixture/latest-fish", [9, 10, 11, 12])])
+        self.assertEqual(tab["executable"], "/fixture/latest-fish-pinned")
+        self.assertEqual(tab["application_target"]["source"], "/fixture/latest-codex")
+        self.assertEqual(tab["return_shell"]["source"], "/fixture/latest-fish")
         self.assertEqual(tab["argv"][:3], ["original-fish", "--interactive", "--init-command"])
         self.assertIn("original-codex", tab["argv"][3])
         before = window.scope_fingerprint([tab])
