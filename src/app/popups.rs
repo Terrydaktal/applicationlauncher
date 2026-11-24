@@ -839,6 +839,21 @@ struct WindowInfoPopup {
 }
 
 impl WindowInfoPopup {
+    fn sync_window(
+        &mut self,
+        ctx: &egui::Context,
+        viewport: egui::ViewportId,
+        current: &WindowInfo,
+    ) {
+        let title_changed =
+            self.window.title != current.title || self.window.raw_title != current.raw_title;
+        self.window = current.clone();
+        if title_changed {
+            // Deferred native windows do not repaint when their parent receives a title frame.
+            ctx.request_repaint_of(viewport);
+        }
+    }
+
     fn queue_expanded_metadata<'a>(
         &self,
         ctx: &egui::Context,
@@ -2811,7 +2826,7 @@ impl App {
                         .iter()
                         .find(|window| window.id == state.window.id)
                     {
-                        state.window = current.clone();
+                        state.sync_window(ctx, popup.id, current);
                     }
                     if let Some(lookup) = state.lookup.as_mut() {
                         lookup.poll();
