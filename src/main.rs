@@ -189,6 +189,13 @@ AUTHORS
 }
 
 fn main() -> eframe::Result {
+    mod app_version_runtime {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/build-support/app_version_runtime.rs"
+        ));
+    }
+    app_version_runtime::handle_cli();
     // Keep the producer section in optimized links without running a metadata
     // probe, and without making diagnostic switches enter the GUI lifecycle.
     std::hint::black_box(&PRODUCT_METADATA);

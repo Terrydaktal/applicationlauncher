@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
+# Application version: exact flags exit before normal startup.
+# shellcheck disable=SC3028 # Optional Bash sourcing detection with a POSIX-safe fallback.
+if [ "${BASH_SOURCE:-$0}" = "$0" ] && [ "$#" -eq 1 ] &&
+	{ [ "$1" = "--version" ] || [ "$1" = "-V" ]; }; then
+	_app_version_entry=$(readlink -f -- "$0") || exit 1
+	if [ "${_app_version_entry##*/}" = "applicationlauncher" ]; then
+		exec python3 -I -S "${_app_version_entry%/*}/build-support/script_runtime.py" "$_app_version_entry"
+	fi
+fi
+
 set -euo pipefail
 
 umask 077

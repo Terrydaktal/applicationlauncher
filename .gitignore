@@ -1,3 +1,8 @@
 /target
 __pycache__/
 *.py[cod]
+
+# Generated application build versions.
+/.app-version/
+/build-support/__pycache__/
+*.program-metadata.json

@@ -9,6 +9,13 @@ static PRODUCT_METADATA: [u8; PRODUCT_METADATA_TEXT.len()] =
     applicationlauncher::metadata_bytes(PRODUCT_METADATA_TEXT);
 
 fn main() {
+    mod app_version_runtime {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/build-support/app_version_runtime.rs"
+        ));
+    }
+    app_version_runtime::handle_cli();
     std::hint::black_box(&PRODUCT_METADATA);
     if std::env::args().nth(1).as_deref() == Some("--lifecycle-gate") {
         use std::os::unix::process::CommandExt;

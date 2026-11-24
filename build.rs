@@ -58,10 +58,13 @@ fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    app_version::emit(manifest_dir.to_str().unwrap(), "rust:.");
     let inputs = vec![
         manifest_dir.join("Cargo.toml"),
         manifest_dir.join("Cargo.lock"),
+        manifest_dir.join("APP-VERSION"),
         manifest_dir.join("build.rs"),
+        manifest_dir.join("build-support"),
         manifest_dir.join(".cargo"),
         manifest_dir.join("rust-toolchain"),
         manifest_dir.join("rust-toolchain.toml"),
@@ -103,3 +106,6 @@ fn main() {
     let build_id = format!("{package_version}-{profile}-{target}-{hash:016x}");
     println!("cargo:rustc-env=APPLICATIONLAUNCHER_BUILD_ID={build_id}");
 }
+
+#[path = "build-support/app_version.rs"]
+mod app_version;
