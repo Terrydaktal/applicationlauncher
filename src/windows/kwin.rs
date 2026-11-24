@@ -74,10 +74,11 @@ pub(crate) fn build_window_info(
                     .filter_map(|candidate| i32::try_from(candidate).ok())
                     .find(|candidate| *candidate > 0 && process_exists(*candidate));
                 if let Some(record_target) = record_target {
-                    let record_process_name = pid_to_name
-                        .get(&record_target)
-                        .cloned()
-                        .or_else(|| read_process_stat(record_target).map(|stat| stat.name));
+                    let record_process_name =
+                        pid_to_name.get(&record_target).cloned().or_else(|| {
+                            read_process_stat(record_target)
+                                .map(|stat| process_display_name(record_target, &stat.name))
+                        });
                     let resolved_process = record_process_name.as_deref().and_then(|name| {
                         is_shell(name)
                             .then(|| {

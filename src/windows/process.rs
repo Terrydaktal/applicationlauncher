@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::models::ProcessChainEntry;
 
@@ -49,6 +49,29 @@ pub(crate) fn read_process_stat(pid: i32) -> Option<ProcessStat> {
     parse_proc_stat(&content)
 }
 
+pub(crate) fn process_display_name(pid: i32, name: &str) -> String {
+    process_display_name_with_image(name, || std::fs::read_link(format!("/proc/{pid}/exe")).ok())
+}
+
+pub(crate) fn process_display_name_with_image(
+    name: &str,
+    image: impl FnOnce() -> Option<PathBuf>,
+) -> String {
+    // Executing a pinned /proc/.../fd/N image makes Linux comm equal N, not argv[0].
+    if !name.is_empty()
+        && name.bytes().all(|byte| byte.is_ascii_digit())
+        && let Some(image) = image()
+        && let Some(path) = image.to_str()
+        && let Some(basename) = Path::new(path.strip_suffix(" (deleted)").unwrap_or(path))
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+    {
+        return basename.to_owned();
+    }
+    name.to_owned()
+}
+
 pub(crate) fn process_pty_path(pid: i32) -> Option<String> {
     let path = std::fs::read_link(format!("/proc/{pid}/fd/0")).ok()?;
     let path = path.to_string_lossy();
@@ -81,7 +104,10 @@ pub(crate) fn get_process_tree() -> ProcessTree {
                             let stat_path = path.join("stat");
                             if let Ok(content) = std::fs::read_to_string(stat_path) {
                                 if let Some(stat) = parse_proc_stat(&content) {
-                                    pid_to_name.insert(stat.pid, stat.name);
+                                    pid_to_name.insert(
+                                        stat.pid,
+                                        process_display_name(stat.pid, &stat.name),
+                                    );
                                     pid_to_ppid.insert(stat.pid, stat.ppid);
                                     ppid_to_children
                                         .entry(stat.ppid)
@@ -319,6 +345,99 @@ pub(crate) fn process_exists(pid: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descriptor_process_names_use_the_running_image_not_the_fd_number() {
+        for (number, image, expected) in [
+            (
+                "11",
+                "/home/lewis/repos/fish-shell/target/release/fish",
+                "fish",
+            ),
+            (
+                "13",
+                "/home/lewis/repos/fish-shell/target/release/fish (deleted)",
+                "fish",
+            ),
+            ("8", "/home/lewis/repos/codex/build/release/codex", "codex"),
+            (
+                "14",
+                "/home/lewis/repos/xfce4-terminal/build/terminal/xfce4-terminal",
+                "xfce4-terminal",
+            ),
+            ("123", "/usr/bin/123", "123"),
+        ] {
+            assert_eq!(
+                process_display_name_with_image(number, || Some(image.into())),
+                expected
+            );
+        }
+        assert_eq!(process_display_name_with_image("11", || None), "11");
+    }
+
+    #[test]
+    fn custom_process_names_are_preserved_without_reading_the_image() {
+        for name in ["pi", "tmux: client", "codex-code-mode", "fish", "7z", ""] {
+            assert_eq!(
+                process_display_name_with_image(name, || panic!("not a descriptor name")),
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_launched_shell_finds_codex_and_keeps_its_window_title() {
+        let stats = [
+            "10 (14) S 1 10 10 0 -1",
+            "20 (11) S 10 20 20 34840 20",
+            "30 (8) S 20 20 20 34840 20",
+        ]
+        .map(|line| parse_proc_stat(line).unwrap())
+        .into_iter()
+        .map(|stat| (stat.pid, stat))
+        .collect::<HashMap<_, _>>();
+        let names = stats
+            .iter()
+            .map(|(&pid, stat)| {
+                let image = match pid {
+                    10 => "/fixture/xfce4-terminal",
+                    20 => "/fixture/fish (deleted)",
+                    30 => "/fixture/codex",
+                    _ => unreachable!(),
+                };
+                (
+                    pid,
+                    process_display_name_with_image(&stat.name, || Some(image.into())),
+                )
+            })
+            .collect();
+        let children = HashMap::from([(10, vec![20]), (20, vec![30])]);
+        for root in [10, 20] {
+            let (pid, name) = find_terminal_leaf_with_stat_reader(root, &children, &names, |pid| {
+                stats.get(&pid).cloned()
+            })
+            .unwrap();
+            assert_eq!((pid, name.as_str()), (30, "codex"));
+            let title =
+                "codex - ~/Dev/sites/knowthatstuff - Fix MathJax rendering in PMD - Terminal";
+            assert_eq!(
+                crate::terminal_display_title(
+                    title,
+                    &name,
+                    Some("codex resume"),
+                    Some("~/Dev/sites/knowthatstuff"),
+                    None,
+                ),
+                title
+            );
+        }
+        assert_eq!(
+            find_terminal_leaf_with_stat_reader(20, &HashMap::new(), &names, |pid| {
+                stats.get(&pid).cloned()
+            }),
+            Some((20, "fish".into()))
+        );
+    }
 
     #[test]
     fn shell_foreground_scan_compares_all_sibling_programs() {

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use super::process::{is_shell, parse_proc_stat};
+use super::process::{is_shell, parse_proc_stat, process_display_name_with_image};
 use crate::models::{ProcessIdentity, ProcessInfoNode, ProcessTreeSnapshot, WindowInfo};
 
 const MAX_SCANNED_PROCESSES: usize = 32_768;
@@ -286,7 +286,13 @@ fn read_node(root: &Path, process: &Process) -> Option<TreeNode> {
         .filter(|part| !part.is_empty())
         .map(|part| String::from_utf8_lossy(part).into_owned())
         .collect();
-    let script = script_name(root, process, &arguments);
+    // Preserve raw comm in the process index and equality guard below. Only the
+    // displayed clone uses the captured image to repair numeric fd-launch names;
+    // do not reread /proc or infer identity from mutable/untrusted argv[0].
+    let mut displayed_process = process.clone();
+    displayed_process.name =
+        process_display_name_with_image(&process.name, || executable.as_ref().ok().cloned());
+    let script = script_name(root, &displayed_process, &arguments);
     let command_line = command_read.map(|_| {
         let mut command = single_line(&arguments.join(" "));
         if truncated {
@@ -296,7 +302,7 @@ fn read_node(root: &Path, process: &Process) -> Option<TreeNode> {
     });
     // Do not attach details read from a reused PID or a newly reparented process.
     (read_process(root, process.pid).as_ref() == Some(process)).then(|| TreeNode {
-        process: process.clone(),
+        process: displayed_process,
         executable: executable.ok(),
         executable_error,
         script,
@@ -597,6 +603,101 @@ mod tests {
             pane: None,
             client: None,
         }
+    }
+
+    #[test]
+    fn descriptor_launched_names_use_captured_images_in_headers_and_details() {
+        for (image, expected) in [
+            ("/fixture/build/terminal/xfce4-terminal", "xfce4-terminal"),
+            ("/fixture/target/release/fish (deleted)", "fish"),
+            ("/fixture/build/codex", "codex"),
+            ("/usr/bin/123", "123"),
+        ] {
+            let fixture = Fixture::new();
+            fixture.add(10, 0, "8");
+            let directory = fixture.0.join("10");
+            std::fs::remove_file(directory.join("exe")).unwrap();
+            symlink(image, directory.join("exe")).unwrap();
+            std::fs::write(directory.join("cmdline"), b"untrusted-argv0\0").unwrap();
+
+            let snapshot = capture_snapshot(&target(10, None), &fixture.0);
+            assert_eq!(snapshot.nodes.len(), 1);
+            let node = &snapshot.nodes[0];
+            assert_eq!(node.name, expected);
+            assert_eq!(
+                node.header.as_ref(),
+                format!("{expected} (pid 10) [window owner]")
+            );
+            assert_eq!(node.identity.start_ticks, 10);
+            assert_eq!(node.executable.as_deref(), Some(Path::new(image)));
+            assert_eq!(read_process(&fixture.0, 10).unwrap().name, "8");
+        }
+    }
+
+    #[test]
+    fn descriptor_launched_interpreters_keep_script_names() {
+        for (image, argv0, script, expected) in [
+            ("/fixture/bash (deleted)", "bash", "/fixture/run.sh", "bash"),
+            (
+                "/fixture/python3.14",
+                "python3",
+                "/fixture/view.py",
+                "python3.14",
+            ),
+        ] {
+            let fixture = Fixture::new();
+            fixture.add(10, 0, "11");
+            let directory = fixture.0.join("10");
+            std::fs::remove_file(directory.join("exe")).unwrap();
+            symlink(image, directory.join("exe")).unwrap();
+            std::fs::write(directory.join("cmdline"), format!("{argv0}\0{script}\0")).unwrap();
+
+            let snapshot = capture_snapshot(&target(10, None), &fixture.0);
+            let node = &snapshot.nodes[0];
+            assert_eq!(node.name, expected);
+            let basename = Path::new(script).file_name().unwrap().to_str().unwrap();
+            assert_eq!(node.script_name.as_deref(), Some(basename));
+            assert!(
+                node.header
+                    .starts_with(&format!("{expected}: {basename} (pid 10)"))
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_name_fallback_preserves_custom_names_and_unavailable_images() {
+        for (name, image, expected) in [
+            ("8", None, "8"),
+            ("pi", Some("/usr/bin/node"), "pi"),
+            ("tmux: server", Some("/fixture/tmux"), "tmux: server"),
+        ] {
+            let fixture = Fixture::new();
+            fixture.add(10, 0, name);
+            let directory = fixture.0.join("10");
+            std::fs::remove_file(directory.join("exe")).unwrap();
+            if let Some(image) = image {
+                symlink(image, directory.join("exe")).unwrap();
+            }
+            std::fs::write(directory.join("cmdline"), b"pretend-xfce4-terminal\0").unwrap();
+            let snapshot = capture_snapshot(&target(10, None), &fixture.0);
+            assert_eq!(snapshot.nodes[0].name, expected);
+        }
+    }
+
+    #[test]
+    fn display_name_recovery_does_not_replace_raw_snapshot_identity_checks() {
+        let fixture = Fixture::new();
+        fixture.add(10, 0, "8");
+        let directory = fixture.0.join("10");
+        std::fs::remove_file(directory.join("exe")).unwrap();
+        symlink("/fixture/xfce4-terminal", directory.join("exe")).unwrap();
+        let captured = read_process(&fixture.0, 10).unwrap();
+        assert!(read_node(&fixture.0, &captured).is_some());
+        let renamed = Process {
+            name: "xfce4-terminal".into(),
+            ..captured
+        };
+        assert!(read_node(&fixture.0, &renamed).is_none());
     }
 
     #[test]
