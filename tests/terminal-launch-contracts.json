@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "scope": "Run in Terminal interactive Fish command delivery",
+  "behaviors": [
+    {
+      "id": "TERMINAL-READER-01",
+      "contract": "Run in Terminal starts one interactive Fish and queues the entered command exactly once through its first prompt's reader. Command text is an environment value, never interpolated into initialization source or reparsed by the terminal. The handoff variable is erased before execution. Existing runtime-environment cleanup, clone and restart paths are unchanged. No simulated keystrokes, sleeps, eval wrapper or replacement Fish is used.",
+      "tests": [
+        "run_in_terminal_uses_one_interactive_reader_and_literal_command_environment",
+        "run_in_terminal_clears_the_handoff_before_the_command_and_its_children_run",
+        "fish_clone_preserves_script_quotes_in_separate_terminal_arguments"
+      ]
+    },
+    {
+      "id": "TERMINAL-READER-02",
+      "contract": "In an isolated real Fish PTY, startup greeting precedes the command once; interactive pre/postexec hooks and command timing run normally; unknown-command errors are compact; command history and success/failure exit status are retained by the same shell. Quoted/multiline commands are preserved and shell state survives subsequent input. Tests neither use personal configuration/history nor open terminal windows.",
+      "tests": [
+        "run_in_terminal_unknown_command_has_normal_error_timing_history_and_status",
+        "run_in_terminal_keeps_quotes_multiline_commands_and_shell_state_in_one_reader",
+        "run_in_terminal_preserves_failed_command_status_without_restarting_fish"
+      ]
+    }
+  ]
+}

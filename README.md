@@ -11,6 +11,13 @@ Only real symbol occurrences match and highlight; the input is not a regular
 expression, wildcard or shell/home expansion. Existing Unicode/visual-title
 projection, pinned-app filtering and optional recent-window ordering still apply.
 
+**Run in Terminal** queues the entered command through Fish's interactive reader
+after startup, using one shell. The command appears at the normal prompt and uses
+Fish's history, pre/post-command hooks, timing and exit-status display, then returns
+to the same shell without another greeting. History follows the user's normal
+Fish settings, so commands containing secrets may be saved. The command handoff
+variable is cleared before execution; no simulated typing or startup delay is used.
+
 ## Window info requests
 
 XFCE Terminal's **Show Info** menu uses

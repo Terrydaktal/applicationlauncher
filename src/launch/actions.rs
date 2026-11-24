@@ -70,17 +70,28 @@ pub(crate) fn launch_terminal_command(command: &str) {
 
     let command = command.to_string();
     std::thread::spawn(move || {
-        let mut cmd = Command::new("xfce4-terminal");
-        cmd.args([
-            "--execute",
-            "fish",
-            "-ic",
-            r#"eval "$APPLICATIONLAUNCHER_TERMINAL_COMMAND"; exec fish"#,
-        ])
-        .env("APPLICATIONLAUNCHER_TERMINAL_COMMAND", command);
-        scrub_command_env(&mut cmd);
+        let cmd = run_in_terminal_command(&command);
         let _ = applicationlauncher::process::spawn_and_reap(cmd);
     });
+}
+
+fn run_in_terminal_command(command: &str) -> Command {
+    // Repaint queues execution after the pending buffer is applied, even in Fish
+    // builds that otherwise execute reader functions immediately.
+    const INIT: &str = r#"
+function __applicationlauncher_run_command --on-event fish_prompt
+    builtin functions --erase __applicationlauncher_run_command
+    builtin commandline --replace -- "$APPLICATIONLAUNCHER_TERMINAL_COMMAND"
+    or return
+    builtin set --erase --global APPLICATIONLAUNCHER_TERMINAL_COMMAND
+    builtin commandline --function repaint execute
+end
+"#;
+    let mut cmd = Command::new("xfce4-terminal");
+    cmd.args(["--execute", "fish", "--interactive", "--init-command", INIT])
+        .env("APPLICATIONLAUNCHER_TERMINAL_COMMAND", command);
+    scrub_command_env(&mut cmd);
+    cmd
 }
 
 pub(crate) fn launch_fish_terminal(
@@ -634,6 +645,101 @@ mod fish_launch_tests {
             .get_envs()
             .find(|(key, _)| *key == OsStr::new(name))
             .map(|(_, value)| value)
+    }
+
+    #[test]
+    fn run_in_terminal_uses_one_interactive_reader_and_literal_command_environment() {
+        let input = "printf '%s\\n' \"quoted 'value'\"; printf '%s' '(literal) $HOME'";
+        let command = run_in_terminal_command(input);
+        let arguments: Vec<_> = command.get_args().collect();
+        assert_eq!(command.get_program(), "xfce4-terminal");
+        assert_eq!(
+            &arguments[..4],
+            ["--execute", "fish", "--interactive", "--init-command"]
+        );
+        assert_eq!(arguments.len(), 5);
+        let init = arguments[4].to_str().unwrap();
+        assert!(init.contains("--on-event fish_prompt"));
+        assert!(init.contains("commandline --replace --"));
+        assert!(init.contains("commandline --function repaint execute"));
+        assert!(!init.contains("eval "));
+        assert!(!init.contains("exec fish"));
+        assert!(!init.contains(input));
+        assert_eq!(
+            environment(&command, "APPLICATIONLAUNCHER_TERMINAL_COMMAND"),
+            Some(Some(OsStr::new(input)))
+        );
+        for name in ["PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "UV_ACTIVE"] {
+            assert_eq!(environment(&command, name), Some(None));
+        }
+    }
+
+    fn check_interactive_command(input: &str, status: i32, expected: &str, state: &str) {
+        let command = run_in_terminal_command(input);
+        let mut fixture = Command::new("/usr/bin/python3");
+        fixture.args(["-I", "-B"]);
+        fixture.arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fish_command_reader.py"));
+        fixture.args([
+            "--expect-status",
+            &status.to_string(),
+            "--expect-output",
+            expected,
+            "--expect-state",
+            state,
+            "--",
+        ]);
+        fixture.args(command.get_args().skip(1));
+        for (key, value) in command.get_envs() {
+            match value {
+                Some(value) => {
+                    fixture.env(key, value);
+                }
+                None => {
+                    fixture.env_remove(key);
+                }
+            }
+        }
+        let output = applicationlauncher::process::output_with_timeout(
+            fixture,
+            std::time::Duration::from_secs(15),
+        )
+        .expect("Fish reader PTY fixture must finish within its deadline");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn run_in_terminal_unknown_command_has_normal_error_timing_history_and_status() {
+        check_interactive_command("applicationlauncher_no_such_command_19b3", 127, "", "");
+    }
+
+    #[test]
+    fn run_in_terminal_keeps_quotes_multiline_commands_and_shell_state_in_one_reader() {
+        check_interactive_command(
+            "set -g applicationlauncher_reader_state 'state retained'\nprintf '%s\\n' \"quoted 'value'\" 'literal $HOME; (not-code)'",
+            0,
+            "quoted 'value'\nliteral $HOME; (not-code)\n",
+            "state retained",
+        );
+    }
+
+    #[test]
+    fn run_in_terminal_preserves_failed_command_status_without_restarting_fish() {
+        check_interactive_command("false", 1, "", "");
+    }
+
+    #[test]
+    fn run_in_terminal_clears_the_handoff_before_the_command_and_its_children_run() {
+        check_interactive_command(
+            r#"if set --query APPLICATIONLAUNCHER_TERMINAL_COMMAND; echo 'handoff leaked'; else; command /bin/sh -c 'test -z "${APPLICATIONLAUNCHER_TERMINAL_COMMAND+x}" && printf "%s\n" "handoff cleared before execution"'; end"#,
+            0,
+            "handoff cleared before execution\n",
+            "",
+        );
     }
 
     #[test]
