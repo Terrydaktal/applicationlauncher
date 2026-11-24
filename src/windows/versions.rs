@@ -42,7 +42,12 @@ pub(crate) use lookup::{PI_RECEIPT_REFRESH, SCRIPT_METADATA_REFRESH};
 pub(crate) use node::NodeApplication;
 pub(crate) use npm::NpmTarget;
 pub(crate) use pi::{BuildStatus as PiBuildStatus, PiBuildEvidence};
-pub(crate) use script::{ScriptApplication, runtime_name};
+pub(crate) use script::ScriptApplication;
+pub(crate) fn runtime_name(name: &str) -> Option<&'static str> {
+    // An interactive shell remains a native program. It becomes a script
+    // runtime only after the passive argv parser finds a concrete file entry.
+    script::runtime_name(name).filter(|runtime| *runtime != "Shell")
+}
 
 const CACHE_TTL: Duration = Duration::from_secs(300);
 const MAX_CACHE_ENTRIES: usize = 128;

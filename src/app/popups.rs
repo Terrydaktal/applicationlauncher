@@ -1182,16 +1182,34 @@ pub(super) fn application_version_rows(
     version: Option<&crate::windows::versions::ProcessVersion>,
     pending: bool,
 ) -> Vec<InfoPopupRow> {
-    let Some(_) = version.and_then(|version| version.runtime_name) else {
+    let pending = pending || version.is_some_and(|version| version.details_pending);
+    if let Some(version) = version
+        && version.runtime_name == Some("Python")
+        && let Some(script) = &version.script_application
+    {
+        return python_script_rows(role, version, script);
+    }
+    let Some(runtime) = version.and_then(|version| version.runtime_name) else {
         return process_version_rows(role, version, pending);
     };
+    let package_applicable = package_fields_applicable(
+        version.and_then(|version| version.application_installation.as_deref()),
+        version.map(|version| &version.application_progs_metadata),
+    );
     let mut rows = Vec::new();
     let mut installed_rows = Vec::new();
     let mut package_rows = Vec::new();
     let mut launch_rows = Vec::new();
     let row = |label: &str, value: String| InfoPopupRow {
         label: info_metadata_label(role, label),
-        scope: InfoFieldScope::RunningInstance,
+        scope: if matches!(
+            label,
+            "runtime" | "interpreter" | "running entry point" | "launch target"
+        ) {
+            InfoFieldScope::InstanceContext
+        } else {
+            InfoFieldScope::RunningInstance
+        },
         value,
         searched: false,
         separator_before: false,
@@ -1239,7 +1257,9 @@ pub(super) fn application_version_rows(
             "installed version",
             application.installed_version.clone(),
         ));
-        package_rows.push(row("package", application.package.clone()));
+        if package_applicable && !application.package.trim().is_empty() {
+            package_rows.push(row("package", application.package.clone()));
+        }
         if let Some((label, value)) = package_field {
             package_rows.push(row(label, value));
         }
@@ -1264,7 +1284,12 @@ pub(super) fn application_version_rows(
             installed
                 .map(|metadata| metadata.version.clone())
                 .unwrap_or_else(|| {
-                    "Unknown (no exact installed application version metadata)".into()
+                    version
+                        .and_then(|version| version.application_metadata_error.as_deref())
+                        .map(|reason| format!("Unavailable ({reason})"))
+                        .unwrap_or_else(|| {
+                            "Unknown (no exact installed application version metadata)".into()
+                        })
                 }),
         ));
         if let Some(installed) = installed {
@@ -1284,22 +1309,6 @@ pub(super) fn application_version_rows(
         for (label, value) in [
             ("kind", application.kind.to_owned()),
             ("launch target", application.target.clone()),
-            (
-                "running version",
-                "Unknown (no application build identity published)".into(),
-            ),
-            (
-                if application.kind.starts_with("Python") {
-                    "source changes since start"
-                } else {
-                    "build status"
-                },
-                if application.kind.starts_with("Python") {
-                    "Unknown (no startup source snapshot published)".into()
-                } else {
-                    "Unknown (no application build identity published)".into()
-                },
-            ),
         ] {
             rows.push(row(label, value));
         }
@@ -1318,55 +1327,48 @@ pub(super) fn application_version_rows(
                 .filter(|chain| !chain.is_empty())
                 .unwrap_or_else(|| "Unavailable".into()),
         ));
-        package_rows.push(row(
-            "package",
-            version
+        if package_applicable
+            && let Some(package) = version
                 .and_then(|version| version.application_package_target.as_ref())
-                .map(|package| package.name.clone())
-                .unwrap_or_else(|| "-".into()),
-        ));
+                .filter(|package| !package.inferred && !package.name.trim().is_empty())
+        {
+            package_rows.push(row("package", package.name.clone()));
+        }
         if let Some((label, value)) = package_field {
             package_rows.push(row(label, value));
         }
+    }
+    if let Some(version) = version {
+        rows.extend(retained_script_rows(role, version));
     }
     if let Some(installation) =
         version.and_then(|version| version.application_installation.as_ref())
     {
         installed_rows.push(row("installation", installation_type_value(installation)));
     }
-    if let Some(root) =
-        version.and_then(|version| version.application_progs_metadata.source_checkout.as_ref())
+    if let Some(launch) = &version.application_launch
+        && launch.chain.len() > 1
     {
-        installed_rows.push(row("source directory", root.display().to_string()));
+        rows.push(row(
+            installation,
+            "Launch chain",
+            launch
+                .chain
+                .iter()
+                .map(|path| path.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" -> "),
+        ));
     }
-    installed_rows.extend(package_rows);
-    installed_rows.extend(launch_rows);
-    installed_rows.push(row(
-        "description",
-        version
-            .and_then(|version| version.application_progs_metadata.description.clone())
-            .unwrap_or_else(|| "Unavailable".into()),
-    ));
-    installed_rows.push(row(
-        "capabilities",
-        version
-            .and_then(|version| version.application_progs_metadata.capabilities.clone())
-            .unwrap_or_else(|| "Unavailable".into()),
-    ));
-    rows.extend(installed_rows.into_iter().map(|mut row| {
-        row.scope = InfoFieldScope::Installation;
-        row
-    }));
+    rows.extend(python::installation_rows(role, version));
     rows
 }
 
-pub(super) fn hosted_metadata_sections(
-    ctx: &egui::Context,
-    id: egui::Id,
+pub(super) fn process_runtime_name(
     node: &ProcessInfoNode,
     version: Option<&crate::windows::versions::ProcessVersion>,
-) -> Vec<InfoMetadataSection> {
-    let runtime = version
+) -> Option<&'static str> {
+    version
         .and_then(|version| version.runtime_name)
         .or_else(|| {
             let name = node
@@ -1380,6 +1382,14 @@ pub(super) fn hosted_metadata_sections(
     let Some(runtime) = runtime else {
         return Vec::new();
     };
+    let python = runtime == "Python";
+    let shell = runtime == "Shell";
+    let script = version.and_then(|version| version.script_application.as_ref());
+    let script_field =
+        shell || (python && script.is_none_or(|script| script.kind != "Python module"));
+    if python && script.is_none() && (version.is_some() || node.script_name.is_none()) {
+        return Vec::new();
+    }
     let name = version
         .and_then(|version| version.application.as_ref())
         .map(|app| {
@@ -1399,49 +1409,79 @@ pub(super) fn hosted_metadata_sections(
         } else {
             "Unknown"
         });
-    let app_id = id.with("hosted-application");
-    let runtime_id = id.with("runtime");
-    let application_rows = if process_info_section_is_open(ctx, app_id, true) && version.is_some() {
-        application_version_rows("Application", version, false)
+    let header = if shell {
+        format!("Script  {name}")
+    } else if python {
+        if let Some(script) = script {
+            if script.kind == "Python module" {
+                format!("Module name: {}", script.target)
+            } else {
+                let filename = version
+                    .and_then(captured_script_filename)
+                    .unwrap_or(&script.name);
+                format!("Script  {filename}")
+            }
+        } else {
+            format!("Script  {}", node.script_name.as_deref().unwrap_or(name))
+        }
     } else {
-        Vec::new()
+        format!("Application: {name}")
     };
-    let runtime_rows = if process_info_section_is_open(ctx, runtime_id, true) {
-        let mut rows = vec![InfoPopupRow {
-            label: "Executable path".into(),
-            scope: InfoFieldScope::RunningInstance,
-            value: node
-                .executable
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "Unavailable".into()),
-            searched: false,
-            separator_before: false,
-            binary_is_current: None,
-        }];
-        rows.extend(process_version_rows("Runtime", version, version.is_none()));
+    let app_id = id.with("hosted-application");
+    let application_rows = if process_info_section_is_open(ctx, app_id, true) && version.is_some() {
+        let mut rows = application_version_rows("Application", version, false);
+        if shell && let Some(row) = rows.iter_mut().find(|row| row.label == "Interpreter") {
+            row.value = shell_interpreter_name(node, version)
+                .unwrap_or("Unknown")
+                .into();
+        }
+        let launch = version.and_then(|version| {
+            if version.runtime_name.is_some() {
+                version.application_launch.as_ref()
+            } else {
+                version.launch.as_ref()
+            }
+        });
+        if !python
+            || launch
+                .and_then(|launch| launch.desktop_entry.as_ref())
+                .is_some_and(|entry| !entry.desktop_file_path.as_os_str().is_empty())
+            || launch
+                .and_then(|launch| launch.desktop_files.as_ref())
+                .and_then(|result| result.as_ref().ok())
+                .is_some_and(|files| !files.is_empty())
+        {
+            append_desktop_entry_rows(&mut rows, App::process_desktop_rows(launch, false));
+        }
         rows
     } else {
         Vec::new()
     };
-    vec![
-        InfoMetadataSection {
-            id: app_id,
-            header: format!("Application: {name}").into(),
-            binary_is_current: version.and_then(|version| version.process_build_is_current()),
-            default_open: true,
-            rows: application_rows,
+    let field_header = script_field.then(|| InfoMetadataFieldHeader {
+        value_range: "Script  ".len()..header.len(),
+        label_scope: InfoFieldScope::InstanceContext,
+        after_row: None,
+    });
+    vec![InfoMetadataSection {
+        id: app_id,
+        header: header.into(),
+        header_scope: (python && !script_field).then_some(InfoFieldScope::InstanceContext),
+        field_header,
+        binary_is_current: if script_field {
+            retained_script_content_is_current(version)
+        } else {
+            version.and_then(|version| version.process_build_is_current())
         },
-        InfoMetadataSection {
-            id: runtime_id,
-            header: format!("Runtime: {runtime}").into(),
-            binary_is_current: version
-                .filter(|version| version.running_unavailable.is_none())
-                .and_then(|version| version.running_latest_binary),
-            default_open: true,
-            rows: runtime_rows,
+        default_open: true,
+        rows: application_rows,
+        children: if python && process_info_section_is_open(ctx, app_id, true) {
+            let mut sections = python::module_sections(ctx, app_id, version);
+            sections.extend(python::dependency_sections(ctx, app_id, version));
+            sections
+        } else {
+            Vec::new()
         },
-    ]
+    }]
 }
 
 fn append_pi_build_rows(
@@ -1502,7 +1542,14 @@ fn append_pi_build_rows(
             ),
         ]
         .into_iter()
-        .map(|field| row(InfoFieldScope::RunningInstance, field)),
+        .map(|field| {
+            let scope = if matches!(field.0, "loaded extension roots" | "startup build receipt") {
+                InfoFieldScope::InstanceContext
+            } else {
+                InfoFieldScope::RunningInstance
+            };
+            row(scope, field)
+        }),
     );
     installed_rows.extend(
         [
@@ -2021,10 +2068,14 @@ impl App {
             }
             let binary_is_current = version
                 .as_deref()
-                .and_then(|version| version.process_build_is_current());
+                .and_then(|version| version.process_header_is_current());
+            let metadata_pending = version
+                .as_ref()
+                .is_none_or(|version| version.details_pending);
             let mut metadata_sections = Vec::new();
             let rows = if open {
-                details_ready &= version.is_some();
+                details_ready &= !metadata_pending;
+                let runtime = process_runtime_name(node, version.as_deref());
                 metadata_sections = hosted_metadata_sections(ctx, id, node, version.as_deref());
                 let launch = version.as_ref().and_then(|version| {
                     if version.runtime_name.is_some() {
@@ -2033,27 +2084,19 @@ impl App {
                         version.launch.as_ref()
                     }
                 });
-                let mut versions = if metadata_sections.is_empty() {
+                let mut versions = if runtime.is_none() {
                     let mut rows = application_version_rows(
                         "Application",
                         version.as_deref(),
-                        version.is_none(),
+                        metadata_pending,
                     );
                     append_desktop_entry_rows(
                         &mut rows,
-                        Self::process_desktop_rows(launch, version.is_none()),
+                        Self::process_desktop_rows(launch, metadata_pending),
                     );
                     rows
                 } else {
-                    if let Some(application) = metadata_sections.first_mut()
-                        && !application.rows.is_empty()
-                    {
-                        append_desktop_entry_rows(
-                            &mut application.rows,
-                            Self::process_desktop_rows(launch, version.is_none()),
-                        );
-                    }
-                    Vec::new()
+                    process_version_rows("Runtime", version.as_deref(), metadata_pending)
                 };
                 let mut process = process_info_rows(window_info, node, Vec::new());
                 tmux::merge_process_rows(
@@ -2066,7 +2109,7 @@ impl App {
                         .map(|snapshot| snapshot.nodes.as_ref())
                         .unwrap_or_default(),
                 );
-                process.extend(versions);
+                append_process_version_rows(&mut process, versions);
                 if owner {
                     let mut rows = window_info_rows(window_info, Vec::new());
                     rows.extend(process);
@@ -3430,14 +3473,15 @@ mod tests {
     }
 
     #[test]
-    fn python_and_java_installed_versions_never_claim_the_running_loaded_version() {
+    fn interpreted_installed_versions_never_claim_the_running_loaded_version() {
         use crate::windows::versions::{ProcessVersion, ScriptApplication};
-        for runtime in ["Python", "Java"] {
+        for runtime in ["Python", "Java", "Node.js", "Shell"] {
             let version = ProcessVersion {
                 runtime_name: Some(runtime),
                 script_application: Some(ScriptApplication {
                     name: "tool".into(),
                     entry_point: Some("/installed/tool".into()),
+                    descriptor: None,
                     target: "/installed/tool".into(),
                     kind: runtime,
                     identification: "Exact argument",
@@ -3461,19 +3505,109 @@ mod tests {
                     .value,
                 "2.4"
             );
+            if runtime == "Python" {
+                assert!(rows.iter().all(|row| row.label != "Running version"));
+            } else {
+                assert!(
+                    rows.iter()
+                        .find(|row| row.label == "Running version")
+                        .unwrap()
+                        .value
+                        .starts_with("Unknown")
+                );
+            }
             assert!(
                 rows.iter()
-                    .find(|row| row.label == "Running version")
-                    .unwrap()
-                    .value
-                    .starts_with("Unknown")
-            );
-            assert!(
-                rows.iter()
-                    .find(|row| row.label == "Installed metadata")
+                    .find(|row| row.label
+                        == if runtime == "Python" {
+                            "Version metadata"
+                        } else {
+                            "Installed metadata"
+                        })
                     .unwrap()
                     .value
                     .contains("/installed/METADATA")
+            );
+        }
+    }
+
+    #[test]
+    fn stamped_python_entry_is_not_presented_as_a_distribution_or_running_version() {
+        use crate::windows::versions::{ProcessVersion, ScriptApplication};
+        let version = ProcessVersion {
+            runtime_name: Some("Python"),
+            script_application: Some(ScriptApplication {
+                name: "tool".into(),
+                target: "/installed/tool.py".into(),
+                entry_point: Some("/installed/tool.py".into()),
+                descriptor: None,
+                kind: "Python script",
+                identification: "Exact file argument",
+            }),
+            application_installed_metadata: Some(program_metadata::interpreted::InstalledVersion {
+                name: "tool.py".into(),
+                version: "0.0.17-2".into(),
+                metadata_path: "/installed/tool.py.program-metadata.json".into(),
+                kind: "Stamped script entry",
+                identification: "Exact installed bytes; not loaded interpreter code".into(),
+            }),
+            ..Default::default()
+        };
+        let rows = application_version_rows("Application", Some(&version), false);
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "Script entry" && row.value == "tool.py")
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.label.contains("Distribution") || row.label == "Running version")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "Installed version" && row.value == "0.0.17-2")
+        );
+        assert_eq!(crate::windows::versions::runtime_name("fish"), None);
+        assert_eq!(crate::windows::versions::runtime_name("bash"), None);
+        assert_eq!(
+            crate::windows::versions::runtime_name("node"),
+            Some("Node.js")
+        );
+    }
+
+    #[test]
+    fn rejected_script_stamp_preserves_exact_reason_for_every_supported_runtime() {
+        use crate::windows::versions::{ProcessVersion, ScriptApplication};
+        for runtime in ["Python", "Java", "Node.js", "Shell"] {
+            let version = ProcessVersion {
+                runtime_name: Some(runtime),
+                script_application: Some(ScriptApplication {
+                    name: "tool".into(),
+                    target: "/installed/tool".into(),
+                    entry_point: Some("/installed/tool".into()),
+                    descriptor: None,
+                    kind: runtime,
+                    identification: "Exact file argument",
+                }),
+                application_metadata_error: Some(
+                    "A declared script input changed since its version stamp".into(),
+                ),
+                ..Default::default()
+            };
+            let rows = application_version_rows("Application", Some(&version), false);
+            let installed = rows
+                .iter()
+                .find(|row| row.label == "Installed version")
+                .unwrap_or_else(|| panic!("missing rejected version for {runtime}"));
+            assert_eq!(
+                installed.value,
+                "Unavailable (A declared script input changed since its version stamp)",
+                "{runtime}"
+            );
+            assert_eq!(installed.scope, InfoFieldScope::Installation);
+            assert!(
+                !rows.iter().any(|row| row.label == "Running version"
+                    && row.value.contains("declared script input"))
             );
         }
     }

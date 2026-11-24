@@ -54,12 +54,14 @@
     },
     {
       "id": "INFO-SELECTION-07",
-      "contract": "Continuous selection retains readable section spacing, compact tree indentation, wheel settings, natural height and independent dropdowns without drag-to-pan, a top copy-all button or a reserved button row",
+      "contract": "Continuous selection retains readable process-section spacing, compact tree indentation, wheel settings, natural height and independent dropdowns without drag-to-pan, a top copy-all button or a reserved button row. The first metadata heading follows its parent's last field without additional vertical padding, including nested metadata; spacing between separate sections and after headings remains unchanged. Field-like Script dropdowns align both their labels and values with the parent process fields, placing the arrow in the existing tree gutter and indenting only expanded script details. Label and freshness colours are unchanged.",
       "tests": [
         "dragging_info_background_does_not_pan_the_document",
         "info_wheel_sensitivity_changes_live_on_both_axes_without_resetting_scroll",
         "process_dropdowns_use_compact_depth_for_arrows_headers_and_details",
         "process_tree_restores_heading_and_section_spacing_without_widening_field_rows",
+        "metadata_headings_follow_parent_fields_without_an_extra_gap",
+        "script_field_heading_aligns_with_parent_values_and_keeps_label_and_status_colours",
         "process_dropdowns_are_independent_and_keep_the_hierarchy_visible",
         "natural_info_height_adds_eight_pixels_to_the_actual_visible_tree"
       ]

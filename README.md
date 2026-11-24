@@ -458,11 +458,11 @@ without displaying registry credentials. No lookup runs while scrolling,
 searching, or with Show Info closed; an in-flight lookup can finish after close
 but its result is discarded.
 
-Expand the Pi process, then **Application: Pi**, in **Show Info** to see its loaded application version,
-code and extension fingerprints, installed patch verification, comparison age,
-coverage and source record paths. These identify Pi's JavaScript and extensions;
-the separate **Runtime: Node.js** dropdown identifies the native runtime and
-its ELF build ID.
+Expand the Pi process in **Show Info** to see its process details and Node.js
+runtime metadata together, with one executable path and a **Runtime: Node.js**
+field. Its **Application: Pi** child shows the loaded application version, code
+and extension fingerprints and source record paths for the JavaScript and
+extensions hosted inside that same process.
 
 Show Info renders Unicode combining strikethrough marks as native styling in
 titles, process headers and metadata. Copying selected text preserves the original

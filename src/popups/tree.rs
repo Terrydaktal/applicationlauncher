@@ -90,7 +90,12 @@ impl Document {
                 if left < right {
                     self.append(
                         &job.text[left..right],
-                        pending_leading,
+                        pending_leading
+                            + if left == section.byte_range.start {
+                                section.leading_space
+                            } else {
+                                0.0
+                            },
                         section.format.clone(),
                     );
                     pending_leading = 0.0;

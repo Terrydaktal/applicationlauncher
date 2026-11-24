@@ -551,6 +551,34 @@ fn rebase_info_selection(
 
 #[cfg(test)]
 fn copy_shown_info(data: &InfoPopupData) -> String {
+    fn append_metadata(
+        output: &mut String,
+        sections: &[crate::models::InfoMetadataSection],
+        indent: usize,
+    ) {
+        for section in sections {
+            if section.rows.is_empty() && section.children.is_empty() {
+                continue;
+            }
+            output.push_str(&format!("{:indent$}{}\n", "", section.header));
+            let width = section
+                .rows
+                .iter()
+                .map(|row| row.label.chars().count())
+                .max()
+                .unwrap_or(0);
+            for row in &section.rows {
+                output.push_str(&format!(
+                    "{:padding$}{:<width$}  {}\n",
+                    "",
+                    row.label,
+                    row.value,
+                    padding = indent + 4
+                ));
+            }
+            append_metadata(output, &section.children, indent + 4);
+        }
+    }
     let mut output = format!("{}\n{}\n\n", data.heading, data.subtitle);
     let mut append_rows = |rows: &[InfoPopupRow]| {
         let width = rows
@@ -582,32 +610,7 @@ fn copy_shown_info(data: &InfoPopupData) -> String {
                     padding = indent + 4
                 ));
             }
-            for metadata in &section.metadata_sections {
-                if metadata.rows.is_empty() {
-                    continue;
-                }
-                output.push_str(&format!(
-                    "{:padding$}{}\n",
-                    "",
-                    metadata.header,
-                    padding = indent + 4
-                ));
-                let width = metadata
-                    .rows
-                    .iter()
-                    .map(|row| row.label.chars().count())
-                    .max()
-                    .unwrap_or(0);
-                for row in &metadata.rows {
-                    output.push_str(&format!(
-                        "{:padding$}{:<width$}  {}\n",
-                        "",
-                        row.label,
-                        row.value,
-                        padding = indent + 8
-                    ));
-                }
-            }
+            append_metadata(&mut output, &section.metadata_sections, indent + 4);
         }
         output.push_str(&format!("\n{}\n", tree.notice));
     }
@@ -696,6 +699,18 @@ pub(crate) fn info_popup_initial_size(
     default_size: [f32; 2],
     min_size: [f32; 2],
 ) -> [f32; 2] {
+    fn isolate_metadata(
+        ctx: &egui::Context,
+        measurement: egui::Id,
+        sections: &mut [crate::models::InfoMetadataSection],
+    ) {
+        for section in sections {
+            section.default_open =
+                process_info_section_is_open(ctx, section.id, section.default_open);
+            section.id = measurement.with(section.id);
+            isolate_metadata(ctx, measurement, &mut section.children);
+        }
+    }
     let screen_reserve = egui::vec2(32.0, 96.0);
     let monitor = ctx
         .input(|input| input.viewport().monitor_size)
@@ -713,11 +728,7 @@ pub(crate) fn info_popup_initial_size(
             section.default_open =
                 process_info_section_is_open(ctx, section.id, section.default_open);
             section.id = measurement_id.with(section.id);
-            for metadata in &mut section.metadata_sections {
-                metadata.default_open =
-                    process_info_section_is_open(ctx, metadata.id, metadata.default_open);
-                metadata.id = measurement_id.with(metadata.id);
-            }
+            isolate_metadata(ctx, measurement_id, &mut section.metadata_sections);
         }
     }
     let mut ui = egui::Ui::new(
@@ -1674,8 +1685,11 @@ mod tests {
         owner.metadata_sections.push(InfoMetadataSection {
             id: owner.id.with("metadata"),
             header: "Application [NET]".into(),
+            header_scope: None,
+            field_header: None,
             binary_is_current: None,
             default_open: true,
+            children: Vec::new(),
             rows: vec![InfoPopupRow {
                 label: "Root package".into(),
                 scope: InfoFieldScope::Installation,
@@ -2324,6 +2338,44 @@ mod tests {
         }
     }
 
+    fn hosted_tree_info() -> InfoPopupData {
+        use crate::models::InfoMetadataSection;
+
+        let mut data = tree_info();
+        let process = &mut data.process_tree.as_mut().unwrap().sections[0];
+        process.header = "pi (pid 1)".into();
+        process.rows[0].label = "Process name".into();
+        process.rows[0].value = "pi".into();
+        process.rows[0].scope = InfoFieldScope::RunningInstance;
+        let row = |label: &str, value: &str| InfoPopupRow {
+            label: label.into(),
+            scope: InfoFieldScope::RunningInstance,
+            value: value.into(),
+            searched: false,
+            separator_before: false,
+            binary_is_current: None,
+        };
+        process.rows.extend([
+            row("Running executable image original path", "/usr/bin/node"),
+            row("Version", "v26.4.0"),
+        ]);
+        let mut runtime = row("Runtime", "Node.js");
+        runtime.scope = InfoFieldScope::InstanceContext;
+        let mut package = row("Package", "@earendil-works/pi-coding-agent");
+        package.scope = InfoFieldScope::Installation;
+        process.metadata_sections = vec![InfoMetadataSection {
+            id: process.id.with("hosted-application"),
+            header: "Application: Pi".into(),
+            header_scope: None,
+            field_header: None,
+            binary_is_current: None,
+            default_open: true,
+            rows: vec![runtime, package],
+            children: Vec::new(),
+        }];
+        data
+    }
+
     #[test]
     fn info_tree_headings_and_selectable_headers_render_strikes_and_keep_raw_copying() {
         for mark in ['\u{0335}', '\u{0336}'] {
@@ -2452,6 +2504,11 @@ mod tests {
                             }));
                             assert!(copy_shown_info(&data).contains(header));
                         }
+                        assert!(!job.text.contains("Runtime: Node.js"));
+                        assert_eq!(
+                            job.text.contains("@earendil-works/pi-coding-agent"),
+                            process_open && application_open
+                        );
                         assert!(!job.text.contains("Update"));
                     }
                 }
@@ -2631,6 +2688,51 @@ mod tests {
         assert!(collapsed[1] < normal[1]);
         assert_eq!(collapsed, [1200.0, 368.0]);
         assert!(!process_info_section_is_open(&ctx, owner_id, true));
+    }
+
+    #[test]
+    fn hosted_application_initial_height_preserves_child_collapse_state() {
+        for scale in [1.0, 2.0] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            let mut data = hosted_tree_info();
+            let process = &mut data.process_tree.as_mut().unwrap().sections[0];
+            let application = &mut process.metadata_sections[0];
+            application.rows = vec![application.rows[0].clone(); 28];
+            let app_id = application.id;
+            let process_id = process.id;
+            let monitor = egui::vec2(3840.0, 2160.0);
+
+            let expanded = measured_info_size(&ctx, &data, monitor);
+            assert!(egui::collapsing_header::CollapsingState::load(&ctx, app_id).is_none());
+            assert!(egui::collapsing_header::CollapsingState::load(&ctx, process_id).is_none());
+
+            let mut app_state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                &ctx, app_id, true,
+            );
+            app_state.set_open(false);
+            app_state.store(&ctx);
+            let collapsed = measured_info_size(&ctx, &data, monitor);
+            assert!(collapsed[1] < expanded[1], "{collapsed:?} >= {expanded:?}");
+            assert!(!process_info_section_is_open(&ctx, app_id, true));
+            assert!(egui::collapsing_header::CollapsingState::load(&ctx, process_id).is_none());
+
+            app_state.set_open(true);
+            app_state.store(&ctx);
+            assert_eq!(measured_info_size(&ctx, &data, monitor), expanded);
+            let mut process_state =
+                egui::collapsing_header::CollapsingState::load_with_default_open(
+                    &ctx, process_id, true,
+                );
+            process_state.set_open(false);
+            process_state.store(&ctx);
+            assert!(measured_info_size(&ctx, &data, monitor)[1] < expanded[1]);
+            assert!(process_info_section_is_open(&ctx, app_id, false));
+            assert!(!process_info_section_is_open(&ctx, process_id, true));
+            process_state.set_open(true);
+            process_state.store(&ctx);
+            assert_eq!(measured_info_size(&ctx, &data, monitor), expanded);
+        }
     }
 
     fn tree_frame(
@@ -3172,8 +3274,11 @@ mod tests {
             owner.metadata_sections = vec![crate::models::InfoMetadataSection {
                 id: owner.id.with("application"),
                 header: "Application: Pi".into(),
+                header_scope: None,
+                field_header: None,
                 binary_is_current: None,
                 default_open: true,
+                children: Vec::new(),
                 rows: owner.rows.clone(),
             }];
             tree_frame(&ctx, &data, Vec::new());
@@ -3232,21 +3337,20 @@ mod tests {
                 let mut field = owner.rows[0].clone();
                 field.label = "Window class".into();
                 owner.rows.push(field.clone());
-                owner.metadata_sections = ["Application: Pi", "Runtime: Node.js"]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, header)| {
-                        let mut row = field.clone();
-                        row.label = format!("Nested field {index}");
-                        InfoMetadataSection {
-                            id: owner.id.with(index),
-                            header: header.into(),
-                            binary_is_current: None,
-                            default_open: true,
-                            rows: vec![row],
-                        }
-                    })
-                    .collect();
+                let mut runtime = field.clone();
+                runtime.label = "Runtime".into();
+                runtime.scope = InfoFieldScope::InstanceContext;
+                field.label = "Nested field 1".into();
+                owner.metadata_sections = vec![InfoMetadataSection {
+                    id: owner.id.with("hosted-application"),
+                    header: "Application: Pi".into(),
+                    header_scope: None,
+                    field_header: None,
+                    binary_is_current: None,
+                    default_open: true,
+                    children: Vec::new(),
+                    rows: vec![runtime, field],
+                }];
                 let (output, editors) = tree_frame(&ctx, &data, Vec::new());
                 assert!(!output.shapes.iter().any(|shape| matches!(
                     &shape.shape,
@@ -3271,10 +3375,7 @@ mod tests {
                 );
                 for (above, below) in [
                     ("xfce4-terminal (pid 1)", "Window PID"),
-                    ("Window class", "Application: Pi"),
-                    ("Application: Pi", "Nested field 0"),
-                    ("Nested field 0", "Runtime: Node.js"),
-                    ("Runtime: Node.js", "Nested field 1"),
+                    ("Application: Pi", "Runtime"),
                 ] {
                     let actual = row(below).top() - row(above).bottom();
                     assert!(
@@ -3285,6 +3386,10 @@ mod tests {
                 let between_processes = row("fish (pid 2)").top() - row("Nested field 1").bottom();
                 assert!((between_processes - 8.0).abs() <= 0.5);
                 assert!((row("Window class").top() - row("Window PID").bottom()).abs() <= 0.5);
+                assert!((row("Application: Pi").top() - row("Window class").bottom()).abs() <= 0.5);
+                assert!((row("Nested field 1").top() - row("Runtime").bottom()).abs() <= 0.5);
+                let indent = ctx.style().spacing.indent;
+                assert!((row("Application: Pi").left() - owner.left() - indent).abs() <= 0.5);
 
                 let id = data.process_tree.as_ref().unwrap().sections[0].id;
                 let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
@@ -3443,42 +3548,224 @@ mod tests {
     }
 
     #[test]
+    fn metadata_headings_follow_parent_fields_without_an_extra_gap() {
+        for scale in [1.0, 2.0] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            let mut data = hosted_tree_info();
+            let application =
+                &mut data.process_tree.as_mut().unwrap().sections[0].metadata_sections[0];
+            let mut script_path = application.rows[0].clone();
+            script_path.label = "Script path".into();
+            script_path.value = "/work/nested.py".into();
+            application
+                .children
+                .push(crate::models::InfoMetadataSection {
+                    id: application.id.with("script"),
+                    header: "Script name: nested.py".into(),
+                    header_scope: Some(InfoFieldScope::InstanceContext),
+                    field_header: None,
+                    binary_is_current: None,
+                    default_open: true,
+                    rows: vec![script_path],
+                    children: Vec::new(),
+                });
+            let (_, documents) = tree_frame(&ctx, &data, Vec::new());
+            assert_eq!(documents.len(), 1);
+            let document = &documents[0];
+            let row = |label: &str| {
+                let byte = document.galley.job.text.find(label).unwrap();
+                let cursor = document.galley.job.text[..byte].chars().count();
+                document
+                    .galley
+                    .pos_from_cursor(egui::text::CCursor::new(cursor))
+            };
+            for (above, below) in [
+                ("Version", "Application: Pi"),
+                ("Package", "Script name: nested.py"),
+            ] {
+                let gap = row(below).top() - row(above).bottom();
+                assert!(
+                    gap.abs() <= 0.5,
+                    "{above} -> {below}: extra gap={gap}, scale={scale}"
+                );
+            }
+            let body_gap = row("Script path").top() - row("Script name: nested.py").bottom();
+            assert!((body_gap - ctx.style().spacing.item_spacing.y).abs() <= 0.5);
+            let process_gap = row("fish (pid 2)").top() - row("Script path").bottom();
+            assert!((process_gap - 8.0).abs() <= 0.5);
+        }
+    }
+
+    #[test]
+    fn python_script_field_headers_align_and_colour_names_without_borrowing_runtime_status() {
+        for scale in [1.0, 2.0] {
+            for open in [false, true] {
+                for native_current in [Some(true), Some(false), None] {
+                    for script_current in [Some(true), Some(false), None] {
+                        let ctx = egui::Context::default();
+                        ctx.set_pixels_per_point(scale);
+                        ctx.style_mut(|style| style.animation_time = 0.0);
+                        let colour = |current| match current {
+                            Some(true) => egui::Color32::from_rgb(130, 225, 145),
+                            Some(false) => egui::Color32::from_rgb(255, 110, 110),
+                            None => ctx.style().visuals.text_color(),
+                        };
+                        let name = "serve_viewer-é.py";
+                        let path = format!("/work/{name}");
+                        let header = format!("Script  {name}");
+                        let mut data = hosted_tree_info();
+                        let process = &mut data.process_tree.as_mut().unwrap().sections[0];
+                        process.header = "python3 (pid 1)".into();
+                        process.binary_is_current = native_current;
+                        process.rows[0].value = "python3".into();
+                        process.rows[1].value = "/usr/bin/python3".into();
+                        process.rows[2].value = "Python 3.14.0".into();
+                        process.rows.push(InfoPopupRow {
+                            label: "Capabilities".into(),
+                            scope: InfoFieldScope::Installation,
+                            value: "CLI  •  Primary role: Command-line tool".into(),
+                            searched: false,
+                            separator_before: false,
+                            binary_is_current: None,
+                        });
+                        let process_id = process.id;
+                        let script = &mut process.metadata_sections[0];
+                        script.header = header.clone().into();
+                        script.header_scope = None;
+                        script.field_header = Some(crate::models::InfoMetadataFieldHeader {
+                            value_range: 8..8 + name.len(),
+                            label_scope: InfoFieldScope::InstanceContext,
+                            after_row: None,
+                        });
+                        script.binary_is_current = script_current;
+                        script.default_open = open;
+                        script.rows[0].value = "Python".into();
+                        script.rows[1].label = "Script path".into();
+                        script.rows[1].value = path.clone().into();
+                        script.rows[1].scope = InfoFieldScope::InstanceContext;
+                        let script_id = script.id;
+                        let (_, documents) = tree_frame(&ctx, &data, Vec::new());
+                        assert_eq!(documents.len(), 1);
+                        let editor = &documents[0];
+                        let job = &editor.galley.job;
+                        assert!(job.text.contains(&header));
+                        assert!(
+                            !job.text.contains("Script name:") && !job.text.contains("Script:")
+                        );
+                        assert!(job.text.contains("Python 3.14.0"));
+                        let x = |needle: &str| {
+                            let byte = job.text.find(needle).unwrap();
+                            editor
+                                .galley
+                                .pos_from_cursor(egui::text::CCursor::new(
+                                    job.text[..byte].chars().count(),
+                                ))
+                                .left()
+                        };
+                        assert!(
+                            (x(name) - x("CLI  •  Primary role: Command-line tool")).abs() < 0.8,
+                            "Python script value must align with parent values at {scale}x"
+                        );
+                        assert!((x("Script") - x("Capabilities")).abs() < 0.8);
+                        for (text, expected) in [
+                            ("Script", egui::Color32::from_rgb(188, 152, 165)),
+                            (name, colour(script_current)),
+                            ("python3", colour(native_current)),
+                        ] {
+                            assert!(
+                                job.sections.iter().any(|part| {
+                                    job.text[part.byte_range.clone()].trim_end() == text
+                                        && part.format.color == expected
+                                }),
+                                "independent {text} colour at {scale}x; native={native_current:?}, script={script_current:?}"
+                            );
+                        }
+                        if open {
+                            for (text, expected) in [
+                                (
+                                    "Script path",
+                                    info_field_label_color(InfoFieldScope::InstanceContext),
+                                ),
+                                (path.as_str(), egui::Color32::WHITE),
+                            ] {
+                                let start = job.text.find(text).unwrap();
+                                let range = start..start + text.len();
+                                assert!(
+                                    job.sections
+                                        .iter()
+                                        .filter(|part| {
+                                            part.byte_range.start < range.end
+                                                && part.byte_range.end > range.start
+                                        })
+                                        .all(|part| part.format.color == expected),
+                                    "{text}"
+                                );
+                            }
+                        }
+                        let copied = copy_shown_info(&data);
+                        assert_eq!(copied.matches(&header).count(), 1);
+                        assert!(!copied.contains("Script name:") && !copied.contains("Script:"));
+                        assert!(copied.contains("Script path") && copied.contains(&path));
+
+                        let start_byte = job.text.find(&header).unwrap();
+                        let end_byte = if open {
+                            job.text.find(&path).unwrap() + path.len()
+                        } else {
+                            start_byte + header.len()
+                        };
+                        let selected = job.text[start_byte..end_byte].to_owned();
+                        let mut state =
+                            egui::text_edit::TextEditState::load(&ctx, editor.response.id).unwrap();
+                        state
+                            .cursor
+                            .set_char_range(Some(egui::text::CCursorRange::two(
+                                egui::text::CCursor::new(job.text[..start_byte].chars().count()),
+                                egui::text::CCursor::new(job.text[..end_byte].chars().count()),
+                            )));
+                        state.store(&ctx, editor.response.id);
+                        ctx.memory_mut(|memory| memory.request_focus(editor.response.id));
+                        let (output, _) = tree_frame(&ctx, &data, vec![egui::Event::Copy]);
+                        assert!(output.platform_output.commands.iter().any(|command| matches!(
+                            command, egui::OutputCommand::CopyText(text) if text == &selected
+                        )));
+
+                        let arrow = ctx
+                            .read_response(script_id.with("tree-arrow"))
+                            .unwrap()
+                            .rect
+                            .center();
+                        tree_frame(&ctx, &data, pointer_events(arrow));
+                        let (_, documents) = tree_frame(&ctx, &data, Vec::new());
+                        let job = &documents[0].galley.job;
+                        assert!(job.text.contains(&header));
+                        assert_eq!(job.text.contains(&path), !open);
+                        assert!(
+                            job.text.contains("Python 3.14.0") && job.text.contains("Capabilities")
+                        );
+                        assert!(process_info_section_is_open(&ctx, process_id, true));
+                        assert_eq!(process_info_section_is_open(&ctx, script_id, open), !open);
+                        assert!(job.sections.iter().any(|part| {
+                            &job.text[part.byte_range.clone()] == name
+                                && part.format.color == colour(script_current)
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn hosted_metadata_dropdowns_preserve_selection_copying_and_independent_state() {
-        use crate::models::InfoMetadataSection;
         let ctx = egui::Context::default();
         ctx.style_mut(|style| style.animation_time = 0.0);
-        let mut data = tree_info();
-        let process = &mut data.process_tree.as_mut().unwrap().sections[0];
-        process.metadata_sections = [
-            (
-                "hosted-application",
-                "Application: Pi",
-                "Package",
-                "@earendil-works/pi-coding-agent",
-            ),
-            ("runtime", "Runtime: Node.js", "Version", "v26.4.0"),
-        ]
-        .into_iter()
-        .map(|(key, header, label, value)| InfoMetadataSection {
-            id: process.id.with(key),
-            header: header.into(),
-            binary_is_current: None,
-            default_open: true,
-            rows: vec![InfoPopupRow {
-                label: label.into(),
-                scope: InfoFieldScope::RunningInstance,
-                value: value.into(),
-                searched: false,
-                separator_before: false,
-                binary_is_current: None,
-            }],
-        })
-        .collect();
+        let data = hosted_tree_info();
+        let process = &data.process_tree.as_ref().unwrap().sections[0];
         let app_id = process.metadata_sections[0].id;
-        let runtime_id = process.metadata_sections[1].id;
+        let process_id = process.id;
         let (_, documents) = tree_frame(&ctx, &data, Vec::new());
         assert_eq!(documents.len(), 1);
-        let runtime_editor_id = documents[0].response.id;
+        let document_id = documents[0].response.id;
         let editor = &documents[0];
         let position = |index| {
             editor.galley_pos
@@ -3488,8 +3775,9 @@ mod tests {
                     .center()
                     .to_vec2()
         };
-        let start_byte = editor.galley.job.text.find("Version").unwrap();
-        let end_byte = start_byte + editor.galley.job.text[start_byte..].find('\n').unwrap();
+        let start_byte = editor.galley.job.text.find("Process name").unwrap();
+        let package_byte = editor.galley.job.text.find("Package").unwrap();
+        let end_byte = package_byte + editor.galley.job.text[package_byte..].find('\n').unwrap();
         let start = position(editor.galley.job.text[..start_byte].chars().count());
         let end = position(editor.galley.job.text[..end_byte].chars().count());
         let pointer = |pos, pressed| egui::Event::PointerButton {
@@ -3506,26 +3794,88 @@ mod tests {
         tree_frame(&ctx, &data, vec![egui::Event::PointerMoved(end)]);
         tree_frame(&ctx, &data, vec![pointer(end, false)]);
         let (copied, _) = tree_frame(&ctx, &data, vec![egui::Event::Copy]);
-        assert!(copied.platform_output.commands.iter().any(|command| matches!(command,
-            egui::OutputCommand::CopyText(text) if text.contains("Version") && text.contains("v26.4.0"))));
+        assert!(
+            copied
+                .platform_output
+                .commands
+                .iter()
+                .any(|command| matches!(command,
+            egui::OutputCommand::CopyText(text) if text.contains("Runtime") && text.contains("Node.js")
+                && text.contains("v26.4.0") && text.contains("Application: Pi")
+                && text.contains("@earendil-works/pi-coding-agent")))
+        );
         let document = copy_shown_info(&data);
-        assert!(document.contains("Application: Pi") && document.contains("Runtime: Node.js"));
+        assert!(document.contains("Application: Pi") && document.contains("Node.js"));
         assert!(
             document.contains("@earendil-works/pi-coding-agent") && document.contains("v26.4.0")
         );
+        assert!(
+            document.contains(
+                "\n    Application: Pi\n        Runtime  Node.js\n        Package  @earendil-works/pi-coding-agent\n"
+            )
+        );
+        assert_eq!(
+            document
+                .matches("Running executable image original path")
+                .count(),
+            1
+        );
+        assert_eq!(document.matches("Runtime").count(), 1);
+        assert!(!document.contains("Runtime: Node.js"));
         assert_eq!(
             document.matches("(pid ").count(),
             2,
             "metadata groups are not extra processes"
         );
-        let mut state =
-            egui::collapsing_header::CollapsingState::load_with_default_open(&ctx, app_id, true);
-        state.set_open(false);
-        state.store(&ctx);
+        let app_arrow = ctx
+            .read_response(app_id.with("tree-arrow"))
+            .unwrap()
+            .rect
+            .center();
+        tree_frame(&ctx, &data, pointer_events(app_arrow));
         let (_, documents) = tree_frame(&ctx, &data, Vec::new());
         assert_eq!(documents.len(), 1);
-        assert_eq!(documents[0].response.id, runtime_editor_id);
-        assert!(process_info_section_is_open(&ctx, runtime_id, true));
+        assert_eq!(documents[0].response.id, document_id);
+        assert!(process_info_section_is_open(&ctx, process_id, true));
+        assert!(!process_info_section_is_open(&ctx, app_id, true));
+        assert!(documents[0].galley.job.text.contains("Application: Pi"));
+        assert!(documents[0].galley.job.text.contains("v26.4.0"));
+        assert!(!documents[0].galley.job.text.contains("Runtime"));
+        assert!(
+            !documents[0]
+                .galley
+                .job
+                .text
+                .contains("@earendil-works/pi-coding-agent")
+        );
+
+        let process_arrow = ctx
+            .read_response(process_id.with("tree-arrow"))
+            .unwrap()
+            .rect
+            .center();
+        tree_frame(&ctx, &data, pointer_events(process_arrow));
+        let (_, documents) = tree_frame(&ctx, &data, Vec::new());
+        let text = &documents[0].galley.job.text;
+        assert!(text.contains("pi (pid 1)"));
+        assert!(!text.contains("Application: Pi") && !text.contains("v26.4.0"));
+        assert!(
+            text.contains("fish (pid 2)"),
+            "A real child process stays visible"
+        );
+        assert!(!process_info_section_is_open(&ctx, app_id, true));
+
+        tree_frame(&ctx, &data, pointer_events(process_arrow));
+        let (_, documents) = tree_frame(&ctx, &data, Vec::new());
+        assert!(documents[0].galley.job.text.contains("Application: Pi"));
+        assert!(documents[0].galley.job.text.contains("v26.4.0"));
+        assert!(
+            !documents[0]
+                .galley
+                .job
+                .text
+                .contains("@earendil-works/pi-coding-agent")
+        );
         assert!(!process_info_section_is_open(&ctx, app_id, true));
     }
 

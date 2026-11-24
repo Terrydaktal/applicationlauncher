@@ -1930,7 +1930,133 @@ mod tests {
     }
 
     #[test]
-    fn hosted_metadata_groups_are_separate_stable_and_independently_collapsible() {
+    fn hosted_process_and_runtime_fields_share_one_layer_without_duplicates() {
+        use crate::windows::versions::{ProcessVersion, ScriptApplication};
+        let window = test_window_info("tool - Terminal");
+        for (runtime, executable) in [
+            ("Node.js", "/usr/bin/node"),
+            ("Node.js", "/usr/bin/node (deleted)"),
+            ("Python", "/usr/bin/python3"),
+            ("Java", "/usr/bin/java"),
+            ("Electron", "/usr/bin/electron"),
+        ] {
+            let mut node = hosted_process("tool", executable);
+            let mut version = ProcessVersion {
+                runtime_name: Some(runtime),
+                version: Some("runtime 99".into()),
+                build_id: Some("running-build".into()),
+                latest_version: Some("runtime 100".into()),
+                latest_build_id: Some("installed-build".into()),
+                package: Some("runtime-package 99".into()),
+                ..Default::default()
+            };
+            if runtime == "Python" {
+                node.script_name = Some("tool.py".into());
+                version.script_application = Some(ScriptApplication {
+                    name: "tool".into(),
+                    target: "tool.py".into(),
+                    entry_point: Some("/work/tool.py".into()),
+                    descriptor: None,
+                    kind: "Python script",
+                    identification: "Process file argument",
+                });
+            }
+            for pending in [false, true] {
+                let version = (!pending).then_some(&version);
+                let runtime_name = super::super::popups::process_runtime_name(&node, version);
+                assert_eq!(runtime_name, Some(runtime));
+                let rows = super::super::popups::process_info_rows(
+                    &window,
+                    &node,
+                    super::super::popups::process_version_rows("Runtime", version, pending),
+                );
+                assert_eq!(
+                    rows.iter()
+                        .take(8)
+                        .map(|row| row.label.as_str())
+                        .collect::<Vec<_>>(),
+                    [
+                        "Process name",
+                        "PID",
+                        "Running executable image original path",
+                        "Executable Version (ELF build ID)",
+                        "Command line",
+                        "Working directory",
+                        "Parent PID",
+                        "Process start (ticks since boot)",
+                    ]
+                );
+                assert!(
+                    rows.iter()
+                        .all(|row| !matches!(row.label.as_str(), "Runtime" | "Interpreter"))
+                );
+                assert_eq!(rows[2].value, executable);
+                let application = super::super::popups::hosted_metadata_sections(
+                    &egui::Context::default(),
+                    egui::Id::new((runtime, pending)),
+                    &node,
+                    version,
+                );
+                assert_eq!(application.len(), 1);
+                let relationship = if runtime == "Python" {
+                    "Interpreter"
+                } else {
+                    "Runtime"
+                };
+                let runtime_rows: Vec<_> = application[0]
+                    .rows
+                    .iter()
+                    .filter(|row| row.label == relationship)
+                    .collect();
+                if pending {
+                    assert!(runtime_rows.is_empty());
+                } else {
+                    assert_eq!(runtime_rows.len(), 1);
+                    assert_eq!(runtime_rows[0].value, runtime);
+                    assert_eq!(runtime_rows[0].scope, InfoFieldScope::InstanceContext);
+                    assert_eq!(runtime_rows[0].binary_is_current, None);
+                    assert_eq!(application[0].rows[0].label, relationship);
+                }
+                let unique_labels: std::collections::HashSet<_> =
+                    rows.iter().map(|row| &row.label).collect();
+                assert_eq!(
+                    unique_labels.len(),
+                    rows.len(),
+                    "Each field occurs once per PID"
+                );
+                if !pending {
+                    assert!(
+                        rows.iter()
+                            .any(|row| row.label == "Executable Version (ELF build ID)"
+                                && row.value == "runtime 99 (running-build)")
+                    );
+                    assert!(
+                        rows.iter().any(|row| row.label == "Package"
+                            && row.value.starts_with("runtime-package 99"))
+                    );
+                }
+            }
+        }
+        let mut unknown_image = hosted_process("tool", "/usr/bin/node");
+        unknown_image.executable = None;
+        assert_eq!(
+            super::super::popups::process_runtime_name(&unknown_image, None),
+            None
+        );
+        assert_eq!(
+            super::super::popups::process_runtime_name(
+                &unknown_image,
+                Some(&ProcessVersion {
+                    runtime_name: Some("Node.js"),
+                    ..Default::default()
+                })
+            ),
+            Some("Node.js")
+        );
+    }
+
+    #[test]
+    fn hosted_metadata_keeps_only_the_application_child_with_stable_independent_state() {
         use crate::windows::versions::{NodeApplication, ProcessVersion};
         let ctx = egui::Context::default();
         let node = hosted_process("pi", "/usr/bin/node");
@@ -1950,59 +2076,45 @@ mod tests {
         };
         let groups =
             super::super::popups::hosted_metadata_sections(&ctx, id, &node, Some(&version));
-        assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].header.as_ref(), "Application: Pi");
-        assert_eq!(groups[1].header.as_ref(), "Runtime: Node.js");
-        assert_ne!(groups[0].id, groups[1].id);
+        assert_eq!(
+            groups.len(),
+            1,
+            "Only application metadata needs a child section"
+        );
+        let application = &groups[0];
+        assert_eq!(application.header.as_ref(), "Application: Pi");
+        assert_eq!(application.id, id.with("hosted-application"));
+        assert!(application.children.is_empty());
         for group in &groups {
+            assert_ne!(group.id, id);
             for row in &group.rows {
-                let running = matches!(
-                    row.label.as_str(),
-                    "Executable path"
-                        | "Version (ELF build ID)"
-                        | "Running version"
-                        | "Running entry point"
-                        | "Running code fingerprint"
-                        | "Running extensions fingerprint"
-                        | "Loaded extension roots"
-                        | "Startup build receipt"
-                );
-                assert_eq!(
-                    row.scope,
-                    if running {
-                        InfoFieldScope::RunningInstance
-                    } else {
-                        InfoFieldScope::Installation
-                    },
-                    "{}: {}",
-                    group.header,
-                    row.label
-                );
+                let expected = match row.label.as_str() {
+                    "Running version"
+                    | "Running code fingerprint"
+                    | "Running extensions fingerprint" => InfoFieldScope::RunningInstance,
+                    "Runtime"
+                    | "Running entry point"
+                    | "Loaded extension roots"
+                    | "Startup build receipt" => InfoFieldScope::InstanceContext,
+                    _ => InfoFieldScope::Installation,
+                };
+                assert_eq!(row.scope, expected, "{}: {}", group.header, row.label);
             }
         }
-        assert!(groups.iter().all(|group| group.id != id));
-        assert!(
-            groups[0]
+        assert_eq!(application.rows[0].label, "Runtime");
+        assert_eq!(application.rows[0].value, "Node.js");
+        assert_eq!(
+            application
                 .rows
                 .iter()
-                .all(|row| !row.label.starts_with("Runtime"))
-        );
-        assert!(
-            groups[1]
-                .rows
-                .iter()
-                .any(|row| row.label == "Executable path" && row.value == "/usr/bin/node")
-        );
-        assert!(
-            groups[1]
-                .rows
-                .iter()
-                .any(|row| row.label == "Version (ELF build ID)"
-                    && row.value == "v26.4.0 (node-build-id)")
+                .filter(|row| row.label == "Runtime")
+                .count(),
+            1
         );
         let mut closed = egui::collapsing_header::CollapsingState::load_with_default_open(
             &ctx,
-            groups[0].id,
+            application.id,
             true,
         );
         closed.set_open(false);
@@ -2010,8 +2122,25 @@ mod tests {
         let collapsed =
             super::super::popups::hosted_metadata_sections(&ctx, id, &node, Some(&version));
         assert!(collapsed[0].rows.is_empty());
-        assert!(!collapsed[1].rows.is_empty());
-        assert_eq!(collapsed[0].id, groups[0].id);
+        assert_eq!(collapsed[0].id, application.id);
+
+        let mut runtime_state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            &ctx,
+            id.with("runtime"),
+            true,
+        );
+        runtime_state.set_open(false);
+        runtime_state.store(&ctx);
+        let hidden =
+            super::super::popups::hosted_metadata_sections(&ctx, id, &node, Some(&version));
+        assert!(hidden[0].rows.is_empty());
+        assert_eq!(hidden[0].id, application.id);
+        closed.set_open(true);
+        closed.store(&ctx);
+        let reopened =
+            super::super::popups::hosted_metadata_sections(&ctx, id, &node, Some(&version));
+        assert!(!reopened[0].rows.is_empty());
+        assert!(reopened[0].children.is_empty());
         let other = super::super::popups::hosted_metadata_sections(
             &ctx,
             egui::Id::new("another-window"),
@@ -2066,6 +2195,8 @@ mod tests {
                         let ctx = egui::Context::default();
                         let version = ProcessVersion {
                             runtime_name: Some("Node.js"),
+                            version: Some("v26.4.0".into()),
+                            build_id: Some("runtime-build".into()),
                             application: Some(NodeApplication {
                                 package: "@earendil-works/pi-coding-agent".into(),
                                 installed_version: "0.84.2".into(),
@@ -2097,22 +2228,36 @@ mod tests {
                             &node,
                             Some(&version),
                         );
-                        assert_eq!(groups[0].header.as_ref(), "Application: Pi");
-                        assert_eq!(groups[1].header.as_ref(), "Runtime: Node.js");
+                        assert_eq!(groups.len(), 1);
+                        let application = &groups[0];
+                        assert!(application.children.is_empty());
+                        assert_eq!(application.header.as_ref(), "Application: Pi");
                         assert_eq!(
-                            groups[0].binary_is_current,
+                            application.binary_is_current,
                             if unavailable {
                                 None
                             } else {
                                 application_current
                             },
                         );
+                        let runtime_rows = super::super::popups::process_version_rows(
+                            "Runtime",
+                            Some(&version),
+                            false,
+                        );
                         assert_eq!(
-                            groups[1].binary_is_current,
+                            runtime_rows
+                                .iter()
+                                .find(|row| row.label == "Executable Version (ELF build ID)")
+                                .unwrap()
+                                .binary_is_current,
                             if unavailable { None } else { runtime_current },
                         );
-                        assert_eq!(groups[0].rows.is_empty(), !open);
-                        assert_eq!(groups[1].rows.is_empty(), !open);
+                        assert_eq!(application.rows.is_empty(), !open);
+                        assert!(
+                            !runtime_rows.is_empty(),
+                            "Application collapse does not hide runtime fields"
+                        );
                     }
                 }
             }
@@ -2127,6 +2272,191 @@ mod tests {
             loading
                 .iter()
                 .all(|section| section.binary_is_current.is_none())
+        );
+    }
+
+    #[test]
+    fn python_script_sections_preserve_filenames_and_omit_unproven_application_fields() {
+        use crate::windows::versions::{ProcessVersion, ScriptApplication};
+        let window = test_window_info("viewer - Terminal");
+        let mut node = hosted_process("python3", "/usr/bin/python3");
+        node.script_name = Some("serve_viewer.py".into());
+        let version = ProcessVersion {
+            runtime_name: Some("Python"),
+            script_application: Some(ScriptApplication {
+                name: "serve_viewer".into(),
+                target: "serve_viewer.py".into(),
+                entry_point: Some("/work/serve_viewer.py".into()),
+                descriptor: None,
+                kind: "Python script",
+                identification: "Process file argument",
+            }),
+            version: Some("Python 3.14.0".into()),
+            package: Some("python 3.14.0-1".into()),
+            running_latest_binary: Some(true),
+            ..Default::default()
+        };
+        assert!(
+            super::super::popups::process_info_rows(&window, &node, Vec::new())
+                .iter()
+                .all(|row| row.label != "Script name")
+        );
+        let groups = super::super::popups::hosted_metadata_sections(
+            &egui::Context::default(),
+            egui::Id::new("python-script"),
+            &node,
+            Some(&version),
+        );
+        assert_eq!(groups.len(), 1);
+        let script = &groups[0];
+        assert_eq!(script.header.as_ref(), "Script  serve_viewer.py");
+        assert_eq!(script.header_scope, None);
+        let field = script.field_header.as_ref().unwrap();
+        assert_eq!(field.label_scope, InfoFieldScope::InstanceContext);
+        assert_eq!(&script.header[field.value_range.clone()], "serve_viewer.py");
+        assert_eq!(script.binary_is_current, None);
+        assert!(script.children.is_empty());
+        assert_eq!(
+            script
+                .rows
+                .iter()
+                .map(|row| (row.label.as_str(), row.value.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("Interpreter", "Python"),
+                ("Script path", "/work/serve_viewer.py"),
+                ("Launch target", "serve_viewer.py"),
+                ("Application languages (on disk)", "Unknown"),
+            ]
+        );
+        assert!(
+            script
+                .rows
+                .iter()
+                .take(3)
+                .all(|row| row.scope == InfoFieldScope::InstanceContext)
+        );
+        assert!(
+            script
+                .rows
+                .iter()
+                .skip(3)
+                .all(|row| row.scope == InfoFieldScope::Installation)
+        );
+    }
+
+    #[test]
+    fn python_module_sections_do_not_invent_script_paths_or_filename_extensions() {
+        use crate::windows::versions::{ProcessVersion, ScriptApplication};
+        let node = hosted_process("python3", "/usr/bin/python3");
+        let mut version = ProcessVersion {
+            runtime_name: Some("Python"),
+            script_application: Some(ScriptApplication {
+                name: "viewer.server".into(),
+                target: "viewer.server".into(),
+                entry_point: None,
+                descriptor: None,
+                kind: "Python module",
+                identification: "Process module argument",
+            }),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("python-module");
+        let sections =
+            super::super::popups::hosted_metadata_sections(&ctx, id, &node, Some(&version));
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].header.as_ref(), "Module name: viewer.server");
+        assert_eq!(
+            sections[0].header_scope,
+            Some(InfoFieldScope::InstanceContext)
+        );
+        assert_eq!(
+            sections[0]
+                .rows
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Interpreter", "Application languages (on disk)"]
+        );
+        assert_eq!(sections[0].rows[0].label, "Interpreter");
+        assert_eq!(sections[0].rows[0].value, "Python");
+        version.script_application = None;
+        assert!(
+            super::super::popups::hosted_metadata_sections(&ctx, id, &node, Some(&version))
+                .is_empty()
+        );
+        assert!(
+            super::super::popups::process_version_rows("Runtime", Some(&version), false)
+                .iter()
+                .any(|row| row.label == "Executable Version (ELF build ID)")
+        );
+    }
+
+    #[test]
+    fn python_script_desktop_fields_require_a_real_script_entry_not_the_runtime_entry() {
+        use crate::windows::versions::{ApplicationLaunch, ProcessVersion, ScriptApplication};
+        let node = hosted_process("python3", "/usr/bin/python3");
+        let entry = AppInfo {
+            name: "Viewer".into(),
+            exec: "python3 /work/serve_viewer.py".into(),
+            icon_path: None,
+            desktop_file_path: "/apps/viewer.desktop".into(),
+            comment: Some("Open the viewer".into()),
+            is_settings_module: false,
+        };
+        let mut version = ProcessVersion {
+            runtime_name: Some("Python"),
+            script_application: Some(ScriptApplication {
+                name: "serve_viewer".into(),
+                target: "/work/serve_viewer.py".into(),
+                entry_point: Some("/work/serve_viewer.py".into()),
+                descriptor: None,
+                kind: "Python script",
+                identification: "Process file argument",
+            }),
+            launch: Some(ApplicationLaunch {
+                desktop_entry: Some(entry.clone()),
+                desktop_exists: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("python-desktop");
+        let without =
+            super::super::popups::hosted_metadata_sections(&ctx, id, &node, Some(&version));
+        assert_eq!(
+            without[0]
+                .rows
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Interpreter",
+                "Script path",
+                "Application languages (on disk)",
+            ],
+            "A single script path does not need a duplicate launch chain or target"
+        );
+        assert!(without[0].rows.iter().all(|row| !matches!(
+            row.label.as_str(),
+            "Desktop file" | "Name" | "Comment" | "Icon path"
+        )));
+        version.application_launch = Some(ApplicationLaunch {
+            desktop_entry: Some(entry),
+            desktop_exists: Some(false),
+            ..Default::default()
+        });
+        let with = super::super::popups::hosted_metadata_sections(&ctx, id, &node, Some(&version));
+        assert!(with[0].rows.iter().any(|row| row.label == "Desktop file"
+            && row.value.contains("/apps/viewer.desktop")
+            && row.value.contains("missing")));
+        assert!(
+            with[0]
+                .rows
+                .iter()
+                .any(|row| row.label == "Name" && row.value == "Viewer")
         );
     }
 

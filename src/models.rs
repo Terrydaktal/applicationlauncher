@@ -461,9 +461,12 @@ impl InfoProgram {
 pub struct InfoMetadataSection {
     pub id: eframe::egui::Id,
     pub header: Arc<str>,
+    pub header_scope: Option<InfoFieldScope>,
+    pub field_header: Option<InfoMetadataFieldHeader>,
     pub binary_is_current: Option<bool>,
     pub default_open: bool,
     pub rows: Vec<InfoPopupRow>,
+    pub children: Vec<InfoMetadataSection>,
 }
 
 #[derive(Clone)]
