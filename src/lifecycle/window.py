@@ -294,9 +294,9 @@ class WindowUpdate:
                 shell = tab["return_shell"]
                 self.require_target(dict(shell, name="fish"))
 
-    def verify_tmux(self, program, active):
-        server, session, _ = worker.tmux_client(active)
+    def verify_tmux(self, program, active, *, attachment_timeout=0):
         original = program["server"]
+        server, session, _ = worker.tmux_client(active, expected_server=original, attachment_timeout=attachment_timeout)
         if (server["socket"], server["process"], session) != (original["socket"], original["process"], program["session"]):
             raise worker.Refused("The tmux client did not attach to the exact existing server/session")
         if worker.run_tmux(server, "display-message", "-p", "-t", session, "#{session_created}").strip() != program["created"]:
@@ -393,7 +393,7 @@ class WindowUpdate:
                 _, active = worker.foreground(root["pid"], root["foreground"])
                 if active["image"] != program["installed"]:
                     raise worker.Refused("The replacement tmux client is not running the selected installed build")
-                self.verify_tmux(program, active)
+                self.verify_tmux(program, active, attachment_timeout=5)
             else:
                 worker.verify_program(program, record["child_pid"])
         self.event("applications_verified")

@@ -686,7 +686,7 @@ def require_handoff(binding):
         raise Refused("The terminal tab input is disabled or another update is pending")
 
 
-def run_tmux(server, *arguments, create=False, installed=False):
+def run_tmux(server, *arguments, create=False, installed=False, timeout=5):
     environment = os.environ.copy()
     for name in ("TMUX", "TMUX_PANE", "XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"):
         environment.pop(name, None)
@@ -702,7 +702,7 @@ def run_tmux(server, *arguments, create=False, installed=False):
     command = [executable, *([] if create else ["-N"]), "-S", server["socket"], *arguments]
     try:
         output = subprocess.run(command, env=environment, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     except subprocess.TimeoutExpired as error:
         raise Refused(f"tmux {arguments[0]} timed out; server state must be checked before retrying") from error
     if output.returncode or len(output.stdout) + len(output.stderr) > LIMIT:
@@ -752,7 +752,7 @@ def replacement_server(server):
     return dict(server, process=saved, socket_identity=[after.st_dev, after.st_ino])
 
 
-def tmux_client(saved):
+def tmux_client(saved, *, expected_server=None, attachment_timeout=0):
     arguments = saved["arguments"][1:]
     label, explicit, index, explicit_label = "default", None, 0, False
     while index < len(arguments) and arguments[index].startswith("-"):
@@ -783,13 +783,31 @@ def tmux_client(saved):
     if not label or "/" in label:
         raise Refused("Invalid tmux socket label")
     socket = explicit or str(Path(environment.get("TMUX_TMPDIR", "/tmp")) / f"tmux-{os.getuid()}" / label)
-    metadata = os.stat(socket)
-    if not Path(socket).is_absolute() or metadata.st_uid != os.getuid() or not stat.S_ISSOCK(metadata.st_mode):
-        raise Refused("A same-user tmux socket is required")
-    server = dict(socket=socket, binary=latest_binary("tmux"), process=saved,
-                  socket_identity=[metadata.st_dev, metadata.st_ino])
-    rows = run_tmux(server, "list-clients", "-F", "#{client_pid}\t#{pid}\t#{session_id}\t#{session_name}")
-    matches = [line.split("\t") for line in rows.splitlines() if line.split("\t")[0] == str(saved["pid"])]
+    binary = latest_binary("tmux")
+    deadline = time.monotonic() + attachment_timeout
+    while True:
+        metadata = os.stat(socket)
+        if not Path(socket).is_absolute() or metadata.st_uid != os.getuid() or not stat.S_ISSOCK(metadata.st_mode):
+            raise Refused("A same-user tmux socket is required")
+        socket_identity = [metadata.st_dev, metadata.st_ino]
+        if expected_server is not None and (socket != expected_server["socket"]
+                or socket_identity != expected_server["socket_identity"] or not same_process(expected_server["process"])):
+            raise Refused("The tmux client did not attach to the exact existing server/session")
+        server = dict(socket=socket, binary=binary, process=saved, socket_identity=socket_identity)
+        timeout = 5
+        if attachment_timeout:
+            if not same_process(saved):
+                raise Refused("The replacement tmux client exited or changed during attachment")
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout <= 0:
+                raise Refused("The replacement tmux client did not attach before the startup timeout")
+        output = run_tmux(server, "list-clients", "-F", "#{client_pid}\t#{pid}\t#{session_id}\t#{session_name}", timeout=timeout)
+        rows = (line.split("\t") for line in output.splitlines())
+        matches = [row for row in rows if row[0] == str(saved["pid"])]
+        if matches or not attachment_timeout:
+            break
+        # The client can have exec'd tmux before the server registers its attachment.
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
     if len(matches) != 1 or len(matches[0]) != 4:
         raise Refused("The exact tmux client could not be identified")
     _, pid, session, name = matches[0]

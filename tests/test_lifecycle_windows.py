@@ -78,7 +78,7 @@ class Coordinator(unittest.TestCase):
                 job.interrupted = application != "tmux"
                 if fault == "stop": raise worker.Refused("No graceful exit")
             patches.enter_context(patch.object(window.WindowUpdate, "stop_tab", side_effect=stop))
-            def verify(*arguments):
+            def verify(*arguments, **options):
                 events.append("verified")
                 if fault == "verify": raise worker.Refused("Wrong conversation")
             patches.enter_context(patch.object(worker, "verify_program", side_effect=verify))

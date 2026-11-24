@@ -144,21 +144,39 @@ class TmuxWindowUpdates(unittest.TestCase):
                             def controlling_terminal():
                                 os.setsid()
                                 fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-                            replacement = subprocess.Popen(tab["argv"], executable=tab["executable"],
+                            argv = list(tab["argv"])
+                            attach_index = argv.index("if-shell")
+                            argv[attach_index:attach_index] = ["wait-for", "allow-attachment", ";"]
+                            replacement = subprocess.Popen(argv, executable=tab["executable"],
                                 cwd=tab["cwd"], env=environment, stdin=slave, stdout=slave, stderr=slave,
                                 preexec_fn=controlling_terminal)
-                            deadline = time.monotonic() + 5
-                            while str(replacement.pid) not in fixture.tmux("list-clients", "-F", "#{client_pid}").splitlines():
-                                self.assertIsNone(replacement.poll(), "The replacement client failed to attach")
-                                self.assertLess(time.monotonic(), deadline, "The new client never attached")
-                                time.sleep(0.02)
                             self.assertEqual(worker.process(replacement.pid)["image"], installed)
-                            with patch.object(job, "remote", return_value=dict(records=[dict(child_pid=replacement.pid)])):
+                            run_tmux = worker.run_tmux
+                            saw_pending = False
+                            def query(*args, **options):
+                                nonlocal saw_pending
+                                result = run_tmux(*args, **options)
+                                if args[1] == "list-clients" and not saw_pending:
+                                    self.assertNotIn(str(replacement.pid), [row.split("\t")[0] for row in result.splitlines()])
+                                    saw_pending = True
+                                    fixture.tmux("wait-for", "-S", "allow-attachment")
+                                return result
+                            with patch.object(job, "remote", return_value=dict(records=[dict(child_pid=replacement.pid)])), \
+                                    patch.object(worker, "run_tmux", side_effect=query):
                                 job.verify_replacement()
+                            self.assertTrue(saw_pending)
                             self.assertTrue(worker.same_process(server["process"]))
                             self.assertEqual(fixture.tmux("list-panes", "-a", "-F", "#{pane_id}:#{pane_pid}"), panes)
                             self.assertIsNone(original.child.poll(), "The old client exited before verification")
-                            self.assertEqual(worker.client_connection(server, replacement.pid)["read_only"], read_only)
+                            connection = worker.client_connection(server, replacement.pid)
+                            self.assertEqual(connection["read_only"], read_only)
+
+                            fixture.tmux("new-session", "-d", "-s", "wrong", "/bin/sleep", "60")
+                            fixture.tmux("switch-client", "-c", connection["tty"], "-t", "=wrong")
+                            with patch.object(job, "remote", return_value=dict(records=[dict(child_pid=replacement.pid)])), \
+                                    patch.object(time, "sleep", side_effect=AssertionError("Retried a wrong attachment")):
+                                with self.assertRaisesRegex(worker.Refused, "exact existing server/session"):
+                                    job.verify_replacement()
                         finally:
                             if replacement is not None:
                                 if replacement.poll() is None:
