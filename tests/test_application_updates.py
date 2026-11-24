@@ -13,6 +13,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import termios
 import time
 import unittest
 from unittest.mock import patch
@@ -485,8 +486,27 @@ class ProgramUpdates(unittest.TestCase):
         for requested in ({}, dict(pid=True, start_ticks=1, application="fish"),
                           dict(pid=60, start_ticks=0, application="codex"),
                           dict(pid=60, start_ticks=700, application="pi")):
-            with self.assertRaisesRegex(worker.Refused, "exact running Fish or Codex"):
+            with self.assertRaisesRegex(worker.Refused, "exact running Fish, Codex or tmux client"):
                 worker.inspect(dict(process=requested), object())
+
+
+class TmuxClientGuards(unittest.TestCase):
+    def test_control_activepane_suspended_unknown_and_inconsistent_readonly_modes_are_refused(self):
+        server = dict(process=dict(pid=20))
+        base = ["10", "20", "$1", "work", "12345", "/dev/pts/99", "0", "0", "attached,focused,UTF-8"]
+        for field, value in [(6, "1"), (8, "attached,active-pane"), (8, "attached,suspended"),
+                             (8, "attached,unknown"), (7, "1"), (8, "attached,read-only"),
+                             (2, "$1;bad"), (4, "0"), (1, "21")]:
+            row = base.copy()
+            row[field] = value
+            with self.subTest(field=field, value=value), patch.object(worker, "run_tmux", return_value="\t".join(row)):
+                with self.assertRaises(worker.Refused):
+                    worker.client_connection(server, 10)
+        for flags, readonly in [("attached,UTF-8", "0"), ("attached,read-only,ignore-size", "1")]:
+            row = base.copy()
+            row[7], row[8] = readonly, flags
+            with patch.object(worker, "run_tmux", return_value="\t".join(row)):
+                self.assertEqual(worker.client_connection(server, 10)["read_only"], readonly == "1")
 
 
 class Guards(unittest.TestCase):
@@ -685,6 +705,226 @@ class PrivateTmux(unittest.TestCase):
         metadata = os.stat(self.socket)
         return dict(socket=self.socket, binary=self.binary, process=worker.process(pid),
                     installed=worker.file_identity(self.binary), socket_identity=[metadata.st_dev, metadata.st_ino])
+
+    @contextmanager
+    def client_tab(self, binary=None, read_only=False):
+        test = self
+        master, slave = os.openpty()
+        environment = dict(os.environ, TERM="xterm-256color")
+        for key in ("TMUX", "TMUX_PANE"):
+            environment.pop(key, None)
+        def controlling_terminal():
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        class Tab:
+            phase, held, prepared, commits, cancelled = "", False, 0, 0, 0
+            def spawn(self, argv, cwd):
+                self.child = subprocess.Popen(argv, cwd=cwd, env=environment,
+                    stdin=slave, stdout=slave, stderr=slave, preexec_fn=controlling_terminal)
+            def terminals(self):
+                saved = worker.process(self.child.pid)
+                return [dict(owner="fixture", owner_pid=90, child_pid=self.child.pid,
+                    foreground_pgid=saved["foreground"], active=True, restart_supported=True,
+                    input_enabled=self.phase != "prepared", window_uuid="window", tab_uuid="tab")]
+            def prepare(self, binding, argv, cwd):
+                test.assertEqual(binding["child_pid"], self.child.pid)
+                self.argv, self.cwd, self.phase, self.held = argv, cwd, "prepared", True
+                self.prepared += 1
+                return "private-lease"
+            def tab(self, binding, token, method):
+                test.assertEqual((binding["tab_uuid"], token), ("tab", "private-lease"))
+                if method == "CommitTabRestart":
+                    test.assertTrue(self.held, "The tab must be held before the old client exits")
+                    if self.child.poll() is None:
+                        self.child.terminate()
+                    self.child.wait(timeout=5)
+                    self.spawn(self.argv, self.cwd)
+                    self.phase, self.held = "complete", False
+                    self.commits += 1
+                elif method == "CancelTabRestart":
+                    self.phase = "cancelled"
+                    self.cancelled += 1
+                return dict(phase=self.phase, child_pid=self.child.pid if self.child.poll() is None else 0)
+        tab = Tab()
+        tab.spawn([binary or self.binary, "-N", "-S", self.socket, "attach-session", "-E", "-t", "one",
+                   *(["-r"] if read_only else [])], self.root)
+        try:
+            deadline = time.monotonic() + 5
+            while str(tab.child.pid) not in self.tmux("list-clients", "-F", "#{client_pid}").splitlines():
+                self.assertIsNone(tab.child.poll(), "The private tmux client failed to attach")
+                self.assertLess(time.monotonic(), deadline, "The private tmux client did not attach")
+                time.sleep(0.02)
+            yield tab
+        finally:
+            if tab.child.poll() is None:
+                tab.child.terminate()
+            tab.child.wait(timeout=5)
+            os.close(master)
+            os.close(slave)
+
+    def client_preview(self, tab):
+        saved = worker.process(tab.child.pid)
+        payload = dict(window_id="window", windows=[dict(id="window", pid=90, title="fixture", **{"class":"xfce4-terminal"})],
+                       process=dict(pid=saved["pid"], start_ticks=saved["start"], application="tmux"))
+        return worker.inspect(payload, tab)
+
+    def test_client_update_keeps_original_server_panes_and_other_client_with_readonly_preserved(self):
+        (self.root / "old").mkdir()
+        old_binary = self.root / "old/tmux"
+        shutil.copyfile(self.binary, old_binary)
+        old_binary.chmod(0o700)
+        self.tmux("split-window", "-d", "-t", "one", "/usr/bin/sleep", "120")
+        with self.client_tab() as other:
+            for read_only in (False, True):
+                with self.subTest(read_only=read_only), self.client_tab(str(old_binary), read_only) as tab, \
+                        patch.object(worker, "pane_plan", side_effect=AssertionError("Client update inspected a pane")), \
+                        patch.object(worker, "server_plan", side_effect=AssertionError("Client update inspected the whole server")), \
+                        patch.object(worker, "stop_program", side_effect=AssertionError("Client update stopped a pane application")):
+                    server = self.server()
+                    panes = self.tmux("list-panes", "-a", "-F", "#{pane_id}:#{pane_pid}")
+                    original = worker.process(tab.child.pid)
+                    report = self.client_preview(tab)
+                    self.assertEqual([action["id"] for action in report["actions"]], ["program"])
+                    self.assertTrue(report["actions"][0]["eligible"], report["actions"])
+                    scope = report["actions"][0]["program"]["tmux_client"]
+                    self.assertEqual(scope["server"]["pid"], server["process"]["pid"])
+                    self.assertEqual(scope["read_only"], read_only)
+                    self.assertEqual(tab.prepared, 0, "Preview must not prepare or detach the terminal")
+                    result = worker.execute(report["plans"]["program"], tab, self.root)
+                    self.assertTrue(result["ok"], result)
+                    self.assertFalse(worker.same_process(original))
+                    self.assertTrue(worker.same_process(server["process"]))
+                    self.assertEqual(self.server()["socket_identity"], server["socket_identity"])
+                    self.assertEqual(self.tmux("list-panes", "-a", "-F", "#{pane_id}:#{pane_pid}"), panes)
+                    self.assertIsNone(other.child.poll(), "Other clients must not be detached")
+                    self.assertEqual(worker.client_connection(server, tab.child.pid)["read_only"], read_only)
+                    self.assertEqual(worker.process(tab.child.pid)["image"], worker.file_identity(self.binary))
+                    self.assertEqual((tab.prepared, tab.commits, tab.cancelled), (1, 1, 0))
+
+    def test_client_update_refuses_incompatible_installed_binary_before_detaching(self):
+        with self.client_tab() as tab, patch.object(worker, "latest_binary", return_value="/usr/bin/false"):
+            original, server = worker.process(tab.child.pid), self.server()
+            report = self.client_preview(tab)
+            self.assertFalse(report["actions"][0]["eligible"])
+            self.assertFalse(report["plans"])
+            self.assertEqual(tab.prepared, 0)
+            self.assertTrue(worker.same_process(original))
+            self.assertTrue(worker.same_process(server["process"]))
+
+    def test_client_update_refuses_unattached_destruction_without_changing_options(self):
+        for option, arguments in [("exit-unattached", ["-s"]), ("destroy-unattached", ["-t", "one"]),
+                                  ("destroy-unattached", ["-g"])]:
+            with self.subTest(option=option, arguments=arguments), self.client_tab() as tab:
+                self.tmux("set-option", *arguments, option, "on")
+                try:
+                    report = self.client_preview(tab)
+                    self.assertFalse(report["actions"][0]["eligible"], report)
+                    self.assertIn("must be off", report["actions"][0]["message"])
+                    self.assertEqual(tab.prepared, 0)
+                    self.assertIsNone(tab.child.poll())
+                    self.assertEqual(self.tmux("show-options", *arguments, "-v", option), "on")
+                finally:
+                    self.tmux("set-option", *arguments, "-u", option)
+
+    def test_client_update_requires_native_handoff_and_exact_pid_start_before_preparing(self):
+        with self.client_tab() as tab:
+            original = tab.terminals
+            def unsupported():
+                return [dict(original()[0], restart_supported=False)]
+            with patch.object(tab, "terminals", side_effect=unsupported):
+                report = self.client_preview(tab)
+            self.assertFalse(report["actions"][0]["eligible"])
+            self.assertIn("tab-replacement API", report["actions"][0]["message"])
+            saved = worker.process(tab.child.pid)
+            for identity in [dict(pid=saved["pid"] + 1, start_ticks=saved["start"], application="tmux"),
+                             dict(pid=saved["pid"], start_ticks=saved["start"] + 1, application="tmux")]:
+                payload = dict(window_id="window", windows=[dict(id="window", pid=90, title="fixture", **{"class":"xfce4-terminal"})], process=identity)
+                report = worker.inspect(payload, tab)
+                self.assertFalse(report["actions"][0]["eligible"])
+                self.assertFalse(report["plans"])
+            self.assertEqual(tab.prepared, 0)
+            self.assertTrue(worker.same_process(saved))
+
+    def test_client_update_rechecks_the_installed_image_after_preparing_without_signalling(self):
+        with self.client_tab() as tab:
+            plan = self.client_preview(tab)["plans"]["program"]
+            original = worker.file_identity
+            def changed_image(path):
+                value = original(path)
+                return [*value[:-1], value[-1] + 1] if path == self.binary and tab.prepared else value
+            with patch.object(worker, "file_identity", side_effect=changed_image):
+                result = worker.execute(plan, tab, self.root)
+            self.assertFalse(result["ok"])
+            self.assertIn("installed client binary changed", result["message"])
+            self.assertEqual((tab.commits, tab.cancelled), (0, 1))
+            self.assertIsNone(tab.child.poll())
+
+    def test_client_update_revalidates_session_identity_without_stopping_any_client(self):
+        self.tmux("new-session", "-d", "-s", "different", "/usr/bin/bash", "--noprofile", "--norc")
+        with self.client_tab() as tab:
+            report = self.client_preview(tab)
+            tty = worker.client_connection(self.server(), tab.child.pid)["tty"]
+            self.tmux("switch-client", "-c", tty, "-t", "different")
+            with patch.object(worker.signal, "pidfd_send_signal", side_effect=AssertionError("A stale client plan sent a signal")):
+                with self.assertRaisesRegex(worker.Refused, "changed; refresh the preview"):
+                    worker.execute(report["plans"]["program"], tab, self.root)
+            self.assertEqual(tab.prepared, 0)
+            self.assertIsNone(tab.child.poll())
+
+    def test_client_update_rechecks_dangerous_options_after_preparing_the_tab(self):
+        with self.client_tab() as tab:
+            plan = self.client_preview(tab)["plans"]["program"]
+            original = tab.prepare
+            def changed(*arguments):
+                token = original(*arguments)
+                self.tmux("set-option", "-s", "exit-unattached", "on")
+                return token
+            try:
+                with patch.object(tab, "prepare", side_effect=changed):
+                    result = worker.execute(plan, tab, self.root)
+                self.assertFalse(result["ok"])
+                self.assertIn("must be off", result["message"])
+                self.assertEqual((tab.commits, tab.cancelled), (0, 1))
+                self.assertIsNone(tab.child.poll())
+            finally:
+                self.tmux("set-option", "-s", "exit-unattached", "off")
+
+    def test_failed_client_handover_retains_empty_tab_and_the_original_session(self):
+        with self.client_tab() as tab:
+            plan = self.client_preview(tab)["plans"]["program"]
+            server = self.server()
+            pane = self.tmux("display-message", "-p", "#{pane_pid}")
+            original = tab.tab
+            def fail_commit(binding, token, method):
+                if method == "CommitTabRestart":
+                    tab.child.terminate()
+                    tab.child.wait(timeout=5)
+                    tab.phase = "failed"
+                    raise worker.Refused("Injected terminal handover failure")
+                return original(binding, token, method)
+            with patch.object(tab, "tab", side_effect=fail_commit):
+                result = worker.execute(plan, tab, self.root)
+            self.assertFalse(result["ok"])
+            self.assertIn("retained reconnection command", result["message"])
+            self.assertTrue(tab.held, "The empty terminal must remain available for recovery")
+            self.assertEqual(tab.cancelled, 0)
+            self.assertTrue(worker.same_process(server["process"]))
+            self.assertEqual(self.tmux("display-message", "-p", "#{pane_pid}"), pane)
+
+    def test_client_reconnect_command_never_creates_or_adopts_another_server(self):
+        with self.client_tab() as tab:
+            plan = self.client_preview(tab)["plans"]["program"]
+            self.stop_server(plan["server"])
+            tab.child.wait(timeout=5)
+            argv = plan["program"]["argv"]
+            tab.spawn(argv, self.root)
+            self.assertNotEqual(tab.child.wait(timeout=5), 0, "No server may be auto-started")
+            self.tmux("-f", "/dev/null", "new-session", "-d", "-s", "one", "/usr/bin/bash", "--noprofile", "--norc")
+            replacement = self.server()
+            tab.spawn(argv, self.root)
+            tab.child.wait(timeout=5)
+            self.assertEqual(self.tmux("list-clients", "-F", "#{client_pid}"), "")
+            self.assertTrue(worker.same_process(replacement["process"]))
 
     def wait_shells(self):
         deadline = time.monotonic() + 5

@@ -59,7 +59,10 @@ def session(binary):
                 json.dumps(current, sort_keys=True, indent=2).splitlines(),
                 fromfile="preview", tofile="after refusal")), file=sys.stderr)
         assert result.returncode == 0, (result.stdout.decode(), result.stderr.decode())
-        return json.loads(result.stdout)
+        report = json.loads(result.stdout)
+        if not report.get("ok", False):
+            print(result.stderr.decode(errors="replace"), file=sys.stderr)
+        return report
 
     def command(*arguments):
         return subprocess.check_output(arguments, timeout=5).decode().strip()
@@ -101,7 +104,7 @@ def session(binary):
     def program_payload(child, selected, application):
         result = payload(child, selected)
         _, active = worker.foreground(selected["child_pid"], selected["foreground_pgid"])
-        if worker.kind(active) == "tmux":
+        if worker.kind(active) == "tmux" and application != "tmux":
             server, session, _ = worker.tmux_client(active)
             pid = int(worker.run_tmux(server, "display-message", "-p", "-t", session, "#{pane_pid}").strip())
             root_process = worker.process(pid)
@@ -218,6 +221,51 @@ def session(binary):
         assert record(first)["child_pid"] == first_record["child_pid"] and record(second)["child_pid"] == second_record["child_pid"]
         assert geometry(first_window) == expected_geometry[0] and geometry(second_window) == expected_geometry[1]
         print("PASS selected tmux Fish update leaves Codex, the server and both exact native windows untouched", flush=True)
+        for name, shell in (("direct", None), ("fish", worker.latest_binary("fish")), ("bash", "/usr/bin/bash")):
+            argv = [tmux, "-N", "-S", socket, "attach-session", "-E", "-t", "one"]
+            launch_argv = argv
+            if shell:
+                launch_argv = (worker.fish_command(tmux, argv, shell) if name == "fish"
+                               else [shell, "--noprofile", "--norc", "-ic", shlex.join(argv) + "; exec /proc/self/exe -i"])
+            client = launch(launch_argv)
+            before = wait_for(lambda: record(client))
+            identifier = wait_for(lambda: window(client))
+            position(identifier, 205, 150, 760, 510)
+            expected = geometry(identifier)
+            def client_preview():
+                value = worker.inspect(program_payload(client, record(client), "tmux"), system)
+                return value if "program" in value["plans"] else None
+            plan = wait_for(client_preview)["plans"]["program"]
+            original_client = plan["program"]["process"]
+            pane_processes = command(tmux, "-N", "-S", socket, "list-panes", "-a", "-F", "#{pane_id}:#{pane_pid}")
+            backup = root / f"tmux-client-{name}"
+            backup.mkdir(mode=0o700)
+            result = run_plan(plan, backup)
+            if not result["ok"]:
+                current = record(client)
+                print("Client handover failure:", name, result, current, flush=True)
+                if current and current["child_pid"] > 1:
+                    print("Remaining root:", worker.process(current["child_pid"]), flush=True)
+            assert result["ok"], result
+            after = record(client)
+            assert before["window_uuid"] == after["window_uuid"] and before["tab_uuid"] == after["tab_uuid"]
+            assert after["input_enabled"] and geometry(identifier) == expected
+            assert worker.same_process(plan["server"]["process"]) and not worker.same_process(original_client)
+            assert command(tmux, "-N", "-S", socket, "list-panes", "-a", "-F", "#{pane_id}:#{pane_pid}") == pane_processes
+            assert record(first)["child_pid"] == first_record["child_pid"] and record(second)["child_pid"] == second_record["child_pid"]
+            if shell:
+                new_shell = worker.process(after["child_pid"])
+                assert new_shell["image"] == plan["root"]["image"], "Client update silently upgraded the return shell"
+                assert Path(f"/proc/{new_shell['pid']}/comm").read_text().strip() == name, "Pinned shell lost its process name"
+                _, active = worker.foreground(new_shell["pid"], new_shell["foreground"])
+                connection = worker.client_connection(plan["server"], active["pid"])
+                worker.run_tmux(plan["server"], "detach-client", "-t", connection["tty"])
+                wait_for(lambda: record(client)["child_pid"] == new_shell["pid"] and not worker.children(new_shell["pid"]))
+                assert geometry(identifier) == expected
+                assert Path(f"/proc/{new_shell['pid']}/comm").read_text().strip() == name
+            client.terminate()
+            client.wait(timeout=5)
+        print("PASS tmux client-only updates preserve native window/tab, geometry, server, panes, other clients and return-to-shell behavior", flush=True)
         previous, changed_at = None, time.monotonic()
         def server_preview():
             nonlocal previous, changed_at

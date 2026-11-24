@@ -983,6 +983,19 @@ closing the dialog does not start work or cancel an already confirmed operation.
 Reopen Show Info after completion to capture the restarted process. These links
 do not build, install or download anything.
 
+Verified outdated local **tmux clients** have an **Update client** link. Its
+confirmation reconnects only that exact client in the same held terminal tab,
+using the latest installed tmux. The original server, sessions, pane applications
+and other clients keep running; pane programs need no restart recipe. The preview
+checks the new binary's protocol compatibility and preserves read-only access.
+Server PID/start time, socket inode, session ID/creation time, client identity and
+installed image are revalidated before detaching, with automatic server creation
+disabled. Unsafe `exit-unattached`/`destroy-unattached` settings, control-mode,
+independent-active-pane clients and unrelated shell jobs refuse the update; no
+options are silently changed. Dedicated Fish/Bash launchers retain their running
+shell image and return to a prompt when tmux detaches, but lose shell-local state.
+Failures retain the reconnection recipe and do not restart the server or panes.
+
 Program/server restart APIs require a fresh preview, an eligible action and explicit
 confirmation. Codex resumes its exact observed main session ID with supported launch
 and permission options. Open child-agent logs are excluded only when their parent

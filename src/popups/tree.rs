@@ -22,6 +22,7 @@ struct UpdateLink {
     start: usize,
     end: usize,
     target: InfoUpdateTarget,
+    label: &'static str,
 }
 
 struct Document {
@@ -267,11 +268,19 @@ impl Document {
                 let mut format =
                     egui::TextFormat::simple(self.font.clone(), ui.visuals().hyperlink_color);
                 format.underline = egui::Stroke::new(1.0, format.color);
-                job.append("Update", 0.0, format);
+                let label = match target {
+                    InfoUpdateTarget::Program {
+                        application: InfoProgram::TmuxClient,
+                        ..
+                    } => "Update client",
+                    _ => "Update",
+                };
+                job.append(label, 0.0, format);
                 UpdateLink {
                     start,
-                    end: start + "Update".len(),
+                    end: start + label.len(),
                     target: target.clone(),
+                    label,
                 }
             });
         for section in &mut job.sections {
@@ -577,11 +586,12 @@ pub(super) fn render(
                 .on_hover_text(match &link.target {
                     InfoUpdateTarget::TerminalWindow(_) => "Update this terminal window or all outdated terminal windows",
                     InfoUpdateTarget::CopyQ(_) => "Restart CopyQ's user autostart service to load the installed application",
+                    InfoUpdateTarget::Program { application: InfoProgram::TmuxClient, .. } => "Reconnect only this tmux client in the same terminal tab; the server, sessions and pane applications keep running",
                     InfoUpdateTarget::Program { .. } => "Update only this program in its existing terminal tab or tmux pane",
                     InfoUpdateTarget::TmuxServer { .. } => "Update this tmux server and restart all its sessions in the existing terminal windows",
                 });
             response.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Link, ui.is_enabled(), "Update")
+                egui::WidgetInfo::labeled(egui::WidgetType::Link, ui.is_enabled(), link.label)
             });
             if response.clicked() {
                 update_target = Some(link.target);

@@ -10,7 +10,8 @@ mod tmux;
 
 pub use application_update::{
     ApplicationUpdateAction, ApplicationUpdateReport, ProgramRestartScope, ProgramUpdateIdentity,
-    TmuxRestartPane, TmuxRestartRemoteClient, TmuxServerIdentity, TmuxServerRestartScope,
+    TmuxClientRestartScope, TmuxRestartPane, TmuxRestartRemoteClient, TmuxServerIdentity,
+    TmuxServerRestartScope,
 };
 pub use client::TrackerClient;
 pub use install::{ensure_tracker_installed, restart_tracker_service, tracker_binary_path};

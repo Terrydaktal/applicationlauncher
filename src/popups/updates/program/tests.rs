@@ -1,12 +1,20 @@
 use super::*;
 
 fn state(application: InfoProgram, tmux: bool) -> State {
-    let scope = serde_json::json!({
+    let mut scope = serde_json::json!({
         "identity": {"pid": 123, "start_ticks": 456, "application": application.name()},
         "executable": format!("/fixture/bin/{}", application.name()), "cwd": "/fixture/work",
         "tmux_pane": if tmux { Some("%7") } else { None },
         "tmux_socket": if tmux { Some("/fixture/tmux.sock") } else { None },
     });
+    if application == InfoProgram::TmuxClient {
+        scope["tmux_pane"] = serde_json::Value::Null;
+        scope["tmux_socket"] = serde_json::Value::Null;
+        scope["tmux_client"] = serde_json::json!({
+            "server": {"pid": 234, "start_ticks": 567, "socket_path": "/fixture/tmux.sock"},
+            "session_id": "$1", "session_name": "work", "session_created": 12345, "read_only": true
+        });
+    }
     State {
         window: "exact-window".into(), process: ProcessIdentity { pid: 123, start_ticks: 456 },
         application, open: true, busy: false, accepted: false, error: None,
@@ -107,7 +115,11 @@ fn key(key: egui::Key) -> Vec<egui::Event> {
 
 #[test]
 fn program_dialog_controls_remain_visible_and_usable_in_a_small_info_window() {
-    for application in [InfoProgram::Fish, InfoProgram::Codex] {
+    for application in [
+        InfoProgram::Fish,
+        InfoProgram::Codex,
+        InfoProgram::TmuxClient,
+    ] {
         let ctx = egui::Context::default();
         let mut state = state(application, true);
         let size = egui::vec2(520.0, 360.0);
@@ -137,7 +149,11 @@ fn program_dialog_controls_remain_visible_and_usable_in_a_small_info_window() {
 
 #[test]
 fn program_confirmation_restarts_only_the_verified_fish_or_codex_after_consent() {
-    for application in [InfoProgram::Fish, InfoProgram::Codex] {
+    for application in [
+        InfoProgram::Fish,
+        InfoProgram::Codex,
+        InfoProgram::TmuxClient,
+    ] {
         for tmux in [false, true] {
             let ctx = egui::Context::default();
             let mut state = state(application, tmux);
@@ -161,7 +177,7 @@ fn program_confirmation_restarts_only_the_verified_fish_or_codex_after_consent()
                     &mut state,
                     click(position(
                         &output,
-                        &format!("Update {} only", application.name())
+                        &format!("Update {} only", application.label())
                     ))
                 )
                 .1,
@@ -173,7 +189,11 @@ fn program_confirmation_restarts_only_the_verified_fish_or_codex_after_consent()
 
 #[test]
 fn program_cancel_escape_backdrop_and_default_enter_never_start_an_update() {
-    for application in [InfoProgram::Fish, InfoProgram::Codex] {
+    for application in [
+        InfoProgram::Fish,
+        InfoProgram::Codex,
+        InfoProgram::TmuxClient,
+    ] {
         for event in [0, 1, 2, 3] {
             let ctx = egui::Context::default();
             let mut state = state(application, true);
@@ -232,6 +252,50 @@ fn program_scope_rejects_changed_pid_start_kind_window_missing_and_ambiguous_met
         assert!(verified_action(&state).is_err(), "mutation {mutation}");
         assert!(!can_start(&state, "fixture-no-IPC"));
     }
+}
+
+#[test]
+fn tmux_client_scope_requires_server_session_and_client_only_metadata() {
+    for mutation in 0..9 {
+        let mut state = state(InfoProgram::TmuxClient, false);
+        let scope = state.report.as_mut().unwrap().actions[0]
+            .program
+            .as_mut()
+            .unwrap();
+        match mutation {
+            0 => scope.tmux_client = None,
+            1 => scope.tmux_client.as_mut().unwrap().server.pid = state.process.pid,
+            2 => scope.tmux_client.as_mut().unwrap().server.start_ticks = 0,
+            3 => scope.tmux_client.as_mut().unwrap().server.socket_path = "relative".into(),
+            4 => scope.tmux_client.as_mut().unwrap().session_id = "$1; kill-server".into(),
+            5 => scope.tmux_client.as_mut().unwrap().session_created = 0,
+            6 => scope.tmux_client.as_mut().unwrap().session_name.clear(),
+            7 => {
+                scope.tmux_pane = Some("%7".into());
+                scope.tmux_socket = Some("/fixture/server.sock".into());
+            }
+            _ => state.application = InfoProgram::Fish,
+        }
+        assert!(verified_action(&state).is_err(), "mutation {mutation}");
+        assert!(!can_start(&state, "fixture-no-IPC"));
+    }
+    let ctx = egui::Context::default();
+    let mut state = state(InfoProgram::TmuxClient, false);
+    let output = settled(&ctx, &mut state);
+    position(&output, "Update tmux client");
+    position(&output, "Read-only access is preserved.");
+    let text = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("pane applications and other clients keep running"));
+    assert!(!text.contains("Running work is interrupted"));
+    assert!(!text.contains("interrupting its current work"));
 }
 
 #[test]

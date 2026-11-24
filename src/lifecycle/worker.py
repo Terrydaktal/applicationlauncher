@@ -983,8 +983,8 @@ def inspect(payload, system):
     if requested is not None and (not isinstance(requested, dict)
             or type(requested.get("pid")) is not int or requested["pid"] <= 1
             or type(requested.get("start_ticks")) is not int or requested["start_ticks"] <= 0
-            or requested.get("application") not in {"fish", "codex"}):
-        raise Refused("Select an exact running Fish or Codex process")
+            or requested.get("application") not in {"fish", "codex", "tmux"}):
+        raise Refused("Select an exact running Fish, Codex or tmux client process")
     selected = [window for window in payload["windows"] if window["id"] == payload["window_id"]]
     if len(selected) != 1 or selected[0]["class"].lower() not in {"xfce4-terminal", "org.xfce.terminal"}:
         raise Refused("Select an existing xfce4-terminal window")
@@ -1008,6 +1008,8 @@ def inspect(payload, system):
                 detail = f"{len(plan['sessions'])} sessions, {len(plan['programs'])} panes, {len(plan['bindings'])} terminal tabs. All are interrupted and recreated; terminal windows stay in place. Scrollback, shell-local state and runtime-only tmux options are not preserved."
                 if plan.get("remote_clients"):
                     detail += f" {len(plan['remote_clients'])} remote mosh tmux client(s) will be disconnected, not reattached; reconnect manually after the update."
+            elif plan["kind"] == "tmux_client":
+                detail = "Reconnect only this tmux client in the same terminal tab. The server, sessions, pane applications and other clients keep running."
             else:
                 detail = f"Restart {plan['program']['kind']} at {plan['program']['cwd']}. Other terminal windows and tmux panes are left untouched. Shell-local state in this tab/pane is not preserved."
             action = dict(id=identifier, label=label, eligible=True, message=detail)
@@ -1020,12 +1022,23 @@ def inspect(payload, system):
                                          executable=program["argv"][0], cwd=program["cwd"])
                 if plan["kind"] == "tmux_pane":
                     action["program"].update(tmux_pane=plan["pane_id"], tmux_socket=plan["server"]["socket"])
+                elif plan["kind"] == "tmux_client":
+                    server, client = plan["server"], plan["client"]
+                    action["program"]["tmux_client"] = dict(
+                        server=dict(pid=server["process"]["pid"], start_ticks=server["process"]["start"], socket_path=server["socket"]),
+                        **{key:client[key] for key in ("session_id", "session_name", "session_created", "read_only")})
             actions.append(action)
         except Exception as error:
             actions.append(dict(id=identifier, label=label, eligible=False, message=str(error)))
 
     if kind(active) == "tmux":
         server, session, _ = tmux_client(active)
+        if requested is not None and requested["application"] == "tmux":
+            def reconnect():
+                require_requested_process(active, requested)
+                return client_plan(server, binding, root, active)
+            add("program", "Update only this tmux client", reconnect)
+            return dict(actions=actions, plans=plans, title=window["title"])
         pane = run_tmux(server, "display-message", "-p", "-t", session, "#{pane_id}").strip()
         def pane_restart():
             value = pane_plan(server, pane, requested) if requested is not None else pane_plan(server, pane)
@@ -1330,7 +1343,8 @@ def execute_locked(plan, system, directory):
         raise Refused("The application, installed binary, active tab, or tmux sessions changed; refresh the preview")
     plan = matches[0]
     # The daemon creates a private, fsynced plan file before starting this worker.
-    leases, committed, interrupted = [], False, []
+    leases, committed, interrupted, descriptors = [], False, [], []
+    restoration = None
     try:
         if plan["kind"] == "terminal_program":
             binding, program = plan["binding"], plan["program"]
@@ -1343,6 +1357,37 @@ def execute_locked(plan, system, directory):
             verify_program(program, clients[binding["tab_uuid"]])
         elif plan["kind"] == "tmux_pane":
             restart_pane(plan)
+        elif plan["kind"] == "tmux_client":
+            binding, program = plan["binding"], plan["program"]
+            require_client_plan(plan)
+            token = system.prepare(binding, client_tab_command(plan, descriptors, directory), program["cwd"])
+            leases.append((binding, token))
+            require_client_plan(plan)
+            if system.tab(binding, token, "GetTabRestartStatus")["phase"] != "prepared":
+                raise Refused("The terminal tab replacement expired before client detachment")
+            descriptor = os.pidfd_open(program["process"]["pid"])
+            descriptors.append(descriptor)
+            if not same_process(program["process"]):
+                raise Refused("The selected tmux client changed before detachment")
+            restart_event(directory, "reconnecting_client", pid=program["process"]["pid"])
+            # Commit while a launcher shell is still waiting for tmux. Otherwise
+            # Fish may enter first-prompt terminal queries with input held, delaying
+            # graceful exit until after the native replacement deadline.
+            committed = True
+            system.tab(binding, token, "CommitTabRestart")
+            try:
+                signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+            except ProcessLookupError:
+                pass  # The terminal's graceful hangup already detached this client.
+            deadline = time.monotonic() + 5
+            while same_process(program["process"]) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if same_process(program["process"]):
+                raise Refused("The tmux client did not exit gracefully; no force-kill was attempted")
+            require_client_server(plan, installed=True)
+            clients = wait_tabs(system, leases)
+            pid = verify_client(plan, clients[binding["tab_uuid"]])
+            restart_event(directory, "client_reattached", pid=pid, session=plan["client"]["session_id"])
         elif plan["kind"] == "tmux_server":
             server = plan["server"]
             preflight_server(plan, directory)
@@ -1410,6 +1455,17 @@ def execute_locked(plan, system, directory):
         message = "Update completed in the existing terminal window(s). Backup retained."
         if plan["kind"] == "tmux_server" and plan.get("remote_clients"):
             message += f" {len(plan['remote_clients'])} remote mosh tmux client(s) were disconnected; reconnect manually."
+        elif plan["kind"] == "tmux_client":
+            message = "tmux client updated in the same terminal tab. The original server, sessions and pane applications were left running. Recovery plan retained."
+        if restoration is not None:
+            failed = sum(pane["status"] == "failed" for pane in restoration["panes"])
+            restored = len(restoration["panes"]) - failed
+            message = f"Tmux server updated and local terminal tabs reattached. {restored} applications restored; {failed} need attention."
+            if failed:
+                message += " Working sessions were left running. Recover only the affected applications; do not repeat the server update."
+            if plan.get("remote_clients"):
+                message += f" {len(plan['remote_clients'])} remote mosh tmux client(s) were disconnected; reconnect them manually."
+            return dict(ok=True, message=message, restoration=restoration)
         return dict(ok=True, message=message)
     except Exception as error:
         recovered = True
@@ -1423,11 +1479,15 @@ def execute_locked(plan, system, directory):
         detail = "; shutdown began: retain the backup and inspect affected tabs before retrying" if committed else "; work may have been interrupted; no force-kill was attempted"
         if plan["kind"] == "tmux_server" and not committed and not interrupted:
             detail = "; no application was stopped"
+        elif plan["kind"] == "tmux_client":
+            detail = ("; the client may be detached: use the retained reconnection command; the server and pane applications were not restarted"
+                      if committed else "; no client or pane application was stopped")
         if not recovered:
             detail += "; some interrupted programs could not be resumed; use the retained recovery plan"
-        if plan["kind"] == "tmux_server":
+        if plan["kind"] in {"tmux_server", "tmux_client"}:
             try:
-                restart_event(directory, "failed", shutdown_began=committed, error=str(error))
+                progress = {"shutdown_began" if plan["kind"] == "tmux_server" else "client_handover_began": committed}
+                restart_event(directory, "failed", **progress, error=str(error))
             except (OSError, Refused):
                 pass
         return dict(ok=False, message=str(error) + detail)
@@ -1442,10 +1502,22 @@ def execute_locked(plan, system, directory):
                     pass
         for binding, token in leases:
             try:
-                if system.tab(binding, token, "GetTabRestartStatus")["phase"] == "prepared":
+                status = system.tab(binding, token, "GetTabRestartStatus")
+                if plan["kind"] == "tmux_client" and committed and not same_process(plan["root"]):
+                    # Let the terminal's child watch observe exit before cancelling:
+                    # cancellation must keep an already-empty tab held open.
+                    deadline = time.monotonic() + 2
+                    while status["phase"] == "prepared" and status["child_pid"] > 0 and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                        status = system.tab(binding, token, "GetTabRestartStatus")
+                    if status["phase"] == "prepared" and status["child_pid"] > 0:
+                        continue
+                if status["phase"] == "prepared":
                     system.tab(binding, token, "CancelTabRestart")
             except Exception:
                 pass
+        for descriptor in descriptors:
+            os.close(descriptor)
 
 
 def main(arguments):

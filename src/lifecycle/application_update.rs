@@ -60,12 +60,21 @@ impl ProgramUpdateIdentity {
     pub fn validate(&self) -> Result<(), String> {
         if self.pid <= 1
             || self.start_ticks == 0
-            || !matches!(self.application.as_str(), "fish" | "codex")
+            || !matches!(self.application.as_str(), "fish" | "codex" | "tmux")
         {
-            return Err("Select an exact running Fish or Codex process".into());
+            return Err("Select an exact running Fish, Codex or tmux client process".into());
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TmuxClientRestartScope {
+    pub server: TmuxServerIdentity,
+    pub session_id: String,
+    pub session_name: String,
+    pub session_created: u64,
+    pub read_only: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -77,6 +86,8 @@ pub struct ProgramRestartScope {
     pub tmux_pane: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_socket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_client: Option<TmuxClientRestartScope>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -520,7 +531,7 @@ mod tests {
 
     #[test]
     fn program_identities_require_exact_supported_processes_and_scope_survives_serialization() {
-        for application in ["fish", "codex"] {
+        for application in ["fish", "codex", "tmux"] {
             let process = ProgramUpdateIdentity {
                 pid: 123,
                 start_ticks: 456,
@@ -541,6 +552,15 @@ mod tests {
                 "program": {"identity": process, "executable": format!("/fixture/{application}"),
                     "cwd": "/fixture/work", "tmux_pane": "%7", "tmux_socket": "/fixture/tmux.sock"}
             });
+            if application == "tmux" {
+                let program = value["program"].as_object_mut().unwrap();
+                program.remove("tmux_pane");
+                program.remove("tmux_socket");
+                program.insert("tmux_client".into(), serde_json::json!({
+                    "server": {"pid": 234, "start_ticks": 567, "socket_path": "/fixture/server.sock"},
+                    "session_id": "$1", "session_name": "work", "session_created": 12345, "read_only": true
+                }));
+            }
             let action: ApplicationUpdateAction = serde_json::from_value(value.clone()).unwrap();
             assert_eq!(
                 action.program.as_ref().unwrap().identity.application,

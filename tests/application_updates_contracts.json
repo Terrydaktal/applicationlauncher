@@ -47,6 +47,31 @@
         "tests/test_lifecycle_return_shell.py::ReturnShell"
       ]
     },
+    {
+      "id": "AU-TMUX-CLIENT",
+      "contract": "Only a verified outdated local tmux client offers Update client. Per-info-window confirmation reconnects that exact PID/start identity in the same held tab using the installed binary, preserving server/socket/session identity, pane PIDs, other clients, readonly flags and the running return-shell image. Read-only previews check protocol compatibility without inspecting or restarting pane applications. Missing handoff, unsupported client modes, stale identities, changed installed binaries and unsafe effective exit-unattached/destroy-unattached settings refuse before detachment; options are never silently changed. Attach forbids auto-start and rejects another server/session at the same socket. Failed handovers retain an empty tab and reconnection plan. Cancel, opening click, default Enter, duplicate work and malformed client scope never start an update. Tests use only private sockets/buses/displays.",
+      "owner": "src/lifecycle/worker.py and src/popups/updates/program.rs",
+      "tests": [
+        "client_update_target_requires_the_exact_outdated_local_tmux_client_not_the_server",
+        "fish_and_codex_update_links_emit_only_the_exact_program_without_toggling_sections",
+        "program_confirmation_restarts_only_the_verified_fish_or_codex_after_consent",
+        "program_cancel_escape_backdrop_and_default_enter_never_start_an_update",
+        "program_dialog_controls_remain_visible_and_usable_in_a_small_info_window",
+        "tmux_client_scope_requires_server_session_and_client_only_metadata",
+        "program_identities_require_exact_supported_processes_and_scope_survives_serialization",
+        "tests/test_application_updates.py::TmuxClientGuards",
+        "tests/test_application_updates.py::PrivateTmux.test_client_update_keeps_original_server_panes_and_other_client_with_readonly_preserved",
+        "tests/test_application_updates.py::PrivateTmux.test_client_update_refuses_incompatible_installed_binary_before_detaching",
+        "tests/test_application_updates.py::PrivateTmux.test_client_update_refuses_unattached_destruction_without_changing_options",
+        "tests/test_application_updates.py::PrivateTmux.test_client_update_requires_native_handoff_and_exact_pid_start_before_preparing",
+        "tests/test_application_updates.py::PrivateTmux.test_client_update_rechecks_the_installed_image_after_preparing_without_signalling",
+        "tests/test_application_updates.py::PrivateTmux.test_client_update_revalidates_session_identity_without_stopping_any_client",
+        "tests/test_application_updates.py::PrivateTmux.test_client_update_rechecks_dangerous_options_after_preparing_the_tab",
+        "tests/test_application_updates.py::PrivateTmux.test_failed_client_handover_retains_empty_tab_and_the_original_session",
+        "tests/test_application_updates.py::PrivateTmux.test_client_reconnect_command_never_creates_or_adopts_another_server",
+        "tests/application_update_native.py"
+      ]
+    },
     {"id": "AU-CODEX-RETURN-SHELL", "contract": "Restarted Codex retains an interactive Fish parent so success, failure and Ctrl+C return to a usable prompt without closing the tab. Exact conversation, literal argv including argv[0], cwd and the window-only running application build are preserved. A running Fish ancestor is pinned rather than upgraded; otherwise a verified installed Fish is prepared before interruption. Both native images stay pinned during handover without executable copies or hashes; private recovery metadata records their identities and shell build changes invalidate the preview. Native, compatibility, no-tab-API and daemon-restart cases keep the same restored window and tab alive.", "owner": "src/lifecycle/window.py and src/lifecycle/worker.py", "tests": ["tests/test_lifecycle_return_shell.py::ReturnShell", "tests/application_update_native.py", "terminal-update-wayland-codex", "terminal-update-wayland-confirmed-daemon-restart", "terminal-update-wayland-external-codex", "terminal-update-wayland-external-without-tab-api"]},
     {"id": "AU-MENU", "contract": "The old Update application menu and standalone popup are removed; both settings layouts omit terminal maintenance and idle-Codex controls without invoking or deleting their backends", "owner": "src/app/maintenance_ui_tests.rs", "tests": ["maintenance_actions_are_absent_from_menu_settings_and_popup_wiring", "deferred_settings_hide_maintenance_controls_without_touching_retained_jobs", "maintenance_backend_apis_remain_available_without_invoking_them"]},
     {"id": "AU-WINDOW-MENU", "contract": "The window-list context menu orders Show info, Open window, Open new window, Update window and Clone window before volume controls and Close window. Update window targets only the exact supported main window owner, never a foreground Codex/Pi/shell or tmux server, and opens the shared Show Info scope/confirmation modal without starting work. Only explicit This window or All outdated windows choices emit their respective scoped requests. Cancellation, Escape and default Enter never update anything; unsupported/invalid owners cannot open the chooser. Launcher navigation and search refocusing stay suspended while the chooser is open. Open window remains independently usable, and direct progress/errors use the launcher inline status.", "owner": "src/app/view.rs", "tests": ["window_context_menu_orders_info_open_new_update_clone_and_labels_close_as_close_window", "update_window_targets_the_terminal_owner_not_its_foreground_application_or_tmux_server", "update_window_is_unavailable_for_unsupported_owners_and_invalid_window_identities", "update_window_menu_item_requires_the_shared_confirmation_and_keeps_open_independent", "inline_terminal_update_status_preserves_scroll_selection_and_expanded_sections", "automatic_single_window_update_never_falls_back_to_another_window", "up_to_date_terminal_cannot_be_selected_or_restarted_even_with_stale_selection"]},

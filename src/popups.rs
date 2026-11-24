@@ -3589,7 +3589,11 @@ mod tests {
     #[test]
     fn fish_and_codex_update_links_emit_only_the_exact_program_without_toggling_sections() {
         use crate::models::{InfoProgram, ProcessIdentity};
-        for application in [InfoProgram::Fish, InfoProgram::Codex] {
+        for application in [
+            InfoProgram::Fish,
+            InfoProgram::Codex,
+            InfoProgram::TmuxClient,
+        ] {
             for open in [false, true] {
                 for scale in [1.0, 2.0] {
                     let ctx = egui::Context::default();
@@ -3631,6 +3635,25 @@ mod tests {
                     render(vec![]);
                     render(vec![]);
                     let link = ctx.read_response(id.with("terminal-update-link")).unwrap();
+                    let label = if application == InfoProgram::TmuxClient {
+                        "Update client"
+                    } else {
+                        "Update"
+                    };
+                    let width = ctx.fonts_mut(|fonts| {
+                        fonts
+                            .layout_no_wrap(
+                                label.into(),
+                                egui::FontId::monospace(13.0),
+                                egui::Color32::WHITE,
+                            )
+                            .size()
+                            .x
+                    });
+                    assert!(
+                        (link.rect.width() - width).abs() <= 1.0,
+                        "The entire {label} link must be clickable"
+                    );
                     assert_eq!(render(pointer_events(link.rect.center())), Some(target));
                     assert_eq!(process_info_section_is_open(&ctx, id, !open), open);
                 }

@@ -141,6 +141,16 @@ fn process_update_target(
             match path.file_name()?.to_str()?.trim_end_matches(" (deleted)") {
                 "fish" => Some(InfoProgram::Fish),
                 "codex" | "codex-code-mode" => Some(InfoProgram::Codex),
+                "tmux"
+                    if window.tmux_pane.as_ref().is_some_and(|pane| {
+                        pane.client_pid == node.identity.pid
+                            && pane.session.server_pid > 1
+                            && pane.session.server_pid != node.identity.pid
+                            && Path::new(&pane.session.socket_path).is_absolute()
+                    }) =>
+                {
+                    Some(InfoProgram::TmuxClient)
+                }
                 _ => None,
             }
         });

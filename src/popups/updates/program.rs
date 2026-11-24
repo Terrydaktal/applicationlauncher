@@ -118,6 +118,25 @@ fn verified_action(state: &State) -> Result<&ApplicationUpdateAction, &str> {
                 }) => {}
         _ => return Err("The tmux pane identity is incomplete; nothing will be restarted."),
     }
+    match (&scope.tmux_client, state.application) {
+        (Some(client), InfoProgram::TmuxClient)
+            if scope.tmux_pane.is_none()
+                && client.server.pid > 1
+                && client.server.pid != state.process.pid
+                && client.server.start_ticks > 0
+                && Path::new(&client.server.socket_path).is_absolute()
+                && client.session_created > 0
+                && !client.session_name.is_empty()
+                && client.session_id.strip_prefix('$').is_some_and(|digits| {
+                    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+                }) => {}
+        (None, InfoProgram::Fish | InfoProgram::Codex) => {}
+        _ => {
+            return Err(
+                "The tmux client/server/session identity is incomplete; nothing will be restarted.",
+            );
+        }
+    }
     Ok(action)
 }
 
@@ -133,22 +152,35 @@ fn can_start(state: &State, id: &str) -> bool {
 }
 
 fn details(ui: &mut egui::Ui, state: &State) {
-    ui.heading(format!("Update {}", state.application.name()));
+    ui.heading(format!("Update {}", state.application.label()));
     ui.label(format!(
         "{} (pid {})",
-        state.application.name(),
+        state.application.label(),
         state.process.pid
     ));
-    ui.label(concat!(
-        "Restart only this program using its latest installed build, in the same terminal tab or tmux pane. ",
-        "The terminal window, tmux server and other panes keep running. ",
-        "This does not build, install or download an update."
-    ));
+    ui.label(if state.application == InfoProgram::TmuxClient {
+        concat!(
+            "Reconnect only this tmux client using the latest installed binary, in the SAME terminal tab. ",
+            "The server, sessions, pane applications and other clients keep running. ",
+            "This does not build, install or download an update."
+        )
+    } else {
+        concat!(
+            "Restart only this program using its latest installed build, in the same terminal tab or tmux pane. ",
+            "The terminal window, tmux server and other panes keep running. ",
+            "This does not build, install or download an update."
+        )
+    });
     ui.label(match state.application {
         InfoProgram::Codex => "Codex resumes this exact conversation, never --last. Running work is interrupted.",
         InfoProgram::Fish => concat!(
             "Only an idle Fish shell can be restarted. A foreground application or background job blocks the update; ",
             "shell-local state is not preserved."
+        ),
+        InfoProgram::TmuxClient => concat!(
+            "The display briefly disconnects; pane work is not restarted. Compatibility is checked before detaching. ",
+            "Control-mode clients and settings that could destroy unattached sessions block the update. ",
+            "A dedicated launcher shell may be replaced; its shell-local state is not preserved."
         ),
     });
     if let Some(report) = &state.report {
@@ -165,6 +197,16 @@ fn details(ui: &mut egui::Ui, state: &State) {
                     ui.label(format!("Working directory: {}", scope.cwd));
                     if let Some(pane) = &scope.tmux_pane {
                         ui.label(format!("tmux pane: {pane} (server is not restarted)"));
+                    }
+                    if let Some(client) = &scope.tmux_client {
+                        ui.monospace(&client.server.socket_path);
+                        ui.label(format!(
+                            "Session: {} ({}) on server pid {}",
+                            client.session_name, client.session_id, client.server.pid
+                        ));
+                        if client.read_only {
+                            ui.label("Read-only access is preserved.");
+                        }
                     }
                 }
                 Err(error) => {

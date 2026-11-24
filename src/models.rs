@@ -455,6 +455,7 @@ pub enum InfoUpdateTarget {
 pub enum InfoProgram {
     Fish,
     Codex,
+    TmuxClient,
 }
 
 impl InfoProgram {
@@ -462,8 +463,25 @@ impl InfoProgram {
         match self {
             Self::Fish => "fish",
             Self::Codex => "codex",
+            Self::TmuxClient => "tmux",
         }
     }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TmuxClient => "tmux client",
+            _ => self.name(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct InfoMetadataFieldHeader {
+    /// Value bytes in the canonical selectable header text; the prefix is its label.
+    pub value_range: std::ops::Range<usize>,
+    pub label_scope: InfoFieldScope,
+    /// Insert after this parent field; absent/missing anchors append after the parent rows.
+    pub after_row: Option<&'static str>,
 }
 
 #[derive(Clone)]

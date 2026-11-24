@@ -7,6 +7,17 @@ mod server;
 use client::rows as client_rows;
 
 pub(super) fn process_rows(window: &WindowInfo, node: &ProcessInfoNode) -> Vec<InfoPopupRow> {
+    if window
+        .tmux_pane
+        .as_ref()
+        .is_some_and(|pane| pane.client_pid == node.identity.pid)
+    {
+        return Vec::new();
+    }
+    connection_rows(window, node)
+}
+
+fn connection_rows(window: &WindowInfo, node: &ProcessInfoNode) -> Vec<InfoPopupRow> {
     let Some(pane) = &window.tmux_pane else {
         return Vec::new();
     };
