@@ -7,7 +7,6 @@ import shutil
 import subprocess
 import tempfile
 import termios
-import time
 import unittest
 from unittest.mock import patch
 
@@ -174,9 +173,10 @@ class TmuxWindowUpdates(unittest.TestCase):
                             fixture.tmux("new-session", "-d", "-s", "wrong", "/bin/sleep", "60")
                             fixture.tmux("switch-client", "-c", connection["tty"], "-t", "=wrong")
                             with patch.object(job, "remote", return_value=dict(records=[dict(child_pid=replacement.pid)])), \
-                                    patch.object(time, "sleep", side_effect=AssertionError("Retried a wrong attachment")):
+                                    patch.object(worker, "run_tmux", wraps=worker.run_tmux) as query:
                                 with self.assertRaisesRegex(worker.Refused, "exact existing server/session"):
                                     job.verify_replacement()
+                            query.assert_called_once()
                         finally:
                             if replacement is not None:
                                 if replacement.poll() is None:
