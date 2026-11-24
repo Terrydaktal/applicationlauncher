@@ -78,14 +78,13 @@ repair_release_pair() {
 	[[ "$status" == 1 ]] || return 1
 	if ! (
 		cd -- "$repo_dir" || exit 1
-		timeout --kill-after=5s 15m cargo build --manifest-path "$repo_dir/Cargo.toml" \
-			--release --locked --bins --target-dir "$repo_dir/target"
+		timeout --kill-after=5s 15m "$repo_dir/scripts/build-release-matrix" --only release-observable
 	) 2>&1 | tail -c 262144 >"$build_log"; then
 		remember_repair_failure
 		return 1
 	fi
 	if ! release_pair_is_compatible; then
-		printf '%s\n' 'Cargo completed without producing a compatible launcher/daemon pair.' >>"$build_log"
+		printf '%s\n' 'Release verification completed without producing a compatible launcher/daemon pair.' >>"$build_log"
 		remember_repair_failure
 		return 1
 	fi

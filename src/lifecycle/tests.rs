@@ -1,6 +1,64 @@
 use super::*;
 
 #[test]
+fn embedded_worker_postimages_match_their_manifest_and_timing_feature() {
+    use sha2::{Digest, Sha256};
+    let manifest: Value = serde_json::from_str(build_info()).unwrap();
+    assert_eq!(manifest["timings"], cfg!(feature = "update-timings"));
+    for (name, source) in [
+        (
+            "window.py",
+            include_str!(concat!(env!("OUT_DIR"), "/lifecycle/window.py")),
+        ),
+        (
+            "external.py",
+            include_str!(concat!(env!("OUT_DIR"), "/lifecycle/external.py")),
+        ),
+    ] {
+        assert_eq!(
+            manifest["files"][name]["postimage_sha256"],
+            format!("{:x}", Sha256::digest(source.as_bytes()))
+        );
+        assert_eq!(
+            manifest["files"][name]["semantic_sha256"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        if !cfg!(feature = "update-timings") {
+            for forbidden in [
+                "lifecycle_timing",
+                "update_timing",
+                "self.timings",
+                "hash_source",
+                "confirmation_wait",
+            ] {
+                assert!(!source.contains(forbidden), "{forbidden} remains in {name}");
+            }
+        }
+    }
+    let directory =
+        std::env::temp_dir().join(format!("lifecycle-postimages-{}", std::process::id()));
+    private_directory(&directory).unwrap();
+    let request = directory.join("request.json");
+    write_private(&request, &json!({})).unwrap();
+    let command = worker_command("window", &request).unwrap();
+    let path = command.get_args().nth(1).unwrap();
+    let shipped_bootstrap = fs::read_to_string(path).unwrap();
+    assert_eq!(
+        shipped_bootstrap.contains("lifecycle_timing"),
+        cfg!(feature = "update-timings")
+    );
+    assert_eq!(
+        shipped_bootstrap.contains("confirmation_wait"),
+        cfg!(feature = "update-timings")
+    );
+    drop(command);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn lifecycle_protocol_requires_bounded_operation_ids_and_explicit_native_scopes() {
     for id in ["job-123", "application-update-123-1"] {
         assert!(valid_id(id));

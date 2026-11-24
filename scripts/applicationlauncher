@@ -49,6 +49,7 @@ source_inputs_are_newer() {
 
 	for input in \
 		"$repo_dir/src" \
+		"$repo_dir/build-support" \
 		"$repo_dir/.cargo" \
 		"$repo_dir/kwin/applicationlauncher-window-feed"; do
 		if [[ -d "$input" ]] && {
@@ -268,7 +269,7 @@ fi
 # Diagnostic/control requests must preserve the incident, not trigger updates.
 for argument in "$@"; do
 	case "$argument" in
-	--diagnose | debug-doctor | replay | --build-id | --shutdown | --help | -h)
+	--diagnose | debug-doctor | replay | --build-id | --build-info | --lifecycle-build-info | --shutdown | --help | -h)
 		exec "$binary" "$@"
 		;;
 	esac

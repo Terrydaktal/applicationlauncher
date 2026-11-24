@@ -17,6 +17,14 @@ fn main() {
     }
     app_version_runtime::handle_cli();
     std::hint::black_box(&PRODUCT_METADATA);
+    if std::env::args().nth(1).as_deref() == Some("--build-info") {
+        println!("{}", applicationlauncher::BUILD_INFO);
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("--lifecycle-build-info") {
+        print!("{}", applicationlauncher::lifecycle::build_info());
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--lifecycle-gate") {
         use std::os::unix::process::CommandExt;
         let arguments: Vec<_> = std::env::args_os().skip(2).collect();

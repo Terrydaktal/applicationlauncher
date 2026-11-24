@@ -210,7 +210,14 @@ fn main() -> eframe::Result {
     // probe, and without making diagnostic switches enter the GUI lifecycle.
     std::hint::black_box(&PRODUCT_METADATA);
     let args: Vec<String> = std::env::args().collect();
-
+    if args.get(1).map(String::as_str) == Some("--build-info") {
+        println!("{}", applicationlauncher::BUILD_INFO);
+        return Ok(());
+    }
+    if args.get(1).map(String::as_str) == Some("--lifecycle-build-info") {
+        print!("{}", applicationlauncher::lifecycle::build_info());
+        return Ok(());
+    }
     if args.iter().any(|argument| argument == "--build-id") {
         println!("{}", applicationlauncher::BUILD_ID);
         return Ok(());

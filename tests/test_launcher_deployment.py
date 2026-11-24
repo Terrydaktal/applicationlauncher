@@ -87,6 +87,10 @@ if [[ ! -f "$FIXTURE_ROOT/partial-build" ]]; then
   mv "$FIXTURE_RELEASE/applicationlauncherd.next" "$FIXTURE_RELEASE/applicationlauncherd"
 fi
 """)
+        self.executable(self.repo / "scripts/build-release-matrix", """
+printf 'verified-release %s\n' "$*" >> "$FIXTURE_ROOT/events"
+exec cargo build --release --locked --bins
+""")
         self.set_pair("0.4.1-release-old", "0.4.1-release-old")
         self.binary(self.root / "new-gui", "gui", "0.4.1-release-repaired")
         self.binary(self.root / "new-daemon", "daemon", "0.4.1-release-repaired")
@@ -165,6 +169,7 @@ esac
         self.run_wrapper("--theme", "Breeze")
         self.wait_for(lambda: "daemon --install" in self.events())
         self.assertEqual(len(self.builds()), 1)
+        self.assertIn("verified-release --only release-observable", self.events())
         self.assertIn("--release --locked --bins", self.builds()[0])
         self.wait_for(lambda: any("args=--theme Breeze" in event for event in self.events()
                                  if event.startswith("launch-gui ")))
@@ -261,7 +266,7 @@ esac
     def test_timed_out_build_cannot_activate_a_replacement(self):
         self.set_pair("0.4.1-release-older", "0.4.1-release-newer")
         self.executable(self.commands / "timeout", """
-if [[ "$*" == *"15m cargo build"* ]]; then
+if [[ "$*" == *"15m "*"/scripts/build-release-matrix"* ]]; then
   printf 'build-timeout\\n' >> "$FIXTURE_ROOT/events"
   exit 124
 fi
@@ -295,7 +300,7 @@ exec /usr/bin/timeout "$@"
 
     def test_diagnostic_and_control_commands_do_not_repair_or_restart(self):
         self.set_pair("0.4.1-release-older", "0.4.1-release-newer")
-        for args in (("--diagnose", "auto"), ("debug-doctor",), ("--build-id",), ("--shutdown",)):
+        for args in (("--diagnose", "auto"), ("debug-doctor",), ("--build-id",), ("--build-info",), ("--lifecycle-build-info",), ("--shutdown",)):
             self.run_wrapper(*args)
         self.assertEqual(self.builds(), [])
         self.assertEqual(self.stops(), [])

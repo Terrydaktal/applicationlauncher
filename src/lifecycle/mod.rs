@@ -19,6 +19,10 @@ pub const PATH: &str = "/Lifecycle";
 pub const INTERFACE: &str = "com.terrydaktal.ApplicationLauncher.Lifecycle1";
 const LIMIT: usize = 2 * 1024 * 1024;
 
+pub fn build_info() -> &'static str {
+    include_str!(concat!(env!("OUT_DIR"), "/lifecycle/manifest.json"))
+}
+
 pub(crate) struct OperationLock(File);
 
 impl OperationLock {
@@ -274,10 +278,10 @@ pub fn worker_command(mode: &str, request: &Path) -> Result<Command, String> {
     let code = format!(
         "import sys, types\nm=types.ModuleType('lifecycle_worker');sys.modules[m.__name__]=m\nexec({:?},m.__dict__)\nw=types.ModuleType('lifecycle_window');sys.modules[w.__name__]=w\nexec({:?},w.__dict__)\ne=types.ModuleType('lifecycle_external');sys.modules[e.__name__]=e\ne.PLACEMENT_JS={:?}\nexec({:?},e.__dict__)\nexec({:?})",
         include_str!("worker.py"),
-        include_str!("window.py"),
+        include_str!(concat!(env!("OUT_DIR"), "/lifecycle/window.py")),
         include_str!("placement.js"),
-        include_str!("external.py"),
-        include_str!("runner.py"),
+        include_str!(concat!(env!("OUT_DIR"), "/lifecycle/external.py")),
+        include_str!(concat!(env!("OUT_DIR"), "/lifecycle/runner.py")),
     );
     #[cfg(feature = "update-timings")]
     let code = format!(

@@ -1,0 +1,250 @@
+# Normative contract. docs/DEBUGGABILITY.md is its operator guide, not a second contract.
+schema_version = 6
+template = false
+profile = "stateful"
+owner = "Terrydaktal"
+expected_failure_modes = ["stalled GUI or IPC", "stale window generations", "failed persistence or recovery", "lost helper", "slow or refused lifecycle update", "native crash", "recorder failure"]
+
+[architecture]
+state_owners = ["GUI owns views and selection", "applicationlauncherd owns tracker generations and lifecycle coordination", "independent Python workers own each restart transaction"]
+mutation_points = ["tracker Runtime methods", "database transactions and atomic_write", "WindowUpdate staged/verified commit and rollback"]
+side_effect_boundaries = ["private same-user D-Bus", "bounded child commands", "private lifecycle requests", "KWin feed", "terminal adapters"]
+fault_containment = "Workers execute outside the GUI and daemon executor; original windows are preserved on refused preflight; failed jobs retain private recovery plans."
+
+[errors]
+typed_codes = "implemented_tested"
+preserves_source_chain = "implemented_tested"
+preserves_first_failure = "implemented_tested"
+causal_ids = ["process PID/start ticks/boot ID", "operation ID", "event parent and sequence", "window generation", "worker request directory"]
+
+[invariants]
+release_checks = ["private same-user regular request files", "PID and start-time revalidation", "verified restart plans before stopping", "launch pair build-ID agreement", "atomic generation publication"]
+progress_rules = ["bounded command deadlines", "no-wait operation locks", "bounded retries and backoff", "explicit failed/completed restart states", "45-second ordinary capture deadline"]
+resource_balances = ["RAII worker registrations", "bounded event and persistent rings", "bounded worker queue", "capture allocation lease", "staged recovery manifests"]
+
+[configuration]
+effective_config = "implemented_tested"
+decision_provenance = "implemented_tested"
+dynamic_change_history = "implemented_tested"
+
+[build]
+identity = "--build-info binds profile, features, exact lock, source inputs and canonical product semantics; --build-id and ELF build ID bind the executable."
+exact_artifact_retention = "implemented_tested"
+symbols_and_unwind = "implemented_tested"
+source_retrieval = "implemented_tested"
+
+[artifacts]
+cache_identity = "implemented_tested"
+atomic_publication = "implemented_tested"
+generation_manifest = "implemented_tested"
+
+[live]
+capabilities_command = "--help and --build-info; minimal has identity only, observable also has independent snapshot/capture commands."
+snapshot_command = "Observable same-UID diagnostic socket: snapshot; external scripts/capture-release-diagnostics.py --pid PID --output PRIVATE_DIRECTORY works without optional in-process instrumentation."
+snapshot_consistency = "best-effort"
+independent_of_failure_loop = "implemented_tested"
+capture_timeout_ms = 2000
+
+[history]
+flight_recorder = "implemented_tested"
+schema = "FlightEvent v1 and checksummed ALTRC001 boundary ring; optional history is absent in release-minimal."
+capacity_events = 512
+drop_and_overwrite_reporting = "implemented_tested"
+
+[audit_trail]
+mutation_audit = "not_applicable"
+event_schema = "Single-user desktop preferences/history have no authenticated multi-actor business-audit requirement. Required restart recovery records are retained separately."
+actor_writer_and_reason = "No independent tenant or business actor; the same local UID controls the launcher and its private service."
+attribution_policy = "No claim of historical actor attribution from optional events."
+transaction_binding = "SQLite transactions and restart manifests remain product correctness mechanisms, not an asserted durable audit trail."
+attempted_write_policy = "Recovery failures retain attempted operation and original typed cause, independently of optional tracing."
+provenance_and_deduplication = "Recovery operation identity is product evidence; no generic mutation-audit stream is asserted."
+change_representation = "Recovery plans retain required pre-replacement application state, not a general before/after database audit."
+direct_write_coverage = "not_applicable"
+tamper_evidence = "Same-UID editable local state has no independent tamper-resistance guarantee."
+retention_and_access = "Private recovery plans are not pruned by diagnostic retention. Terminal updates retain images through open descriptors only, never copies or hashes; metadata cannot recover an unlinked executable after its last holder exits. Existing binary caches are untouched."
+query_and_export = "Recovery plans and progress/result JSON remain directly readable."
+sink_failure_policy = "Required recovery publication failure refuses replacement; optional recorder failure never authorizes replacement."
+cost_and_backpressure = "Bounded product recovery metadata and file/process/session identity checks remain in every artifact. Neither terminal-update path copies or hashes executables or hashes restart scope."
+assurance_test = "tests/test_lifecycle_windows.py and tests/test_lifecycle_recovery_builds.py preserve required recovery state in either generated mode."
+max_event_bytes = 0
+max_added_commit_p99_ms = 0.0
+max_throughput_regression_percent = 0.0
+max_audit_wait_ms = 0
+max_storage_bytes_per_day = 0
+
+[concurrency]
+task_registry = "implemented_tested"
+lock_wait_introspection = "implemented_untested"
+cross_process_correlation = "implemented_tested"
+
+[resources]
+ownership_reporting = "implemented_tested"
+declared_budgets = ["512 events and 64 named workers per process", "1000 admitted events/second per process", "2 MiB persistent ring per component", "64 MiB persistent writes per recorder lifetime", "1 MiB semantic snapshot", "32 MiB ordinary bundle", "8 completed/unfinished captures; completed captures expire after seven days on collection"]
+high_water_reporting = "implemented_tested"
+
+[reproduction]
+recorded_inputs = ["versioned redacted boundary summaries", "required private restart plan and progress journals", "exact compiled source/feature/lock manifests"]
+replay_command = "Observable: applicationlauncher replay RING_OR_BUNDLE; deterministic reducer replay is not replay of the OS, GPU or thread schedule."
+fault_injection = ["diagnostic-build only: window-feed-drop/duplicate", "terminal-send-failure", "tracker-write-busy", "diagnostic-response-delay", "contained panic/native-crash/blocked-main-loop probes"]
+
+[postmortem]
+crash_capture = "implemented_tested"
+includes_history = "implemented_tested"
+oom_or_external_kill_detection = "implemented_untested"
+retention_policy = "Exact binaries/symbols/sources: three builds/component plus running and published-profile build IDs. Automatic ordinary bundles: eight captures, seven-day completed-bundle expiry. Explicit external capture destinations remain caller-managed."
+
+[recovery]
+pre_repair_evidence = "implemented_tested"
+restart_or_fallback_history = "implemented_tested"
+last_failure_retention = "implemented_tested"
+
+[domain]
+state_dump = "Best-effort component identity, effective diagnostics/categories, tracker/GUI/app/attention/feed gauges and high waters, named worker wait states, semantic transitions, ring loss and sink health; detailed frame/wheel statistics only during authorized capture."
+cross_boundary_ids = ["daemon and GUI build IDs", "PID/start/boot identity", "window/feed generations", "restart operation and parent span IDs"]
+
+[security]
+authorization = "Private 0700 directories and 0600 files; same-UID socket peer validation; debugger authorization is exact-peer-PID and expires in 60 seconds; explicit cores are sensitive."
+redaction = ["no environment or file contents in ordinary capture", "credential-bearing lines/fields redacted", "bounded scalar timing labels; no titles, prompts, argv or payloads", "external GDB uses no locals or frame arguments"]
+max_bundle_bytes = 33554432
+retention_days = 7
+
+[budgets]
+measurement_status = "implemented_untested"
+steady_cpu_percent = 0.25
+steady_memory_bytes = 1048576
+activated_cpu_percent = 10.0
+
+[deployment_modes]
+minimal_release = "scripts/build-release-matrix: release-minimal; optional Rust modules/macros, Python observers and transitive log/tracing runtime are erased."
+observable_release = "Default Cargo features and installed target/release pair remain release-observable."
+global_runtime_switch = "Observable only: APPLICATIONLAUNCHER_DIAGNOSTICS=off (legacy value minimal is an alias, not an erased artifact)."
+per_category_switches = ["Observable startup allow-list APPLICATIONLAUNCHER_DIAGNOSTIC_CATEGORIES=baseline,stderr,update-timings; empty disables all categories", "LifecycleTiming1 ActivateUpdateTimings(seconds) enables only new update jobs for at most 300 seconds"]
+diagnostic_builds = ["diagnostic-build feature, same production optimization; only this artifact contains fault-injection hooks and synthetic probes"]
+optional_diagnostics_default_enabled = false
+lazy_buffer_allocation = true
+lazy_helper_start = true
+
+[performance_isolation]
+preserves_release_optimization = true
+compile_time_exclusion_supported = true
+critical_hot_paths = ["search ranking and title projection", "native-build equality", "GUI rows/tiles", "audio samples", "Python restart boundaries"]
+disabled_hot_path_extra_instructions = 0
+baseline_comparison = "Relocation-normalized optimized search/projection/build-comparison instructions; generated pre-observer Python boundary. Historical whole-GUI non-inferiority is not established by these scoped checks."
+minimal_mode_test = "Negative workspace compilation with optional modules absent; actual stripped ELF symbol/string/dependency and embedded Python AST/bytecode checks."
+runtime_disabled_test = "Lazy observer argument tests and packaged private-daemon off-mode trials."
+always_on_test = "Packaged private-daemon idle CPU/RSS and startup trials; recorder contention/rate/output tests."
+activated_mode_tests = ["tests/benchmark_lifecycle_timing.py", "tests/test_lifecycle_timing.py", "diagnostic-build blocked-main-loop capture integration test"]
+
+[artifact_isolation]
+single_semantic_source = true
+release_minimal_erasure = "implemented_tested"
+release_minimal_runtime_diagnostic_checks = 0
+semantic_source_and_generation = "Authoritative src plus cfg/token erasure; build-support/lifecycle_sources.py erases observer AST nodes; pinned dependency observer adapters have no surviving linked runtime. No alternate product algorithms."
+performance_closure = ["whole GUI and daemon linked runtime: no optional recorder/log/tracing symbols or forbidden markers", "designated optimized search/projection/native comparison instructions", "embedded Python restart modules including runner error paths"]
+assurance_artifacts = ["target/release-profiles/diagnostic-build: verified GUI and daemon ELF IDs/SHA256, source, semantics and actual feature inventories"]
+release_minimal_postimages = ["target/release-profiles/release-minimal/verification.json: exact GUI/daemon ELF IDs and hashes, embedded Python digests and dependency proof"]
+permitted_release_facilities = ["private DWARF/unwind data and build IDs", "immutable identity/provenance manifests and identity-only CLI", "external capture tools, not linked helpers", "required recovery journals/status/errors and safety checks", "product scheduling clocks, operation IDs and renderer/backend behavior"]
+forbidden_release_markers = ["own observability/diagnostic_capture/replay symbols", "tracing/tracing_core/log runtime symbols", "MAX_LOG_LEVEL_FILTER", "ALTRC001", "APPLICATIONLAUNCHER_DIAGNOSTICS", "lifecycle_timing", "ActivateUpdateTimings", "fault-injection environment keys"]
+postimage_absence_test = "tests/verify_release_artifact.py on the packaged GUI and daemon, not a source-only feature check."
+runtime_check_absence_test = "Absent-module negative build, undefined-observer-token compile test, actual linked symbol/marker inspection and designated machine-code comparison."
+dependency_absence_test = "tests/verify_release_artifact.py compares resolved product dependencies, verifies generation adapters and rejects tracing-core; linked observer symbols must be zero."
+semantic_equivalence_test = "Canonical pre-observer Rust and Python digests across all profiles, same product tests, and identical typed malformed-request outcome from packaged workers."
+artifact_provenance_test = "Hash-verified compile-input/source archives, actual generated lock, exact ELF/split-symbol/native-library checksums and archive-only source-frame recovery."
+
+[instrumentation_policy]
+facility_admission = "required"
+default_class = "activated"
+max_steady_cpu_percent = 0.25
+max_steady_memory_bytes = 1048576
+max_event_rate_per_second = 1000
+max_disk_bytes_per_day = 67108864 # Per recorder process; lifetime cap is stronger than its daily cap.
+max_snapshot_pause_ms = 100
+max_activation_ttl_seconds = 300
+max_activated_capture_bytes = 33554432
+max_minimal_cpu_regression_percent = 0.0
+max_runtime_disabled_cpu_regression_percent = 0.1
+max_steady_p99_latency_regression_percent = 1.0
+max_activated_cpu_percent = 10.0
+synchronous_hot_path_io = false
+global_contended_event_index = false
+require_overhead_test = true
+promotion_requires_measurement = true
+
+[assurance]
+contract_test = "tests/test_debuggability_contract.py plus the skill schema-version-6 strict validator."
+synthetic_scenarios = ["private malformed lifecycle request", "contained diagnostic panic/native crash and blocked-main-loop capture", "ring wrap/loss and output failure", "archive-only source recovery", "healthy private daemon negative control"]
+symbolization_test = "tests/verify_release_diagnosis.py uses archived stripped executable, split symbols, exact source and native modules in an isolated startup-core fixture."
+redaction_test = "src/observability.rs and src/diagnostic_capture.rs unit tests; tests/test_lifecycle_timing.py and tests/test_release_diagnostics.py."
+overhead_test = "tests/verify_performance_closure.py, tests/verify_release_diagnosis.py, tests/benchmark_lifecycle_timing.py; scope and unexecuted GUI/historical measurements remain explicit."
+snapshot_test = "Contended recorder tests, exact-PID packaged-daemon snapshot trials and diagnostic-build main-loop-blocked integration test."
+
+[exceptions]
+items = [
+  {control="audit_trail.mutation_audit", disposition="not_applicable", reason="Local single-UID desktop preferences and recoverable history require integrity/recovery, not independent historical actor accountability; required restart plans remain product behavior."},
+  {control="audit_trail.direct_write_coverage", disposition="not_applicable", reason="No required generic durable audit stream is claimed for the single-UID local store; required restart publication and database transactions remain enforced."},
+]
+
+[controls]
+"architecture.state_owners" = {status="implemented_tested", reason="Restart policy and UI mechanics must not share ambiguous ownership.", implementation="src/tracker/service.rs; src/lifecycle/window.py; src/app/mod.rs", test="tests/test_lifecycle_windows.py; src/app/tests.rs"}
+"architecture.mutation_points" = {status="implemented_tested", reason="Generation and rollback errors need authoritative transitions.", implementation="src/tracker/service.rs; src/tracker/database.rs; src/lifecycle/window.py", test="tests/test_lifecycle_windows.py; tests/test_lifecycle_recovery_builds.py"}
+"architecture.side_effect_boundaries" = {status="implemented_tested", reason="IPC and child commands can fail independently.", implementation="src/process.rs; src/lifecycle/mod.rs", test="src/lifecycle/tests.rs; tests/test_release_diagnostics.py"}
+"architecture.fault_containment" = {status="implemented_tested", reason="An update must not block the GUI or silently discard an original window.", implementation="src/lifecycle/window.py; src/lifecycle/runner.py", test="tests/test_lifecycle_windows.py; tests/test_lifecycle_external.py"}
+"errors.causal_ids" = {status="implemented_tested", reason="Separate processes and repeated updates need stable correlation.", implementation="src/operation.rs; src/lifecycle/worker.py; src/lifecycle/timing.py; src/observability.rs", test="tests/test_lifecycle_timing.py; src/lifecycle/tests.rs"}
+"invariants.release_checks" = {status="implemented_tested", reason="Diagnostics must not replace correctness and safety checks.", implementation="src/lifecycle/mod.rs; src/lifecycle/window.py; scripts/lib/release-compatibility.sh", test="tests/test_lifecycle_windows.py; tests/test_launcher_deployment.py"}
+"invariants.progress_rules" = {status="implemented_tested", reason="Waits and retries need finite outcomes.", implementation="src/process.rs; src/lifecycle/window.py; src/diagnostic_capture.rs", test="tests/test_lifecycle_windows.py; tests/test_release_diagnostics.py"}
+"invariants.resource_balances" = {status="implemented_tested", reason="Observers must stay bounded and release ownership.", implementation="src/observability.rs; src/diagnostic_capture.rs", test="src/observability.rs; src/diagnostic_capture.rs"}
+"build.identity" = {status="implemented_tested", reason="A matching version string cannot identify an exact executable.", implementation="build.rs; build-support/artifact_manifest.rs", test="tests/verify_release_artifact.py; tests/verify_release_diagnosis.py"}
+"live.capabilities_command" = {status="implemented_tested", reason="Operators need to discover the real artifact's available evidence.", implementation="src/main.rs; src/bin/applicationlauncherd.rs", test="tests/verify_release_artifact.py; tests/verify_release_diagnosis.py"}
+"live.snapshot_command" = {status="implemented_tested", reason="Capture cannot rely on the blocked main executor.", implementation="src/observability.rs; scripts/capture-release-diagnostics.py", test="tests/production_diagnostics.rs; tests/verify_release_diagnosis.py"}
+"history.schema" = {status="implemented_tested", reason="Ordered bounded history must remain replayable after exit.", implementation="src/observability.rs; src/replay.rs", test="src/replay.rs; src/observability.rs"}
+"audit_trail.event_schema" = {status="not_applicable", reason="No independent durable mutation-audit obligation for this local single-UID desktop store.", implementation="", test=""}
+"audit_trail.actor_writer_and_reason" = {status="not_applicable", reason="There is no separate authenticated business actor or tenant to attribute in this single-UID application.", implementation="", test=""}
+"audit_trail.attribution_policy" = {status="not_applicable", reason="Optional flight events do not assert durable actor attribution.", implementation="", test=""}
+"audit_trail.transaction_binding" = {status="not_applicable", reason="Required recovery manifests and SQLite transactions enforce correctness, not a generic audit stream.", implementation="", test=""}
+"audit_trail.attempted_write_policy" = {status="not_applicable", reason="There is no required mutation audit; product recovery failures are retained separately.", implementation="", test=""}
+"audit_trail.provenance_and_deduplication" = {status="not_applicable", reason="No independent mutation-audit event stream exists to deduplicate.", implementation="", test=""}
+"audit_trail.change_representation" = {status="not_applicable", reason="No general before/after historical business reconstruction is required.", implementation="", test=""}
+"audit_trail.tamper_evidence" = {status="not_applicable", reason="The owning UID controls the editable desktop configuration and recovery records; no adversarial same-UID tamper guarantee is claimed.", implementation="", test=""}
+"audit_trail.retention_and_access" = {status="not_applicable", reason="Required recovery plans have product retention, not a generic audit-retention obligation.", implementation="", test=""}
+"audit_trail.query_and_export" = {status="not_applicable", reason="No generic durable mutation audit exists to export.", implementation="", test=""}
+"audit_trail.sink_failure_policy" = {status="not_applicable", reason="Required recovery publication already fails closed; there is no optional diagnostic-to-audit substitution.", implementation="", test=""}
+"audit_trail.cost_and_backpressure" = {status="not_applicable", reason="Only required recovery costs apply; no additional durable audit sink is introduced.", implementation="", test=""}
+"audit_trail.assurance_test" = {status="not_applicable", reason="The conditional audit overlay does not apply; product recovery checks are covered independently.", implementation="", test=""}
+"resources.declared_budgets" = {status="implemented_tested", reason="Optional evidence must not grow without bound.", implementation="src/observability.rs; src/diagnostic_capture.rs; src/lifecycle/timing.py", test="tests/test_lifecycle_timing.py; tests/test_release_diagnostics.py; src/observability.rs"}
+"reproduction.recorded_inputs" = {status="implemented_tested", reason="Recorded summaries must distinguish observed decisions from guessed history.", implementation="src/replay.rs; src/lifecycle/window.py", test="src/replay.rs; tests/test_lifecycle_windows.py"}
+"reproduction.replay_command" = {status="implemented_tested", reason="Boundary reduction can reproduce state errors without executing a live update.", implementation="src/replay.rs; src/main.rs", test="src/replay.rs"}
+"reproduction.fault_injection" = {status="implemented_tested", reason="Matching seeded faults need separate optimized assurance artifacts.", implementation="src/replay.rs; src/diagnostic_capture.rs", test="tests/production_diagnostics.rs; tests/verify_release_artifact.py"}
+"postmortem.retention_policy" = {status="implemented_tested", reason="Symbols must remain matched and bundles cannot grow indefinitely.", implementation="scripts/build-debuggable-release; src/diagnostic_capture.rs", test="tests/verify_release_diagnosis.py; src/diagnostic_capture.rs"}
+"domain.state_dump" = {status="implemented_tested", reason="Generic stacks alone cannot explain feed generations or worker state.", implementation="src/observability.rs; src/replay.rs", test="tests/production_diagnostics.rs; tests/verify_release_diagnosis.py"}
+"domain.cross_boundary_ids" = {status="implemented_tested", reason="GUI, tracker and independent workers share operations but not PIDs.", implementation="src/operation.rs; src/observability.rs; src/lifecycle/timing.py", test="tests/test_lifecycle_timing.py; tests/verify_release_diagnosis.py"}
+"security.authorization" = {status="implemented_tested", reason="Debugger access and restart requests are sensitive same-user capabilities.", implementation="src/observability.rs; src/lifecycle/mod.rs", test="tests/production_diagnostics.rs; src/lifecycle/tests.rs"}
+"security.redaction" = {status="implemented_tested", reason="Diagnostics must avoid credentials, conversation contents and raw payloads.", implementation="src/observability.rs; src/diagnostic_capture.rs; scripts/capture-release-diagnostics.py", test="tests/test_lifecycle_timing.py; tests/test_release_diagnostics.py; src/diagnostic_capture.rs"}
+"assurance.contract_test" = {status="implemented_tested", reason="Artifact and evidence claims must remain mechanically discoverable.", implementation="debuggability.toml; tests/test_debuggability_contract.py", test="tests/test_debuggability_contract.py; skill validate_contract.py --strict"}
+"assurance.synthetic_scenarios" = {status="implemented_tested", reason="Evidence paths need controlled failures and clean controls.", implementation="tests/verify_release_diagnosis.py; tests/production_diagnostics.rs", test="tests/verify_release_diagnosis.py; tests/production_diagnostics.rs"}
+"assurance.symbolization_test" = {status="implemented_tested", reason="A successful archive command does not prove useful source recovery.", implementation="tests/verify_release_diagnosis.py", test="tests/verify_release_diagnosis.py"}
+"assurance.redaction_test" = {status="implemented_tested", reason="Private mode bits do not replace payload redaction.", implementation="tests/test_release_diagnostics.py; tests/test_lifecycle_timing.py", test="tests/test_release_diagnostics.py; tests/test_lifecycle_timing.py"}
+"assurance.overhead_test" = {status="implemented_tested", reason="Erased, disabled, normal and activated scopes need separate measurements.", implementation="tests/verify_performance_closure.py; tests/verify_release_diagnosis.py; tests/benchmark_lifecycle_timing.py", test="tests/verify_performance_closure.py; tests/verify_release_diagnosis.py; tests/benchmark_lifecycle_timing.py"}
+"assurance.snapshot_test" = {status="implemented_tested", reason="Capture must report contention rather than waiting on the stuck subsystem.", implementation="src/observability.rs; tests/production_diagnostics.rs", test="src/observability.rs; tests/production_diagnostics.rs; tests/verify_release_diagnosis.py"}
+"deployment_modes.minimal_release" = {status="implemented_tested", reason="Runtime off is not compile-time erasure.", implementation="build-support/minimal_workspace.py; src/lib.rs", test="tests/verify_release_artifact.py; tests/verify_performance_closure.py; negative workspace product tests"}
+"deployment_modes.observable_release" = {status="implemented_tested", reason="Normal launches should retain bounded useful evidence without a trace flag.", implementation="Cargo.toml; build-support/release_matrix.py", test="tests/verify_release_artifact.py; tests/verify_release_diagnosis.py"}
+"deployment_modes.global_runtime_switch" = {status="implemented_tested", reason="Operators need one veto over all optional categories.", implementation="src/lib.rs; src/observability.rs; src/lifecycle/timing.rs", test="src/observability.rs; src/lifecycle/timing.rs; tests/verify_release_diagnosis.py"}
+"deployment_modes.per_category_switches" = {status="implemented_tested", reason="Detailed update timing must be isolated from baseline state and stderr.", implementation="src/observability.rs; src/lifecycle/timing.rs", test="src/observability.rs; src/lifecycle/timing.rs; tests/test_lifecycle_timing.py"}
+"deployment_modes.diagnostic_builds" = {status="implemented_tested", reason="Fault hooks must not be shipped in ordinary artifacts.", implementation="Cargo.toml; src/replay.rs", test="tests/verify_release_artifact.py; tests/production_diagnostics.rs"}
+"performance_isolation.critical_hot_paths" = {status="implemented_tested", reason="Whole-process averages can hide a search-loop regression.", implementation="src/search.rs; src/freshness.rs", test="tests/verify_performance_closure.py"}
+"performance_isolation.baseline_comparison" = {status="implemented_untested", reason="Designated optimized loops are compared; an equivalent historical whole-GUI baseline is unavailable and is not claimed tested.", implementation="tests/verify_performance_closure.py; tests/benchmark_lifecycle_timing.py", test="Scoped relocation-normalized and Python boundary receipts; historical whole-GUI comparison is explicitly unexecuted."}
+"performance_isolation.minimal_mode_test" = {status="implemented_tested", reason="Flags alone cannot prove an erased artifact.", implementation="build-support/minimal_workspace.py; tests/verify_release_artifact.py", test="Negative workspace product tests; tests/verify_release_artifact.py; tests/verify_performance_closure.py"}
+"performance_isolation.runtime_disabled_test" = {status="implemented_tested", reason="Disabled arguments must not allocate or sample clocks.", implementation="src/lib.rs; src/observability.rs; src/lifecycle/timing.py", test="src/observability.rs; tests/test_lifecycle_timing.py; tests/verify_release_diagnosis.py"}
+"performance_isolation.always_on_test" = {status="implemented_tested", reason="Baseline evidence must have a measured bounded footprint.", implementation="tests/verify_release_diagnosis.py; src/observability.rs", test="tests/verify_release_diagnosis.py; src/observability.rs"}
+"performance_isolation.activated_mode_tests" = {status="implemented_tested", reason="Short detailed traces have different costs and expiry requirements.", implementation="src/lifecycle/timing.py; tests/benchmark_lifecycle_timing.py", test="tests/test_lifecycle_timing.py; tests/benchmark_lifecycle_timing.py; tests/production_diagnostics.rs"}
+"artifact_isolation.semantic_source_and_generation" = {status="implemented_tested", reason="Independent fast and assurance implementations could drift.", implementation="build-support/artifact_manifest.rs; build-support/lifecycle_sources.py; build-support/minimal_workspace.py", test="tests/verify_release_artifact.py; tests/test_lifecycle_timing.py; matrix semantic-digest gate"}
+"artifact_isolation.performance_closure" = {status="implemented_tested", reason="Transitive logging and generated Python can survive host-only cfg checks.", implementation="tests/verify_release_artifact.py; tests/verify_performance_closure.py", test="tests/verify_release_artifact.py; tests/verify_performance_closure.py"}
+"artifact_isolation.assurance_artifacts" = {status="implemented_tested", reason="Only exact optimized linked artifacts can establish release fidelity.", implementation="build-support/release_matrix.py", test="tests/verify_release_artifact.py; tests/production_diagnostics.rs"}
+"artifact_isolation.release_minimal_postimages" = {status="implemented_tested", reason="The generated source is not itself the shipped executable.", implementation="tests/verify_release_artifact.py", test="tests/verify_release_artifact.py on both packaged ELFs"}
+"artifact_isolation.permitted_release_facilities" = {status="implemented_tested", reason="Erasure must preserve safety, recovery, identity and external symbolization.", implementation="src/lifecycle/mod.rs; src/lifecycle/window.py; build.rs", test="Negative workspace product tests; tests/verify_release_diagnosis.py"}
+"artifact_isolation.forbidden_release_markers" = {status="implemented_tested", reason="A no-op observer shim is insufficient unless all observer runtime disappears.", implementation="tests/verify_release_artifact.py", test="tests/verify_release_artifact.py linked symbol/string and Python bytecode checks"}
+"artifact_isolation.postimage_absence_test" = {status="implemented_tested", reason="Diagnostics must be absent from actual packaged postimages.", implementation="tests/verify_release_artifact.py", test="tests/verify_release_artifact.py"}
+"artifact_isolation.runtime_check_absence_test" = {status="implemented_tested", reason="A false Boolean still leaves a runtime condition.", implementation="src/lib.rs; tests/verify_performance_closure.py", test="Undefined-observer-token and absent-source compilation; tests/verify_performance_closure.py"}
+"artifact_isolation.dependency_absence_test" = {status="implemented_tested", reason="Transitive log/tracing checks can survive own-module exclusion.", implementation="build-support/erased-log/src/lib.rs; build-support/erased-tracing/src/lib.rs; tests/verify_release_artifact.py", test="tests/verify_release_artifact.py compares product dependency graph and requires zero linked observer symbols"}
+"artifact_isolation.semantic_equivalence_test" = {status="implemented_tested", reason="Observer removal must not remove required error or recovery paths.", implementation="build-support/artifact_manifest.rs; build-support/lifecycle_sources.py", test="tests/test_lifecycle_timing.py; tests/verify_release_diagnosis.py; matrix semantic-digest gate"}
+"artifact_isolation.artifact_provenance_test" = {status="implemented_tested", reason="A nearby rebuilt executable is not a match for a preserved failure.", implementation="build-support/source_archive.py; scripts/build-debuggable-release", test="tests/verify_release_diagnosis.py; tests/verify_release_artifact.py"}

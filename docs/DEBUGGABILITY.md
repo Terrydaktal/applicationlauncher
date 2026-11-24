@@ -1,208 +1,261 @@
-# Production Debuggability Contract
+# Debugging Releases
 
-Application Launcher must remain diagnosable in the same optimized release
-configuration that is used normally. A debug build is not an acceptable
-substitute for evidence from a release-only hang, crash, CPU storm, or stale
-GUI/daemon state.
+The normative **Stateful**, schema-version-6 contract is
+[`../debuggability.toml`](../debuggability.toml). This is its operator guide.
+Ordinary launches remain observable without a tracing flag. Build verification
+never restarts an existing application.
 
-## Runtime Modes
+## Artifacts
 
-The mode is process-local and is included in every semantic snapshot.
+| Artifact | Location | Evidence |
+| --- | --- | --- |
+| `release-observable` | Default `target/release/{applicationlauncher,applicationlauncherd}` | Bounded events, counters, gauges/high waters, worker states, sink health and independent diagnostic socket |
+| `release-minimal` | `target/release-profiles/release-minimal/` | Exact optimized ELF, private symbols/unwind data, immutable identity/source manifests, required recovery records and external capture; no optional in-process diagnostic runtime |
+| `diagnostic-build` | `target/release-profiles/diagnostic-build/` | Same release optimization plus explicitly gated fault hooks and contained synthetic probes |
 
-| Mode | Entry | Always available | Runtime behavior |
-| --- | --- | --- | --- |
-| `minimal` | `APPLICATIONLAUNCHER_DIAGNOSTICS=minimal` before process startup | ELF identity, full external symbols, panic hook, independent diagnostic endpoint | Event and counter calls return before locking or allocating. The endpoint blocks in `accept` and consumes no idle CPU. |
-| `observable` | Default | Minimal facilities plus bounded events, counters, gauges, and worker registry | Records only lifecycle/state boundaries. Rendering, row layout, search ranking, title-spinner updates, and audio samples are excluded. |
-| `runtime-activated` | An authorized `--diagnose auto` collector is attached | Repeated stacks, process state, semantic snapshot, journals, checksums, and requested perf/core evidence | Temporary. Only the exact same-user socket peer PID is authorized with `PR_SET_PTRACER`; authorization expires after 60 seconds and is explicitly revoked after capture. |
+Runtime `off` in an observable artifact is **not** an erased artifact.
+`--build-info` reports the actual profile, features, lock/source hashes and
+canonical product semantics without starting the GUI, daemon or worker.
 
-The permitted state transitions are:
-
-```text
-minimal -> runtime-activated -> minimal
-observable -> runtime-activated -> observable
-```
-
-A build never silently changes the configured base mode. Heavy collection is
-not scheduled by the GUI update loop or by the daemon D-Bus executor.
-
-## Budgets
-
-The constants are exported by `src/observability.rs` and included in diagnostic
-snapshots.
-
-| Facility | Hard limit or measured budget |
-| --- | --- |
-| Observable idle CPU | At most 2,500 ppm (0.25% of one CPU) |
-| Structured event write p99 | At most 50 microseconds |
-| Observable resident-memory increment | At most 1 MiB |
-| Stripped production binary | At most 64 MiB per component |
-| Exact unstripped or separate debug artifact | At most 512 MiB per file |
-| Build archive retention | 3 builds per component, plus still-running build IDs |
-| Flight recorder | 512 events; oldest event is evicted first |
-| Persistent trace ring | 512 checksummed 4 KiB slots; 2 MiB per component |
-| Named workers | 64 concurrent entries |
-| Event string field | 96 UTF-8 bytes |
-| Boundary payload | 2 KiB |
-| Semantic snapshot | 1 MiB |
-| Panic log | 4 MiB per component |
-| Normal diagnostic bundle | 32 MiB, excluding an explicitly requested full core |
-| Normal diagnostic collection | 45 seconds |
-| Per-command text capture | 4 MiB |
-| Repeated stacks | 3 by default; caller values are clamped to 1 through 10 |
-| Endpoint discovery | 32 socket candidates, 4 live targets, 250 ms response timeout per candidate |
-| Checksum manifest | 256 files and 8 directory levels |
-
-Build metadata, exact binary archiving, and split-symbol generation have zero
-runtime CPU and RSS cost. The independent diagnostic server is blocked while
-idle. Observable mode has deliberately bounded nonzero work at coarse lifecycle
-boundaries; claiming literal zero cost for an always-on recorder would be
-incorrect.
-
-## Structured State
-
-Every event has a monotonic timestamp, wall timestamp, sequence, thread ID and
-name, category, action, optional operation and parent IDs, object/reason fields,
-old/new state, and optional duration. Fields are truncated before insertion and
-likely credential values are redacted.
-
-Counters are a fixed enum backed by atomics. Gauges are also fixed atomics.
-Neither can grow due to external input. The worker registry is bounded and uses
-an RAII registration so completed and unwound workers disappear.
-
-Do not add event recording to:
-
-- `eframe::App::update` frame iteration;
-- visible-row or tile rendering;
-- fuzzy-rank candidate or token loops;
-- braille-spinner title updates;
-- audio-level samples.
-
-Add events around infrequent lifecycle transitions, retries, failures, snapshot
-replacement, process startup/shutdown, and external operation boundaries.
-
-## Live Capture
-
-Run this while preserving the faulty processes:
-
-```bash
-applicationlauncher --diagnose auto
-```
-
-Optional activated-only evidence:
-
-```bash
-applicationlauncher --diagnose auto --perf
-applicationlauncher --diagnose auto --core
-```
-
-`--core` is explicit because a full core can contain credentials, document
-contents, prompts, and other private process memory. Normal text evidence is
-line-redacted for common credential forms. Environment variables and open file
-contents are not collected.
-
-The collector discovers private PID-specific sockets for the GUI and daemon. It
-does not depend on either GUI repainting or the daemon D-Bus executor. For each
-responding target it captures:
-
-- application build identity, executable identity, and ELF build ID;
-- bounded `/proc` status, scheduling, memory-map, cgroup, I/O, limits, and
-  per-thread state;
-- the bounded semantic snapshot and recent structured events;
-- repeated all-thread stacks using `eu-stack`, with `gdb` fallback;
-- a bounded `ps -L` snapshot and relevant user journal records;
-- optional short `perf` recording or explicit full live core;
-- a SHA-256 manifest covering the completed bundle.
-
-Output is timestamped below
-`$XDG_STATE_HOME/applicationlauncher/diagnostics`, with directory mode `0700`
-and ordinary evidence mode `0600`.
-
-## Release Artifacts
-
-Build and archive a production release with:
+Build, verify, archive and publish the normal observable pair:
 
 ```bash
 scripts/build-debuggable-release
 ```
 
-The normal release profile keeps full DWARF and explicitly requests a GNU SHA-1
-ELF build ID. For each GUI and daemon ELF build ID the script stores:
+This delegates to `scripts/build-release-matrix`, which:
 
-- the exact unstripped Cargo output;
-- a stripped copy with a GNU debug link;
-- a separate debug-symbol file;
-- `build-info.json` with source revision, dirty-tree hash, application and ELF
-  build IDs, binary hashes and sizes, target, compiler, linker, flags, features,
-  and dependency graph;
-- a SHA-256 artifact manifest.
+1. Compiles variants in `target/profile-build`, never over the active pair.
+2. Packages actual ELFs with compressed full DWARF and GNU build IDs.
+3. Rejects minimal observer symbols/strings, residual Python observer AST/bytecode,
+   altered product dependencies and ordinary-release fault hooks.
+4. Archives exact/stripped binaries, split symbols, hash-verified source inputs,
+   immutable Rust source packages, the generated lock and native `DT_NEEDED` modules.
+5. Runs private packaged-daemon and archive-only symbol-recovery trials.
+6. Compares canonical product digests and designated optimized instructions.
+7. Publishes the observable pair after its gates pass. The wrapper's build-ID
+   agreement check also guards against a partial two-file publication.
 
-The default archive is
-`$XDG_STATE_HOME/applicationlauncher/builds/by-build-id/BUILD_ID`. Artifact
-generation never changes or restarts a running process. Successful generation
-retains the newest three builds for each component and any older build ID still
-mapped by a running launcher or daemon. Override the count with
-`--keep-builds COUNT` or `APPLICATIONLAUNCHER_BUILD_KEEP_BUILDS`.
+Compatibility repair uses `--only release-observable`: it runs that artifact's
+gates, not a new three-profile comparison, and does not overwrite a complete
+matrix receipt. Plain Cargo builds remain useful for development but do not
+constitute matrix verification. A source change after linking refuses archival
+rather than recording a nearby but different source tree.
 
-## Progress Invariants
+Optimization level, LTO/codegen defaults, target CPU, allocator, panic strategy,
+renderer and product features remain unchanged.
 
-- The diagnostic endpoint blocks in `accept`; it has no idle polling loop.
-- Diagnostic authorization is revoked by explicit completion or a 60-second
-  timeout.
-- Every command has a timeout and bounded captured stdout/stderr.
-- Endpoint discovery has fixed candidate, target, and response-time bounds.
-- Bundle growth stops at the global text/perf budget. A core is exempt only when
-  explicitly requested.
-- Manifest traversal has fixed file-count and directory-depth bounds.
-- The recorder evicts before inserting past capacity.
-- The persistent trace writer uses a bounded non-blocking queue and writes the
-  payload before its commit header; incomplete slots are ignored during replay.
-- The worker registry refuses entries after its fixed maximum.
-- Daemon retry loops retain their existing sleep/backoff and do not emit an
-  event on every poll.
-- Capture failures are accumulated in `capture.json`; one failed evidence source
-  does not discard successful evidence from either process.
+### Erasure Mechanism
 
-## Boundary Replay And Fault Injection
+`build-support/minimal_workspace.py` generates a disposable manifest using the
+authoritative product source. `cfg` and token macros erase own observers before
+Rust type checking. `lifecycle_sources.py` erases Python timing and optional
+traceback capture without removing required errors or recovery writes.
 
-The persistent ring stores versioned typed boundary records for window-feed
-resynchronization, terminal actions, attention dispatch, tracker mutations,
-search decisions, icon resolution, timers, and explicitly injected faults. It
-does not record visible rows, fuzzy-rank candidates, spinner frames, or audio
-samples. This keeps normal rendering and search paths out of the persistence
-cost while retaining the external inputs and lifecycle decisions that can be
-replayed.
+Pinned Linux `log`/`tracing` observer adapters erase transitive event tokens and
+identity-only instrumentation wrappers. They are generation tools, not an
+alternative product implementation or proof by themselves: actual linked
+observer symbols/markers must be zero. Product dependency versions must remain
+identical. New dependency API usage fails compilation or verification rather
+than silently broadening this supported graph.
 
-Replay a ring or a captured bundle with:
+Physically omit optional source modules and test the remaining product:
 
 ```bash
-applicationlauncher replay PATH_TO_RING_OR_BUNDLE
+uv run --offline --no-project --python /usr/bin/python python -I -B build-support/minimal_workspace.py --negative --test
 ```
 
-Replay validates sequence ordering, schema versions, checksums, and the
-deterministic state reducer. Decision explanations are recorded only while a
-diagnostic peer has explicitly activated runtime collection.
+Safety checks, operation IDs used by product coordination, required CLI errors,
+restart plans/status, scheduling clocks and renderer behavior are not erased as
+convenience logs.
 
-Fault injection requires both `APPLICATIONLAUNCHER_ALLOW_FAULT_INJECTION=1`
-and a comma-separated `APPLICATIONLAUNCHER_FAULT_INJECTION` value. Supported
-points are `window-feed-drop`, `window-feed-duplicate`,
-`terminal-send-failure`, `tracker-write-busy`, and `diagnostic-response-delay`.
-An optional `APPLICATIONLAUNCHER_FAULT_SEED` applies the fault every Nth
-operation. The normal process path performs only a cheap disabled-plan check;
-no fault is active by default.
+## Runtime Controls
 
-## Verification
+Observable startup controls:
 
-Run:
+```text
+APPLICATIONLAUNCHER_DIAGNOSTICS=off
+APPLICATIONLAUNCHER_DIAGNOSTIC_CATEGORIES=baseline,stderr,update-timings
+```
+
+The default is observable. Legacy runtime `minimal` aliases `off`. An explicitly
+empty category allow-list disables all optional categories. Disabled macros do
+not evaluate fields or log arguments. Baseline-disabled startup creates no
+recorder writer; the independent same-user control socket remains available.
+
+`baseline` covers state, counters, gauges and workers; `stderr` covers optional
+log macros; `update-timings` permits, but does not activate, detailed update
+tracing. Fault hooks exist only in `diagnostic-build`.
+
+For a slow update, an agent can directly invoke the running daemon's same-user
+D-Bus API `LifecycleTiming1.ActivateUpdateTimings(seconds)` on `/LifecycleTiming`.
+The user need not run a command or restart the daemon. There is no
+`--trace-updates` flag. Leases last at most 300 seconds; zero stops new leases,
+and existing workers retain their original deadline.
+
+Only new window-update jobs receive a private lease. JSONL spans distinguish
+confirmation, planning, recovery-metadata publication, discovery, staging,
+replacement, verification and recovery. Neither native nor compatibility updates
+copy or hash executables. Older captures can contain hash/copy stages from the
+removed recovery-image cache. Monotonic wall and process CPU times
+are separate. Nested spans are inclusive, not additive; a missing end means
+incomplete evidence, not success. IPC duration does not claim remote CPU attribution.
+
+Files live under
+`$XDG_STATE_HOME/applicationlauncher/lifecycle/timings/OPERATION.jsonl`, readable
+without the UI or daemon executor. They are not automatically included in normal
+capture bundles; retain the matching file alongside a bundle.
+
+Required private restart plans, status and results remain in every build profile.
+Running application images are held by open descriptors during handover, even if
+unlinked; file/process/session identities and structured restart scope are checked
+without content hashing. These records are not persistent executable backups:
+once all descriptor holders and processes exit, an unlinked image cannot be
+recovered from the plan alone. Existing recovery-image caches are left untouched.
+
+Window updates stop the foreground application, not its dedicated return-shell
+ancestry. The coordinator checks those shells for identity changes or new jobs
+before handing over to the verified replacement. Native interrupted recovery
+keeps the original tab held open through delayed child exit and restores input
+when the pending update ends. This last safeguard requires a terminal containing
+the recovery-hold fix; it cannot retrofit older running native terminal code.
+Freshness compares retained restarted images with a verified published
+installation rather than treating their old build path as the current version.
+
+### Show Info Presence Checks
+
+Process fields remain captured metadata, not periodically refetched discovery.
+The `window-process-presence` worker reads only captured `/proc/PID/stat` entries
+to remove proven exits, zombies or reused PIDs. At most one check per info window
+is pending, with a one-second interval, 512-process/8-KiB-stat limits and a
+500-ms collection budget. No process-directory scan, executable hashing, version
+execution or package query occurs in this path. Unknown reads retain the entry;
+a lost worker retains metadata and retries after the interval, while a late reply
+cannot prune a newer capture. Surviving process IDs, cached metadata and dropdown
+state are not reset. Reopen the panel to capture new processes.
+
+Recognised image-loader branches are hidden, not terminated. The per-window
+checkbox exposes their captured live entries and count; generic sandboxes and
+important process/ancestor paths are never hidden by name alone. The notice
+states the capture/removal policy. Observable builds use the existing bounded
+worker registry; minimal builds erase that registry and worker-state strings,
+not the required presence behavior. Regression coverage lives in
+`src/windows/process_tree/{helper_tests,presence}.rs`,
+`src/app/popups/refresh_tests.rs` and `src/popups.rs`.
+
+## Capture
+
+The agent can collect ordinary observable evidence directly:
 
 ```bash
-applicationlauncher debug-doctor
-cargo test --all-targets --locked
+applicationlauncher --diagnose auto
 ```
 
-`debug-doctor` verifies ELF identity, available symbolization data, required
-tools, the private output mode, the independent endpoint, exact-PID ptrace
-authorization, recorder p99 latency, retained recorder RSS, idle endpoint CPU,
-core routing, and whether the current ELF has an archived artifact. Tests cover
-hard bounds, redaction, checksums, unavailable endpoints, malformed ELF input,
-panic reports, a diagnosable blocked process, and a contained native-crash
-probe.
+The collector discovers private same-user PID sockets independently of GUI
+repaints and the daemon D-Bus executor. It collects build/process identity,
+best-effort semantic state, bounded `/proc` data, repeated stacks, relevant
+journals and checksums. Exact-peer-PID debugger authorization expires after 60
+seconds and is explicitly revoked. `--perf` and `--core` request additional
+sensitive evidence explicitly.
+
+Minimal has no in-process diagnostic endpoint. Its external helper needs no
+application flag:
+
+```bash
+uv run --offline --no-project --python /usr/bin/python python -I -B scripts/capture-release-diagnostics.py --pid PID --output PRIVATE_DIRECTORY
+```
+
+Add `--stacks` for debugger attachment, or use `--executable ARCHIVED_ELF --core
+CORE` for post-exit stacks. Failed/unavailable sources are reported without
+discarding other evidence. PID/start/boot identity is checked before and after.
+No environments or open-file contents are collected. GDB disables auto-loading,
+debuginfod, locals and frame arguments; it never executes target methods.
+
+Same-UID sibling ptrace can be refused by Yama, especially for minimal without
+debugger authorization. Passive evidence remains available; a parent-debugger
+fixture does not prove arbitrary live attachment permission. Cores can contain
+private memory. OOM/SIGKILL may leave no core or semantic tail.
+
+Build archives default to
+`$XDG_STATE_HOME/applicationlauncher/builds/by-build-id/ELF_BUILD_ID/`.
+Three builds/component plus running and published-profile IDs and their source
+archives are retained.
+Automatic capture retains at most eight directories; completed captures older
+than seven days expire on collection. Unfinished evidence is preserved and can
+refuse new collection when the budget fills. Explicit external-helper output
+is caller-managed. Required recovery plans/progress/results are never pruned.
+
+## Budgets
+
+| Facility | Bound |
+| --- | --- |
+| Events | 512 events, 1000 admitted/second/process; contention drops rather than blocks |
+| Persistent evidence | 512 checksummed 4 KiB slots/component; nonblocking queue 64; 64 MiB logical writes/recorder lifetime |
+| Fields / boundary payload | 96 UTF-8 bytes / 2 KiB |
+| Workers / semantic snapshot | 64 workers / 1 MiB; unavailable locks explicitly reported |
+| Ordinary capture | 32 MiB, 45 seconds; explicit full cores are separate sensitive requests |
+| External helper | 32 MiB, 45 seconds plus command-termination grace; 1 MiB/command, 128 threads |
+| Update tracing | 300 seconds, 256 rows, 1 KiB/row, 128 KiB/file, depth eight |
+| Timing retention | 64 files / 8 MiB; no-wait allocation, active-file locks, 128-entry scan |
+| Runtime / symbols | 64 MiB stripped / 512 MiB exact or separate-symbol file |
+
+Loss/overwrite counters and persistent sink health/first errno expose recorder
+degradation. Sink failure cannot change restart policy or replace the original
+product exception. The ring is optional evidence, not a durable audit trail.
+No events belong in fuzzy-rank candidate loops, tile/row layout, spinner frames
+or audio samples. Frame/wheel detail is capture-activated only.
+
+Detailed update timing is admitted to distinguish delays combined by existing
+recovery journals, not as an always-on profiler. Tests enforce disabled-boundary
+p99 under 2 microseconds, activated-boundary p99 under 1 millisecond,
+initialization p99 under 5 milliseconds and incremental Python allocation under
+1 MiB. Only fixed scalar labels are captured, not titles, prompts, argv, user
+paths or exception payloads. Demote it when equivalent cheaper evidence exists,
+privacy needs change or measured budgets fail.
+
+## Lifecycle Restoration Results
+
+Tmux recovery evidence is required product state, not optional instrumentation.
+Private application-update directories retain `restart-plan.json`,
+`restart-events.jsonl`, `restore-status.json`, per-pane exit receipts and
+`result.json` in both observable and minimal artifacts. Progress/results are
+atomically replaced and bounded by the existing 2 MiB metadata limit and
+128-pane scope limit. Recovery directories remain until manually removed.
+
+The status record separates verified server replacement and local client
+reattachment from each application's pending/restored/failed outcome. The
+journal identifies the session, rebuilt pane and final verification reason;
+exit receipts retain launcher status without recording terminal output.
+Shared verification deadlines avoid serial waits for each Pi. A missing result
+from an exited worker is still a failure, while a verified running server with
+individual application failures completes with explicit warnings. Working
+sessions are not automatically restarted as recovery.
+
+These files include application names and working-directory/session metadata
+already required by the private recovery plan. They do not add conversation
+text, raw process environments, credentials or captured terminal payloads.
+
+## Assurance And Limits
+
+Run ordinary Rust/Python tests, diagnostic-build integration tests, negative
+minimal compilation and the release matrix. Exact ELF proof and acceptance
+receipts live in `target/release-profiles/`; failures retain logs/trial records.
+
+`tests/verify_release_diagnosis.py` uses a private bus without activation
+directories, private HOME/XDG state, stubbed desktop commands and no inherited
+display or credentials. It exercises typed malformed-request errors, healthy
+idle/startup controls, passive capture and independent snapshots. GDB stops a
+private fixture before product initialization and recovers its source frame
+after exit using archived stripped ELF, split symbols, source and native modules.
+This proves retrieval, **not** real crash causal localization.
+`tests/production_diagnostics.rs` separately tests contained diagnostic-only
+panic/native crash and capture while the main thread is blocked.
+
+Residual coverage is explicit: historical whole-GUI non-inferiority, real GPU
+fault capture, heap-leak localization and arbitrary minimal sibling-debugger
+permission are not certified. Optimized-code identity covers named search,
+projection and build-comparison functions, not every GUI instruction.
+Private-daemon/startup and Python-boundary measurements do not establish every
+whole-GUI CPU/RSS/p99 budget. Link/load-time native modules are archived; later
+GPU-driver loads and device memory require incident-specific evidence. No
+deterministic OS/GPU/thread replay or complete named-lock ownership is claimed.

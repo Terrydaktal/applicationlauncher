@@ -1,0 +1,22 @@
+[package]
+name = "log"
+version = "0.4.32"
+edition = "2021"
+license = "MIT"
+description = "Compile-time logging erasure for the pinned Linux release-minimal graph"
+
+[features]
+default = []
+std = []
+max_level_off = []
+max_level_error = []
+max_level_warn = []
+max_level_info = []
+max_level_debug = []
+max_level_trace = []
+release_max_level_off = []
+release_max_level_error = []
+release_max_level_warn = []
+release_max_level_info = []
+release_max_level_debug = []
+release_max_level_trace = []

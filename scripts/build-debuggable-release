@@ -8,6 +8,7 @@ repo_dir="$(cd -- "$(dirname -- "$script_path")/.." && pwd -P)"
 archive_root="${APPLICATIONLAUNCHER_BUILD_ARCHIVE:-${XDG_STATE_HOME:-$HOME/.local/state}/applicationlauncher/builds}"
 keep_builds="${APPLICATIONLAUNCHER_BUILD_KEEP_BUILDS:-3}"
 run_build=true
+binary_dir="$repo_dir/target/release"
 temporary_dirs=()
 
 cleanup() {
@@ -25,7 +26,7 @@ NAME
     build-debuggable-release - Build and archive production Application Launcher artifacts
 
 SYNOPSIS
-    build-debuggable-release [--archive DIRECTORY] [--keep-builds COUNT] [--no-build]
+    build-debuggable-release [--archive DIRECTORY] [--keep-builds COUNT] [--no-build] [--binary-dir DIRECTORY]
 
 DESCRIPTION
     Builds the exact release configuration, extracts each ELF build ID, and
@@ -44,14 +45,18 @@ OPTIONS
     --no-build
         Archive existing target/release binaries without invoking Cargo.
 
+    --binary-dir DIRECTORY
+        Archive a verified packaged artifact pair instead of target/release.
+
     -h, --help
         Print this help and exit.
 
 OPERATION
-    Cargo produces full DWARF and a GNU build ID. This script never modifies the
-    target/release executable. It creates a private, idempotent archive indexed
-    by the executable's ELF build ID, then removes archives outside the bounded
-    retention window unless a running process still uses that build ID.
+    The default command verifies all release profiles, archives matching symbols
+    and sources, then publishes the observable pair in target/release. Builds use
+    an isolated Cargo directory and never restart a running process. --no-build
+    only archives the selected existing pair. Archives outside the retention
+    window are removed unless a running process still uses that ELF build ID.
 
 EXAMPLES
     scripts/build-debuggable-release
@@ -96,6 +101,11 @@ while (($# > 0)); do
 		run_build=false
 		shift
 		;;
+	--binary-dir)
+		[[ $# -ge 2 ]] || exit 1
+		binary_dir="$2"
+		shift 2
+		;;
 	--keep-builds)
 		[[ $# -ge 2 ]] || {
 			printf '%s\n' 'build-debuggable-release: --keep-builds requires a count' >&2
@@ -128,7 +138,7 @@ for command in cargo flock git jq objcopy readelf rustc sha256sum stat; do
 done
 
 if [[ "$run_build" == true ]]; then
-	cargo build --manifest-path "$repo_dir/Cargo.toml" --release --locked --bins
+	exec "$repo_dir/scripts/build-release-matrix" --archive "$archive_root" --keep-builds "$keep_builds"
 fi
 
 mkdir -p -- "$archive_root/by-build-id"
@@ -163,7 +173,7 @@ source_epoch="$(date +%s)"
 archive_manifest='[]'
 
 for component in applicationlauncher applicationlauncherd; do
-	binary="$repo_dir/target/release/$component"
+	binary="$binary_dir/$component"
 	[[ -x "$binary" ]] || {
 		printf 'build-debuggable-release: missing release binary: %s\n' "$binary" >&2
 		exit 1
@@ -175,6 +185,10 @@ for component in applicationlauncher applicationlauncherd; do
 		exit 1
 	}
 	application_build_id="$("$binary" --build-id)"
+	lifecycle_build_info="$("$binary" --lifecycle-build-info)"
+	artifact_build_info="$("$binary" --build-info)"
+	source_archive="$(/usr/bin/python3 -I "$repo_dir/build-support/source_archive.py" "$binary" "$archive_root/sources")"
+	source_archive_sha256="$(sha256sum "$source_archive" | awk '{print $1}')"
 	artifact_dir="$archive_root/by-build-id/$elf_build_id"
 	temporary_dir="$archive_root/by-build-id/.${elf_build_id}.$$"
 	mkdir -p -- "$temporary_dir"
@@ -211,6 +225,10 @@ for component in applicationlauncher applicationlauncherd; do
 		--arg component "$component" \
 		--arg package_version "$(cargo metadata --manifest-path "$repo_dir/Cargo.toml" --locked --no-deps --format-version 1 | jq -r '.packages[0].version')" \
 		--arg application_build_id "$application_build_id" \
+		--argjson lifecycle_build_info "$lifecycle_build_info" \
+		--argjson artifact_build_info "$artifact_build_info" \
+		--arg source_archive "$source_archive" \
+		--arg source_archive_sha256 "$source_archive_sha256" \
 		--arg elf_build_id "$elf_build_id" \
 		--arg git_revision "$git_revision" \
 		--argjson git_dirty "$git_dirty" \
@@ -235,11 +253,14 @@ for component in applicationlauncher applicationlauncherd; do
             package_version: $package_version,
             application_build_id: $application_build_id,
             elf_build_id: $elf_build_id,
-            source: {revision: $git_revision, dirty: $git_dirty, dirty_hash: $dirty_hash},
+            source: {revision: $git_revision, dirty: $git_dirty, dirty_hash: $dirty_hash,
+                archive: $source_archive, archive_sha256: $source_archive_sha256},
             build: {
                 profile: $profile,
                 target: $target,
-                features: ["default"],
+                features: $lifecycle_build_info.features,
+                lifecycle_postimages: $lifecycle_build_info,
+                artifact_identity: $artifact_build_info,
                 rustflags: $rustflags,
                 configured_rustflags: ["-C", "link-arg=-Wl,--build-id=sha1"],
                 release_profile: {opt_level: 3, debug: 2, split_debuginfo: "off", strip: "none", panic: "unwind"},
@@ -303,6 +324,15 @@ while IFS= read -r build_id; do
 	[[ "$build_id" =~ ^[0-9a-fA-F]{16,}$ ]] && protected_build_ids["${build_id,,}"]=1
 done < <(jq -r '.artifacts[].elf_build_id // empty' "$archive_root/latest-build.json")
 
+for profile in release-minimal release-observable diagnostic-build; do
+	for component in applicationlauncher applicationlauncherd; do
+		published="$repo_dir/target/release-profiles/$profile/$component"
+		[[ -f "$published" && ! -L "$published" ]] || continue
+		build_id="$(readelf -n "$published" 2>/dev/null | sed -n 's/.*Build ID: //p' | sed -n '1p')"
+		[[ "$build_id" =~ ^[0-9a-fA-F]{16,}$ ]] && protected_build_ids["${build_id,,}"]=1
+	done
+done
+
 for process_exe in /proc/[0-9]*/exe; do
 	process_target="$(readlink "$process_exe" 2>/dev/null || true)"
 	process_target="${process_target% (deleted)}"
@@ -342,6 +372,17 @@ for component in applicationlauncher applicationlauncherd; do
 			printf '%020d\t%s\n' "$generated_unix_time" "${build_id,,}"
 		done | sort -t $'\t' -k1,1nr -k2,2
 	)
+done
+
+declare -A referenced_sources=()
+for build_info in "$archive_root"/by-build-id/*/build-info.json; do
+	[[ -f "$build_info" && ! -L "$build_info" ]] || continue
+	source_archive="$(jq -r '.source.archive // empty' "$build_info")"
+	[[ -n "$source_archive" ]] && referenced_sources["$source_archive"]=1
+done
+for source_archive in "$archive_root"/sources/*.tar.gz; do
+	[[ -f "$source_archive" && ! -L "$source_archive" ]] || continue
+	[[ -n "${referenced_sources[$source_archive]:-}" ]] || rm -f -- "$source_archive"
 done
 
 printf 'Archived debuggable release artifacts in %s\n' "$archive_root"

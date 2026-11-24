@@ -527,17 +527,18 @@ Install Rust dependencies and build with Cargo. `kdotool` is the main external r
 ## Build
 
 ```bash
-cargo build --release
-```
-
-To retain exact production artifacts and separate symbols indexed by ELF build
-ID, use:
-
-```bash
 scripts/build-debuggable-release
 ```
 
-This post-link step has no runtime CPU cost. See
+This verifies all release profiles, archives exact binaries/symbols/sources and
+publishes the observable pair without restarting existing processes. For a
+development-only compilation:
+
+```bash
+cargo build --release
+```
+
+Development compilation does not substitute for release-matrix verification. See
 [`docs/DEBUGGABILITY.md`](docs/DEBUGGABILITY.md) for the stateful production
 debuggability contract and explicit CPU, latency, RSS, and size budgets.
 

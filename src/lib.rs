@@ -17,6 +17,11 @@ pub mod tracker;
 
 pub const BUILD_ID: &str = env!("APPLICATIONLAUNCHER_BUILD_ID");
 
+pub const BUILD_INFO: &str = include_str!(concat!(
+    env!("OUT_DIR"),
+    "/lifecycle/artifact-manifest.json"
+));
+
 /// Observer arguments are tokens, not evaluated expressions, in the minimal artifact.
 #[macro_export]
 macro_rules! observe {
