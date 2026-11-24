@@ -65,6 +65,7 @@ class WindowUpdate:
     def __init__(self, request, system, directory, backend=None):
         self.request, self.system, self.directory = request, system, Path(directory)
         self.backend = backend
+        self.owns_backend = False
         self.descriptors = []
         self.interrupted = False
         self.released = False
@@ -76,6 +77,9 @@ class WindowUpdate:
     def remote(self, action, value=None, timeout=45000):
         if self.backend is not None:
             return self.backend.operate(action, value or {})
+        return self.native_remote(action, value, timeout)
+
+    def native_remote(self, action, value=None, timeout=45000):
         request = self.request
         reply = self.system.call(request["helper_owner"], "/org/xfce/Terminal/Update",
             "org.xfce.Terminal.Update1", "Operate", "(sss)",
@@ -84,6 +88,10 @@ class WindowUpdate:
         if "error" in result:
             raise worker.Refused(result["error"])
         return result["ok"]
+
+    def compatibility_backend(self):
+        from lifecycle_external import MenuBackend
+        return MenuBackend(self.request, self.system, self.directory, self.snapshot, self.native_remote)
 
     def publish(self, phase, message, **values):
         status = dict(protocol=1, phase=phase, message=message, original_closed=self.original_closed,
@@ -334,12 +342,20 @@ class WindowUpdate:
                 self.snapshot = self.remote("Capture")
             with self.timings.span("tab_plan"):
                 self.tabs = self.capture_tabs(self.snapshot)
+            if (self.backend is None and not self.snapshot.get("capabilities", {}).get("hold")
+                    and any(tab["program"]["kind"] != "tmux" for tab in self.tabs)):
+                original_scope = scope_fingerprint(self.tabs)
+                with self.timings.span("fallback_select", route="compatibility"):
+                    self.backend = self.compatibility_backend()
+                    self.owns_backend = True
+                    self.snapshot = self.remote("Capture")
+                    self.tabs = self.capture_tabs(self.snapshot)
+                if scope_fingerprint(self.tabs) != original_scope:
+                    raise worker.Refused("The exact application/session scope changed during compatibility handover; nothing was stopped")
+                self.event("compatibility_selected", reason="missing-window-hold-api")
             if (self.request.get("scope_fingerprint") is not None
                     and scope_fingerprint(self.tabs) != self.request["scope_fingerprint"]):
                 raise worker.Refused("The exact application/session scope changed after preview; nothing was stopped")
-            if (any(tab["program"]["kind"] != "tmux" for tab in self.tabs)
-                    and not self.snapshot.get("capabilities", {}).get("hold") and self.backend is None):
-                raise worker.Refused("This running terminal lacks the safe window-hold API; restart it manually once. No application was stopped")
             descriptions = [f"{tab['program']['kind']}: {tab['cwd']}" + (
                 f"; conversation {tab['argv'][2]}" if tab["program"]["kind"] == "codex" else "") for tab in self.tabs]
             self.publish("ready", "\n".join(descriptions) + "\nOnly the terminal build is updated; application builds are preserved.",
@@ -402,5 +418,9 @@ class WindowUpdate:
             return dict(ok=False, message=message, failure=failure, recovery_failure=recovery_failure)
         finally:
             self.timings.close()
-            for descriptor in self.descriptors:
-                os.close(descriptor)
+            try:
+                if self.owns_backend:
+                    self.backend.close()
+            finally:
+                for descriptor in self.descriptors:
+                    os.close(descriptor)

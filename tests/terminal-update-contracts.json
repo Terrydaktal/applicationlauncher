@@ -31,7 +31,7 @@
     },
     {
       "id": "TERMUPDATE-COMPAT-03",
-      "contract": "A compatibility update retires only the original tmux client and dedicated shell ancestry after verifying its replacement attachment. The server and panes remain alive, no duplicate clients remain, and sibling jobs or failed attachment verification refuse retirement rather than trigger an old terminal close-running-programs dialog.",
+      "contract": "A compatibility update retires only the original tmux client after verifying its replacement attachment, leaving dedicated return shells until final window closure. The server and panes remain alive, no duplicate clients remain, and sibling jobs or failed attachment verification refuse retirement rather than trigger an old terminal close-running-programs dialog.",
       "tests": ["test_external_tmux_client_retires_only_after_replacement_verification", "test_tmux_window_with_sibling_shell_jobs_is_refused_before_replacement", "terminal-update-wayland-external-tmux-shell"]
     },
     {

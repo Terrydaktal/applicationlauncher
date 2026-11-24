@@ -468,6 +468,12 @@ impl Service {
             ));
         }
         value["helper_owner"] = json!(sender.as_str());
+        value["daemon_binary"] = json!(
+            crate::tracker::tracker_binary_path()
+                .map_err(refuse)?
+                .display()
+                .to_string()
+        );
         let directory = state_dir().join(&id);
         private_directory(&state_dir()).map_err(refuse)?;
         if directory.exists() {

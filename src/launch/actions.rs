@@ -5,7 +5,7 @@ use std::process::Command;
 
 pub(crate) fn launch_app(exec: &str) {
     let Some(mut argv) = desktop_exec_argv(exec) else {
-        eprintln!("Could not parse desktop Exec value");
+        applicationlauncher::diagnostic_log!("Could not parse desktop Exec value");
         return;
     };
     let executable = argv.remove(0);

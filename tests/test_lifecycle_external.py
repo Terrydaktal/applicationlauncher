@@ -1,5 +1,6 @@
 """Compatibility replacement guards. Only disposable processes and files are used."""
 import copy
+from contextlib import ExitStack
 import fcntl
 import importlib.util
 import os
@@ -236,6 +237,87 @@ class Guards(unittest.TestCase):
             backend.preflight(stopped=True)
         self.assertTrue(backend.closed)
         self.assertEqual(backend.desktop.call.call_args.kwargs["id"], "exact-window")
+
+
+class NativeMenu(unittest.TestCase):
+    def setUp(self):
+        self.request = dict(job_id="00000000-0000-0000-0000-000000000001", owner_pid=50,
+            owner_bus=":1.7", executable="/fixture/new-terminal", daemon_binary="/fixture/applicationlauncherd",
+            service="org.xfce.Terminal5.Update.i00000000_0000_0000_0000_000000000001")
+        self.snapshot = dict(owner=dict(pid=50, start=70), binary=self.request["executable"],
+            pinned=[1, 2, 3, 4], window=saved_window(), records=[dict(window_uuid="native-window",
+                tab_uuid="exact-tab", active=True, child_pid=60, foreground_pgid=60,
+                pty="/dev/pts/1", input_enabled=True)])
+        self.saved = dict(owner=dict(pid=50, start=70), owner_bus=":1.7", binary=self.snapshot["binary"],
+            installed=self.snapshot["pinned"].copy(), window=copy.deepcopy(self.snapshot["window"]),
+            records=copy.deepcopy(self.snapshot["records"]), display_environment=dict(WAYLAND_DISPLAY="wayland-test"))
+        self.system, self.desktop = Mock(), Mock()
+        self.system.dbus.return_value = [1]
+        self.native = Mock(return_value={})
+        self.patches = self.enterContext(ExitStack())
+        self.patches.enter_context(patch.object(external, "Desktop", return_value=self.desktop))
+        self.capture = self.patches.enter_context(patch.object(external, "capture", return_value=self.saved))
+
+    def create(self):
+        backend = external.MenuBackend(self.request, self.system, "/fixture/job", self.snapshot, self.native)
+        self.addCleanup(backend.close)
+        return backend
+
+    def test_menu_fallback_uses_a_separate_service_and_preserves_the_launch_target(self):
+        backend = self.create()
+        self.assertNotEqual(backend.service, self.request["service"])
+        self.assertEqual(backend.request["job_id"], self.request["job_id"])
+        self.assertEqual(backend.request["external"]["window"], dict(id="window", pid=50))
+        self.assertEqual(backend.request["display_environment"], self.saved["display_environment"])
+        with patch.object(worker, "latest_binary", side_effect=AssertionError("Native launch target was replaced with PATH")):
+            backend.capture()
+        self.capture.assert_called_with(self.system, self.desktop, dict(id="window", pid=50), binary=self.request["executable"])
+
+    def test_confirmation_and_status_use_the_original_helper_but_mechanics_are_shared(self):
+        backend = self.create()
+        backend.operate("AwaitConfirmation", {})
+        self.native.assert_called_once_with("AwaitConfirmation", {}, timeout=310000)
+        backend.operate("Publish", dict(phase="ready"))
+        self.native.assert_called_with("Publish", dict(phase="ready"), timeout=45000)
+        with patch.object(external.Backend, "operate", return_value={}) as operate:
+            for action in ("Capture", "Preflight", "Stage", "Release", "Records", "Commit", "Recover", "Discard"):
+                backend.operate(action, {})
+                operate.assert_called_with(action, {})
+
+    def test_native_preflight_is_not_called_after_the_old_window_may_have_closed(self):
+        backend = self.create()
+        with patch.object(external.Backend, "preflight", return_value={}) as preflight:
+            backend.preflight()
+            self.native.assert_called_once_with("Preflight", {})
+            self.native.reset_mock()
+            backend.preflight(stopped=True)
+            self.native.assert_not_called()
+            preflight.assert_called_with(True)
+
+    def test_fallback_refuses_retargeted_owners_tabs_builds_and_placement(self):
+        valid = copy.deepcopy(self.saved)
+        changes = {
+            "owner pid": lambda saved: saved["owner"].update(pid=51),
+            "owner start": lambda saved: saved["owner"].update(start=71),
+            "bus owner": lambda saved: saved.update(owner_bus=":1.8"),
+            "binary": lambda saved: saved.update(binary="/fixture/other-terminal"),
+            "installed image": lambda saved: saved.update(installed=[9, 2, 3, 4]),
+            "tab": lambda saved: saved["records"][0].update(tab_uuid="other-tab"),
+            "PTY": lambda saved: saved["records"][0].update(pty="/dev/pts/2"),
+            "input hold": lambda saved: saved["records"][0].update(input_enabled=False),
+            "geometry": lambda saved: saved["window"]["geometry"].update(x=100),
+            "monitor": lambda saved: saved["window"]["output"].update(scale=2000),
+        }
+        for reason, change in changes.items():
+            with self.subTest(reason=reason):
+                saved = copy.deepcopy(valid)
+                change(saved)
+                self.capture.return_value = saved
+                self.desktop.close.reset_mock()
+                with self.assertRaises(worker.Refused):
+                    self.create()
+                self.desktop.close.assert_called_once()
+                self.native.assert_not_called()
 
 
 if __name__ == "__main__": unittest.main()

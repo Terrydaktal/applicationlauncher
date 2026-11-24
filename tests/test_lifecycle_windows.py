@@ -61,7 +61,15 @@ class Coordinator(unittest.TestCase):
                 window.atomic_record(Path(directory) / "timing-request.json", dict(schema_version=1,
                     deadline_unix_ms=time.time_ns() // 1_000_000 + 120000, build_id="private-test-build"))
             patches.enter_context(patch.dict(os.environ, XDG_STATE_HOME=directory))
-            patches.enter_context(patch.object(window.WindowUpdate, "capture_tabs", return_value=[tab]))
+            captures = 0
+            def capture(snapshot):
+                nonlocal captures
+                captures += 1
+                result = copy.deepcopy(tab)
+                if fault == "scope" and captures > 1:
+                    result["program"]["argv"][2] = "different-session"
+                return [result]
+            patches.enter_context(patch.object(window.WindowUpdate, "capture_tabs", side_effect=capture))
             patches.enter_context(patch.object(window.WindowUpdate, "revalidate", side_effect=lambda: events.append("revalidated")))
             patches.enter_context(patch.object(window.WindowUpdate, "preserve_builds", side_effect=lambda: events.append("builds-preserved")))
             def stop(target, retire_tmux=False):
@@ -77,13 +85,24 @@ class Coordinator(unittest.TestCase):
             patches.enter_context(patch.object(worker, "foreground", return_value=({}, saved)))
             patches.enter_context(patch.object(window.WindowUpdate, "verify_tmux", side_effect=verify))
             system = System()
+            class Backend:
+                def operate(self, action, value):
+                    return json.loads(system.call("unused", "unused", "unused", "Operate", "(sss)", ["private", action, json.dumps(value)])[0])["ok"]
+                def close(self):
+                    events.append("compatibility-closed")
+            def compatibility():
+                events.append("compatibility-selected")
+                if fault == "compatibility":
+                    raise worker.Refused("The original tabs changed during compatibility handover")
+                return Backend()
+            patches.enter_context(patch.object(window.WindowUpdate, "compatibility_backend", side_effect=compatibility))
             backend = None
             if external:
-                class Backend:
-                    def operate(self, action, value):
-                        return json.loads(system.call("unused", "unused", "unused", "Operate", "(sss)", ["private", action, json.dumps(value)])[0])["ok"]
                 backend = Backend()
-            job = window.WindowUpdate(dict(helper_owner=":1.2", token="private"), system, directory, backend=backend)
+            request = dict(helper_owner=":1.2", token="private")
+            if preview_scope is not None:
+                request["scope_fingerprint"] = preview_scope
+            job = window.WindowUpdate(request, system, directory, backend=backend)
             result = job.run()
             records = {path.name: json.loads(path.read_text()) for path in Path(directory).glob("*.json")}
             if timings:
@@ -124,17 +143,44 @@ class Coordinator(unittest.TestCase):
                 self.assertFalse(statuses[-1]["original_closed"])
                 if fault == "stop": self.assertNotIn("Release", events)
 
-    def test_old_terminals_without_native_hold_are_refused_before_staging_non_tmux_apps(self):
-        result, events, _, _ = self.run_job(capabilities=False)
-        self.assertFalse(result["ok"])
-        self.assertIn("window-hold API", result["message"])
-        self.assertNotIn("Stage", events)
-        self.assertNotIn("stopped", events)
+    def test_old_terminal_menu_uses_compatibility_before_staging_non_tmux_apps(self):
+        for application in ("codex", "fish", "htop"):
+            with self.subTest(application=application):
+                result, events, _, _ = self.run_job(application=application, capabilities=False)
+                self.assertTrue(result["ok"], result)
+                self.assertLess(events.index("compatibility-selected"), events.index("AwaitConfirmation"))
+                self.assertLess(events.index("Stage"), events.index("stopped"))
+                self.assertLess(events.index("verified"), events.index("Commit"))
+                self.assertNotIn("Hold", events)
+                self.assertEqual(events.count("Stage"), 1)
+                self.assertIn("compatibility-closed", events)
+
+    def test_compatibility_menu_failure_never_stops_before_confirmation_and_staging(self):
+        for fault in ("compatibility", "scope", "AwaitConfirmation", "Stage"):
+            with self.subTest(fault=fault):
+                result, events, statuses, _ = self.run_job(fault, capabilities=False)
+                self.assertFalse(result["ok"])
+                self.assertNotIn("stopped", events)
+                self.assertNotIn("Release", events)
+                self.assertNotIn("Commit", events)
+                self.assertEqual(statuses[-1]["phase"], "failed")
+
+    def test_compatibility_shutdown_or_verification_failure_does_not_replay(self):
+        for fault in ("stop", "verify"):
+            with self.subTest(fault=fault):
+                result, events, _, records = self.run_job(fault, capabilities=False)
+                self.assertFalse(result["ok"])
+                self.assertIn("Recover", events)
+                self.assertNotIn("Commit", events)
+                self.assertEqual(events.count("Stage"), 1)
+                self.assertIn("restart-plan.json", records)
+                self.assertIn("compatibility-closed", events)
 
     def test_daemon_owned_compatibility_update_needs_no_native_hold(self):
         result, events, _, _ = self.run_job(capabilities=False, external=True)
         self.assertTrue(result["ok"], result)
         self.assertNotIn("Hold", events)
+        self.assertNotIn("compatibility-selected", events)
         self.assertLess(events.index("Stage"), events.index("stopped"))
         self.assertLess(events.index("verified"), events.index("Commit"))
 
@@ -142,6 +188,7 @@ class Coordinator(unittest.TestCase):
         result, events, statuses, _ = self.run_job(application="tmux", capabilities=False)
         self.assertTrue(result["ok"], result)
         self.assertNotIn("Hold", events)
+        self.assertNotIn("compatibility-selected", events)
         ready = next(status for status in statuses if status["phase"] == "ready")
         self.assertTrue(ready["preserves_processes"])
 

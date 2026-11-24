@@ -1068,7 +1068,12 @@ The terminal-maintenance client uses the native mechanics path when the running
 terminal advertises both update status and safe window holds. It requests
 `UpdateInPlaceWithConsent(window_uuid, true)` when available, otherwise the older
 `UpdateInPlace` request. Without those capabilities it uses the daemon-owned
-compatibility path described above, not a manual-restart requirement. Both
+compatibility path described above, not a manual-restart requirement. The terminal's
+own Update in Place menu also selects that shared compatibility backend when the
+old process lacks safe window holds. Its existing helper still handles confirmation
+and status; a separate replacement service avoids taking over that helper's identity.
+The exact native launch target, window, tabs and application/session scope must
+match before staging. Both
 transports use the same lifecycle coordinator and application adapters; the GUI
 does not implement restart policy. The GUI can be closed, and confirmed workers
 survive a daemon restart with their private recovery records intact.

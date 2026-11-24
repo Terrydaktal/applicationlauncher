@@ -149,7 +149,7 @@ def proc_record(pid, window_id):
 
 
 @update_timing.observed("capture_terminal")
-def capture(system, desktop, window):
+def capture(system, desktop, window, binary=None):
     pid, identifier = window["pid"], window["id"]
     owner_process = worker.process(pid)
     if worker.kind(owner_process) != "xfce4-terminal":
@@ -178,7 +178,7 @@ def capture(system, desktop, window):
         if len(matches) != 1 or (len(windows) > 1 and sum(stable(row["title"]) == stable(actual["title"]) for row in windows) != 1):
             raise worker.Refused("The window-to-tab mapping is ambiguous; no window was changed")
         records = matches[0]
-    binary = worker.latest_binary("xfce4-terminal")
+    binary = worker.latest_binary("xfce4-terminal") if binary is None else binary
     with open(binary, "rb") as stream: installed = hashlib.file_digest(stream, "sha256").hexdigest()
     with open(f"/proc/{pid}/exe", "rb") as stream: running = hashlib.file_digest(stream, "sha256").hexdigest()
     if installed == running: raise worker.Refused("This terminal already runs the current installed build")
@@ -260,7 +260,7 @@ class GateIdentityError(worker.Refused):
 
 
 class Backend:
-    def __init__(self, request, system, directory):
+    def __init__(self, request, system, directory, service=None):
         self.request, self.system, self.directory = request, system, Path(directory)
         self.desktop = Desktop(system)
         self.snapshot = None
@@ -271,13 +271,19 @@ class Backend:
         self.new_window = None
         self.new_records = []
         self.new_owner = None
-        self.service = "org.xfce.Terminal5.Update.i" + request["job_id"].replace("-", "_")
+        self.service = service or "org.xfce.Terminal5.Update.i" + request["job_id"].replace("-", "_")
         if system.dbus("RequestName", "(su)", [self.service, 4])[0] != 1:
             raise worker.Refused("The replacement service identity is already in use")
 
     def current(self, allow_missing=False):
         saved = self.request["external"]
         return self.desktop.call("capture", pid=saved["window"]["pid"], id=saved["window"]["id"], allowMissing=allow_missing)
+
+    def launch_binary(self):
+        return worker.latest_binary("xfce4-terminal")
+
+    def capture(self):
+        return capture(self.system, self.desktop, self.request["external"]["window"], binary=self.launch_binary())
 
     def preflight(self, stopped=False):
         saved = self.request["external"]
@@ -289,11 +295,11 @@ class Backend:
             if not worker.same_process(saved["owner"]): raise worker.Refused("The terminal process identity changed")
             same_placement(saved["window_state"], actual, saved["window_state"]["minimized"])
             if not stopped:
-                fresh = capture(self.system, self.desktop, saved["window"])
+                fresh = self.capture()
                 keys = ("window_uuid", "tab_uuid", "active", "child_pid", "foreground_pgid", "pty")
                 if [[row.get(key) for key in keys] for row in fresh["records"]] != [[row.get(key) for key in keys] for row in saved["records"]]:
                     raise worker.Refused("The original tabs or foreground ownership changed after preview")
-        if worker.latest_binary("xfce4-terminal") != saved["binary"] or worker.file_identity(saved["binary"]) != saved["installed"]:
+        if self.launch_binary() != saved["binary"] or worker.file_identity(saved["binary"]) != saved["installed"]:
             raise worker.Refused("The installed terminal build changed after preview")
         return {}
 
@@ -428,7 +434,7 @@ class Backend:
             return {}
         if action == "Capture":
             self.preflight()
-            self.snapshot = capture(self.system, self.desktop, self.request["external"]["window"])
+            self.snapshot = self.capture()
             return self.snapshot
         if action == "Preflight": return self.preflight()
         if action == "Stage": return self.stage(value["tabs"])
@@ -470,3 +476,47 @@ class Backend:
         if hasattr(self, "gates_directory"): self.gates_directory.cleanup()
         if self.descriptor is not None: os.close(self.descriptor)
         self.desktop.close()
+
+
+class MenuBackend(Backend):
+    """Keep native confirmation/status while using the shared legacy mechanics."""
+
+    def __init__(self, request, system, directory, snapshot, native_remote):
+        self.native_remote = native_remote
+        # The terminal helper already owns the operation's original service name.
+        service = "org.xfce.Terminal5.Update.i" + str(uuid.uuid4()).replace("-", "_")
+        super().__init__(dict(request), system, directory, service=service)
+        try:
+            window = dict(pid=request["owner_pid"], id=snapshot["window"]["id"])
+            saved = capture(system, self.desktop, window, binary=snapshot["binary"])
+            if (saved["owner"]["pid"] != snapshot["owner"]["pid"]
+                    or saved["owner"]["start"] != snapshot["owner"]["start"]
+                    or saved["owner_bus"] != request["owner_bus"]):
+                raise worker.Refused("The terminal owner changed during compatibility handover")
+            if (saved["binary"] != snapshot["binary"] or saved["installed"] != snapshot["pinned"]
+                    or saved["binary"] != request["executable"]):
+                raise worker.Refused("The terminal launch target changed during compatibility handover")
+            if ([worker.binding_identity(row) for row in saved["records"]]
+                    != [worker.binding_identity(row) for row in snapshot["records"]]
+                    or any(not row.get("input_enabled", True) for row in saved["records"])):
+                raise worker.Refused("The original tabs changed during compatibility handover")
+            same_placement(snapshot["window"], saved["window"], snapshot["window"]["minimized"])
+            self.request.update(external=dict(window=window, owner=saved["owner"], records=saved["records"],
+                binary=saved["binary"], installed=saved["installed"], window_state=saved["window"]),
+                display_environment=saved["display_environment"])
+        except Exception:
+            self.close()
+            raise
+
+    def launch_binary(self):
+        return self.request["executable"]
+
+    def preflight(self, stopped=False):
+        if not stopped:
+            self.native_remote("Preflight", {})
+        return super().preflight(stopped)
+
+    def operate(self, action, value):
+        if action in ("Publish", "AwaitConfirmation"):
+            return self.native_remote(action, value, timeout=310000 if action == "AwaitConfirmation" else 45000)
+        return super().operate(action, value)
