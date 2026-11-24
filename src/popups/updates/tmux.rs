@@ -2,8 +2,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use applicationlauncher::tracker::{
-    ApplicationUpdateAction, ApplicationUpdateReport, TerminalUpgradePhase, TmuxServerIdentity,
-    TrackerClient,
+    ApplicationRestoreStatus, ApplicationUpdateAction, ApplicationUpdateReport,
+    TerminalUpgradePhase, TmuxServerIdentity, TrackerClient,
 };
 use eframe::egui;
 
@@ -13,6 +13,7 @@ struct State {
     open: bool,
     busy: bool,
     accepted: bool,
+    started: bool,
     report: Option<ApplicationUpdateReport>,
     error: Option<String>,
 }
@@ -52,6 +53,7 @@ pub(super) fn open(
                 open: true,
                 busy: false,
                 accepted: false,
+                started: false,
                 report: None,
                 error: None,
             })),
@@ -183,14 +185,178 @@ fn preview(ui: &mut egui::Ui, state: &State) {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum View {
+    Preview,
+    Progress,
+    Result,
+}
+
+fn view(state: &State) -> View {
+    if state.error.is_some()
+        || state.report.as_ref().is_some_and(|report| {
+            matches!(
+                report.phase,
+                TerminalUpgradePhase::Complete | TerminalUpgradePhase::Failed
+            )
+        })
+    {
+        View::Result
+    } else if state.started
+        || state
+            .report
+            .as_ref()
+            .is_some_and(|report| report.phase == TerminalUpgradePhase::Running)
+    {
+        View::Progress
+    } else {
+        View::Preview
+    }
+}
+
+fn status_heading(state: &State) -> (&'static str, egui::Color32) {
+    match state.report.as_ref() {
+        Some(report) if report.phase == TerminalUpgradePhase::Complete => {
+            if report.restoration.as_ref().is_some_and(|status| {
+                status
+                    .panes
+                    .iter()
+                    .any(|pane| matches!(pane.status, ApplicationRestoreStatus::Failed))
+            }) {
+                ("Tmux server updated with warnings", egui::Color32::YELLOW)
+            } else {
+                ("Tmux server update complete", egui::Color32::LIGHT_GREEN)
+            }
+        }
+        Some(report) if report.phase == TerminalUpgradePhase::Failed => {
+            ("Tmux server update failed", egui::Color32::LIGHT_RED)
+        }
+        _ => ("Tmux update status unavailable", egui::Color32::YELLOW),
+    }
+}
+
+fn status(ui: &mut egui::Ui, state: &State, running: bool) {
+    if running {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("The update is running. Closing this status window does not cancel it.");
+        });
+    }
+    if let Some(error) = &state.error {
+        ui.colored_label(egui::Color32::LIGHT_RED, error);
+    }
+    let Some(report) = &state.report else { return };
+    if let Some(restoration) = &report.restoration {
+        if restoration.server_replaced {
+            if report.phase == TerminalUpgradePhase::Failed {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Server: replacement was started; inspect the failure below",
+                );
+            } else {
+                ui.colored_label(egui::Color32::LIGHT_GREEN, "Server: replacement verified");
+            }
+            ui.label(format!(
+                "Local terminal tabs reattached: {}",
+                restoration.clients_reattached
+            ));
+        }
+        let restored = restoration
+            .panes
+            .iter()
+            .filter(|pane| matches!(pane.status, ApplicationRestoreStatus::Restored))
+            .count();
+        let failed = restoration
+            .panes
+            .iter()
+            .filter(|pane| matches!(pane.status, ApplicationRestoreStatus::Failed))
+            .count();
+        let pending = restoration.panes.len() - restored - failed;
+        ui.strong(format!("Applications: {restored} restored, {failed} need attention, {pending} awaiting verification"));
+        if failed > 0 {
+            ui.colored_label(egui::Color32::YELLOW, "Recover only the applications listed below as needing attention. Do not repeat the server update; working sessions remain running.");
+        }
+        ui.separator();
+        let panes = [
+            ApplicationRestoreStatus::Failed,
+            ApplicationRestoreStatus::Pending,
+            ApplicationRestoreStatus::Restored,
+        ]
+        .into_iter()
+        .flat_map(|status| {
+            restoration
+                .panes
+                .iter()
+                .filter(move |pane| pane.status == status)
+        });
+        for pane in panes {
+            let (label, colour) = match pane.status {
+                ApplicationRestoreStatus::Pending => ("Waiting", egui::Color32::GRAY),
+                ApplicationRestoreStatus::Restored => ("Restored", egui::Color32::LIGHT_GREEN),
+                ApplicationRestoreStatus::Failed => ("Needs attention", egui::Color32::LIGHT_RED),
+            };
+            ui.colored_label(
+                colour,
+                format!(
+                    "{label}: {} - {}.{} - {}",
+                    pane.session, pane.window_index, pane.pane_index, pane.application
+                ),
+            );
+            if !matches!(pane.status, ApplicationRestoreStatus::Restored) {
+                ui.label(&pane.message);
+                ui.monospace(&pane.cwd);
+            }
+        }
+    } else if running {
+        ui.label(
+            "Replacing the tmux server, rebuilding sessions and reconnecting terminal tabs...",
+        );
+    }
+    ui.separator();
+    ui.label(&report.message);
+    if let Some(path) = &report.backup_path {
+        ui.collapsing("Recovery details", |ui| {
+            ui.label("Saved recovery plan:");
+            ui.monospace(path);
+        });
+    }
+}
+
 fn dialog(ctx: &egui::Context, id: egui::Id, state: &mut State) -> Option<Action> {
     let response = egui::Modal::new(id).show(ctx, |ui| {
         ui.set_width((ctx.content_rect().width() - 48.0).clamp(1.0, 620.0));
-        ui.heading("Update tmux server");
+        let view = view(state);
+        match view {
+            View::Preview => { ui.heading("Update tmux server"); }
+            View::Progress => { ui.heading("Tmux server update progress"); }
+            View::Result => {
+                let (heading, colour) = status_heading(state);
+                ui.heading(egui::RichText::new(heading).color(colour));
+            }
+        }
         egui::ScrollArea::vertical()
-            .id_salt("server-restart-preview")
+            .id_salt(if view == View::Preview { "server-restart-preview" } else { "server-restart-status" })
             .max_height((ctx.content_rect().height() - 170.0).max(60.0))
-            .show(ui, |ui| preview(ui, state));
+            .show(ui, |ui| match view {
+                View::Preview => preview(ui, state),
+                View::Progress => status(ui, state, true),
+                View::Result => status(ui, state, false),
+            });
+        if view != View::Preview {
+            state.accepted = false;
+            if state.error.is_some() && !state.busy && state.started {
+                if let Some(report) = &state.report {
+                    if ui.button("Refresh status").clicked() {
+                        return Some(Action::Poll(report.operation_id.clone()));
+                    }
+                }
+            }
+            let close = ui.button("Close");
+            if ctx.memory(|memory| memory.focused()) != Some(close.id) {
+                close.request_focus();
+            }
+            return close.clicked().then_some(Action::Close);
+        }
         let ready = !state.busy
             && state.error.is_none()
             && state
@@ -311,9 +477,11 @@ fn request(shared: Shared, ctx: egui::Context, popup: egui::ViewportId, action: 
             {
                 return;
             }
+            state.started = true;
         }
         state.busy = true;
         state.accepted = false;
+        state.error = None;
         state.window.clone()
     };
     let guard = RequestGuard {
@@ -342,6 +510,9 @@ fn request(shared: Shared, ctx: egui::Context, popup: egui::ViewportId, action: 
                 let running = matches!(report.phase, TerminalUpgradePhase::Preparing | TerminalUpgradePhase::Running);
                 let open = {
                     let mut state = worker_shared.lock().map_err(|_| "Server update dialog state unavailable")?;
+                    if report.phase == TerminalUpgradePhase::Ready && report.selected_action.is_none() {
+                        state.started = false;
+                    }
                     state.report = Some(report.clone());
                     state.open
                 };

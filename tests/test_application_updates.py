@@ -381,6 +381,16 @@ class PiSessions(unittest.TestCase):
         self.assertEqual(inspect.call_count, 2)
         sleep.assert_called_once()
 
+    def test_restored_pi_can_be_offline_or_have_started_tools_without_loosening_stop_guards(self):
+        self.children[self.launcher["pid"]].remove(self.helper["pid"])
+        self.children[self.saved["pid"]].append(999)
+        self.processes[999] = dict(self.saved, pid=999, executable="/usr/bin/sleep")
+        restored = worker.pi_plan(self.saved, require_idle=False)
+        self.assertEqual(restored["session_file"], str(self.session))
+        self.assertEqual(restored["helpers"], [])
+        with self.assertRaisesRegex(worker.Refused, "active tool/background jobs"):
+            worker.pi_plan(self.saved)
+
     def test_pi_changed_session_is_revalidated_before_sending_any_signal(self):
         plan = worker.pi_plan(self.saved)
         self.activity["chat_id"] = "0" * 64
@@ -1160,6 +1170,30 @@ class PrivateTmux(unittest.TestCase):
         with self.assertRaises(OSError):
             worker.restart_event(self.root, "must-not-overwrite")
         self.assertEqual(target.read_text(), "unchanged")
+
+    def test_server_update_completes_with_a_warning_when_one_application_launcher_exits(self):
+        self.tmux("split-window", "-d", "-h", "/usr/bin/bash", "--noprofile", "--norc")
+        plan = dict(self.wait_shells(), input={})
+        first = next(iter(plan["programs"]))
+        old_server = plan["server"]["process"]
+        program = plan["programs"][first]["program"]
+        program.update(kind="pi", argv=["/usr/bin/false"])
+        stop = worker.stop_program
+        def stop_fixture(saved):
+            stop(dict(saved, kind="bash"))
+        started = time.monotonic()
+        with patch.object(worker, "inspect", return_value={"plans": {"tmux_server": plan}}), \
+                patch.object(worker, "stop_program", side_effect=stop_fixture):
+            result = worker.execute(plan, object(), self.root)
+        self.assertTrue(result["ok"], result)
+        self.assertLess(time.monotonic() - started, 10, "An exited Pi launcher must not consume its 120-second startup timeout")
+        self.assertFalse(worker.same_process(old_server))
+        self.assertTrue(worker.same_process(self.server()["process"]))
+        self.assertEqual(sorted(pane["status"] for pane in result["restoration"]["panes"]), ["failed", "restored"])
+        failed = next(pane for pane in result["restoration"]["panes"] if pane["status"] == "failed")
+        self.assertIn("status 1", failed["message"])
+        self.assertIn("Recover only the affected applications", result["message"])
+        self.assertEqual(json.loads(worker.restore_receipt(self.root, first).read_text())["exit_code"], 1)
 
     def test_confirmed_server_restart_disconnects_the_remote_client_and_recreates_its_detached_session(self):
         self.wait_shells()

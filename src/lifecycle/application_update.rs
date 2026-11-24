@@ -102,6 +102,35 @@ pub struct ApplicationUpdateAction {
     pub program: Option<ProgramRestartScope>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationRestoreStatus {
+    #[default]
+    Pending,
+    Restored,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ApplicationRestorePane {
+    pub session: String,
+    pub window_index: String,
+    pub pane_index: String,
+    pub pane_id: String,
+    pub application: String,
+    pub cwd: String,
+    pub status: ApplicationRestoreStatus,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ApplicationRestoration {
+    pub server_replaced: bool,
+    pub clients_reattached: usize,
+    pub finished: bool,
+    pub panes: Vec<ApplicationRestorePane>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ApplicationUpdateReport {
     pub operation_id: String,
@@ -112,6 +141,8 @@ pub struct ApplicationUpdateReport {
     pub selected_action: Option<String>,
     pub backup_path: Option<String>,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restoration: Option<ApplicationRestoration>,
 }
 
 struct Job {
@@ -352,15 +383,7 @@ impl Work {
         let mut job = self.job.lock().unwrap();
         match result {
             Ok(value) => {
-                job.report.phase = if value["ok"] == true {
-                    TerminalUpgradePhase::Complete
-                } else {
-                    TerminalUpgradePhase::Failed
-                };
-                job.report.message = value["message"]
-                    .as_str()
-                    .unwrap_or("Restart worker returned an invalid result; inspect the backup")
-                    .into();
+                apply_result(&mut job.report, &value);
             }
             Err(error) => {
                 job.report.phase = TerminalUpgradePhase::Failed;
@@ -387,16 +410,16 @@ fn report_from_directory(id: &str, directory: &std::path::Path) -> Option<Applic
     if report.operation_id != id {
         return None;
     }
+    if report.selected_action.as_deref() == Some("tmux_server") {
+        if let Ok(value) = super::read_private(&directory.join("restore-status.json")) {
+            report.restoration = serde_json::from_value(value).ok();
+            if report.phase == TerminalUpgradePhase::Running && report.restoration.is_some() {
+                report.message = "Server replacement and local tab reattachment completed; verifying restored applications.".into();
+            }
+        }
+    }
     if let Ok(result) = super::read_private(&directory.join("result.json")) {
-        report.phase = if result["ok"] == true {
-            TerminalUpgradePhase::Complete
-        } else {
-            TerminalUpgradePhase::Failed
-        };
-        report.message = result["message"]
-            .as_str()
-            .unwrap_or("Invalid lifecycle worker result; inspect recovery records")
-            .into();
+        apply_result(&mut report, &result);
     }
     if report.phase == TerminalUpgradePhase::Running
         && !super::worker_pending_or_alive(directory, &directory.join("restart-plan.json"))
@@ -405,6 +428,41 @@ fn report_from_directory(id: &str, directory: &std::path::Path) -> Option<Applic
         report.message = "Lifecycle worker exited without a completion record. Inspect the retained recovery plan; no automatic retry was attempted".into();
     }
     Some(report)
+}
+
+fn apply_result(report: &mut ApplicationUpdateReport, result: &serde_json::Value) {
+    report.phase = if result["ok"] == true {
+        TerminalUpgradePhase::Complete
+    } else {
+        TerminalUpgradePhase::Failed
+    };
+    report.message = result["message"]
+        .as_str()
+        .unwrap_or("Invalid lifecycle worker result; inspect recovery records")
+        .into();
+    if let Some(value) = result.get("restoration") {
+        match serde_json::from_value::<ApplicationRestoration>(value.clone()) {
+            Ok(restoration) => {
+                if result["ok"] == true
+                    && (!restoration.finished
+                        || !restoration.server_replaced
+                        || restoration.panes.is_empty()
+                        || restoration
+                            .panes
+                            .iter()
+                            .any(|pane| pane.status == ApplicationRestoreStatus::Pending))
+                {
+                    report.phase = TerminalUpgradePhase::Failed;
+                    report.message = "The worker returned an incomplete restoration result; inspect recovery records before retrying".into();
+                }
+                report.restoration = Some(restoration);
+            }
+            Err(_) => {
+                report.phase = TerminalUpgradePhase::Failed;
+                report.message = "The worker returned invalid restoration details; inspect recovery records before retrying".into();
+            }
+        }
+    }
 }
 
 impl Drop for Work {
@@ -489,6 +547,76 @@ fn run_worker(mode: &str, input: &Path, timeout: Duration) -> Result<serde_json:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn restoration_result() -> serde_json::Value {
+        serde_json::json!({
+            "ok": true, "message": "Server updated; one application needs attention",
+            "restoration": {"server_replaced": true, "clients_reattached": 1, "finished": true,
+                "panes": [
+                    {"session":"work", "window_index":"0", "pane_index":"0", "pane_id":"%10", "application":"codex", "cwd":"/work", "status":"restored", "message":"Exact conversation verified"},
+                    {"session":"girls", "window_index":"0", "pane_index":"0", "pane_id":"%11", "application":"pi", "cwd":"/girls", "status":"failed", "message":"Application launcher exited (status 2)"}
+                ]}
+        })
+    }
+
+    #[test]
+    fn application_restore_warnings_survive_durable_reports_without_failing_the_server_update() {
+        let id = format!(
+            "application-update-results-{}-{}",
+            std::process::id(),
+            crate::tracker::now_ms()
+        );
+        let directory = std::env::temp_dir().join(&id);
+        super::super::private_directory(&directory).unwrap();
+        let report = ApplicationUpdateReport {
+            operation_id: id.clone(),
+            selected_action: Some("tmux_server".into()),
+            phase: TerminalUpgradePhase::Running,
+            ..Default::default()
+        };
+        write_private(
+            &directory.join("report.json"),
+            &serde_json::to_value(&report).unwrap(),
+        )
+        .unwrap();
+        let result = restoration_result();
+        write_private(&directory.join("result.json"), &result).unwrap();
+        let restored = report_from_directory(&id, &directory).unwrap();
+        assert_eq!(restored.phase, TerminalUpgradePhase::Complete);
+        let status = restored.restoration.unwrap();
+        assert!(status.finished && status.server_replaced);
+        assert_eq!(status.panes[0].status, ApplicationRestoreStatus::Restored);
+        assert_eq!(status.panes[1].status, ApplicationRestoreStatus::Failed);
+        assert!(status.panes[1].message.contains("status 2"));
+        std::fs::remove_dir_all(directory).unwrap();
+        let mut older = serde_json::to_value(report).unwrap();
+        older.as_object_mut().unwrap().remove("restoration");
+        assert!(
+            serde_json::from_value::<ApplicationUpdateReport>(older)
+                .unwrap()
+                .restoration
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn incomplete_or_invalid_restoration_results_cannot_claim_success() {
+        for modification in ["pending", "unfinished", "no-server", "malformed", "empty"] {
+            let mut result = restoration_result();
+            match modification {
+                "pending" => result["restoration"]["panes"][0]["status"] = "pending".into(),
+                "unfinished" => result["restoration"]["finished"] = false.into(),
+                "no-server" => result["restoration"]["server_replaced"] = false.into(),
+                "malformed" => result["restoration"] = true.into(),
+                "empty" => result["restoration"]["panes"] = serde_json::json!([]),
+                _ => unreachable!(),
+            }
+            let mut report = ApplicationUpdateReport::default();
+            apply_result(&mut report, &result);
+            assert_eq!(report.phase, TerminalUpgradePhase::Failed, "{modification}");
+            assert!(report.message.contains("inspect recovery records"));
+        }
+    }
 
     #[test]
     fn completed_or_interrupted_program_reports_survive_an_empty_registry() {

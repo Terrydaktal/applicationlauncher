@@ -1,6 +1,7 @@
 use super::*;
 use applicationlauncher::tracker::{
-    TmuxRestartPane, TmuxRestartRemoteClient, TmuxServerRestartScope,
+    ApplicationRestoration, ApplicationRestorePane, TmuxRestartPane, TmuxRestartRemoteClient,
+    TmuxServerRestartScope,
 };
 
 const UPDATE: &str = "Update server and restart all sessions";
@@ -18,6 +19,7 @@ fn state() -> State {
         open: true,
         busy: false,
         accepted: false,
+        started: false,
         error: None,
         report: Some(ApplicationUpdateReport {
             operation_id: "fixture-no-IPC".into(),
@@ -138,6 +140,142 @@ fn settled(ctx: &egui::Context, state: &mut State) -> egui::FullOutput {
         assert!(frame(ctx, state, vec![]).1.is_none());
     }
     frame(ctx, state, vec![]).0
+}
+
+fn restoration(failed: bool, finished: bool) -> ApplicationRestoration {
+    ApplicationRestoration {
+        server_replaced: true,
+        clients_reattached: 1,
+        finished,
+        panes: vec![
+            ApplicationRestorePane {
+                session: "work".into(),
+                window_index: "0".into(),
+                pane_index: "0".into(),
+                pane_id: "%10".into(),
+                application: "codex".into(),
+                cwd: "/fixture/work".into(),
+                status: ApplicationRestoreStatus::Restored,
+                message: "Exact conversation verified".into(),
+            },
+            ApplicationRestorePane {
+                session: "girls".into(),
+                window_index: "0".into(),
+                pane_index: "0".into(),
+                pane_id: "%11".into(),
+                application: "pi".into(),
+                cwd: "/fixture/girls".into(),
+                status: if !finished {
+                    ApplicationRestoreStatus::Pending
+                } else if failed {
+                    ApplicationRestoreStatus::Failed
+                } else {
+                    ApplicationRestoreStatus::Restored
+                },
+                message: "Application launcher exited (status 2)".into(),
+            },
+        ],
+    }
+}
+
+#[test]
+fn server_result_is_a_distinct_status_view_and_cannot_repeat_the_update() {
+    for failed in [false, true] {
+        let ctx = egui::Context::default();
+        let mut state = state();
+        state.started = true;
+        state.accepted = true;
+        let report = state.report.as_mut().unwrap();
+        report.selected_action = Some("tmux_server".into());
+        report.phase = TerminalUpgradePhase::Complete;
+        report.message = "Tmux server updated and local terminal tabs reattached".into();
+        report.restoration = Some(restoration(failed, true));
+        let output = settled(&ctx, &mut state);
+        let content = text(&output);
+        assert_eq!(view(&state), View::Result);
+        assert!(
+            content.contains(if failed {
+                "Tmux server updated with warnings"
+            } else {
+                "Tmux server update complete"
+            }),
+            "{content}"
+        );
+        assert!(
+            content.contains("Restored: work - 0.0 - codex"),
+            "{content}"
+        );
+        if failed {
+            assert!(
+                content.contains("Needs attention: girls - 0.0 - pi"),
+                "{content}"
+            );
+            assert!(
+                content.contains("Application launcher exited (status 2)"),
+                "{content}"
+            );
+            assert!(
+                content.contains("Do not repeat the server update"),
+                "{content}"
+            );
+        }
+        assert!(!content.contains(UPDATE), "{content}");
+        assert!(!content.contains(ACCEPT), "{content}");
+        assert!(!content.contains("stops ALL sessions"), "{content}");
+        assert!(!state.accepted);
+        assert_eq!(
+            frame(&ctx, &mut state, click(position(&output, "Close"))).1,
+            Some(Action::Close)
+        );
+    }
+}
+
+#[test]
+fn server_progress_names_the_pending_application_without_repeating_confirmation() {
+    let ctx = egui::Context::default();
+    let mut state = state();
+    state.started = true;
+    state.busy = true;
+    let report = state.report.as_mut().unwrap();
+    report.phase = TerminalUpgradePhase::Running;
+    report.restoration = Some(restoration(false, false));
+    let output = settled(&ctx, &mut state);
+    let content = text(&output);
+    assert_eq!(view(&state), View::Progress);
+    assert!(content.contains("Tmux server update progress"), "{content}");
+    assert!(
+        content.contains("1 restored, 0 need attention, 1 awaiting verification"),
+        "{content}"
+    );
+    assert!(content.contains("Waiting: girls - 0.0 - pi"), "{content}");
+    assert!(!content.contains(UPDATE), "{content}");
+    assert!(!content.contains(ACCEPT), "{content}");
+}
+
+#[test]
+fn server_failure_and_lost_status_are_not_presented_as_success() {
+    let ctx = egui::Context::default();
+    let mut state = state();
+    state.started = true;
+    state.report.as_mut().unwrap().phase = TerminalUpgradePhase::Failed;
+    assert!(text(&settled(&ctx, &mut state)).contains("Tmux server update failed"));
+    state.report.as_mut().unwrap().phase = TerminalUpgradePhase::Running;
+    state.error = Some("Daemon connection lost; inspect recovery records".into());
+    let content = text(&settled(&ctx, &mut state));
+    assert!(
+        content.contains("Tmux update status unavailable"),
+        "{content}"
+    );
+    assert!(
+        !content.contains("Tmux server update complete"),
+        "{content}"
+    );
+    assert!(!content.contains(UPDATE), "{content}");
+    let output = settled(&ctx, &mut state);
+    assert_eq!(
+        frame(&ctx, &mut state, click(position(&output, "Refresh status"))).1,
+        Some(Action::Poll("fixture-no-IPC".into()))
+    );
 }
 
 #[test]
@@ -434,11 +572,13 @@ fn native_info_server_link_opens_the_server_modal_without_terminal_update_events
         rows: vec![],
         process_tree: Some(InfoProcessTree {
             notice: "fixture".into(),
+            image_loader_helper_count: 0,
             sections: vec![InfoProcessSection {
                 id,
                 depth: 0,
                 header: "tmux-server (pid 123)".into(),
                 binary_is_current: Some(false),
+                script_header: None,
                 update_target: Some(InfoUpdateTarget::TmuxServer {
                     window: "exact-window".into(),
                     server: target.clone(),

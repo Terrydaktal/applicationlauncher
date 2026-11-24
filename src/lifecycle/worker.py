@@ -1229,42 +1229,134 @@ def wait_tabs(system, leases):
     return completed
 
 
-def fish_command(executable, arguments, shell):
+def exit_receipt(path):
+    command = ["/usr/bin/python3", "-I", "-c",
+               "import json,os,sys;fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600);"
+               "os.write(fd,json.dumps({'exit_code':int(sys.argv[2])}).encode());os.close(fd)", str(path)]
+    return shlex.join(command) + " $status"
+
+
+def fish_command(executable, arguments, shell, receipt=None):
     # A short exec shim preserves argv[0] independently of a pinned image path.
     # Fish remains the interactive parent, including after an interrupt/failed exit.
     command = ["/usr/bin/python3", "-I", "-c", "import os,sys;os.execv(sys.argv[1],sys.argv[2:])",
                executable, *arguments]
-    return [shell, "--interactive", "--init-command", shlex.join(command)]
+    startup = shlex.join(command)
+    if receipt is not None:
+        startup += "; " + exit_receipt(receipt)
+    return [shell, "--interactive", "--init-command", startup]
 
 
-def pane_command(program):
+def pane_command(program, receipt=None):
     arguments = program["argv"]
     if program["kind"] == "codex":
         argv0 = program["process"]["arguments"][0]
-        return fish_command(arguments[0], [argv0, *arguments[1:]], latest_binary("fish"))
+        return fish_command(arguments[0], [argv0, *arguments[1:]], latest_binary("fish"), receipt)
     if program["kind"] == "pi":
         shell = latest_binary("fish")
-        return [shell, "-lc", shlex.join(arguments) + "; exec " + shlex.quote(shell)]
+        command = shlex.join(arguments)
+        if receipt is not None:
+            command += "; " + exit_receipt(receipt)
+        return [shell, "-lc", command + "; exec " + shlex.quote(shell)]
     return arguments
+
+
+def check_program(program, root_pid):
+    try:
+        root = process(root_pid)
+    except (FileNotFoundError, ProcessLookupError) as error:
+        raise ProcessLookupError("The recreated pane's process exited") from error
+    _, active = foreground(root_pid, root["foreground"])
+    if kind(active) != program["kind"]:
+        raise Refused(f"Expected {program['kind']}; foreground program is {kind(active)}")
+    if active["image"] != program["installed"]:
+        raise Refused("The running executable does not match the planned installed image")
+    if active["cwd"] != program["cwd"]:
+        raise Refused("The application opened in a different working directory")
+    if program["kind"] == "pi":
+        # Restoring an exact local conversation does not require an idle model backend.
+        restored = pi_plan(active, require_idle=False)
+        if any(restored[key] != program[key] for key in ("argv", "session_id", "session_inode", "entry_point", "installed_entry", "installed_launcher")):
+            raise Refused("Pi has not opened the planned exact conversation and installed entry point")
+    elif program["kind"] == "codex" and active["arguments"][1:] != program["argv"][1:]:
+        raise Refused("Codex has not resumed the planned exact conversation")
 
 
 def verify_program(program, root_pid):
     deadline = time.monotonic() + (120 if program["kind"] == "pi" else 12)
+    reason = "No running application was observed"
     while time.monotonic() < deadline:
         try:
-            root = process(root_pid)
-            _, active = foreground(root_pid, root["foreground"])
-            if kind(active) == program["kind"] and active["image"] == program["installed"] and active["cwd"] == program["cwd"]:
-                if program["kind"] == "pi":
-                    restored = pi_plan(active)
-                    if all(restored[key] == program[key] for key in ("argv", "session_id", "session_inode", "entry_point", "installed_entry", "installed_launcher")):
-                        return
-                elif program["kind"] != "codex" or active["arguments"][1:] == program["argv"][1:]:
-                    return
-        except (OSError, ProcessLookupError, ValueError, Refused):
-            pass
+            check_program(program, root_pid)
+            return
+        except (OSError, ProcessLookupError, ValueError, Refused) as error:
+            reason = str(error)[:400]
         time.sleep(0.05)
-    raise Refused("The restarted program did not reach its verified binary, directory and exact session; inspect the backup")
+    raise Refused("The restarted program did not reach its verified binary, directory and exact session: " + reason)
+
+
+def restore_receipt(directory, old_pane):
+    if not old_pane.startswith("%") or not old_pane[1:].isdigit():
+        raise Refused("Invalid saved tmux pane identity")
+    return Path(directory) / f"pane-{old_pane[1:]}.exit.json"
+
+
+def verify_server_programs(plan, replacement, pane_map, directory):
+    scope = server_restart_scope(plan)
+    progress = dict(server_replaced=True, clients_reattached=len(plan["bindings"]), finished=False, panes=[])
+    for old_row, pane in zip(plan["panes"], scope["panes"]):
+        progress["panes"].append(dict(pane, pane_id=pane_map[old_row[1]], status="pending", message="Waiting for application startup"))
+    records = {row[1]: record for row, record in zip(plan["panes"], progress["panes"])}
+    roots = dict(rows(run_tmux(replacement, "list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}"), 2))
+    started = time.monotonic()
+    pending = dict(pane_map)
+    atomic_record(Path(directory) / "restore-status.json", progress)
+    while pending:
+        if not same_process(replacement["process"]):
+            raise Refused("The replacement tmux server exited during application restoration; inspect the recovery plan")
+        changed = False
+        for old_pane, new_pane in list(pending.items()):
+            program = plan["programs"][old_pane]["program"]
+            record = records[old_pane]
+            previous = (record["status"], record["message"])
+            try:
+                if new_pane not in roots:
+                    raise ProcessLookupError("The recreated pane is missing")
+                check_program(program, int(roots[new_pane]))
+                record.update(status="restored", message="Running executable, directory and exact session verified")
+                del pending[old_pane]
+            except (OSError, ValueError, Refused) as error:
+                record["message"] = str(error)[:400]
+                receipt = restore_receipt(directory, old_pane)
+                exited = None
+                try:
+                    exited, _ = owned_json(receipt)
+                except FileNotFoundError:
+                    pass
+                except (OSError, ValueError, Refused):
+                    record.update(status="failed", message="The application exit receipt could not be verified; inspect this pane")
+                if exited is not None:
+                    record.update(status="failed", message=f"Application launcher exited (status {exited.get('exit_code', 'unknown')}); inspect this pane's error output and resume only this application")
+                elif isinstance(error, ProcessLookupError):
+                    record.update(status="failed", message="The recreated pane's process exited before restoration could be verified")
+                elif time.monotonic() - started >= (120 if program["kind"] == "pi" else 12):
+                    record.update(status="failed", message="Verification timed out: " + record["message"])
+                if record["status"] == "failed":
+                    del pending[old_pane]
+            if previous != (record["status"], record["message"]):
+                changed = True
+                if record["status"] != "pending":
+                    restart_event(directory, "application_restored" if record["status"] == "restored" else "application_restore_failed",
+                                  pane=new_pane, session=record["session"], application=program["kind"], message=record["message"])
+        if changed:
+            atomic_record(Path(directory) / "restore-status.json", progress)
+        if pending:
+            time.sleep(0.1)
+    progress["finished"] = True
+    if not same_process(replacement["process"]) or not server_listening(replacement):
+        raise Refused("The replacement tmux server is no longer running; inspect the recovery plan")
+    atomic_record(Path(directory) / "restore-status.json", progress)
+    return progress
 
 
 def stop_program(program):
@@ -1351,10 +1443,13 @@ def recreate_server(plan, directory):
         gate = Path(directory) / ("gate-" + pane.removeprefix("%"))
         if gate.exists() or gate.is_symlink():
             raise Refused("A program startup gate already exists; the old operation cannot be replayed blindly")
+        receipt = restore_receipt(directory, pane)
+        if receipt.exists() or receipt.is_symlink():
+            raise Refused("An application exit receipt already exists; inspect the previous operation")
         gates.append(gate)
         # A closed gate ensures no duplicate Codex session starts before every binding is rebuilt.
         command = 'while [ ! -f "$1" ]; do sleep 0.05; done; shift; exec "$@"'
-        return ["/bin/sh", "-c", command, "application-update-gate", str(gate), *pane_command(program)]
+        return ["/bin/sh", "-c", command, "application-update-gate", str(gate), *pane_command(program, receipt)]
     for old_session, name, _, _, active_window in plan["sessions"]:
         session_windows = [row for row in plan["windows"] if row[0] == old_session]
         if not session_windows:
@@ -1543,10 +1638,9 @@ def execute_locked(plan, system, directory):
                 descriptor = os.open(gate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                 os.close(descriptor)
             restart_event(directory, "programs_released")
-            for old_pane, new_pane in pane_map.items():
-                pid = int(run_tmux(replacement, "display-message", "-p", "-t", new_pane, "#{pane_pid}").strip())
-                verify_program(plan["programs"][old_pane]["program"], pid)
-            restart_event(directory, "complete")
+            restoration = verify_server_programs(plan, replacement, pane_map, directory)
+            warnings = sum(pane["status"] == "failed" for pane in restoration["panes"])
+            restart_event(directory, "complete", restored=len(restoration["panes"]) - warnings, warnings=warnings)
         else:
             raise Refused("Unknown application update scope")
         message = "Update completed in the existing terminal window(s). Backup retained."

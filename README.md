@@ -1032,6 +1032,26 @@ Prepared tabs remain open as the old server exits. The new server recreates the
 sessions and layouts, clients reattach in their original tabs, and startup gates
 release the programs only after the client/session bindings are checked. The
 final program binary, working directory and exact Codex/Pi session are verified.
+Application verification visits all recreated panes under shared startup deadlines;
+one slow Pi does not prevent other panes being verified or add another serial
+120-second wait for every Pi. Codex/Pi launchers record their exit status before
+returning to Fish, so an exited launcher is reported without consuming that timeout.
+Pi restoration verifies the local process and exact conversation independently
+of backend availability or whether the restored application has started tools.
+The stricter idle/job checks still apply before interrupting the original program.
+
+After confirmation, the dialog becomes a progress/status view rather than keeping
+the restart prompt. The final result separately reports server replacement,
+reattached local tabs and each application as restored or needing attention, with
+failed applications listed first. If the new server and bindings are valid, an
+application restore failure completes the server update with warnings; it does
+not stop verification of other panes, terminate working sessions or repeat the
+server restart. A server/startup/topology/handoff failure still fails the operation.
+The result has only Close (or read-only Refresh status after a connection error),
+not another restart button. Recover only affected applications using the saved
+exact-session plan. Results and progress survive GUI/daemon replacement in private
+`restore-status.json` and `result.json` files, with per-pane outcomes in the journal.
+
 Scrollback, shell-local variables and runtime-only tmux options are not preserved.
 The original server's global colour preferences (`NO_COLOR`, `FORCE_COLOR`,
 `CLICOLOR`, `CLICOLOR_FORCE` and `COLORTERM`) are captured separately. Replacement

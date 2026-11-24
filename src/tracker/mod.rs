@@ -9,6 +9,7 @@ mod terminal_upgrade;
 mod tmux;
 
 pub use application_update::{
+    ApplicationRestoration, ApplicationRestorePane, ApplicationRestoreStatus,
     ApplicationUpdateAction, ApplicationUpdateReport, ProgramRestartScope, ProgramUpdateIdentity,
     TmuxClientRestartScope, TmuxRestartPane, TmuxRestartRemoteClient, TmuxServerIdentity,
     TmuxServerRestartScope,
