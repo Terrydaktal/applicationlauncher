@@ -19,7 +19,7 @@ pub(crate) fn load_field_rank_model() -> Option<FieldRankModel> {
     let Some(model) =
         FieldRankModel::from_versioned_parts(stored.schema_version, stored.bias, &stored.weights)
     else {
-        eprintln!(
+        applicationlauncher::diagnostic_log!(
             "Ignoring incompatible application field-rank model: {}",
             path.display()
         );

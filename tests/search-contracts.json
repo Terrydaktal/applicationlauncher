@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "scope": "Window and application search query acceptance, ranking and highlights",
+  "profile": "release",
+  "behaviors": [
+    {
+      "id": "SEARCH-SYMBOLS-01",
+      "contract": "ASCII punctuation-only queries such as ~, /, :: and ++ match literal substrings in both panels, including symbol-only application names. They never become match-all, regex, wildcard, shell expansion or fuzzy symbol queries. Prepared and unprepared retrieval agree. Matched symbols retain exact highlight colouring and original Unicode/strikethrough offsets, repeated occurrences and cropped focus; visible-range helpers never expand a symbol to neighbouring words. Empty/whitespace or stripped-decoration queries remain empty. Ordinary word queries retain the shared fuzzy rules, while pinned apps, system-module filtering and optional recent-window ordering are preserved.",
+      "tests": [
+        "punctuation_only_search_queries_match_literal_symbols_without_fuzzy_fallback",
+        "punctuation_only_window_search_preserves_recent_order_and_excludes_nonmatching_windows",
+        "punctuation_only_application_search_keeps_symbol_only_names_and_settings_filtering",
+        "punctuation_only_highlights_keep_unicode_strikes_repeated_matches_and_crop_focus"
+      ],
+      "shared_library_tests": [
+        "symbol_fallback_is_opt_in_and_never_matches_missing_or_fuzzy_symbols",
+        "symbol_only_prepared_fields_keep_literal_matches_and_original_unicode_highlight_offsets",
+        "literal_fallback_does_not_change_word_queries_rankings_highlights_or_features",
+        "symbol_fallback_prepared_and_unprepared_sorting_keep_payloads_and_caller_scores_consistent"
+      ]
+    }
+  ]
+}

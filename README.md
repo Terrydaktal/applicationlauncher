@@ -2,6 +2,15 @@
 
 `applicationlauncher` is a Rust GUI launcher and persistent window-session tracker for KDE Plasma on Wayland. The GUI combines searchable open windows and installed applications. The companion `applicationlauncherd` process records window activation and closure history, maintains crash-recovery, five-minute, hourly and named snapshots, and can restore missing windows without closing unrelated work.
 
+## Search
+
+Word queries keep the shared fuzzy matcher's normal token, typo and field-ranking
+rules. ASCII punctuation-only queries such as `~`, `/`, `::` and `++` use literal
+substring matching in both panels, rather than being discarded as empty tokens.
+Only real symbol occurrences match and highlight; the input is not a regular
+expression, wildcard or shell/home expansion. Existing Unicode/visual-title
+projection, pinned-app filtering and optional recent-window ordering still apply.
+
 ## Window info requests
 
 XFCE Terminal's **Show Info** menu uses

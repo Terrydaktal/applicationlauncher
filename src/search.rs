@@ -96,8 +96,9 @@ pub(crate) fn search_projection(value: &str) -> String {
 
 pub(crate) fn search_queries(query: &str) -> Option<(MetadataQuery, MetadataQuery)> {
     let projected_query = search_projection(query);
-    let base_query = MetadataQuery::new(&projected_query)?;
-    let typo_query = MetadataQuery::new(&projected_query)?.with_typo_fallback(true);
+    let base_query = MetadataQuery::new_with_literal_fallback(&projected_query)?;
+    let typo_query =
+        MetadataQuery::new_with_literal_fallback(&projected_query)?.with_typo_fallback(true);
     Some((base_query, typo_query))
 }
 
@@ -139,7 +140,9 @@ impl PreparedSearchDocument {
             .collect::<Vec<_>>();
         let fields = projected_values
             .iter()
-            .filter_map(|(priority, value)| PreparedMetadataField::new(*priority, value))
+            .filter_map(|(priority, value)| {
+                PreparedMetadataField::new_with_literal_fallback(*priority, value)
+            })
             .collect();
         Self {
             key,
@@ -1475,8 +1478,9 @@ pub(crate) fn expand_range_to_token_boundaries(
 pub(crate) fn fuzzy_rank_visible_match_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
     let (projected_text, projection_to_original) = search_projection_with_map(text);
     let projected_query = search_projection(query);
-    let Some(query) =
-        MetadataQuery::new(&projected_query).map(|query| query.with_typo_fallback(true))
+    let literal_only = !projected_query.chars().any(char::is_alphanumeric);
+    let Some(query) = MetadataQuery::new_with_literal_fallback(&projected_query)
+        .map(|query| query.with_typo_fallback(true))
     else {
         return Vec::new();
     };
@@ -1493,6 +1497,14 @@ pub(crate) fn fuzzy_rank_visible_match_ranges(text: &str, query: &str) -> Vec<(u
     let Some(rank) = query.search_rank(candidate) else {
         return Vec::new();
     };
+    if literal_only {
+        return query
+            .highlights_for_rank(candidate, &rank)
+            .into_iter()
+            .flat_map(|highlight| highlight.ranges)
+            .filter_map(|(start, end, _)| map_projected_range(&projection_to_original, start, end))
+            .collect();
+    }
     let provenance = rank.provenance();
 
     match provenance.variant_scope {
@@ -1801,7 +1813,9 @@ pub(crate) fn render_title_strikethrough(mut job: egui::text::LayoutJob) -> egui
     let text = std::mem::take(&mut job.text);
     let sections = std::mem::take(&mut job.sections);
     job.text = String::with_capacity(text.len());
+    let mut pending_leading_space = 0.0;
     for section in sections {
+        pending_leading_space += section.leading_space;
         let mut struck_format = section.format.clone();
         struck_format.strikethrough = egui::Stroke::new(1.0, section.format.color);
         for (offset, character) in text[section.byte_range.clone()].char_indices() {
@@ -1822,15 +1836,17 @@ pub(crate) fn render_title_strikethrough(mut job: egui::text::LayoutJob) -> egui
             job.text.push(character);
             if let Some(previous) = job.sections.last_mut()
                 && previous.format == *format
+                && pending_leading_space == 0.0
             {
                 previous.byte_range.end = job.text.len();
             } else {
                 job.sections.push(egui::text::LayoutSection {
-                    leading_space: 0.0,
+                    leading_space: pending_leading_space,
                     byte_range: start..job.text.len(),
                     format: format.clone(),
                 });
             }
+            pending_leading_space = 0.0;
         }
     }
     job

@@ -4703,4 +4703,167 @@ mod tests {
         assert_eq!(projected, "gimp -  mage");
         assert!(search_queries("mpv").is_some());
     }
+
+    #[test]
+    fn punctuation_only_search_queries_match_literal_symbols_without_fuzzy_fallback() {
+        for symbol in ["~", "/", "::", "++", "[!]", ".", "_"] {
+            let (base, typo) = search_queries(&format!(" {symbol} ")).unwrap();
+            let value = format!("tool {symbol} project");
+            let document = crate::search::PreparedSearchDocument::new(
+                "literal".into(),
+                vec![(0, value.clone())],
+            );
+            assert_eq!(
+                base.search_rank_prepared(document.candidate(0.0)),
+                typo.search_rank_prepared(document.candidate(0.0))
+            );
+            let (_, display, highlights, is_typo) =
+                compute_display_title_and_highlights(&value, &document.values, &base, &typo, 512)
+                    .unwrap();
+            assert_eq!(display, value);
+            assert_eq!(highlights, vec![(5, 5 + symbol.len(), true)], "{symbol}");
+            assert!(!is_typo);
+            let unrelated = crate::search::PreparedSearchDocument::new(
+                "unrelated".into(),
+                vec![(0, "no punctuation here".into())],
+            );
+            assert!(
+                base.search_rank_prepared(unrelated.candidate(0.0))
+                    .is_none()
+            );
+            assert!(
+                typo.search_rank_prepared(unrelated.candidate(0.0))
+                    .is_none()
+            );
+        }
+        for empty in ["", " ", "\t\n", "\u{0336}"] {
+            assert!(search_queries(empty).is_none());
+        }
+    }
+
+    #[test]
+    fn punctuation_only_window_search_preserves_recent_order_and_excludes_nonmatching_windows() {
+        let windows: Vec<_> = [
+            ("older", "fish - ~/work - Terminal", 100),
+            ("unrelated", "Editor", 300),
+            ("newer", "fish - ~/longer-project - Terminal", 200),
+        ]
+        .into_iter()
+        .map(|(id, title, activated)| {
+            let mut window = test_window_info(title);
+            window.id = id.into();
+            window.cwd_path = Some("/tmp/fixture".into());
+            window.last_activated_at_ms = Some(activated);
+            window
+        })
+        .collect();
+        let documents: Vec<_> = windows.iter().map(window_search_document).collect();
+        let (base, typo) = search_queries("~").unwrap();
+        for recent in [false, true] {
+            let matches = ranked_window_matches(&windows, &documents, &base, &typo, None, recent);
+            assert_eq!(matches.len(), 2);
+            assert!(
+                matches
+                    .iter()
+                    .all(|item| item.window.id != "unrelated" && !item.title_is_typo)
+            );
+            for item in &matches {
+                assert!(!item.highlight_segments.is_empty());
+                assert!(
+                    item.highlight_segments
+                        .iter()
+                        .all(|(start, end, exact)| *exact
+                            && &item.display_title[*start..*end] == "~")
+                );
+            }
+            if recent {
+                assert_eq!(
+                    matches
+                        .iter()
+                        .map(|item| item.window.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["newer", "older"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn punctuation_only_application_search_keeps_symbol_only_names_and_settings_filtering() {
+        let apps: Vec<_> = [
+            ("~", "home", false),
+            ("Plain", "plain", false),
+            ("Settings~", "settings", true),
+        ]
+        .into_iter()
+        .map(|(name, stem, settings)| AppInfo {
+            name: name.into(),
+            exec: format!("/opt/{stem}"),
+            desktop_file_path: format!("/fixture/{stem}.desktop").into(),
+            comment: None,
+            icon_path: None,
+            is_settings_module: settings,
+        })
+        .collect();
+        let documents: Vec<_> = apps.iter().map(app_search_document).collect();
+        let pinned = vec![apps[0].desktop_file_path.clone()];
+        let (base, typo) = search_queries("~").unwrap();
+        for show_settings in [false, true] {
+            let matches = ranked_app_matches(
+                &apps,
+                &documents,
+                &pinned,
+                show_settings,
+                &base,
+                &typo,
+                None,
+            );
+            assert_eq!(matches.len(), if show_settings { 2 } else { 1 });
+            assert_eq!(matches[0].app.name, "~");
+            assert!(matches[0].is_pinned);
+            assert!(
+                matches
+                    .iter()
+                    .all(|item| item.app.name != "Plain" && !item.title_is_typo)
+            );
+            assert!(matches[0].highlight_segments.iter().any(
+                |(start, end, exact)| *exact && &matches[0].display_title[*start..*end] == "~"
+            ));
+        }
+    }
+
+    #[test]
+    fn punctuation_only_highlights_keep_unicode_strikes_repeated_matches_and_crop_focus() {
+        let title = "🙂 c\u{0336}o\u{0336}d\u{0336}e\u{0336}x\u{0336} - ~\u{0336}/work - ~/other - Terminal";
+        let values = vec![(0, title.into())];
+        let (base, typo) = search_queries("~").unwrap();
+        let (_, display, segments, is_typo) =
+            compute_display_title_and_highlights(title, &values, &base, &typo, 512).unwrap();
+        assert_eq!(display, title);
+        assert!(!is_typo);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(&display[segments[0].0..segments[0].1], "~\u{0336}");
+        assert_eq!(&display[segments[1].0..segments[1].1], "~");
+        assert!(segments.iter().all(|(_, _, exact)| *exact));
+        let title = format!("{} :: exact symbol", "long leading text ".repeat(20));
+        let (base, typo) = search_queries("::").unwrap();
+        let (_, display, segments, is_typo) =
+            compute_display_title_and_highlights(&title, &[(0, title.clone())], &base, &typo, 40)
+                .unwrap();
+        assert!(display.starts_with("..."));
+        assert!(!is_typo);
+        assert!(
+            segments
+                .iter()
+                .any(|(start, end, exact)| *exact && &display[*start..*end] == "::")
+        );
+        assert_eq!(
+            title_highlight_segments("tool ~ and ~", "~"),
+            vec![(5, 6, true), (11, 12, true)]
+        );
+        assert_eq!(
+            fuzzy_rank_visible_match_ranges("tool~and~more", "~"),
+            vec![(4, 5), (8, 9)]
+        );
+    }
 }
