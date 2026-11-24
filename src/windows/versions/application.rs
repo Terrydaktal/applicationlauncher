@@ -451,17 +451,17 @@ mod tests {
         };
         assert_eq!(
             inspect(),
-            "Yes · 3 inputs checked · 1 newer · 0 missing · added: unknown"
+            "1 newer · 0 missing · added: unknown · 3 inputs checked"
         );
         mtime(&source, 100);
         assert_eq!(
             inspect(),
-            "No newer recorded inputs detected · 3 inputs checked · 0 newer · 0 missing · added: unknown · full build status unknown"
+            "0 newer · 0 missing · added: unknown · 3 inputs checked · full build status unknown"
         );
         std::fs::remove_file(header).unwrap();
         assert_eq!(
             inspect(),
-            "Yes · 3 inputs checked · 0 newer · 1 missing · added: unknown"
+            "0 newer · 1 missing · added: unknown · 3 inputs checked"
         );
         assert!(!fixture.0.join("MUST_NOT_RUN").exists());
     }

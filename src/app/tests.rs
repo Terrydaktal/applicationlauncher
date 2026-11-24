@@ -1212,10 +1212,9 @@ mod tests {
         };
         assert!(rows(None, true).iter().all(|row| row.value == "Loading..."));
         assert!(rows(None, false).iter().all(|row| row.value
-            == if row.label == "Package" {
-                "-"
-            } else {
-                "Unavailable"
+            == match row.label.as_str() {
+                "Application languages (on disk)" => "Unknown",
+                _ => "Unavailable",
             }));
         let version = crate::windows::versions::ProcessVersion {
             uncompiled_changes: Some("Unknown (no supported local build metadata)".into()),
@@ -1223,6 +1222,7 @@ mod tests {
         };
         let rows = rows(Some(&version), false);
         assert_eq!(rows.len(), 8);
+        assert!(!rows.iter().any(|row| row.label == "Build system (on disk)"));
         assert!(
             !rows
                 .iter()
@@ -1255,16 +1255,21 @@ mod tests {
             for (version, pending) in [(None, true), (None, false), (Some(&version), false)] {
                 let rows = super::super::popups::process_version_rows(role, version, pending);
                 let mut expected = vec![
-                    "Version (ELF build ID)",
-                    "Latest version on disk (ELF build ID)",
-                    "Uncompiled changes",
+                    "Executable Version (ELF build ID)",
                     "Type",
-                    "Package",
+                    "Capabilities",
+                    "Description",
+                    "Application languages (on disk)",
+                    "Uncompiled changes",
                 ];
+                expected.push("Latest version on disk (ELF build ID)");
+                if pending {
+                    expected.push("Package");
+                }
                 if version.is_some() {
                     expected.push("Latest version (Pacman/AUR)");
                 }
-                expected.extend(["Launch chain", "Description", "Capabilities"]);
+                expected.push("Launch chain");
                 assert_eq!(
                     rows.iter()
                         .map(|row| row.label.as_str())
@@ -1293,7 +1298,7 @@ mod tests {
         let rows = super::super::popups::process_version_rows("Application", Some(&version), false);
         let value = |label: &str| &rows.iter().find(|row| row.label == label).unwrap().value;
         assert_eq!(
-            value("Version (ELF build ID)"),
+            value("Executable Version (ELF build ID)"),
             "Unavailable (process exited before inspection)"
         );
         assert_eq!(value("Description"), "Unprivileged sandboxing tool");
@@ -1369,27 +1374,21 @@ mod tests {
                             row.label
                                 == super::super::popups::info_metadata_label(
                                     role,
-                                    "Version (ELF build ID)",
+                                    "Executable Version (ELF build ID)",
                                 )
                         })
                         .unwrap();
                     let running = &rows[running_index];
-                    assert_eq!(
-                        rows.last().unwrap().label,
-                        super::super::popups::info_metadata_label(role, "capabilities")
+                    let latest_label = super::super::popups::info_metadata_label(
+                        role,
+                        "Latest version on disk (ELF build ID)",
                     );
-                    assert_eq!(
-                        rows[running_index + 1].label,
-                        super::super::popups::info_metadata_label(
-                            role,
-                            "Latest version on disk (ELF build ID)"
-                        )
-                    );
+                    let latest = rows.iter().find(|row| row.label == latest_label).unwrap();
                     assert_eq!(
                         running.binary_is_current,
                         build_id.filter(|id| !id.is_empty()).and(current)
                     );
-                    assert_eq!(rows[running_index + 1].binary_is_current, None);
+                    assert_eq!(latest.binary_is_current, None);
                     assert!(
                         rows.iter()
                             .filter(|row| row.label != running.label)
@@ -1451,8 +1450,11 @@ mod tests {
             "extra/xfce4-terminal 1.2.0-1",
         ));
         let rows = super::super::popups::process_version_rows("Application", Some(&version), false);
-        assert!(rows.iter().any(|row| row.label == "Version (ELF build ID)"
-            && row.value == "running binary (Unavailable)"));
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "Executable Version (ELF build ID)"
+                    && row.value == "running binary (Unavailable)")
+        );
         assert!(
             rows.iter()
                 .any(|row| row.label == "Latest version on disk (ELF build ID)"
@@ -1460,7 +1462,7 @@ mod tests {
         );
         let repository = rows
             .iter()
-            .find(|row| row.label == "Latest version (in last Pacman sync)")
+            .find(|row| row.label == "Latest package (in last Pacman sync)")
             .unwrap();
         assert_eq!(
             repository.value,
@@ -1534,11 +1536,10 @@ mod tests {
                             row.label
                                 == super::super::popups::info_metadata_label(
                                     role,
-                                    latest
-                                        .as_ref()
-                                        .map_or("latest version (Pacman/AUR)", |version| {
-                                            version.field_label()
-                                        }),
+                                    latest.as_ref().map_or(
+                                        "latest version (Pacman/AUR)",
+                                        |_| "latest package (in last Pacman sync)",
+                                    ),
                                 )
                         })
                         .expect("forks and clones must retain the upstream package comparison");
@@ -1641,7 +1642,7 @@ mod tests {
             assert!(
                 runtime_rows
                     .iter()
-                    .any(|row| row.label == "Latest version (in last Pacman sync)"
+                    .any(|row| row.label == "Latest package (in last Pacman sync)"
                         && row.value == "core/runtime 1.0 (synced 2 days ago)"),
                 "{runtime}"
             );
@@ -1710,7 +1711,7 @@ mod tests {
         );
         assert!(value("Running version").starts_with("Unknown"));
         assert_eq!(
-            runtime_value("Version (ELF build ID)"),
+            runtime_value("Executable Version (ELF build ID)"),
             "v26.4.0 (Unavailable)"
         );
         assert_eq!(value("Description"), "Pi coding agent");
@@ -1730,7 +1731,11 @@ mod tests {
         );
         assert_eq!(runtime_value("Type"), "PEP");
         assert_eq!(value("Type"), "NET");
-        assert!(!rows.iter().any(|row| row.label == "Version (ELF build ID)"));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.label == "Executable Version (ELF build ID)")
+        );
         assert!(
             rows.iter()
                 .all(|row| !row.searched && !row.separator_before)
@@ -1739,7 +1744,8 @@ mod tests {
         assert!(
             runtime_rows
                 .iter()
-                .all(|row| !row.label.starts_with("Application "))
+                .all(|row| !row.label.starts_with("Application ")
+                    || row.label == "Application languages (on disk)")
         );
     }
 
@@ -1765,7 +1771,43 @@ mod tests {
     }
 
     #[test]
-    fn script_name_is_separate_from_the_interpreter_and_raw_command_line() {
+    fn generic_process_fields_stay_green_scoped_across_applications() {
+        let window = test_window_info("test - Terminal");
+        for name in [
+            "xfce4-terminal",
+            "bash",
+            "fish",
+            "tmux",
+            "ssh",
+            "mosh",
+            "node",
+            "python3",
+            "java",
+        ] {
+            let mut node = hosted_process(name, &format!("/usr/bin/{name}"));
+            if name == "bash" {
+                node.script_name = Some("pi-remote-qwen-radiance".into());
+            }
+            for unavailable in [false, true] {
+                if unavailable {
+                    node.executable = None;
+                    node.cwd = None;
+                }
+                let rows = super::super::popups::process_info_rows(&window, &node, Vec::new());
+                for row in rows {
+                    assert_eq!(
+                        row.scope,
+                        InfoFieldScope::RunningInstance,
+                        "{name}: {}",
+                        row.label
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn script_name_is_not_duplicated_in_process_rows() {
         let window = test_window_info("pi - ~/work - Terminal");
         let mut node = hosted_process("bash", "/usr/bin/bash");
         node.script_name = Some("pi-remote-qwen-radiance".into());
@@ -1773,11 +1815,14 @@ mod tests {
         let rows = super::super::popups::process_info_rows(&window, &node, Vec::new());
         assert_eq!((&*rows[0].label, &*rows[0].value), ("Process name", "bash"));
         assert_eq!(
-            (&*rows[1].label, &*rows[1].value),
-            ("Script name", "pi-remote-qwen-radiance")
+            (&*rows[2].label, &*rows[2].value),
+            ("Running executable image original path", "/usr/bin/bash")
         );
-        assert_eq!(rows[1].scope, InfoFieldScope::RunningInstance);
-        assert!(!rows[1].searched);
+        assert!(rows.iter().all(|row| row.label != "Script name"));
+        for row in &rows {
+            assert_eq!(row.scope, InfoFieldScope::RunningInstance, "{}", row.label);
+        }
+        assert!(!rows[2].searched);
         assert_eq!(
             rows.iter()
                 .find(|row| row.label == "Command line")
@@ -1864,11 +1909,9 @@ mod tests {
         let node = hosted_process("fish", "/usr/bin/fish");
         let process_rows = super::super::popups::process_info_rows(&window, &node, Vec::new());
         assert_eq!(process_rows.len(), 7);
-        assert!(
-            process_rows
-                .iter()
-                .all(|row| row.scope == InfoFieldScope::RunningInstance)
-        );
+        for row in &process_rows {
+            assert_eq!(row.scope, InfoFieldScope::RunningInstance, "{}", row.label);
+        }
         for pending in [false, true] {
             for role in ["Application", "Runtime", "Custom role"] {
                 let rows = super::super::popups::process_version_rows(role, None, pending);
@@ -2353,7 +2396,7 @@ mod tests {
             assert_eq!(
                 row(
                     super::super::popups::process_version_rows("Runtime", Some(&version), false),
-                    "Version (ELF build ID)"
+                    "Executable Version (ELF build ID)"
                 )
                 .value,
                 "v26.4.0 (node-elf-identity)"
@@ -2361,7 +2404,7 @@ mod tests {
             assert_eq!(
                 row(
                     super::super::popups::process_version_rows("Runtime", Some(&version), false),
-                    "Version (ELF build ID)"
+                    "Executable Version (ELF build ID)"
                 )
                 .binary_is_current,
                 Some(true)
@@ -2569,15 +2612,16 @@ mod tests {
                 "Minimized",
                 "Last activated",
                 "Activation sequence",
-                "Version (ELF build ID)",
-                "Latest version on disk (ELF build ID)",
-                "Uncompiled changes",
+                "Executable Version (ELF build ID)",
                 "Type",
-                "Package",
+                "Capabilities",
+                "Description",
+                "Application languages (source checkout)",
+                "Build system (source checkout)",
+                "Uncompiled changes",
+                "Latest version on disk (ELF build ID)",
                 "Latest version (Pacman/AUR)",
                 "Launch chain",
-                "Description",
-                "Capabilities",
             ];
             assert_eq!(
                 rows.iter()
@@ -2601,7 +2645,7 @@ mod tests {
             };
             assert_eq!(value("Geometry"), "x=0, y=0, width=800, height=600");
             assert_eq!(
-                value("Version (ELF build ID)"),
+                value("Executable Version (ELF build ID)"),
                 "running version (Unavailable)"
             );
             assert_eq!(
@@ -2685,26 +2729,28 @@ mod tests {
             );
             assert_eq!(
                 rows.iter()
-                    .take(7)
+                    .take(8)
                     .map(|row| row.label.as_str())
                     .collect::<Vec<_>>(),
                 [
                     "Process name",
                     "PID",
+                    "Running executable image original path",
+                    "Executable Version (ELF build ID)",
+                    "Command line",
+                    "Working directory",
                     "Parent PID",
                     "Process start (ticks since boot)",
-                    "Working directory",
-                    "Command line",
-                    "Executable path",
                 ],
                 "process identity order for {name} (pid {pid})"
             );
             let position = |label: &str| rows.iter().position(|row| row.label == label).unwrap();
             assert!(
-                position("Process start (ticks since boot)") < position("Version (ELF build ID)")
+                position("Running executable image original path")
+                    < position("Executable Version (ELF build ID)")
             );
             assert!(
-                position("Version (ELF build ID)")
+                position("Executable Version (ELF build ID)")
                     < position("Latest version on disk (ELF build ID)")
             );
             assert!(!rows.iter().any(|row| row.label == "Process desktop file"));
@@ -2739,7 +2785,7 @@ mod tests {
             };
             assert_eq!(value("Process name"), name);
             assert_eq!(value("PID"), pid.to_string());
-            assert_eq!(value("Executable path"), executable);
+            assert_eq!(value("Running executable image original path"), executable);
             assert_eq!(
                 value("Working directory"),
                 display_path(cwd.as_deref().unwrap())

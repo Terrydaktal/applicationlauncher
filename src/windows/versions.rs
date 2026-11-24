@@ -3371,11 +3371,12 @@ int main(int argc, char **argv) {{
             );
             assert_eq!(report.newer_count, 1);
             assert!(report.newer_files.contains(&newer));
-            assert!(changes.starts_with("Yes ·"), "{changes}");
+            assert!(changes.starts_with("1 newer · 1 missing ·"), "{changes}");
             assert!(changes.contains("1 newer · 1 missing"), "{changes}");
         } else {
             assert_eq!(report.newer_count, 0);
-            assert!(changes.starts_with("Unknown ·"), "{changes}");
+            assert!(changes.starts_with("0 newer · 1 missing ·"), "{changes}");
+            assert!(changes.ends_with("full build status unknown"), "{changes}");
             assert!(changes.contains("0 newer · 1 missing"), "{changes}");
         }
         assert!(current());
@@ -3596,7 +3597,36 @@ int main(int argc, char **argv) {{
                         .uncompiled_changes
                         .as_deref()
                         .unwrap_or("")
-                        .starts_with("No newer recorded inputs detected"),
+                        .starts_with("0 newer · 0 missing ·"),
+                    "{process:?}"
+                );
+            }
+            if let Some(expected) = case.installation {
+                assert_eq!(
+                    process.installation.as_deref(),
+                    Some(expected.as_str()),
+                    "{process:?}"
+                );
+            }
+            if let Some(expected) = case.uncompiled_display {
+                assert_eq!(
+                    program_metadata::build_status::display_uncompiled_changes(
+                        process
+                            .uncompiled_changes
+                            .as_deref()
+                            .unwrap_or("Unavailable")
+                    ),
+                    expected,
+                    "{process:?}"
+                );
+            }
+            if let Some(expected) = case.description_contains {
+                assert!(
+                    process
+                        .progs_metadata
+                        .description
+                        .as_deref()
+                        .is_some_and(|description| description.contains(&expected)),
                     "{process:?}"
                 );
             }

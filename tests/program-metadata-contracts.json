@@ -84,10 +84,21 @@
       ]
     },
     {
-      "id": "METADATA-COMPILATION-NOT-APPLICABLE-01",
-      "contract": "Uncompiled changes is displayed and copied as a neutral '-' for confirmed not-applicable results in installed application, native process and hosted runtime Info. Detailed backend reasons remain intact for diagnostics. Unknown, unavailable, pending, changed and no-newer results retain their distinct meaning; other fields' not-applicable explanations are unchanged.",
+      "id": "METADATA-PACKAGE-APPLICABILITY-01",
+      "contract": "Package and Root package rows are omitted for source-managed and unmanaged classifications (FRK, DEV, CLO, OPT, USC, UBI and normalized legacy aliases), regardless of an unrelated or upstream package record. Completed native metadata without an actual owner does not show an empty package row; undecided native ownership may show Loading until classified. Hosted npm applications retain actual installed manifest identities, while other scripts require a non-inferred owning package. Separate upstream Pacman/AUR/npm version comparisons, package values, badge colours and retained backend evidence are unchanged.",
       "tests": [
-        "not_applicable_uncompiled_changes_use_dash_in_application_process_and_runtime_rows",
+        "source_managed_and_unmanaged_info_omits_package_roots_but_keeps_upstream_comparisons",
+        "native_package_rows_require_an_owner_and_preserve_loading_values_badges_and_roots",
+        "hosted_package_rows_use_actual_installed_identities_not_inferred_upstream_packages"
+      ]
+    },
+    {
+      "id": "METADATA-COMPILATION-NOT-APPLICABLE-01",
+      "contract": "Uncompiled changes is omitted from installed application, native process and hosted runtime Info for Pacman/AUR-managed packages, interpreted entries and confirmed not-applicable results, including existing dash representations. A captured system-package owner or installation classification suffices even while details are pending. Detailed backend reasons remain intact for diagnostics. Applicable source-build unknown, unavailable, pending, changed and no-newer results retain their values and distinct meaning; other fields' not-applicable explanations are unchanged.",
+      "tests": [
+        "not_applicable_uncompiled_changes_are_omitted_from_application_process_and_runtime_rows",
+        "system_package_info_omits_uncompiled_changes_even_while_details_are_pending",
+        "source_build_info_keeps_unknown_pending_and_changed_results_without_mutating_them",
         "uncompiled_changes_values_use_status_colours_in_application_and_process_info"
       ]
     },
@@ -97,7 +108,7 @@
       "tests": [
         "shared_ninja_queries_preserve_response_files_and_never_execute_build_commands",
         "shared_compact_input_counts_reach_installed_application_metadata",
-        "not_applicable_uncompiled_changes_use_dash_in_application_process_and_runtime_rows",
+        "not_applicable_uncompiled_changes_are_omitted_from_application_process_and_runtime_rows",
         "unsupported_sources_remain_unknown_instead_of_using_repository_wide_timestamps_as_proof",
         "uncompiled_changes_values_use_status_colours_in_application_and_process_info"
       ]
@@ -199,7 +210,7 @@
     },
     {
       "id": "METADATA-CORE-11",
-      "contract": "Show Info combines running Version (ELF build ID) and Latest version on disk (ELF build ID) values as version (ID), without duplicate standalone ELF-ID rows. Process/runtime scopes are preserved and only the running version gets green/red comparison colouring; on-disk versions, missing IDs and installation-only views stay neutral. Diagnostic reasons remain visible and identical loading/unavailable messages are not duplicated. Tmux SHA256 rows follow their corresponding combined version field.",
+      "contract": "Show Info combines running Executable Version (ELF build ID) and Latest version on disk (ELF build ID) values as version (ID), without duplicate standalone ELF-ID rows. Process/runtime scopes are preserved and only the running version gets green/red comparison colouring; on-disk versions, missing IDs and installation-only views stay neutral. Diagnostic reasons remain visible and identical loading/unavailable messages are not duplicated. Tmux SHA256 rows follow their corresponding combined version field.",
       "tests": ["combined_version_fields_use_the_requested_format_and_preserve_scope_and_freshness", "combined_version_fields_keep_loading_and_missing_builds_neutral_without_duplicates", "only_running_version_carries_freshness_without_a_separate_status_row", "on_disk_versions_stay_neutral_for_all_build_ids_and_comparisons", "browser_headers_and_running_versions_are_coloured_but_disk_versions_stay_neutral", "python_build_id_absence_is_independent_of_version_and_process_access"]
     },
     {

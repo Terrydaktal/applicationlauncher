@@ -160,6 +160,56 @@ fn uncompiled_changes_color(value: &str) -> Option<egui::Color32> {
     }
 }
 
+fn append_uncompiled_changes(
+    job: &mut egui::text::LayoutJob,
+    value: &str,
+    font: egui::FontId,
+    base: egui::Color32,
+) {
+    if value.contains(" · ") {
+        use program_metadata::build_status::{SummaryTone, uncompiled_changes_clause_tone};
+
+        for (index, clause) in value.split(" · ").enumerate() {
+            if index > 0 {
+                job.append(" · ", 0.0, egui::TextFormat::simple(font.clone(), base));
+            }
+            let color = match uncompiled_changes_clause_tone(clause) {
+                SummaryTone::Good => binary_current_color(Some(true)).unwrap(),
+                SummaryTone::Bad => binary_current_color(Some(false)).unwrap(),
+                SummaryTone::Warning => egui::Color32::from_rgb(255, 220, 100),
+                SummaryTone::Neutral => uncompiled_changes_color(clause).unwrap_or(base),
+            };
+            append_info_text(job, clause, egui::TextFormat::simple(font.clone(), color));
+        }
+        return;
+    }
+
+    // Older receipts and non-structured failure explanations retain their status
+    // colour. A caveat in a legacy sentence must not turn a clean observation red.
+    let color = uncompiled_changes_color(value).unwrap_or(base);
+    let caveat = [
+        "added: unknown",
+        "full build status unknown",
+        "scan incomplete",
+    ]
+    .into_iter()
+    .filter_map(|caveat| value.find(caveat))
+    .min()
+    .unwrap_or(value.len());
+    append_info_text(
+        job,
+        &value[..caveat],
+        egui::TextFormat::simple(font.clone(), color),
+    );
+    if caveat < value.len() {
+        append_info_text(
+            job,
+            &value[caveat..],
+            egui::TextFormat::simple(font, egui::Color32::from_rgb(255, 220, 100)),
+        );
+    }
+}
+
 fn info_process_header_layout(
     header: &str,
     current: Option<bool>,
@@ -187,6 +237,7 @@ fn info_field_label_color(scope: InfoFieldScope) -> egui::Color32 {
         InfoFieldScope::Neutral => egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170),
         InfoFieldScope::Window => egui::Color32::from_rgb(144, 166, 188),
         InfoFieldScope::RunningInstance => egui::Color32::from_rgb(146, 180, 160),
+        InfoFieldScope::InstanceContext => egui::Color32::from_rgb(188, 152, 165),
         InfoFieldScope::Installation => egui::Color32::from_rgb(184, 167, 143),
     }
 }
@@ -258,30 +309,22 @@ fn info_popup_layout(
             &label,
             format(body_font.clone(), label_color),
         );
-        let value = format!("{}\n", row.value);
-        let caveat_start = if row.label == "Uncompiled changes" {
-            [
-                "added: unknown",
-                "full build status unknown",
-                "scan incomplete",
-            ]
-            .into_iter()
-            .filter_map(|caveat| row.value.find(caveat))
-            .min()
+        if row.label == "Uncompiled changes" {
+            append_uncompiled_changes(
+                &mut layout_job,
+                &format!("{}\n", row.value),
+                body_font.clone(),
+                if row.searched {
+                    searchable_value_color
+                } else {
+                    egui::Color32::WHITE
+                },
+            );
         } else {
-            None
-        };
-        let (observation, caveat) = value.split_at(caveat_start.unwrap_or(value.len()));
-        append_info_text(
-            &mut layout_job,
-            observation,
-            format(body_font.clone(), value_color),
-        );
-        if !caveat.is_empty() {
             append_info_text(
                 &mut layout_job,
-                caveat,
-                format(body_font.clone(), egui::Color32::from_rgb(255, 220, 100)),
+                &format!("{}\n", row.value),
+                format(body_font.clone(), value_color),
             );
         }
     }
@@ -1173,7 +1216,7 @@ mod tests {
                     binary_is_current: None,
                 },
                 InfoPopupRow {
-                    label: "Executable path".into(),
+                    label: "Running executable image original path".into(),
                     scope: InfoFieldScope::RunningInstance,
                     value: "/usr/bin/codex".into(),
                     searched: false,
@@ -1363,6 +1406,15 @@ mod tests {
                     && Some(section.format.color) == installation_type_color(badge)
             }));
         }
+        for (text, colour) in [
+            ("Script name", egui::Color32::from_rgb(188, 152, 165)),
+            ("pi-remote-qwen-radiance", egui::Color32::WHITE),
+        ] {
+            assert!(projection.job.sections.iter().any(|section| {
+                projection.job.text[section.byte_range.clone()].trim_end() == text
+                    && section.format.color == colour
+            }));
+        }
     }
 
     #[test]
@@ -1410,6 +1462,10 @@ mod tests {
             (
                 InfoFieldScope::RunningInstance,
                 egui::Color32::from_rgb(146, 180, 160),
+            ),
+            (
+                InfoFieldScope::InstanceContext,
+                egui::Color32::from_rgb(188, 152, 165),
             ),
             (
                 InfoFieldScope::Installation,
@@ -1847,36 +1903,10 @@ mod tests {
                     green,
                     Some("full build status unknown"),
                 ),
-                (
-                    "No newer recorded inputs detected · 977 inputs checked · 0 newer · 0 missing · added: unknown · full build status unknown",
-                    green,
-                    Some("added: unknown"),
-                ),
-                (
-                    "No newer recorded inputs detected · 1 inputs checked · 0 newer · 0 missing · added: unknown",
-                    green,
-                    Some("added: unknown"),
-                ),
                 ("Yes", red, None),
                 ("Yes (recorded build inputs changed; source.c)", red, None),
-                (
-                    "Yes · 40 inputs checked · 2 newer · 3 missing · added: unknown",
-                    red,
-                    Some("added: unknown"),
-                ),
-                (
-                    "Yes · 40 inputs checked · 0 newer · 1 missing · scan incomplete",
-                    red,
-                    Some("scan incomplete"),
-                ),
-                (
-                    "Yes · 40 inputs checked · 2 newer · 0 missing · full build status unknown",
-                    red,
-                    Some("full build status unknown"),
-                ),
                 ("Unknown", yellow, None),
                 ("Unknown (build evidence incomplete)", yellow, None),
-                ("Unknown · scan incomplete", yellow, Some("scan incomplete")),
                 ("unknown", yellow, None),
                 (
                     "Not applicable (package-managed binary)",
@@ -1884,6 +1914,11 @@ mod tests {
                     None,
                 ),
                 ("Loading...", egui::Color32::WHITE, None),
+                (
+                    "Checking recorded build inputs…",
+                    egui::Color32::WHITE,
+                    None,
+                ),
                 ("Unavailable", egui::Color32::WHITE, None),
                 ("-", egui::Color32::WHITE, None),
             ] {
@@ -1959,6 +1994,148 @@ mod tests {
     }
 
     #[test]
+    fn compact_uncompiled_changes_paint_each_clause_independently_and_copy_plain_text() {
+        let green = binary_current_color(Some(true)).unwrap();
+        let red = binary_current_color(Some(false)).unwrap();
+        let yellow = egui::Color32::from_rgb(255, 220, 100);
+        let white = egui::Color32::WHITE;
+        for tree in [false, true] {
+            for scale in [1.0, 2.0] {
+                for (clauses, searched, current) in [
+                    (
+                        vec![
+                            ("0 newer", green),
+                            ("1 missing", red),
+                            ("added: unknown", yellow),
+                            ("1815 inputs checked", white),
+                            ("full build status unknown", yellow),
+                        ],
+                        false,
+                        Some(false),
+                    ),
+                    (
+                        vec![
+                            ("2 newer", red),
+                            ("0 missing", green),
+                            ("added: 3", red),
+                            ("1 changed", red),
+                            ("2 touched unchanged", white),
+                            ("1815 inputs checked", white),
+                        ],
+                        false,
+                        Some(true),
+                    ),
+                    (
+                        vec![
+                            ("0 newer", green),
+                            ("0 missing", green),
+                            ("added: 0", green),
+                            ("0 changed", green),
+                            ("0 touched unchanged", white),
+                            ("1815 inputs checked", white),
+                            ("scan incomplete", yellow),
+                        ],
+                        true,
+                        None,
+                    ),
+                    (
+                        vec![("Unknown", yellow), ("scan incomplete", yellow)],
+                        false,
+                        None,
+                    ),
+                ] {
+                    let base = if searched {
+                        egui::Color32::from_rgb(255, 236, 170)
+                    } else {
+                        white
+                    };
+                    let value = clauses
+                        .iter()
+                        .map(|(clause, _)| *clause)
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    let row = InfoPopupRow {
+                        label: "Uncompiled changes".into(),
+                        scope: InfoFieldScope::Installation,
+                        value: value.clone(),
+                        searched,
+                        separator_before: false,
+                        // Executable identity colouring must not override input evidence.
+                        binary_is_current: current,
+                    };
+                    let ctx = egui::Context::default();
+                    ctx.set_pixels_per_point(scale);
+                    let mut data = if tree { tree_info() } else { window_info() };
+                    let editor = if let Some(tree) = &mut data.process_tree {
+                        tree.sections[0].rows.push(row);
+                        tree_frame(&ctx, &data, Vec::new()).1.remove(0)
+                    } else {
+                        data.rows.push(row);
+                        frame(&ctx, &data, Vec::new()).1
+                    };
+                    let layout = &editor.galley.job;
+                    let start = layout.text.rfind(&value).unwrap();
+                    let mut cursor = start;
+                    for (index, (clause, color)) in clauses.iter().enumerate() {
+                        if index > 0 {
+                            let separator = &layout.text[cursor..cursor + " · ".len()];
+                            assert_eq!(separator, " · ");
+                            for byte in cursor..cursor + separator.len() {
+                                let section = layout
+                                    .sections
+                                    .iter()
+                                    .find(|section| section.byte_range.contains(&byte))
+                                    .unwrap();
+                                assert_eq!(section.format.color, base);
+                            }
+                            cursor += separator.len();
+                        }
+                        for byte in cursor..cursor + clause.len() {
+                            let section = layout
+                                .sections
+                                .iter()
+                                .find(|section| section.byte_range.contains(&byte))
+                                .unwrap();
+                            assert_eq!(
+                                section.format.color,
+                                if *color == white { base } else { *color },
+                                "clause={clause}, tree={tree}, scale={scale}"
+                            );
+                        }
+                        cursor += clause.len();
+                    }
+                    assert_eq!(cursor, start + value.len());
+                    assert!(copy_shown_info(&data).contains(&value));
+                    let first = layout.text[..start].chars().count();
+                    let mut state = editor.state;
+                    state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(first),
+                            egui::text::CCursor::new(first + value.chars().count()),
+                        )));
+                    state.store(&ctx, editor.response.id);
+                    ctx.memory_mut(|memory| memory.request_focus(editor.response.id));
+                    let output = if tree {
+                        tree_frame(&ctx, &data, vec![egui::Event::Copy]).0
+                    } else {
+                        frame(&ctx, &data, vec![egui::Event::Copy]).0
+                    };
+                    assert!(
+                        output
+                            .platform_output
+                            .commands
+                            .iter()
+                            .any(|command| matches!(
+                                command, egui::OutputCommand::CopyText(copied) if copied == &value
+                            ))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn info_dividers_are_painted_in_blank_rows_without_changing_text_or_highlights() {
         let data = window_info();
         for scale in [1.0, 2.0] {
@@ -1975,7 +2152,11 @@ mod tests {
             assert_eq!(editor.galley.job.text, layout.text);
             assert_eq!(cursors.len(), 2);
             assert!(layout.text.contains("\n\nActive process"));
-            assert!(layout.text.contains("\n\nExecutable path"));
+            assert!(
+                layout
+                    .text
+                    .contains("\n\nRunning executable image original path")
+            );
             let lines: Vec<_> = output
                 .shapes
                 .iter()
@@ -2072,7 +2253,7 @@ mod tests {
             .collect();
         assert!(selected_text.contains("Window PID"));
         assert!(selected_text.contains("Active process"));
-        assert!(selected_text.contains("Executable path"));
+        assert!(selected_text.contains("Running executable image original path"));
         assert!(selected_text.contains("/usr/bin/codex"));
         let (output, _) = frame(&ctx, &data, vec![egui::Event::Copy]);
         assert!(output.platform_output.commands.iter().any(|command| {
@@ -2297,7 +2478,7 @@ mod tests {
                     let installed_value = format!("{browser} 2.0 ({installed})");
                     owner.rows = [
                         (
-                            "Version (ELF build ID)",
+                            "Executable Version (ELF build ID)",
                             running_value.as_str(),
                             InfoFieldScope::RunningInstance,
                         ),

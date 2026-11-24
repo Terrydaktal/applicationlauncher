@@ -400,6 +400,8 @@ pub enum InfoFieldScope {
     Neutral,
     Window,
     RunningInstance,
+    /// Application-specific runtime details, not generic OS process information.
+    InstanceContext,
     Installation,
 }
 

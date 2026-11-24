@@ -192,7 +192,7 @@ mod tests {
         let status = uncompiled_changes(&output, &File::open(&output).unwrap());
         assert_eq!(
             status,
-            "Yes · 2 inputs checked · 1 newer · 0 missing · added: unknown"
+            "1 newer · 0 missing · added: unknown · 2 inputs checked"
         );
         assert_eq!(
             fs::read_to_string(fixture.0.join("important.rsp")).unwrap(),
@@ -203,7 +203,7 @@ mod tests {
         let status = uncompiled_changes(&output, &File::open(&output).unwrap());
         assert_eq!(
             status,
-            "No newer recorded inputs detected · 2 inputs checked · 0 newer · 0 missing · added: unknown · full build status unknown"
+            "0 newer · 0 missing · added: unknown · 2 inputs checked · full build status unknown"
         );
     }
 
@@ -224,10 +224,10 @@ mod tests {
             200,
         );
         let status = uncompiled_changes(&output, &File::open(&output).unwrap());
-        assert!(status.starts_with("Yes"), "{status}");
+        assert!(status.starts_with("1 newer · "), "{status}");
         fixture.write("src/main.rs", "fn main() {}", 100);
         let status = uncompiled_changes(&output, &File::open(&output).unwrap());
-        assert!(!status.starts_with("Yes"), "{status}");
+        assert!(status.starts_with("0 newer · "), "{status}");
         assert!(!fixture.0.join("MUST_NOT_RUN").exists());
     }
 
