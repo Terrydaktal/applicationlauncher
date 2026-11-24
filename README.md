@@ -1006,8 +1006,12 @@ launcher source, same-user PID/start-bound activity marker and unique matching
 project session header identify its exact session file, including verified history
 migration identities. Restarts replay only supported launcher options, reuse the
 backend without installing anything, and never select `--session last`. Only the
-launcher's verified loopback SSH tunnel is treated as an owned helper; active
-tools and unrelated shell jobs still block a restart. After confirmation Pi is
+launcher's verified loopback SSH tunnel is treated as an owned helper. Its private
+connection supervisor may retain one Bash wrapper for a backgrounded `ssh()`
+function, but only with the worker's same sealed launcher image, arguments,
+process group, terminal and directory, and exactly the expected SSH child. Every
+link is revalidated and included in graceful-exit waiting; arbitrary wrappers,
+active tools and unrelated shell jobs still block a restart. After confirmation Pi is
 stopped gracefully and its launcher/tunnel must exit before its pane is recreated.
 The restored Pi must match the captured session, installed launcher/entry point and
 Node image, not merely have the same process title.

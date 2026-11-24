@@ -324,14 +324,15 @@ def owned_directory(path):
         raise Refused(f"Unsafe Pi metadata directory: {path}")
 
 
-def owned_json(path, header=False):
+def owned_json(path, header=False, private=False):
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor, "rb") as stream:
         metadata = os.fstat(stream.fileno())
         if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
-                or metadata.st_nlink != 1 or metadata.st_mode & 0o022):
+                or metadata.st_nlink != 1 or metadata.st_mode & 0o022
+                or (private and stat.S_IMODE(metadata.st_mode) != 0o600)):
             raise Refused("Unsafe Pi session/activity metadata")
-        limit = 16384 if header else 512 * 1024
+        limit = 16384 if header or private else 512 * 1024
         data = stream.readline(limit + 1) if header else stream.read(limit + 1)
         if len(data) > limit:
             raise Refused("Pi session/activity metadata exceeds its safety limit")
@@ -442,13 +443,11 @@ def pi_options(arguments):
     return result
 
 
-def pi_plan(saved):
-    launcher = process(saved["parent"])
+def pi_launcher_image(launcher):
     arguments = launcher["arguments"]
     if (kind(launcher) != "bash" or len(arguments) < 2
             or not arguments[1].startswith("/proc/self/fd/")
-            or not arguments[1].removeprefix("/proc/self/fd/").isdigit()
-            or any(launcher[key] != saved[key] for key in ("group", "tty", "cwd"))):
+            or not arguments[1].removeprefix("/proc/self/fd/").isdigit()):
         raise Refused("Pi requires its verified Radiance launcher; the Node process title alone is not a restart recipe")
     script = f"/proc/{launcher['pid']}/fd/{arguments[1].rsplit('/', 1)[1]}"
     if os.readlink(script) != f"/memfd:{PI_LAUNCHER} (deleted)":
@@ -460,6 +459,94 @@ def pi_plan(saved):
             raise Refused("Pi's original launcher source is not sealed")
     finally:
         os.close(descriptor)
+    return script
+
+
+def pi_connection(saved, launcher, supervisor, executable, remote, port):
+    """Accept only the private supervisor and its idle, sealed tunnel worker."""
+    paths = [os.fsdecode(value.partition(b"=")[2])
+             for value in read_limited(f"/proc/{saved['pid']}/environ", 128 * 1024).split(b"\0")
+             if value.startswith(b"QWEN_RADIANCE_CONNECTION_STATE=")]
+    if len(paths) != 1 or not Path(paths[0]).is_absolute():
+        raise Refused("Pi's backend connection state is unavailable or ambiguous")
+    path = Path(paths[0])
+    directory = path.parent.lstat()
+    if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid()
+            or stat.S_IMODE(directory.st_mode) != 0o700):
+        raise Refused("Unsafe Pi backend connection directory")
+    record, _ = owned_json(path, private=True)
+    expected = [str(Path(executable).with_name("pi-radiance-connection")),
+                "--state", str(path), "--parent-pid", str(launcher["pid"]),
+                "--launcher", executable, "--remote", remote, "--local-port", str(port)]
+    helper_file = os.lstat(expected[0])
+    if (not stat.S_ISREG(helper_file.st_mode) or helper_file.st_uid != os.getuid()
+            or helper_file.st_nlink != 1 or helper_file.st_mode & 0o022 or not helper_file.st_mode & 0o100
+            or supervisor["image"] != file_identity("/usr/bin/python3")
+            or supervisor["arguments"][1:] != expected
+            or supervisor["parent"] != launcher["pid"]
+            or any(supervisor[key] != launcher[key] for key in ("group", "tty", "cwd"))):
+        raise Refused("The Pi launcher has an unrelated backend connection helper")
+    timestamp = record.get("updated_at_unix_ms")
+    age = time.time_ns() // 1_000_000 - timestamp if type(timestamp) is int else None
+    if (record.get("schema") != "coherence.pi.backend-connection.v1"
+            or record.get("state") not in {"offline", "checking", "ready"}
+            or type(record.get("local_port")) is not int or record["local_port"] != port
+            or type(record.get("supervisor_pid")) is not int or record["supervisor_pid"] != supervisor["pid"]
+            or record.get("supervisor_start_ticks") != str(supervisor["start"])
+            or age is None or not -1000 <= age <= 3000):
+        raise Refused("Pi's backend connection receipt does not match its live supervisor")
+    descendants = []
+    worker_pids = children(supervisor["pid"])
+    if worker_pids:
+        if len(worker_pids) != 1:
+            raise Refused("Pi's backend connection has unrelated background jobs")
+        worker = process(worker_pids[0])
+        worker_script = pi_launcher_image(worker)
+        if (worker["arguments"][2:] != ["--backend-connection", "--reuse-existing", "--no-install",
+                                         "--remote", remote, "--local-port", str(port)]
+                or worker["parent"] != supervisor["pid"] or worker["group"] != worker["pid"]
+                or worker["tty"] != 0 or worker["cwd"] != launcher["cwd"]):
+            raise Refused("Pi's backend connection worker identity is unsupported")
+        tunnels = children(worker["pid"])
+        if len(tunnels) != 1:
+            raise Refused("Pi's backend connection is busy authenticating or warming up; retry when it settles")
+        descendants = [worker]
+        tunnel = process(tunnels[0])
+        if kind(tunnel) == "bash":
+            # A backgrounded ssh() shell function retains one launcher subshell.
+            if (tunnel["parent"] != worker["pid"] or tunnel["image"] != worker["image"]
+                    or tunnel["arguments"] != worker["arguments"]
+                    or any(tunnel[key] != worker[key] for key in ("group", "tty", "cwd"))
+                    or file_identity(pi_launcher_image(tunnel)) != file_identity(worker_script)):
+                raise Refused("Pi's backend connection has an unrelated SSH wrapper")
+            descendants.append(tunnel)
+            tunnels = children(tunnel["pid"])
+            if len(tunnels) != 1:
+                raise Refused("Pi's backend connection has an unrelated or busy SSH wrapper")
+            tunnel = process(tunnels[0])
+        if (kind(tunnel) != "ssh" or tunnel["parent"] != descendants[-1]["pid"]
+                or any(tunnel[key] != worker[key] for key in ("group", "tty", "cwd"))
+                or tunnel["arguments"][1:] != ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                    "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", "-N", "-T",
+                    "-o", "ExitOnForwardFailure=yes", "-L", f"127.0.0.1:{port}:127.0.0.1:8080", remote]
+                or children(tunnel["pid"])):
+            raise Refused("Pi's backend connection has an unrelated or busy SSH worker")
+        descendants.append(tunnel)
+    if (children(supervisor["pid"]) != worker_pids
+            or any(children(parent["pid"]) != [child["pid"]] for parent, child in zip(descendants, descendants[1:]))
+            or (descendants and children(descendants[-1]["pid"]))
+            or any(not same_process(value) for value in [supervisor, *descendants])):
+        raise Refused("Pi's backend connection changed during inspection; retry the preview")
+    return dict(state_path=str(path), supervisor_pid=supervisor["pid"],
+                supervisor_start_ticks=str(supervisor["start"]), local_port=port), descendants
+
+
+def pi_plan(saved, *, require_idle=True):
+    launcher = process(saved["parent"])
+    arguments = launcher["arguments"]
+    script = pi_launcher_image(launcher)
+    if any(launcher[key] != saved[key] for key in ("group", "tty", "cwd")):
+        raise Refused("Pi requires its verified Radiance launcher; the Node process title alone is not a restart recipe")
     activity = pi_activity(saved)
     session = pi_session(saved, activity)
     published = shutil.which(PI_LAUNCHER)
@@ -469,26 +556,35 @@ def pi_plan(saved):
     metadata = os.stat(executable)
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
         raise Refused("The installed Pi launcher is unsafe")
-    helpers = []
-    for pid in children(launcher["pid"]):
+    helpers, connection, descendants = [], None, []
+    remote = next((value for option, value in zip(arguments, arguments[1:]) if option == "--remote"), "lewis@ai")
+    for pid in children(launcher["pid"]) if require_idle else []:
         if pid == saved["pid"]:
             continue
         helper = process(pid)
         argv = helper["arguments"]
+        if kind(helper).startswith("python3"):
+            if connection is not None:
+                raise Refused("The Pi launcher has unrelated background jobs; only one backend connection is supported")
+            connection, descendants = pi_connection(saved, launcher, helper, executable, remote, activity["port"])
+            helpers.append(helper)
+            continue
         if (kind(helper) != "ssh" or helper["parent"] != launcher["pid"]
                 or any(helper[key] != launcher[key] for key in ("group", "tty"))
                 or argv[1:7] != ["-N", "-T", "-o", "ExitOnForwardFailure=yes", "-L", f"127.0.0.1:{activity['port']}:127.0.0.1:8080"]
-                or len(argv) != 8 or argv[7] != next((value for option, value in zip(arguments, arguments[1:]) if option == "--remote"), "lewis@ai")
+                or len(argv) != 8 or argv[7] != remote
                 or children(pid)):
             raise Refused("The Pi launcher has unrelated background jobs; only its verified SSH tunnel may be restarted")
         helpers.append(helper)
-    if len(helpers) > 1 or children(saved["pid"]):
+    if require_idle and (len(helpers) > 1 or children(saved["pid"])):
         raise Refused("Pi has active tool/background jobs; wait for it to become idle before restarting")
     entry = str((Path.home() / ".local/bin/pi").resolve(strict=True))
     result = dict(kind="pi", process=saved, launcher=launcher, helpers=helpers, cwd=saved["cwd"],
                   argv=[executable, *pi_options(arguments[2:]), "--session", session["session_file"]],
                   installed=file_identity(latest_binary("node")), launcher_image=file_identity(script),
                   installed_launcher=file_identity(executable), entry_point=entry, installed_entry=file_identity(entry), **session)
+    if connection is not None:
+        result.update(connection=connection, connection_descendants=descendants)
     if not same_process(saved) or not same_process(launcher):
         raise Refused("The Pi process or launcher changed during inspection")
     return result
@@ -1183,7 +1279,8 @@ def stop_program(program):
             or set(children(launcher["pid"])) != {saved["pid"], *(helper["pid"] for helper in program["helpers"])}
             or any(not same_process(helper) for helper in program["helpers"])):
         raise Refused("Pi's launcher changed or a tool is running; no interruption was attempted")
-    if signature(pi_plan(process(saved["pid"]))) != signature(program):
+    current = pi_plan(process(saved["pid"]))
+    if signature(current) != signature(program):
         raise Refused("Pi's session, installed application or launcher changed; no interruption was attempted")
     descriptor = os.pidfd_open(saved["pid"])
     try:
@@ -1193,7 +1290,7 @@ def stop_program(program):
     finally:
         os.close(descriptor)
     deadline = time.monotonic() + 5
-    processes = [saved, launcher, *program["helpers"]]
+    processes = [saved, launcher, *current["helpers"], *current.get("connection_descendants", [])]
     while time.monotonic() < deadline:
         if not any(same_process(value) for value in processes):
             return
