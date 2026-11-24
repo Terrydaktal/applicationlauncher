@@ -724,9 +724,10 @@ and confirmation workflow. Current or unknown terminal builds and unrelated proc
 terminal-update link. Cancelling the chooser leaves Show Info open without starting any work;
 up-to-date windows are never selected for restart.
 These operations use already built/installed binaries; they do not build or upgrade packages.
-The window-list context menu starts with **Show info** and uses **Close window**
-for closing the selected window. It also has **Update window** immediately above
-**Open window**. It opens the same **Update xfce4-terminal?** confirmation dialog
+The window-list context menu starts with **Show info**, **Open window**,
+**Open new window**, **Update window** and **Clone window**, in that order,
+and uses **Close window** for closing the selected window.
+**Update window** opens the same **Update xfce4-terminal?** confirmation dialog
 as Show Info, with **This window**, **All outdated windows** and **Cancel**.
 Opening the dialog starts no update. The target is the exact window owner, not
 its foreground program, tmux client or tmux server. This is currently enabled

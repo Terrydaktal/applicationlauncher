@@ -22,7 +22,7 @@ fn application_context_menus_offer_progs_for_both_panel_layouts_and_modes() {
 }
 
 #[test]
-fn window_context_menu_starts_with_show_info_and_labels_close_as_close_window() {
+fn window_context_menu_orders_info_open_new_update_clone_and_labels_close_as_close_window() {
     let view = include_str!("view.rs");
     let menu = view
         .split_once("overlay_response.clone().context_menu(|ui| {")
@@ -34,8 +34,24 @@ fn window_context_menu_starts_with_show_info_and_labels_close_as_close_window() 
         .split_once("// Volume Control")
         .unwrap()
         .0;
-    let first_button = menu.split_once("ui.button(").unwrap().1;
-    assert!(first_button.starts_with("\"Show info\""));
+    let actions = [
+        "ui.button(\"Show info\")",
+        "ui.button(\"Open window\")",
+        "ui.button(\"Open new window\")",
+        "window_update_action(ui, win)",
+        "ui.button(\"Clone window\")",
+    ];
+    let positions = actions.map(|action| {
+        assert_eq!(menu.matches(action).count(), 1, "{action}");
+        menu.find(action).unwrap()
+    });
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(
+        menu.split_once("ui.button(")
+            .unwrap()
+            .1
+            .starts_with("\"Show info\"")
+    );
     assert_eq!(menu.matches("ui.button(\"Show info\")").count(), 1);
     assert!(view.contains("ui.button(\"Close window\")"));
     assert!(!view.contains("ui.button(\"Close application\")"));

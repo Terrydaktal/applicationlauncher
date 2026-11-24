@@ -1056,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn update_window_menu_item_precedes_open_window_and_requires_the_shared_confirmation() {
+    fn update_window_menu_item_requires_the_shared_confirmation_and_keeps_open_independent() {
         fn render(
             ctx: &egui::Context,
             window: &WindowInfo,
@@ -1075,7 +1075,8 @@ mod tests {
                 |ctx| {
                     let mut target = None;
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        (target, actions.1) = super::super::view::window_open_actions(ui, window);
+                        actions.1 = ui.button("Open window").clicked();
+                        target = super::super::view::window_update_action(ui, window);
                     });
                     actions.0 = crate::popups::show_window_update_dialog(ctx, target);
                 },
@@ -1131,7 +1132,7 @@ mod tests {
             let (output, _, _) = render(&ctx, &window, vec![]);
             let update = button(&output, "Update window");
             let open = button(&output, "Open window");
-            assert!(update.y < open.y);
+            assert!(open.y < update.y);
             let (output, event, opened) = render(&ctx, &window, click(update));
             assert!(
                 event.is_none() && !opened,

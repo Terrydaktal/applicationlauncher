@@ -1,17 +1,16 @@
 use super::*;
 
-pub(super) fn window_open_actions(
+pub(super) fn window_update_action(
     ui: &mut egui::Ui,
     window: &WindowInfo,
-) -> (Option<InfoUpdateTarget>, bool) {
+) -> Option<InfoUpdateTarget> {
     let update = terminal_maintenance::window_update_target(window);
     let update_clicked = ui
         .add_enabled(update.is_some(), egui::Button::new("Update window"))
         .on_hover_text("Choose whether to update this xfce4-terminal window or all outdated terminal windows in place, preserving their position and size.")
         .on_disabled_hover_text("In-place window updates are currently supported only for xfce4-terminal.")
         .clicked();
-    let open = ui.button("Open window").clicked();
-    (update.filter(|_| update_clicked), open)
+    update.filter(|_| update_clicked)
 }
 
 pub(super) fn launcher_modal_open(ctx: &egui::Context) -> bool {
@@ -2095,10 +2094,10 @@ impl eframe::App for App {
                                                         self.open_window_info_popup(ctx, win.clone());
                                                         ui.close();
                                                     }
-                                                    if ui.button("Clone window").clicked() {
+                                                    if ui.button("Open window").clicked() {
                                                         self.active_pane = ActivePane::Windows;
                                                         self.selected_index = index;
-                                                        self.clone_window_and_exit(win, ctx);
+                                                        self.activate_and_exit(win.id.clone(), ctx);
                                                         ui.close();
                                                     }
                                                     if ui.button("Open new window").clicked() {
@@ -2107,15 +2106,14 @@ impl eframe::App for App {
                                                         self.launch_window_app_and_exit(win, ctx);
                                                         ui.close();
                                                     }
-                                                    let (update, open) = window_open_actions(ui, win);
-                                                    if let Some(target) = update {
+                                                    if let Some(target) = window_update_action(ui, win) {
                                                         pending_window_update = Some(target);
                                                         ui.close();
                                                     }
-                                                    if open {
+                                                    if ui.button("Clone window").clicked() {
                                                         self.active_pane = ActivePane::Windows;
                                                         self.selected_index = index;
-                                                        self.activate_and_exit(win.id.clone(), ctx);
+                                                        self.clone_window_and_exit(win, ctx);
                                                         ui.close();
                                                     }
                                                     // Volume Control
