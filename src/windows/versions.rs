@@ -485,8 +485,10 @@ fn probe_on_disk_candidate(
             chain: resolved.chain.clone(),
             identification:
                 "On-disk argv[0] candidate only; the running executable is inaccessible".into(),
+            desktop_image: Some(stamp),
             ..Default::default()
         });
+        application::collect_desktop_files(&mut result);
     }
     let unchanged = resolved.unchanged()
         && file
@@ -1139,6 +1141,7 @@ fn probe_process_with_source_policy(
         };
         launch.declare_window_entry(entry);
     }
+    application::collect_desktop_files(&mut result);
     if package_image.is_some() && !package_image_is_current() {
         if !launch_target_verified {
             result.running_latest_binary = None;

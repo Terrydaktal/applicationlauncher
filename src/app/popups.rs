@@ -5,6 +5,9 @@ use std::sync::atomic::AtomicBool;
 #[cfg(test)]
 mod applicability_tests;
 #[cfg(test)]
+mod desktop_entry_tests;
+mod desktop_files;
+#[cfg(test)]
 mod development_tests;
 mod tmux;
 
@@ -738,6 +741,11 @@ fn application_info_rows(state: &AppInfoPopup) -> Vec<InfoPopupRow> {
             details.is_none(),
             None,
         ),
+    );
+    desktop_files::append(
+        &mut rows,
+        Some(&state.app.desktop_file_path),
+        details.and_then(|info| info.desktop_files.as_ref()),
     );
     rows
 }
@@ -1762,12 +1770,18 @@ impl App {
         pending: bool,
     ) -> Vec<InfoPopupRow> {
         let entry = launch.and_then(|launch| launch.desktop_entry.as_ref());
-        desktop_entry_rows(
+        let mut rows = desktop_entry_rows(
             entry,
             launch.and_then(|launch| launch.desktop_exists),
             pending,
             None,
-        )
+        );
+        desktop_files::append(
+            &mut rows,
+            entry.map(|entry| entry.desktop_file_path.as_path()),
+            launch.and_then(|launch| launch.desktop_files.as_ref()),
+        );
+        rows
     }
 
     fn open_info_popup(&mut self, ctx: &egui::Context, target: InfoTarget) {

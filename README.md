@@ -128,6 +128,16 @@ and reads the current desktop fields without changing the independently resolved
 installation or claiming the old image is current. Missing installed icons stay
 missing; unrelated source-tree images are not guessed as application icons.
 
+The existing **Desktop file** value appends other current launchers targeting the
+same exact application file, plus same-ID copies hidden by XDG precedence. Paths
+include bracketed desktop IDs, effective/overridden state and target-match notes;
+different launch options remain distinct. The primary path stays first, and its
+Name, Comment and Icon are not replaced or merged. Ambiguous matches are listed
+without inventing a primary association or a historical launch route. A bounded,
+passive shared-reader search runs in detailed metadata workers and is cached with
+the Info snapshot, never while painting, copying or checking collapsed headers.
+Search failures remain bracketed explanations within the same field.
+
 The shared Qt 6/KDE reader follows supported compiled QStringLiteral arguments to
 loader-validated Qt metadata calls. It recovers complete fork suffixes without
 launching GUI applications or reading today's source version into an older image.

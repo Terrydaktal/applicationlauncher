@@ -6,6 +6,8 @@ use super::{AvailablePackageVersion, NpmTarget, PackageTarget, ProgsMetadata, in
 
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
 
+pub(crate) type DesktopFileSearch = Result<Vec<program_metadata::desktop::RelatedEntry>, String>;
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ApplicationLaunch {
     pub(crate) executable: Option<PathBuf>,
@@ -13,10 +15,22 @@ pub(crate) struct ApplicationLaunch {
     pub(crate) identification: String,
     pub(crate) desktop_entry: Option<crate::models::AppInfo>,
     pub(crate) desktop_exists: Option<bool>,
+    pub(crate) desktop_files: Option<DesktopFileSearch>,
+    pub(crate) desktop_image: Option<super::ExecutableIdentity>,
     pub(crate) published_target_verified: bool,
 }
 
 impl ApplicationLaunch {
+    pub(super) fn collect_desktop_files(&mut self) {
+        self.desktop_files = Some(search_desktop_files(
+            self.executable.as_deref(),
+            self.desktop_entry
+                .as_ref()
+                .map(|entry| entry.desktop_file_path.as_path()),
+            self.desktop_image,
+        ));
+    }
+
     pub(super) fn declare_window_entry(&mut self, entry: &crate::models::AppInfo) {
         if self.desktop_entry.is_none() {
             self.desktop_entry = Some(entry.clone());
@@ -27,6 +41,56 @@ impl ApplicationLaunch {
             self.identification.push_str("Desktop entry declared by the window; launcher target not verified against this process");
         }
     }
+}
+
+pub(super) fn collect_desktop_files(version: &mut super::ProcessVersion) {
+    for launch in [&mut version.launch, &mut version.application_launch]
+        .into_iter()
+        .flatten()
+    {
+        if launch.executable.is_some() || launch.desktop_entry.is_some() {
+            launch.collect_desktop_files();
+        }
+    }
+}
+
+fn search_desktop_files(
+    executable: Option<&Path>,
+    desktop: Option<&Path>,
+    expected: Option<super::ExecutableIdentity>,
+) -> DesktopFileSearch {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let image = executable
+        .and_then(|path| {
+            File::options()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+                .ok()
+        })
+        .filter(|file| file.metadata().is_ok_and(|metadata| metadata.is_file()));
+    let stamp = image
+        .as_ref()
+        .and_then(|file| file.metadata().ok())
+        .map(|metadata| super::executable_identity(&metadata));
+    if expected.is_some() && expected != stamp {
+        return Err("application target changed or is unavailable since metadata capture".into());
+    }
+    let result = program_metadata::desktop::related_entries(
+        image.as_ref(),
+        desktop,
+        std::time::Instant::now() + std::time::Duration::from_millis(500),
+    );
+    if stamp.is_some()
+        && executable
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|metadata| super::executable_identity(&metadata))
+            != stamp
+    {
+        return Err("application target changed during desktop-file search".into());
+    }
+    result
 }
 
 fn desktop_exists(path: &Path) -> Option<bool> {
@@ -98,7 +162,7 @@ pub(super) fn associate_running_desktop(
             launch.identification.push_str("; ");
         }
         launch.identification.push_str(
-            "Current desktop-entry route matches the pinned running image; this does not identify the current published installation",
+            "Current desktop metadata is associated with the pinned running image; this does not prove the historical launch route or identify the current published installation",
         );
     }
 }
@@ -131,6 +195,7 @@ pub(crate) struct ApplicationInfo {
     pub(crate) launcher_resolved: Option<PathBuf>,
     pub(crate) launcher_exists: bool,
     pub(crate) desktop_exists: Option<bool>,
+    pub(crate) desktop_files: Option<DesktopFileSearch>,
     pub(crate) chain: Vec<PathBuf>,
     pub(crate) resolution: String,
     pub(crate) executable: Option<PathBuf>,
@@ -234,6 +299,8 @@ pub(super) fn process_launch(
                 desktop_entry: Some(entry),
                 desktop_exists: Some(true),
                 published_target_verified: true,
+                desktop_image: expected.as_ref().map(super::executable_identity),
+                ..Default::default()
             };
         }
     }
@@ -268,11 +335,22 @@ pub(super) fn process_launch(
         chain: resolved.chain,
         identification,
         published_target_verified: unchanged && installed.is_published(),
+        desktop_image: unchanged
+            .then(|| expected.as_ref().map(super::executable_identity))
+            .flatten(),
         ..Default::default()
     }
 }
 
 pub(crate) fn inspect_application(exec: &str, desktop_file: &Path) -> ApplicationInfo {
+    let mut result = inspect_application_details(exec, desktop_file);
+    if result.desktop_files.is_none() {
+        result.desktop_files = Some(search_desktop_files(None, Some(desktop_file), None));
+    }
+    result
+}
+
+fn inspect_application_details(exec: &str, desktop_file: &Path) -> ApplicationInfo {
     let mut result = ApplicationInfo {
         desktop_exists: desktop_exists(desktop_file),
         ..Default::default()
@@ -430,6 +508,141 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn related_desktop_search_is_shared_by_installed_and_process_info_and_rejects_replaced_images()
+    {
+        const CHILD: &str = "APPLICATIONLAUNCHER_DESKTOP_RELATIONS_CHILD";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let executable = root.join("tool");
+            let selected = root.join("user/applications/tool.desktop");
+            let entry = crate::models::AppInfo {
+                name: "Selected name".into(),
+                exec: executable.display().to_string(),
+                desktop_file_path: selected.clone(),
+                icon_path: None,
+                comment: None,
+                is_settings_module: false,
+            };
+            let mut launch = ApplicationLaunch {
+                executable: Some(executable.clone()),
+                desktop_image: Some(super::super::executable_identity(
+                    &std::fs::metadata(&executable).unwrap(),
+                )),
+                desktop_entry: Some(entry),
+                desktop_exists: Some(true),
+                ..Default::default()
+            };
+            launch.collect_desktop_files();
+            let records = launch.desktop_files.as_ref().unwrap().as_ref().unwrap();
+            assert_eq!(records.len(), 3);
+            assert_eq!(launch.desktop_entry.as_ref().unwrap().name, "Selected name");
+            let installed = inspect_application(executable.to_str().unwrap(), &selected);
+            assert_eq!(installed.desktop_files, launch.desktop_files);
+            std::fs::rename(&executable, root.join("old-image")).unwrap();
+            std::fs::copy(root.join("other"), &executable).unwrap();
+            launch.collect_desktop_files();
+            assert!(
+                launch
+                    .desktop_files
+                    .as_ref()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap_err()
+                    .contains("changed")
+            );
+            return;
+        }
+        let fixture = Fixture::new();
+        let executable = fixture.elf("tool");
+        let other = fixture.elf("other");
+        for directory in ["user/applications", "system/applications"] {
+            std::fs::create_dir_all(fixture.0.join(directory)).unwrap();
+        }
+        for (path, target) in [
+            ("user/applications/tool.desktop", &executable),
+            ("system/applications/tool.desktop", &other),
+            ("system/applications/tool-private.desktop", &executable),
+        ] {
+            fixture.file(
+                path,
+                format!(
+                    "[Desktop Entry]\nType=Application\nName=Tool\nExec={} --fixture\n",
+                    target.display()
+                ),
+            );
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "windows::versions::application::tests::related_desktop_search_is_shared_by_installed_and_process_info_and_rejects_replaced_images", "--nocapture"])
+            .env(CHILD, &fixture.0)
+            .env("XDG_DATA_HOME", fixture.0.join("user"))
+            .env("XDG_DATA_DIRS", fixture.0.join("system"))
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn reused_desktop_candidates_are_reread_and_reject_changed_routes_and_ambiguity() {
+        let fixture = Fixture::new();
+        let executable = fixture.elf("program");
+        let other = fixture.elf("other");
+        let desktop = fixture.file(
+            "tool.desktop",
+            format!(
+                "[Desktop Entry]\nType=Application\nName=Stale Name\nExec={}\n",
+                executable.display()
+            ),
+        );
+        let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let stale = program_metadata::desktop::read(&desktop, None, deadline()).unwrap();
+        let candidates = vec![(desktop.clone(), stale)];
+        let pinned = File::open(&executable).unwrap();
+        let inspect = |matches: &[(PathBuf, program_metadata::desktop::Entry)]| {
+            let mut launch = ApplicationLaunch {
+                executable: Some(executable.clone()),
+                ..Default::default()
+            };
+            associate_installed_desktop_from_matches(&mut launch, &pinned, matches);
+            launch
+        };
+        fixture.file(
+            "tool.desktop",
+            format!(
+                "[Desktop Entry]\nType=Application\nName=Fresh Name\nExec={}\n",
+                executable.display()
+            ),
+        );
+        assert_eq!(
+            inspect(&candidates).desktop_entry.unwrap().name,
+            "Fresh Name"
+        );
+        let duplicated = vec![candidates[0].clone(), candidates[0].clone()];
+        assert!(inspect(&duplicated).desktop_entry.is_none());
+        fixture.file(
+            "tool.desktop",
+            format!(
+                "[Desktop Entry]\nType=Application\nName=Wrong Image\nExec={}\n",
+                other.display()
+            ),
+        );
+        assert!(inspect(&candidates).desktop_entry.is_none());
+        fixture.file(
+            "tool.desktop",
+            format!(
+                "[Desktop Entry]\nType=Application\nName=Hidden\nHidden=true\nExec={}\n",
+                executable.display()
+            ),
+        );
+        assert!(inspect(&candidates).desktop_entry.is_none());
+        std::fs::remove_file(desktop).unwrap();
+        assert!(inspect(&candidates).desktop_entry.is_none());
     }
 
     #[test]
@@ -592,7 +805,7 @@ mod tests {
         assert!(
             launch
                 .identification
-                .contains("does not identify the current published installation")
+                .contains("does not prove the historical launch route or identify the current published installation")
         );
     }
 
