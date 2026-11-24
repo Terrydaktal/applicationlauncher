@@ -5,13 +5,12 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use super::{ProcessVersion, ProcessVersionTarget, probe_header_checked, probe_version_checked};
+use super::{ProcessVersion, ProcessVersionTarget, probe_header_checked, probe_version_deferred};
 use crate::models::{ProcessIdentity, ProcessInfoNode};
 use crate::windows::process_tree::process_identity_is_current;
 
 const MAX_PENDING: usize = 16;
 const MAX_RESULTS: usize = 512;
-const CANDIDATE_REFRESH: Duration = Duration::from_secs(10);
 pub(crate) const PI_RECEIPT_REFRESH: Duration = Duration::from_secs(2);
 pub(crate) const SCRIPT_METADATA_REFRESH: Duration = Duration::from_secs(2);
 #[cfg(test)]
@@ -34,6 +33,8 @@ struct Request {
     executable_snapshot: ExecutableSnapshot,
     target: ProcessVersionTarget,
     include_packages: bool,
+    cwd: Option<PathBuf>,
+    script_refresh: Option<ScriptSnapshot>,
 }
 
 enum PackageLookup {
@@ -113,6 +114,7 @@ struct State {
     pending: VecDeque<Request>,
     packages: VecDeque<PackageRequest>,
     receipts: VecDeque<ReceiptRequest>,
+    sources: VecDeque<source_checks::Request>,
     receipt_pending: HashSet<ProcessIdentity>,
     receipt_checked: HashMap<ProcessIdentity, Instant>,
     script_checked: HashMap<ProcessIdentity, Instant>,
@@ -120,6 +122,26 @@ struct State {
     script_pending: HashSet<ProcessIdentity>,
     results: HashMap<ProcessIdentity, Option<Arc<ProcessVersion>>>,
     detailed: HashSet<ProcessIdentity>,
+    detail_pending: HashSet<ProcessIdentity>,
+}
+
+impl State {
+    fn invalidate(&mut self, identity: ProcessIdentity) {
+        self.results.remove(&identity);
+        self.detailed.remove(&identity);
+        self.detail_pending.remove(&identity);
+        self.metadata_checked.remove(&identity);
+        self.active_revisions.remove(&identity);
+        self.pending.retain(|request| request.identity != identity);
+        self.receipts.retain(|request| request.identity != identity);
+        self.receipt_pending.remove(&identity);
+        self.receipt_checked.remove(&identity);
+        self.script_checked.remove(&identity);
+        self.script_snapshots.remove(&identity);
+        self.script_pending.remove(&identity);
+        self.packages.retain(|request| request.identity != identity);
+        self.sources.retain(|request| request.identity != identity);
+    }
 }
 
 pub(crate) struct ProcessVersionCache {
@@ -127,12 +149,26 @@ pub(crate) struct ProcessVersionCache {
 }
 
 impl ProcessVersionCache {
+    #[cfg(test)]
+    pub(crate) fn with_test_probe(
+        ctx: egui::Context,
+        viewport: egui::ViewportId,
+        probe: impl Fn(ProcessIdentity) -> ProcessVersion + Send + 'static,
+    ) -> Self {
+        Self::start_with_packages(
+            ctx,
+            viewport,
+            move |request| probe(request.identity),
+            |_| None,
+        )
+    }
+
     pub(crate) fn new(ctx: egui::Context, viewport_id: egui::ViewportId) -> Self {
         Self::start(ctx, viewport_id, |request| {
             let current =
                 || process_identity_is_current(request.identity, request.executable_identity);
             if request.include_packages {
-                probe_version_checked(&request.target, current)
+                probe_version_deferred(&request.target, current)
             } else {
                 probe_header_checked(&request.target, current)
             }
@@ -199,137 +235,172 @@ impl ProcessVersionCache {
         + Send
         + 'static,
     ) -> Self {
+        Self::start_with_source_checks(
+            ctx,
+            viewport_id,
+            probe,
+            package_probe,
+            receipt_probe,
+            source_checks::inspect,
+        )
+    }
+
+    fn start_with_source_checks(
+        ctx: egui::Context,
+        viewport_id: egui::ViewportId,
+        probe: impl Fn(&Request) -> ProcessVersion + Send + 'static,
+        package_probe: impl Fn(&PackageRequest) -> Option<super::AvailablePackageVersion>
+        + Send
+        + 'static,
+        receipt_probe: impl Fn(&ReceiptRequest) -> (super::NodeApplication, super::PiBuildEvidence)
+        + Send
+        + 'static,
+        source_probe: impl Fn(&source_checks::Request) -> String + Send + 'static,
+    ) -> Self {
         let shared: Arc<(Mutex<State>, Condvar)> = Arc::default();
+        source_checks::start(Arc::clone(&shared), ctx.clone(), viewport_id, source_probe);
         let worker_shared = Arc::clone(&shared);
         let package_shared = Arc::clone(&shared);
         let receipt_shared = Arc::clone(&shared);
         let package_ctx = ctx.clone();
         let receipt_ctx = ctx.clone();
-        applicationlauncher::observability::spawn_named(
-            "process-info-pi-receipts",
-            move |worker| {
-                loop {
-                    worker.set_state("waiting-for-expanded-pi-section");
-                    let request = {
-                        let mut state = receipt_shared
-                            .0
-                            .lock()
+        applicationlauncher::spawn_worker!("process-info-pi-receipts", move |worker| {
+            loop {
+                applicationlauncher::observe! { worker.set_state("waiting-for-expanded-pi-section"); }
+                let request = {
+                    let mut state = receipt_shared
+                        .0
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    while !state.stopped && state.receipts.is_empty() {
+                        state = receipt_shared
+                            .1
+                            .wait(state)
                             .unwrap_or_else(|error| error.into_inner());
-                        while !state.stopped && state.receipts.is_empty() {
-                            state = receipt_shared
-                                .1
-                                .wait(state)
-                                .unwrap_or_else(|error| error.into_inner());
-                        }
-                        if state.stopped {
-                            break;
-                        }
-                        state.receipts.pop_front().unwrap()
-                    };
-                    worker.set_state("reading-pi-build-receipt");
-                    let (application, evidence) = receipt_probe(&request);
-                    let updated_launch =
-                        (application.entry_point != request.application.entry_point).then(|| {
-                            super::application::process_launch(
-                                &application.entry_point,
-                                super::installation::installed_executable(&application.entry_point)
-                                    .as_ref(),
-                                request.desktop_entry.as_ref(),
-                            )
-                        });
-                    let publish = {
-                        let mut state = receipt_shared
-                            .0
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner());
-                        if state.stopped {
-                            break;
-                        }
-                        if state.generation != request.generation
-                            || state.active_revisions.get(&request.identity)
-                                != Some(&request.revision)
-                        {
-                            continue;
-                        }
-                        state.receipt_pending.remove(&request.identity);
-                        if let Some(Some(version)) = state.results.get_mut(&request.identity) {
-                            let version = Arc::make_mut(version);
-                            version.application = Some(application);
-                            version.application_build = Some(evidence);
-                            if let Some(launch) = updated_launch {
-                                version.application_launch = Some(launch);
-                            }
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if publish {
-                        receipt_ctx.request_repaint_of(egui::ViewportId::ROOT);
-                        receipt_ctx.request_repaint_of(viewport_id);
                     }
-                }
-            },
-        );
-        applicationlauncher::observability::spawn_named(
-            "process-info-package-versions",
-            move |worker| {
-                // One bounded lookup per expanded process; no timer or idle polling.
-                loop {
-                    worker.set_state("waiting-for-package-request");
-                    let request = {
-                        let (mutex, wake) = &*package_shared;
-                        let mut state = mutex.lock().unwrap_or_else(|error| error.into_inner());
-                        while !state.stopped && state.packages.is_empty() {
-                            state = wake.wait(state).unwrap_or_else(|error| error.into_inner());
-                        }
-                        if state.stopped {
-                            break;
-                        }
-                        state.packages.pop_front().unwrap()
-                    };
-                    worker.set_state(match &request.target {
-                        PackageLookup::System(_) => "querying-pacman-or-aur",
-                        PackageLookup::Npm(_) => "querying-npm-registry",
+                    if state.stopped {
+                        break;
+                    }
+                    state.receipts.pop_front().unwrap()
+                };
+                applicationlauncher::observe! { worker.set_state("reading-pi-build-receipt"); }
+                let (application, evidence) = receipt_probe(&request);
+                let updated_launch = (application.entry_point != request.application.entry_point)
+                    .then(|| {
+                        super::application::process_launch(
+                            &application.entry_point,
+                            super::installation::installed_executable(&application.entry_point)
+                                .as_ref(),
+                            request.desktop_entry.as_ref(),
+                        )
                     });
-                    let result = package_probe(&request)
-                        .unwrap_or_else(|| "Unavailable (package lookup failed)".into());
-                    let publish = {
-                        let mut state = package_shared
-                            .0
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner());
-                        if state.stopped {
-                            break;
-                        }
-                        if state.generation != request.generation
-                            || state.active_revisions.get(&request.identity)
-                                != Some(&request.revision)
-                        {
-                            continue;
-                        }
-                        if let Some(Some(version)) = state.results.get_mut(&request.identity) {
-                            let version = Arc::make_mut(version);
-                            request
-                                .target
-                                .set_result(version, request.application, result);
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if publish {
-                        package_ctx.request_repaint_of(egui::ViewportId::ROOT);
-                        package_ctx.request_repaint_of(viewport_id);
+                // Lightweight refresh must not rescan source/build metadata.
+                // Keep captured facts only while their exact entry artifact is
+                // unchanged; validate off-lock before publishing this reply.
+                let development_current = updated_launch.is_none()
+                    && request.development.as_ref().is_none_or(|metadata| {
+                        super::development::artifact_unchanged(&application.entry_point, metadata)
+                    });
+                let publish = {
+                    let mut state = receipt_shared
+                        .0
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if state.stopped {
+                        break;
                     }
+                    if state.generation != request.generation
+                        || state.active_revisions.get(&request.identity) != Some(&request.revision)
+                    {
+                        continue;
+                    }
+                    state.receipt_pending.remove(&request.identity);
+                    if let Some(Some(version)) = state.results.get_mut(&request.identity) {
+                        let version = Arc::make_mut(version);
+                        version.application = Some(application);
+                        version.application_build = Some(evidence);
+                        if !development_current {
+                            version.application_development = None;
+                        }
+                        if let Some(launch) = updated_launch {
+                            version.application_launch = Some(launch);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if publish {
+                    receipt_ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    receipt_ctx.request_repaint_of(viewport_id);
                 }
-            },
-        );
-        applicationlauncher::observability::spawn_named("process-info-versions", move |worker| {
-            // Header checks and expanded metadata share a bounded worker; idle queues sleep.
+            }
+        },);
+        applicationlauncher::spawn_worker!("process-info-package-versions", move |worker| {
+            // One bounded lookup per expanded process; no timer or idle polling.
             loop {
                 applicationlauncher::observe! { worker.set_state("waiting-for-package-request"); }
                 let request = {
+                    let (mutex, wake) = &*package_shared;
+                    let mut state = mutex.lock().unwrap_or_else(|error| error.into_inner());
+                    while !state.stopped && state.packages.is_empty() {
+                        state = wake.wait(state).unwrap_or_else(|error| error.into_inner());
+                    }
+                    if state.stopped {
+                        break;
+                    }
+                    state.packages.pop_front().unwrap()
+                };
+                applicationlauncher::observe! { worker.set_state(match &request.target {
+                    PackageLookup::System(_) => "querying-pacman-or-aur",
+                    PackageLookup::Npm(_) => "querying-npm-registry",
+                }); }
+                let result = package_probe(&request)
+                    .unwrap_or_else(|| "Unavailable (package lookup failed)".into());
+                // The app's fd can close or be reused during a registry query.
+                // Validate outside the state lock; never restore such an app's
+                // package field after its script metadata has been discarded.
+                if request
+                    .descriptor
+                    .as_ref()
+                    .is_some_and(|source| !source.unchanged())
+                {
+                    continue;
+                }
+                let publish = {
+                    let mut state = package_shared
+                        .0
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if state.stopped {
+                        break;
+                    }
+                    if state.generation != request.generation
+                        || state.active_revisions.get(&request.identity) != Some(&request.revision)
+                    {
+                        continue;
+                    }
+                    if let Some(Some(version)) = state.results.get_mut(&request.identity) {
+                        let version = Arc::make_mut(version);
+                        request
+                            .target
+                            .set_result(version, request.application, result);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if publish {
+                    package_ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    package_ctx.request_repaint_of(viewport_id);
+                }
+            }
+        },);
+        applicationlauncher::spawn_worker!("process-info-versions", move |worker| {
+            // Header checks and expanded metadata share a bounded worker; idle queues sleep.
+            loop {
+                applicationlauncher::observe! { worker.set_state("waiting-for-process-info-request"); }
+                let mut request = {
                     let (mutex, wake) = &*worker_shared;
                     let mut state = mutex.lock().unwrap_or_else(|error| error.into_inner());
                     while !state.stopped && state.pending.is_empty() {
@@ -338,10 +409,54 @@ impl ProcessVersionCache {
                     if state.stopped {
                         break;
                     }
-                    state.pending.pop_front().unwrap()
+                    // Visible details must not wait for every collapsed ancestor.
+                    let next = state
+                        .pending
+                        .iter()
+                        .position(|request| {
+                            request.include_packages && request.script_refresh.is_none()
+                        })
+                        .unwrap_or(0);
+                    state.pending.remove(next).unwrap()
                 };
-                worker.set_state("probing-process-info");
+                if let Some(previous) = &request.script_refresh {
+                    let unchanged = previous.current() == *previous;
+                    let mut state = worker_shared
+                        .0
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if state.stopped {
+                        break;
+                    }
+                    if state.generation != request.generation
+                        || state.active_revisions.get(&request.identity) != Some(&request.revision)
+                    {
+                        continue;
+                    }
+                    if unchanged {
+                        state.script_pending.remove(&request.identity);
+                        state
+                            .script_checked
+                            .insert(request.identity, Instant::now());
+                        continue;
+                    }
+                    // Only a real change invalidates older metadata/package
+                    // replies. Unchanged fingerprints never reprobe runtimes.
+                    state.next_revision = state.next_revision.wrapping_add(1);
+                    request.revision = state.next_revision;
+                    state
+                        .active_revisions
+                        .insert(request.identity, request.revision);
+                }
+                applicationlauncher::observe! { worker.set_state("probing-process-info"); }
                 let mut version = probe(&request);
+                version.details_pending = !request.include_packages;
+                let mut script_snapshot =
+                    ScriptSnapshot::for_version(&version, request.cwd.as_deref());
+                version.discard_changed_python_modules();
+                if version.discard_changed_script_metadata() {
+                    script_snapshot = None;
+                }
                 let publish = {
                     let mut state = worker_shared
                         .0
@@ -353,6 +468,15 @@ impl ProcessVersionCache {
                     if state.generation == request.generation
                         && state.active_revisions.get(&request.identity) == Some(&request.revision)
                     {
+                        state.script_pending.remove(&request.identity);
+                        state
+                            .script_checked
+                            .insert(request.identity, Instant::now());
+                        if let Some(snapshot) = script_snapshot {
+                            state.script_snapshots.insert(request.identity, snapshot);
+                        } else {
+                            state.script_snapshots.remove(&request.identity);
+                        }
                         if version
                             .application
                             .as_ref()
@@ -364,6 +488,8 @@ impl ProcessVersionCache {
                         }
                         if request.include_packages {
                             state.detailed.insert(request.identity);
+                            state.detail_pending.remove(&request.identity);
+                            source_checks::enqueue(&mut state, &request, &mut version);
                             for (target, application) in [
                                 (
                                     version.package_target.clone().map(PackageLookup::System),
@@ -441,6 +567,7 @@ impl ProcessVersionCache {
         state.generation = state.generation.wrapping_add(1);
         state.pending.clear();
         state.packages.clear();
+        state.sources.clear();
         state.receipts.clear();
         state.receipt_pending.clear();
         state.receipt_checked.clear();
@@ -451,6 +578,7 @@ impl ProcessVersionCache {
         state.active_revisions.clear();
         state.metadata_checked.clear();
         state.detailed.clear();
+        state.detail_pending.clear();
     }
 
     #[cfg(test)]
@@ -504,40 +632,17 @@ impl ProcessVersionCache {
         if state
             .metadata_checked
             .get(&node.identity)
-            .is_some_and(|(checked, executable)| {
-                !executable.matches(node)
-                    || (node.executable.is_none()
-                        && checked.elapsed() >= CANDIDATE_REFRESH
-                        && state
-                            .results
-                            .get(&node.identity)
-                            .is_some_and(Option::is_some))
-            })
+            .is_some_and(|(_, executable)| !executable.matches(node))
         {
-            state.results.remove(&node.identity);
-            state.detailed.remove(&node.identity);
-            state.metadata_checked.remove(&node.identity);
-            state.active_revisions.remove(&node.identity);
-            state
-                .pending
-                .retain(|request| request.identity != node.identity);
-            state
-                .receipts
-                .retain(|request| request.identity != node.identity);
-            state.receipt_pending.remove(&node.identity);
-            state.receipt_checked.remove(&node.identity);
-            state
-                .packages
-                .retain(|request| request.identity != node.identity);
+            state.invalidate(node.identity);
         }
+        let cached = state.results.get(&node.identity).cloned().flatten();
+        let upgrade_header = include_packages
+            && !state.detailed.contains(&node.identity)
+            && !state.detail_pending.contains(&node.identity)
+            && cached.is_some();
         if include_packages && !state.detailed.contains(&node.identity) {
-            if state
-                .results
-                .get(&node.identity)
-                .is_some_and(Option::is_some)
-            {
-                state.results.remove(&node.identity);
-            } else if let Some(request) = state
+            if let Some(request) = state
                 .pending
                 .iter_mut()
                 .find(|request| request.identity == node.identity && !request.include_packages)
@@ -547,10 +652,67 @@ impl ProcessVersionCache {
                 request.target.application_entry = application.map(|(entry, _)| entry.clone());
                 request.target.window_declared_entry =
                     application.is_some_and(|(_, declared)| declared);
-                return None;
+                state.detail_pending.insert(node.identity);
+                return cached;
             }
         }
-        if let Some(result) = state.results.get(&node.identity).cloned() {
+        if let Some(result) = state
+            .results
+            .get(&node.identity)
+            .cloned()
+            .filter(|_| !upgrade_header)
+        {
+            if refresh_receipt
+                && include_packages
+                && result.is_some()
+                && state.pending.len() < MAX_PENDING
+                && !state.script_pending.contains(&node.identity)
+                && state
+                    .script_checked
+                    .get(&node.identity)
+                    .is_none_or(|checked| checked.elapsed() >= SCRIPT_METADATA_REFRESH)
+                && let Some(snapshot) = state.script_snapshots.get(&node.identity).cloned()
+            {
+                let application = application();
+                let generation = state.generation;
+                let revision = state
+                    .active_revisions
+                    .get(&node.identity)
+                    .copied()
+                    .unwrap_or_default();
+                state.script_pending.insert(node.identity);
+                state.script_checked.insert(node.identity, Instant::now());
+                state.pending.push_back(Request {
+                    generation,
+                    revision,
+                    identity: node.identity,
+                    executable_identity: node.executable_identity,
+                    executable_snapshot: ExecutableSnapshot::of(node),
+                    include_packages: true,
+                    cwd: node.cwd.clone(),
+                    script_refresh: Some(snapshot),
+                    target: ProcessVersionTarget {
+                        pid: node.identity.pid,
+                        executable: node
+                            .executable
+                            .clone()
+                            .or_else(|| node.raw_argv0.clone())
+                            .unwrap_or_default(),
+                        launch_context: super::ProcessLaunchContext {
+                            raw_argv0: node.raw_argv0.clone(),
+                            executable_unavailable: node.executable.is_none().then_some(
+                                node.executable_error
+                                    .unwrap_or("process executable unavailable"),
+                            ),
+                        },
+                        program: Some(node.name.clone()),
+                        application_entry: application.map(|(entry, _)| entry.clone()),
+                        window_declared_entry: application.is_some_and(|(_, declared)| declared),
+                    },
+                });
+                self.shared.1.notify_all();
+                return result;
+            }
             if refresh_receipt
                 && let Some(application) = result
                     .as_ref()
@@ -602,8 +764,10 @@ impl ProcessVersionCache {
                 ..Default::default()
             }));
         };
-        if state.results.len() >= MAX_RESULTS || state.pending.len() >= MAX_PENDING {
-            return None;
+        if (state.results.len() >= MAX_RESULTS && cached.is_none())
+            || state.pending.len() >= MAX_PENDING
+        {
+            return cached;
         }
         let generation = state.generation;
         state.next_revision = state.next_revision.wrapping_add(1);
@@ -617,6 +781,9 @@ impl ProcessVersionCache {
             (Instant::now(), ExecutableSnapshot::of(node)),
         );
         let application = application();
+        if include_packages {
+            state.detail_pending.insert(node.identity);
+        }
         state.pending.push_back(Request {
             generation,
             revision,
@@ -641,9 +808,11 @@ impl ProcessVersionCache {
                 window_declared_entry: application.is_some_and(|(_, declared)| declared),
             },
         });
-        state.results.insert(node.identity, None);
+        // Retain cheap header evidence (notably current-build highlighting)
+        // while the expanded metadata request is queued or in flight.
+        state.results.entry(node.identity).or_insert(None);
         self.shared.1.notify_all();
-        None
+        cached
     }
 }
 
@@ -657,6 +826,7 @@ impl Drop for ProcessVersionCache {
         state.stopped = true;
         state.pending.clear();
         state.packages.clear();
+        state.sources.clear();
         state.receipts.clear();
         state.receipt_pending.clear();
         self.shared.1.notify_all();
@@ -669,7 +839,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    fn node(pid: i32) -> ProcessInfoNode {
+    pub(super) fn node(pid: i32) -> ProcessInfoNode {
         ProcessInfoNode {
             identity: ProcessIdentity {
                 pid,
@@ -990,24 +1160,40 @@ mod tests {
     }
 
     #[test]
-    fn inferred_candidate_refresh_is_worker_only_and_does_not_stale_verified_metadata() {
+    fn unreadable_executable_keeps_candidate_and_package_metadata_without_timed_refresh() {
         let probes = Arc::new(AtomicUsize::new(0));
         let count = probes.clone();
-        let cache = ProcessVersionCache::start(
+        let packages = Arc::new(AtomicUsize::new(0));
+        let package_count = packages.clone();
+        let cache = ProcessVersionCache::start_with_packages(
             egui::Context::default(),
             egui::ViewportId::ROOT,
             move |_| ProcessVersion {
                 latest_version: Some(format!("revision {}", count.fetch_add(1, Ordering::SeqCst))),
+                package_target: Some(super::super::PackageTarget {
+                    name: "systemd".into(),
+                    inferred: false,
+                }),
                 ..Default::default()
+            },
+            move |_| {
+                package_count.fetch_add(1, Ordering::SeqCst);
+                Some(crate::windows::versions::available_package_fixture(
+                    super::super::PackageVersionSource::Pacman,
+                    "core/systemd 262-1",
+                ))
             },
         );
         let mut missing = node(1);
         missing.executable = None;
+        missing.executable_error = Some("Permission denied reading process executable");
         missing.raw_argv0 = Some("/candidate/not-statted-by-renderer".into());
         let wait = |process: &ProcessInfoNode| {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
-                if let Some(result) = cache.request(process) {
+                if let Some(result) = cache.request(process)
+                    && result.latest_package_version.is_some()
+                {
                     break result;
                 }
                 assert!(Instant::now() < deadline);
@@ -1015,18 +1201,33 @@ mod tests {
             }
         };
         assert_eq!(wait(&missing).latest_version.as_deref(), Some("revision 0"));
-        cache
-            .shared
-            .0
-            .lock()
-            .unwrap()
-            .metadata_checked
-            .get_mut(&missing.identity)
-            .unwrap()
-            .0 = Instant::now() - CANDIDATE_REFRESH;
-        assert_eq!(wait(&missing).latest_version.as_deref(), Some("revision 1"));
+        for age in [10, 20, 3600] {
+            cache
+                .shared
+                .0
+                .lock()
+                .unwrap()
+                .metadata_checked
+                .get_mut(&missing.identity)
+                .unwrap()
+                .0 = Instant::now() - Duration::from_secs(age);
+            for _ in 0..100 {
+                let result = cache
+                    .request(&missing)
+                    .expect("cached info must not reload");
+                assert_eq!(result.latest_version.as_deref(), Some("revision 0"));
+                assert_eq!(
+                    result.latest_package_version.as_ref().unwrap().text,
+                    "core/systemd 262-1"
+                );
+            }
+        }
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        assert_eq!(packages.load(Ordering::SeqCst), 1);
         missing.raw_argv0 = Some("/different/candidate".into());
-        assert_eq!(wait(&missing).latest_version.as_deref(), Some("revision 2"));
+        assert_eq!(wait(&missing).latest_version.as_deref(), Some("revision 1"));
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+        assert_eq!(packages.load(Ordering::SeqCst), 2);
     }
 
     #[test]

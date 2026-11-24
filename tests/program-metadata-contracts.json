@@ -225,8 +225,8 @@
     },
     {
       "id": "METADATA-CORE-08",
-      "contract": "Unreadable proc executable/cwd preserve access errors and exact raw argv0; an absolute, live-identity-checked, regular ELF candidate provides only separately labelled passive installed metadata. Display command text, scripts, FIFOs, changed argv0, symlink retargets and stale PID identity cannot authorize a candidate. Candidate refresh and filesystem validation occur on workers, never during painting.",
-      "tests": ["unreadable_proc_paths_keep_errors_and_raw_argv0_without_fabricating_executable", "truncated_or_empty_argv0_is_not_reconstructed_from_display_command_line", "inaccessible_running_image_recovers_only_passive_absolute_argv0_disk_metadata", "absolute_raw_argv0_candidates_are_background_bounded_and_never_use_display_text", "inferred_candidate_refresh_is_worker_only_and_does_not_stale_verified_metadata", "inaccessible_process_details_keep_permission_errors_separate_from_candidate_paths"]
+      "contract": "Unreadable proc executable/cwd preserve access errors and exact raw argv0; an absolute, live-identity-checked, regular ELF candidate provides only separately labelled passive installed metadata. Display command text, scripts, FIFOs, changed argv0, symlink retargets and stale PID identity cannot authorize a candidate. Candidate resolution and filesystem validation occur on workers, never during painting. Completed results stay cached until Info reopens or the captured process/executable snapshot changes, without timed permission-denied retries.",
+      "tests": ["unreadable_proc_paths_keep_errors_and_raw_argv0_without_fabricating_executable", "truncated_or_empty_argv0_is_not_reconstructed_from_display_command_line", "inaccessible_running_image_recovers_only_passive_absolute_argv0_disk_metadata", "absolute_raw_argv0_candidates_are_background_bounded_and_never_use_display_text", "unreadable_executable_keeps_candidate_and_package_metadata_without_timed_refresh", "inaccessible_process_details_keep_permission_errors_separate_from_candidate_paths"]
     },
     {
       "id": "METADATA-CORE-09",

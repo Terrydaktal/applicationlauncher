@@ -9,6 +9,8 @@ mod desktop_entry_tests;
 mod desktop_files;
 #[cfg(test)]
 mod development_tests;
+#[cfg(test)]
+mod progressive_tests;
 mod python;
 #[cfg(test)]
 mod retained_script_tests;
@@ -836,6 +838,31 @@ struct WindowInfoPopup {
     tmux: Option<crate::windows::tmux_info::Lookup>,
 }
 
+impl WindowInfoPopup {
+    fn queue_expanded_metadata<'a>(
+        &self,
+        ctx: &egui::Context,
+        viewport: egui::ViewportId,
+        apps: &[AppInfo],
+        nodes: impl IntoIterator<Item = &'a ProcessInfoNode>,
+    ) {
+        let Some(cache) = &self.versions else {
+            return;
+        };
+        // Queue expanded sections before ancestor headers can occupy the worker.
+        for node in nodes {
+            let owner = self.window.pid == Some(node.identity.pid);
+            let id = process_info_section_id((viewport, &self.window.id), node.identity);
+            if process_info_section_is_open(ctx, id, owner) {
+                cache.request_for_application(node, true, || {
+                    process_desktop_candidate(apps, &self.window, node)
+                });
+            }
+        }
+    }
+
+}
+
 impl InfoTarget {
     fn same_target(&self, other: &Self) -> bool {
         match (self, other) {
@@ -1151,6 +1178,21 @@ pub(super) fn process_version_rows(
     version: Option<&crate::windows::versions::ProcessVersion>,
     pending: bool,
 ) -> Vec<InfoPopupRow> {
+    let pending = pending || version.is_some_and(|version| version.details_pending);
+    let missing_version_display = version
+        .filter(|version| {
+            version.version.is_none()
+                && (version.version_reason.is_some() || version.package.is_some())
+        })
+        .map(|version| {
+            program_metadata::version_display::VersionDisplay::executable(
+                None,
+                version.version_issue,
+                version.version_reason.as_deref(),
+                version.package.as_deref(),
+                program_metadata::version_display::VersionScope::Running,
+            )
+        });
     let mut rows: Vec<_> = [
         (
             "version",

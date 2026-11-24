@@ -32,6 +32,16 @@ worker against current terminal D-Bus records and KWin windows; it requires the
 exact terminal PID and window UUID and refuses ambiguous or closed targets. An
 older running launcher GUI must be restarted once to acquire this control command.
 
+Expanded process sections are queued before collapsed ancestor headers, and newly
+expanded sections overtake queued header-only work. Local source-build checks run
+alongside package, installation and desktop metadata collection, with at most one
+extra scoped worker per active process lookup. Both branches finish before the
+existing process, executable and package identity checks publish the result.
+Queues remain bounded, closing or reopening an info window cancels stale replies,
+and no checks are removed or replaced with a guessed clean result. The panel still
+fits its contents once the expanded details arrive; faster collection reduces that
+delay rather than changing the window-sizing policy.
+
 Python script details include a closed-by-default **Referenced project modules**
 section, separate from **Declared dependencies**. It lists statically referenced
 local project files using their original filenames and full paths, including
@@ -41,6 +51,18 @@ analysis is labelled and explains unresolved references; unavailable inspection 
 distinct from a completed scan finding no local modules. Expanding, selecting,
 copying and collapsing these cached details does not execute Python or rescan the
 filesystem, and the rows do not imply freshness or a running version.
+
+One native-process lookup reuses the installation reader's desktop discovery for
+package comparison and launch association, rereading the current desktop Exec
+against the pinned image before use. Main-image producer records, banners and
+authorized fixed version probes are collected once when the running and on-disk
+paths and complete artifact identities match; private-library and running-API
+evidence still require independent inspection. Host-local ownership queries avoid unrelated
+sync-repository/GPG initialisation. The shared metadata library can reuse unchanged
+Ninja graph replies across info windows in the same launcher process, but still
+checks every source input on each lookup. The opt-in
+`windows::versions::collection::benchmarks::live_metadata_stage_timings` test
+reports stage durations for an explicitly supplied fixture process PID.
 
 ## Shared program metadata
 
@@ -58,9 +80,9 @@ snapshot when opened and reuses metadata while its observed executable path and
 identity stay unchanged; reopen it to inspect later updates. An inaccessible
 running executable retains its actual permission error. An exact absolute raw
 argv[0] can supply a separately labelled, passively validated on-disk candidate,
-never a running version or build ID. Only these inferred candidates receive a
-bounded worker refresh (at most once per ten seconds); rendering does not read
-their files. Unsupported or
+never a running version or build ID. Inferred candidates and package results
+remain cached for the captured process rather than refreshing on a timer;
+rendering does not read their files. Unsupported or
 ambiguous evidence includes a reason rather than a guessed version. Source/user programs are never executed
 just because their name matches an allowlist. Native version execution requires
 the shared backend's fresh trusted-system checks or an explicit exact-path local
@@ -285,6 +307,7 @@ version cache; opening a new Info snapshot inspects current installation state.
 - `src/windows/versions.rs`: On-demand, bounded running/on-disk executable version and build-ID probes for Show Info. `versions/freshness.rs` checks local build status without compiling.
 - `src/windows/versions/application.rs`: Read-only application-tile inspection. Separates desktop launch wrappers from installed application binaries, with bounded launch-chain resolution and no script execution.
 - `src/windows/versions/lookup.rs`: Independent binary-version and package-version workers per information window for expanded process sections, with bounded/deduplicated requests, PID/executable identity guards and cancellation of stale popup work.
+- `src/windows/versions/collection.rs`: Overlaps independent source-build and installation checks on a scoped worker, joining them before publication and preserving explanatory unknown results if the worker fails.
 - `src/windows/versions/node.rs`: Read-only installed Node application/package discovery, including symlinked CLI commands whose process title hides the script path; application metadata stays separate from Node runtime versions and ELF identities.
 - `src/windows/versions/script.rs`: Bounded, read-only Python and Java launch-target identification from process arguments. Resolves explicit script/JAR paths and labels modules/classes without importing or executing application code or guessing their files.
 - `src/windows/versions/pi.rs`: Bounded reader for Coherence Pi's installed build manifest and per-process startup receipt. Validates PID/start time, ownership, file safety, freshness and SDK/extension/patch identities without running Node or reading conversation contents.
@@ -485,7 +508,10 @@ Process headings use the arrow pointer without disabling selection; the collapse
 arrows use the hand pointer, and metadata retains the text-selection cursor.
 Ordinary application/process metadata stays captured until the information window
 is closed and reopened or its process identity changes, without periodic full
-reloads. Pi's lightweight startup-receipt updates remain separate.
+reloads. This also applies to inferred on-disk candidates when `/proc/PID/exe`
+is unreadable: permission denial does not start a ten-second metadata/package
+retry. Reopening Info requests fresh data. Pi's lightweight startup-receipt
+updates remain separate.
 Pi's Unicode program marker is normalized to `pi` in launcher titles, carrying
 any strikethrough onto both letters. Raw window and tmux pane titles are unchanged.
 
