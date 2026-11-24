@@ -4,6 +4,8 @@ use std::sync::atomic::AtomicBool;
 
 #[cfg(test)]
 mod applicability_tests;
+#[cfg(test)]
+mod development_tests;
 mod tmux;
 
 const MAX_INFO_POPUPS: usize = 32;
@@ -253,6 +255,7 @@ impl Drop for AppInfoPopup {
 
 #[derive(Default)]
 struct InstalledApplicationFields<'a> {
+    development: Option<&'a program_metadata::development::Metadata>,
     executable: Option<&'a Path>,
     chain: Option<&'a [PathBuf]>,
     version: Option<&'a str>,
@@ -471,6 +474,28 @@ fn installed_application_rows(
             ),
         )
     });
+    let source_checkout = fields
+        .development
+        .is_some_and(program_metadata::development::Metadata::is_source_checkout)
+        || crate::windows::versions::development_source_managed(
+            fields.installation,
+            fields.metadata,
+        );
+    let development = fields
+        .development
+        .filter(|metadata| !source_checkout || metadata.is_source_checkout());
+    let show_uncompiled_changes = uncompiled_changes_applicable(&fields);
+    let show_build_system = build_system_applicable(&fields);
+    let language_label = if source_checkout {
+        "application languages (source checkout)"
+    } else {
+        "application languages (on disk)"
+    };
+    let build_label = if source_checkout {
+        "build system (source checkout)"
+    } else {
+        "build system (on disk)"
+    };
     let mut rows = [
         (
             "installation",
@@ -684,6 +709,7 @@ fn application_info_rows(state: &AppInfoPopup) -> Vec<InfoPopupRow> {
     let mut rows = installed_application_rows(
         "Application",
         InstalledApplicationFields {
+            development: details.and_then(|info| info.development.as_ref()),
             executable: details.and_then(|info| info.executable.as_deref()),
             chain: details.map(|info| info.chain.as_slice()),
             version: details.and_then(|info| info.version.as_deref()),
@@ -855,6 +881,184 @@ fn latest_package_version_field(
     })
 }
 
+fn development_languages_display(metadata: &program_metadata::development::Metadata) -> String {
+    // Primary application attribution remains distinct from secondary component
+    // evidence, without a separate empty-results row or stronger source claims.
+    let application = metadata.application_languages_display();
+    let grouped_entry = metadata.source_languages.is_empty()
+        && metadata.application_languages.is_empty()
+        && metadata.binary_languages.iter().any(|evidence| {
+            evidence.kind == program_metadata::development::LanguageEvidenceKind::ScriptDeclaration
+        });
+    let application = development_language_roles(&application, "primary", grouped_entry);
+    if metadata.is_source_checkout() {
+        return application;
+    }
+    let components = metadata.component_languages_display();
+    if components == "None detected" {
+        application
+    } else {
+        format!(
+            "{application} · {}",
+            development_language_roles(&components, "secondary", true)
+        )
+    }
+}
+
+fn development_language_roles(display: &str, role: &str, grouped: bool) -> String {
+    // Shared component and declared-entry displays have one group qualifier;
+    // application ownership instead carries confidence on individual languages.
+    let (names, group_qualifier) = if grouped {
+        development_language_qualifier(display)
+    } else {
+        (display, None)
+    };
+    let mut depth = 0usize;
+    names
+        .split(|character| match character {
+            '(' => {
+                depth += 1;
+                false
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                false
+            }
+            ',' => depth == 0,
+            _ => false,
+        })
+        .map(str::trim)
+        .map(|item| {
+            let (language, qualifier) = if group_qualifier.is_some() {
+                (item, group_qualifier)
+            } else {
+                development_language_qualifier(item)
+            };
+            match qualifier {
+                Some(qualifier) => {
+                    let separator = if language == "Unknown" { ";" } else { "," };
+                    format!("{language} ({role}{separator} {qualifier})")
+                }
+                None => format!("{language} ({role})"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn development_language_qualifier(display: &str) -> (&str, Option<&str>) {
+    if let Some((language, tail)) = display.split_once(" (")
+        && let Some(qualifier) = tail.strip_suffix(')')
+    {
+        (language, Some(qualifier))
+    } else {
+        (display, None)
+    }
+}
+
+fn development_rows(
+    role: &str,
+    metadata: Option<&program_metadata::development::Metadata>,
+    scope: InfoFieldScope,
+    artifact: &str,
+    pending: bool,
+    unavailable: Option<&str>,
+) -> Vec<InfoPopupRow> {
+    // These shared formatters consume snapshots only. Never inspect source
+    // paths, build directories or descriptor guards from the paint/copy path.
+    let source_checkout = artifact == "source checkout"
+        || metadata.is_some_and(program_metadata::development::Metadata::is_source_checkout);
+    let metadata = metadata.filter(|metadata| !source_checkout || metadata.is_source_checkout());
+    let artifact = if source_checkout {
+        "source checkout"
+    } else {
+        artifact
+    };
+    let scope = if source_checkout {
+        InfoFieldScope::Installation
+    } else {
+        scope
+    };
+    let unavailable = if source_checkout { None } else { unavailable };
+    let languages = metadata
+        .map(development_languages_display)
+        .unwrap_or_else(|| "Unknown".into());
+    let unknown = program_metadata::development::Metadata::default();
+    let metadata = metadata.unwrap_or(&unknown);
+    [
+        ("application languages", languages),
+        ("build system", metadata.build_system_display()),
+    ]
+    .into_iter()
+    .map(|(label, value)| InfoPopupRow {
+        label: info_metadata_label(role, &format!("{label} ({artifact})")),
+        scope,
+        value: if let Some(reason) = unavailable {
+            format!("Unknown ({reason})")
+        } else if pending {
+            "Loading...".into()
+        } else {
+            value
+        },
+        searched: false,
+        separator_before: false,
+        binary_is_current: None,
+    })
+    .collect()
+}
+
+fn hosted_development_rows(
+    role: &str,
+    version: &crate::windows::versions::ProcessVersion,
+) -> Vec<InfoPopupRow> {
+    let retained = version
+        .script_application
+        .as_ref()
+        .is_some_and(|script| script.descriptor.is_some());
+    let source_checkout = crate::windows::versions::development_source_managed(
+        version.application_installation.as_deref(),
+        Some(&version.application_progs_metadata),
+    ) || version
+        .application_development
+        .as_ref()
+        .is_some_and(program_metadata::development::Metadata::is_source_checkout);
+    let artifact = if source_checkout {
+        "source checkout"
+    } else if retained {
+        "retained script"
+    } else {
+        "on disk"
+    };
+    let show_build_system = build_system_applicable(&InstalledApplicationFields {
+        development: version.application_development.as_ref(),
+        installation: version.application_installation.as_deref(),
+        package: version
+            .application_package_target
+            .as_ref()
+            .filter(|target| !target.inferred)
+            .map(|target| target.name.as_str()),
+        metadata: Some(&version.application_progs_metadata),
+        ..Default::default()
+    });
+    let mut rows = development_rows(
+        role,
+        version.application_development.as_ref(),
+        if retained {
+            InfoFieldScope::InstanceContext
+        } else {
+            InfoFieldScope::Installation
+        },
+        artifact,
+        false,
+        version.running_unavailable,
+    );
+    if !show_build_system {
+        let label = info_metadata_label(role, &format!("build system ({artifact})"));
+        rows.retain(|row| row.label != label);
+    }
+    rows
+}
+
 pub(super) fn process_version_rows(
     role: &str,
     version: Option<&crate::windows::versions::ProcessVersion>,
@@ -939,6 +1143,7 @@ pub(super) fn process_version_rows(
     rows.extend(installed_application_rows(
         role,
         InstalledApplicationFields {
+            development: version.and_then(|version| version.latest_development.as_ref()),
             executable: launch.and_then(|launch| launch.executable.as_deref()),
             chain: launch.map(|launch| launch.chain.as_slice()),
             version: version.and_then(|version| version.latest_version.as_deref()),

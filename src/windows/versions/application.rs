@@ -126,6 +126,7 @@ fn app_info_from_current_desktop(
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ApplicationInfo {
+    pub(crate) development: Option<program_metadata::development::Metadata>,
     pub(crate) launcher: Option<PathBuf>,
     pub(crate) launcher_resolved: Option<PathBuf>,
     pub(crate) launcher_exists: bool,
@@ -347,6 +348,18 @@ pub(crate) fn inspect_application(exec: &str, desktop_file: &Path) -> Applicatio
     result.package = package;
     result.installation = Some(installation);
     result.metadata = metadata;
+    result.development = Some(super::development::inspect_selected(
+        file,
+        executable,
+        result.metadata.source_checkout.as_deref(),
+        super::development_source_managed(result.installation.as_deref(), Some(&result.metadata)),
+        std::time::Instant::now() + std::time::Duration::from_millis(750),
+    ));
+    result.desktop_files = Some(program_metadata::desktop::related_entries(
+        Some(file),
+        Some(desktop_file),
+        std::time::Instant::now() + std::time::Duration::from_millis(500),
+    ));
     if !resolution.unchanged() {
         return ApplicationInfo {
             launcher: result.launcher,

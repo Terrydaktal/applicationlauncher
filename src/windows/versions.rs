@@ -67,6 +67,11 @@ struct ProcessLaunchContext {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProcessVersion {
+    pub(crate) details_pending: bool,
+    pub(crate) source_check: Option<std::sync::Arc<freshness::Check>>,
+    pub(crate) development: Option<program_metadata::development::Metadata>,
+    pub(crate) latest_development: Option<program_metadata::development::Metadata>,
+    pub(crate) application_development: Option<program_metadata::development::Metadata>,
     pub(crate) running_unavailable: Option<&'static str>,
     pub(crate) on_disk_candidate: Option<PathBuf>,
     pub(crate) on_disk_candidate_reason: Option<String>,
@@ -141,6 +146,8 @@ impl ProcessVersion {
 
     fn discard_running_metadata(&mut self, reason: &'static str) {
         self.running_unavailable = Some(reason);
+        development::retain_checkout(&mut self.development);
+        development::retain_checkout(&mut self.application_development);
         self.version = None;
         self.version_source = None;
         self.runtime_version = None;
@@ -167,6 +174,21 @@ impl ProcessVersion {
         self.application_latest_npm_version = None;
         self.application_launch = None;
     }
+}
+
+pub(crate) fn development_source_managed(
+    installation: Option<&str>,
+    metadata: Option<&ProgsMetadata>,
+) -> bool {
+    metadata.is_some_and(|metadata| metadata.source_checkout.is_some())
+        || [
+            installation,
+            metadata.and_then(|metadata| metadata.package_type.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(crate::popups::installation_badge)
+        .any(|badge| matches!(badge, "FRK" | "DEV" | "CLO"))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -435,6 +457,16 @@ fn probe_on_disk_candidate(
             installation::inspect_with_owner(&resolved.path, result.package.as_deref());
         result.installation = Some(installation);
         result.progs_metadata = progs_metadata;
+        result.latest_development = Some(development::inspect_selected(
+            &file,
+            &resolved.path,
+            result.progs_metadata.source_checkout.as_deref(),
+            development_source_managed(
+                result.installation.as_deref(),
+                Some(&result.progs_metadata),
+            ),
+            Instant::now() + Duration::from_millis(750),
+        ));
         result.package_target = available::target(&resolved.path, result.package.as_deref());
         result.uncompiled_changes = Some(
             if package_image
@@ -1060,12 +1092,23 @@ fn probe_process_with_source_policy(
             ));
         }
     }
-    if let Some(disk) = latest_identity
+    // Detailed worker only: share one bounded budget across the independently
+    // pinned running image, current installation and hosted entry point.
+    development::inspect_process(
+        &mut result,
+        running.as_ref().ok().map(|(file, _)| file),
+        latest.as_ref(),
+        &clean_path,
+        installed.as_ref().map(|installed| installed.path.as_path()),
+        Instant::now() + Duration::from_millis(750),
+    );
+    if let Some(disk) = latest_identity.as_ref()
         && !installed
             .as_ref()
             .is_some_and(|installed| installed.unchanged(disk))
     {
         result.latest_version = None;
+        development::retain_checkout(&mut result.latest_development);
         result.application_installed_metadata = None;
         result.latest_version_reason = Some("on-disk binary changed during inspection".into());
         result.latest_version_issue = Some(program_metadata::executable::MetadataIssue::Changed);
