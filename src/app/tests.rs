@@ -1590,6 +1590,7 @@ mod tests {
                     target: "main".into(),
                     kind: "Local application",
                     entry_point: Some("/local/app/main".into()),
+                    descriptor: None,
                     identification: "Test fixture",
                 });
             }
@@ -2488,6 +2489,7 @@ mod tests {
                 script_application: Some(ScriptApplication {
                     name: name.into(),
                     entry_point: Some(entry.into()),
+                    descriptor: None,
                     target: entry.into(),
                     kind,
                     identification: "Process file argument",

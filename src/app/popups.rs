@@ -9,6 +9,8 @@ mod desktop_entry_tests;
 mod desktop_files;
 #[cfg(test)]
 mod development_tests;
+#[cfg(test)]
+mod retained_script_tests;
 mod tmux;
 
 const MAX_INFO_POPUPS: usize = 32;
@@ -26,6 +28,82 @@ fn terminal_update_window(
                 .is_some_and(|name| name == "xfce4-terminal" || name == "xfce4-terminal (deleted)")
         }))
     .then(|| window.id.clone())
+}
+
+fn process_version_update_target(
+    window: &WindowInfo,
+    node: &ProcessInfoNode,
+    version: Option<&crate::windows::versions::ProcessVersion>,
+) -> Option<InfoUpdateTarget> {
+    process_update_target(
+        window,
+        node,
+        // Displaying the interpreter's status must not grant a script the
+        // existing interactive-shell restart action.
+        version.and_then(|version| version.process_build_is_current()),
+    )
+}
+
+fn captured_script_filename(version: &crate::windows::versions::ProcessVersion) -> Option<&str> {
+    let application = version.script_application.as_ref()?;
+    if application.descriptor.is_some() {
+        let details = version.script_details.as_ref()?;
+        let target = details.storage_target.to_str()?;
+        target
+            .strip_prefix("/memfd:")
+            .or_else(|| target.strip_prefix("memfd:"))
+            .map(|name| name.trim_end_matches(" (deleted)"))
+            .or_else(|| {
+                details
+                    .storage_target
+                    .file_name()
+                    .and_then(|name| name.to_str())
+            })
+    } else {
+        Path::new(&application.target).file_name()?.to_str()
+    }
+}
+
+fn process_script_header(
+    node: &ProcessInfoNode,
+    version: Option<&crate::windows::versions::ProcessVersion>,
+) -> Option<InfoScriptHeader> {
+    let runtime = version
+        .and_then(|version| version.runtime_name)
+        .or_else(|| {
+            node.executable.as_ref().and_then(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| {
+                        program_metadata::interpreted::script::runtime_name(
+                            name.trim_end_matches(" (deleted)"),
+                        )
+                    })
+            })
+        });
+    if !matches!(runtime, Some("Shell" | "Python"))
+        || version
+            .and_then(|version| version.script_application.as_ref())
+            .is_some_and(|application| application.kind == "Python module")
+    {
+        return None;
+    }
+    let script = node.script_name.as_deref()?;
+    let prefix = format!("{}: ", node.name);
+    let suffix = node.header.strip_prefix(&prefix)?.strip_prefix(script)?;
+    if !suffix.starts_with(" (pid ") {
+        return None;
+    }
+    let compared_version = version.filter(|version| {
+        // A refreshed script receipt can outlive the tree snapshot naming it.
+        // Match the full captured basename (not a lossy application file stem)
+        // before colouring that name from the receipt's content comparison.
+        captured_script_filename(version) == Some(script)
+    });
+    Some(InfoScriptHeader {
+        name_range: prefix.len()..prefix.len() + script.len(),
+        is_current: retained_script_content_is_current(compared_version),
+    })
 }
 
 fn process_update_target(
@@ -1312,6 +1390,23 @@ pub(super) fn application_version_rows(
         ] {
             rows.push(row(label, value));
         }
+        if application.kind != "Shell script" {
+            rows.push(row(
+                "running version",
+                "Unknown (no application build identity published)".into(),
+            ));
+        }
+        if application.kind.starts_with("Python") {
+            rows.push(row(
+                "source changes since start",
+                "Unknown (no startup source snapshot published)".into(),
+            ));
+        } else if application.kind != "Shell script" {
+            rows.push(row(
+                "build status",
+                "Unknown (no application build identity published)".into(),
+            ));
+        }
         launch_rows.push(row(
             "Launch chain",
             version
@@ -1378,8 +1473,61 @@ pub(super) fn process_runtime_name(
                 .to_str()?
                 .trim_end_matches(" (deleted)");
             crate::windows::versions::runtime_name(name)
-        });
-    let Some(runtime) = runtime else {
+        })
+}
+
+fn shell_interpreter_name(
+    node: &ProcessInfoNode,
+    version: Option<&crate::windows::versions::ProcessVersion>,
+) -> Option<&'static str> {
+    let version = version?;
+    if version.runtime_name != Some("Shell") || version.running_unavailable.is_some() {
+        return None;
+    }
+    match node
+        .executable
+        .as_ref()?
+        .file_name()?
+        .to_str()?
+        .trim_end_matches(" (deleted)")
+    {
+        "bash" => Some("Bash"),
+        "dash" => Some("Dash"),
+        "zsh" => Some("Zsh"),
+        "fish" => Some("Fish"),
+        "ksh" => Some("Ksh"),
+        "mksh" => Some("Mksh"),
+        "sh" => Some("sh"),
+        _ => None,
+    }
+}
+
+/// Content equality is independent of interpreter freshness and original launch
+/// provenance. Only use the worker's captured comparison, never re-read files
+/// while formatting a process or script heading.
+pub(super) fn retained_script_content_is_current(
+    version: Option<&crate::windows::versions::ProcessVersion>,
+) -> Option<bool> {
+    use program_metadata::interpreted::script::ScriptComparison;
+    let version = version?;
+    if version.running_unavailable.is_some() || version.script_details_error.is_some() {
+        return None;
+    }
+    version.script_application.as_ref()?;
+    match version.script_details.as_ref()?.comparison {
+        ScriptComparison::Same => Some(true),
+        ScriptComparison::Different => Some(false),
+        ScriptComparison::Unknown => None,
+    }
+}
+
+pub(super) fn hosted_metadata_sections(
+    ctx: &egui::Context,
+    id: egui::Id,
+    node: &ProcessInfoNode,
+    version: Option<&crate::windows::versions::ProcessVersion>,
+) -> Vec<InfoMetadataSection> {
+    let Some(runtime) = process_runtime_name(node, version) else {
         return Vec::new();
     };
     let python = runtime == "Python";
@@ -1703,9 +1851,6 @@ pub(super) fn process_info_rows(
             false,
         ),
     ];
-    if let Some(script) = &node.script_name {
-        rows.insert(1, row("Script name", script.clone(), false));
-    }
     rows.extend(tmux::process_rows(window, node));
     append_process_version_rows(&mut rows, version_rows);
     rows
@@ -2137,7 +2282,8 @@ impl App {
                 depth: node.depth,
                 header: node.header.clone(),
                 binary_is_current,
-                update_target: process_update_target(window_info, node, binary_is_current),
+                script_header: process_script_header(node, version.as_deref()),
+                update_target: process_version_update_target(window_info, node, version.as_deref()),
                 default_open: owner,
                 rows,
                 metadata_sections,
@@ -2157,6 +2303,7 @@ impl App {
                 id: process_info_section_id((viewport_id, &window_info.id), identity),
                 depth: 0,
                 binary_is_current: None,
+                script_header: None,
                 update_target: None,
                 header: format!(
                     "{} (window owner; process metadata {})",
@@ -3062,6 +3209,7 @@ mod tests {
                 target: "whisper_service.py".into(),
                 kind: "Python script",
                 entry_point: Some("/project/whisper_service.py".into()),
+                descriptor: None,
                 identification: "Process arguments",
             }),
             application_installation: Some("[DEV] Development Checkout (User-managed)".into()),

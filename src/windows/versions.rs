@@ -83,6 +83,11 @@ pub(crate) struct ProcessVersion {
     pub(crate) runtime_name: Option<&'static str>,
     pub(crate) application: Option<NodeApplication>,
     pub(crate) script_application: Option<ScriptApplication>,
+    pub(crate) script_details: Option<program_metadata::interpreted::script::DescriptorDetails>,
+    pub(crate) script_details_error: Option<String>,
+    pub(crate) python_context:
+        Option<program_metadata::interpreted::python_process::PythonProcessMetadata>,
+    pub(crate) python_context_error: Option<String>,
     pub(crate) application_installed_metadata:
         Option<program_metadata::interpreted::InstalledVersion>,
     pub(crate) application_metadata_error: Option<String>,
@@ -120,6 +125,63 @@ pub(crate) struct ProcessVersion {
 }
 
 impl ProcessVersion {
+
+    /// A script descriptor can change while its interpreter remains the same
+    /// process. Invalidate only metadata attributed through that descriptor.
+    fn discard_changed_script_metadata(&mut self) -> bool {
+        if self
+            .script_application
+            .as_ref()
+            .is_none_or(ScriptApplication::unchanged)
+        {
+            self.discard_changed_script_details();
+            return false;
+        }
+        self.script_application = None;
+        self.script_details = None;
+        self.script_details_error =
+            Some("Script descriptor or process changed during inspection".into());
+        self.python_context = None;
+        self.python_context_error = None;
+        self.application_installed_metadata = None;
+        self.application_metadata_error =
+            Some("Script descriptor or process changed during inspection".into());
+        self.application_build = None;
+        development::retain_checkout(&mut self.application_development);
+        self.application_installation = None;
+        self.application_progs_metadata = ProgsMetadata::default();
+        self.application_package_target = None;
+        self.application_latest_package_version = None;
+        self.application_npm_target = None;
+        self.application_latest_npm_version = None;
+        self.application_launch = None;
+        true
+    }
+
+    fn discard_changed_script_details(&mut self) {
+        if self
+            .script_details
+            .as_ref()
+            .is_some_and(|details| !details.unchanged())
+        {
+            self.script_details = None;
+            self.script_details_error = Some(
+                "Retained script or installed-wrapper candidate changed during inspection".into(),
+            );
+        }
+    }
+
+    pub(crate) fn process_header_is_current(&self) -> Option<bool> {
+        // A shell process identifies the interpreter, even after expanded
+        // inspection discovers its script. Its executable's verified status
+        // must not disappear on expansion or certify the hosted script below.
+        // Other hosted applications retain their existing receipt-based policy.
+        if self.runtime_name == Some("Shell") && self.running_unavailable.is_none() {
+            return self.running_latest_binary;
+        }
+        self.process_build_is_current()
+    }
+
     pub(crate) fn process_build_is_current(&self) -> Option<bool> {
         if self.running_unavailable.is_some() {
             return None;
@@ -1077,9 +1139,26 @@ fn probe_process_with_source_policy(
             .and_then(|application| NpmTarget::package(&application.package));
     }
     if running.is_ok()
-        && let Some(runtime @ ("Python" | "Java")) = result.runtime_name
+        && result.application.is_none()
+        && let Some(runtime @ ("Python" | "Java" | "Node.js" | "Shell")) =
+            script::runtime_name(name)
     {
         result.script_application = script::probe(runtime, target.pid);
+        if result.script_application.is_some() {
+            result.runtime_name = Some(runtime);
+        }
+        if let Some(application) = result.script_application.as_ref()
+            && let Some(source) = application.descriptor.as_ref()
+        {
+            let candidate = script_comparison_candidate(application);
+            match source.inspect_details(
+                candidate.as_deref(),
+                Instant::now() + Duration::from_millis(750),
+            ) {
+                Ok(details) => result.script_details = Some(details),
+                Err(reason) => result.script_details_error = Some(reason),
+            }
+        }
         if let Some(entry) = result
             .script_application
             .as_ref()
@@ -1097,6 +1176,21 @@ fn probe_process_with_source_policy(
                 installation::installed_executable(entry).as_ref(),
                 target.application_entry.as_ref(),
             ));
+        }
+        result.discard_changed_script_metadata();
+        if runtime == "Python"
+            && let Some(script) = &result.script_application
+        {
+            match program_metadata::interpreted::python_process::inspect(
+                target.pid,
+                script,
+                result.application_installed_metadata.as_ref(),
+                result.application_progs_metadata.source_checkout.as_deref(),
+                Instant::now() + Duration::from_millis(750),
+            ) {
+                Ok(context) => result.python_context = Some(context),
+                Err(reason) => result.python_context_error = Some(reason),
+            }
         }
     }
     // Detailed worker only: share one bounded budget across the independently
@@ -1174,7 +1268,34 @@ fn probe_process_with_source_policy(
             });
         }
     }
+    result.discard_changed_script_metadata();
+    // Transfer the independently pinned installation only after all validation
+    // above. A slow input check must not hold up this result or the next process.
+    if result.uncompiled_changes.as_deref() == Some(freshness::PENDING)
+        && let (Some(installed), Some(file), Some(disk)) = (installed, latest, latest_identity)
+    {
+        result.source_check = Some(std::sync::Arc::new(
+            freshness::Check::installed(installed, file, captured_launcher)
+                .with_expected_stamp(executable_identity(&disk)),
+        ));
+    }
     result
+}
+
+/// This is a current content-comparison hint, never the historical launch route
+/// or permission to attribute the candidate's package/version to the process.
+fn script_comparison_candidate(application: &ScriptApplication) -> Option<PathBuf> {
+    let by_name =
+        program_metadata::interpreted::script::installed_script_candidate(&application.name);
+    let by_filename = || {
+        let name = application.entry_point.as_ref()?.file_name()?.to_str()?;
+        (name != application.name)
+            .then(|| program_metadata::interpreted::script::installed_script_candidate(name))
+            .flatten()
+    };
+    by_name
+        .or_else(by_filename)
+        .or_else(|| application.entry_point.clone())
 }
 
 #[cfg(test)]
@@ -1714,8 +1835,10 @@ int main(int argc, char **argv) {{
                 ..Default::default()
             };
             assert_eq!(version.process_build_is_current(), status);
+            assert_eq!(version.process_header_is_current(), status);
             version.running_unavailable = Some("process changed");
             assert_eq!(version.process_build_is_current(), None);
+            assert_eq!(version.process_header_is_current(), None);
         }
     }
 
@@ -1727,6 +1850,7 @@ int main(int argc, char **argv) {{
             ..Default::default()
         };
         assert_eq!(version.process_build_is_current(), None);
+        assert_eq!(version.process_header_is_current(), None);
         for (status, current) in [
             (PiBuildStatus::Current, Some(true)),
             (PiBuildStatus::RestartRequired, Some(false)),
@@ -1738,6 +1862,21 @@ int main(int argc, char **argv) {{
                 ..Default::default()
             });
             assert_eq!(version.process_build_is_current(), current);
+            assert_eq!(version.process_header_is_current(), current);
+        }
+    }
+
+    #[test]
+    fn non_shell_hosted_headers_still_require_application_evidence_not_runtime_identity() {
+        for runtime in ["Node.js", "Python", "Java", "Electron"] {
+            for current in [Some(true), Some(false), None] {
+                let version = ProcessVersion {
+                    runtime_name: Some(runtime),
+                    running_latest_binary: current,
+                    ..Default::default()
+                };
+                assert_eq!(version.process_header_is_current(), None);
+            }
         }
     }
 

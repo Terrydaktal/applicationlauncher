@@ -416,11 +416,20 @@ pub struct InfoPopupRow {
 }
 
 #[derive(Clone)]
+pub struct InfoScriptHeader {
+    /// Exact UTF-8 byte range of the script name in the combined process header.
+    pub name_range: std::ops::Range<usize>,
+    /// Retained/current script-byte comparison, never interpreter freshness.
+    pub is_current: Option<bool>,
+}
+
+#[derive(Clone)]
 pub struct InfoProcessSection {
     pub id: eframe::egui::Id,
     pub depth: usize,
     pub header: Arc<str>,
     pub binary_is_current: Option<bool>,
+    pub script_header: Option<InfoScriptHeader>,
     pub update_target: Option<InfoUpdateTarget>,
     pub default_open: bool,
     pub rows: Vec<InfoPopupRow>,

@@ -213,17 +213,58 @@ fn append_uncompiled_changes(
 fn info_process_header_layout(
     header: &str,
     current: Option<bool>,
+    script: Option<&crate::models::InfoScriptHeader>,
     font: egui::FontId,
     base: egui::Color32,
 ) -> egui::text::LayoutJob {
     let name = header
         .rsplit_once(" (pid ")
         .map_or(header, |(name, _)| name);
-    let mut job = info_text_layout(
-        name,
-        font.clone(),
-        binary_current_color(current).unwrap_or(base),
-    );
+    let parts = script.and_then(|script| {
+        let interpreter_end = script.name_range.start.checked_sub(2)?;
+        if script.name_range.end != name.len() || script.name_range.is_empty() {
+            return None;
+        }
+        let interpreter = name.get(..interpreter_end)?;
+        let separator = name.get(interpreter_end..script.name_range.start)?;
+        let script_name = name.get(script.name_range.clone())?;
+        (!interpreter.is_empty() && separator == ": ").then_some((
+            interpreter,
+            separator,
+            script_name,
+            script.is_current,
+        ))
+    });
+    let mut job = if let Some((interpreter, separator, script_name, script_current)) = parts {
+        let mut job = info_text_layout(
+            interpreter,
+            font.clone(),
+            binary_current_color(current).unwrap_or(base),
+        );
+        append_info_text(
+            &mut job,
+            separator,
+            egui::TextFormat::simple(font.clone(), base),
+        );
+        append_info_text(
+            &mut job,
+            script_name,
+            egui::TextFormat::simple(
+                font.clone(),
+                binary_current_color(script_current).unwrap_or(base),
+            ),
+        );
+        job
+    } else {
+        // Invalid spans stay neutral rather than granting the whole combined
+        // interpreter/script label the interpreter's status.
+        let colour = if script.is_some() { None } else { current };
+        info_text_layout(
+            name,
+            font.clone(),
+            binary_current_color(colour).unwrap_or(base),
+        )
+    };
     append_info_text(
         &mut job,
         &header[name.len()..],
@@ -248,6 +289,17 @@ fn info_popup_layout(
     rows: &[InfoPopupRow],
     body_font: egui::FontId,
     heading_font: egui::FontId,
+) -> (egui::text::LayoutJob, Vec<usize>) {
+    info_popup_layout_with_label_width(heading, subtitle, rows, body_font, heading_font, 0)
+}
+
+fn info_popup_layout_with_label_width(
+    heading: &str,
+    subtitle: &str,
+    rows: &[InfoPopupRow],
+    body_font: egui::FontId,
+    heading_font: egui::FontId,
+    minimum_label_width: usize,
 ) -> (egui::text::LayoutJob, Vec<usize>) {
     let searchable_value_color = egui::Color32::from_rgb(255, 236, 170);
     let mut layout_job = egui::text::LayoutJob::default();
@@ -286,7 +338,8 @@ fn info_popup_layout(
         .iter()
         .map(|row| row.label.chars().count())
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(minimum_label_width);
     for row in rows {
         if row.separator_before {
             divider(&mut layout_job);
@@ -1350,6 +1403,17 @@ mod tests {
                 binary_is_current: None,
             },
         );
+        data.rows.insert(
+            2,
+            InfoPopupRow {
+                label: "Script name".into(),
+                scope: InfoFieldScope::InstanceContext,
+                value: "pi-remote-qwen-radiance".into(),
+                searched: false,
+                separator_before: false,
+                binary_is_current: None,
+            },
+        );
         let (output, editor) = frame(&ctx, &data, Vec::new());
         let (raw_job, dividers) = info_popup_layout(
             &data.heading,
@@ -2304,6 +2368,7 @@ mod tests {
                         depth: 0,
                         header: "xfce4-terminal (pid 1)".into(),
                         binary_is_current: None,
+                        script_header: None,
                         update_target: None,
                         default_open: true,
                         metadata_sections: Vec::new(),
@@ -2321,6 +2386,7 @@ mod tests {
                         depth: 1,
                         header: "fish (pid 2)".into(),
                         binary_is_current: None,
+                        script_header: None,
                         update_target: None,
                         default_open: false,
                         metadata_sections: Vec::new(),
@@ -2466,43 +2532,416 @@ mod tests {
     }
 
     #[test]
-    fn hosted_metadata_headers_show_independent_freshness_when_open_or_collapsed() {
-        use crate::models::InfoMetadataSection;
+    fn shell_process_headers_colour_interpreter_and_script_independently() {
         for scale in [1.0, 2.0] {
             for open in [false, true] {
-                for application in [Some(true), Some(false), None] {
-                    for runtime in [Some(true), Some(false), None] {
+                let ctx = egui::Context::default();
+                ctx.set_pixels_per_point(scale);
+                let script = "pi-remote-qwen-radiance-é";
+                let header = format!("bash: {script} (pid 456416) [active process]");
+                let mut data = tree_info();
+                for (interpreter, interpreter_colour) in [
+                    (Some(true), egui::Color32::from_rgb(130, 225, 145)),
+                    (Some(false), egui::Color32::from_rgb(255, 110, 110)),
+                    (None, ctx.style().visuals.text_color()),
+                ] {
+                    for (comparison, script_colour) in [
+                        (Some(true), egui::Color32::from_rgb(130, 225, 145)),
+                        (Some(false), egui::Color32::from_rgb(255, 110, 110)),
+                        (None, ctx.style().visuals.text_color()),
+                    ] {
+                        let section = &mut data.process_tree.as_mut().unwrap().sections[1];
+                        section.header = header.clone().into();
+                        section.default_open = open;
+                        section.binary_is_current = interpreter;
+                        section.script_header = Some(crate::models::InfoScriptHeader {
+                            name_range: 6..6 + script.len(),
+                            is_current: comparison,
+                        });
+                        let (output, _) = tree_frame(&ctx, &data, Vec::new());
+                        let job = output
+                            .shapes
+                            .iter()
+                            .find_map(|shape| match &shape.shape {
+                                egui::Shape::Text(text)
+                                    if text.galley.job.text.contains(&header) =>
+                                {
+                                    Some(&text.galley.job)
+                                }
+                                _ => None,
+                            })
+                            .unwrap();
+                        for (name, expected) in
+                            [("bash", interpreter_colour), (script, script_colour)]
+                        {
+                            assert!(
+                                job.sections.iter().any(|part| {
+                                    &job.text[part.byte_range.clone()] == name
+                                        && part.format.color == expected
+                                }),
+                                "missing independently coloured {name}"
+                            );
+                        }
+                        assert!(copy_shown_info(&data).contains(&header));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_script_header_spans_are_neutral_and_cannot_split_utf8_or_panic() {
+        let header = "bash: é (pid 12)";
+        for name_range in [0..100, 0..2, 7..8, 6..7, 6..6, 6..10] {
+            let script = crate::models::InfoScriptHeader {
+                name_range,
+                is_current: Some(false),
+            };
+            let job = info_process_header_layout(
+                header,
+                Some(true),
+                Some(&script),
+                egui::FontId::monospace(14.0),
+                egui::Color32::WHITE,
+            );
+            assert_eq!(job.text, header);
+            assert!(
+                job.sections
+                    .iter()
+                    .all(|part| part.format.color == egui::Color32::WHITE)
+            );
+        }
+    }
+
+    #[test]
+    fn script_field_heading_aligns_with_parent_values_and_keeps_label_and_status_colours() {
+        for scale in [1.0, 2.0] {
+            for depth in [0, 2] {
+                for open in [false, true] {
+                    for (current, expected) in [
+                        (Some(true), egui::Color32::from_rgb(130, 225, 145)),
+                        (Some(false), egui::Color32::from_rgb(255, 110, 110)),
+                        (None, egui::Color32::from_gray(140)),
+                    ] {
                         let ctx = egui::Context::default();
                         ctx.set_pixels_per_point(scale);
                         let mut data = tree_info();
+                        let row = |label: &str, value: &str| InfoPopupRow {
+                            label: label.into(),
+                            scope: InfoFieldScope::Installation,
+                            value: value.into(),
+                            searched: false,
+                            separator_before: false,
+                            binary_is_current: None,
+                        };
+                        let name = "pi-remote-qwen-radiance-é";
+                        let header = format!("Script  {name}");
                         let owner = &mut data.process_tree.as_mut().unwrap().sections[0];
-                        owner.metadata_sections = [
-                            ("Application: Pi", application),
-                            ("Runtime: Node.js", runtime),
-                        ]
-                        .into_iter()
-                        .map(|(header, current)| InfoMetadataSection {
-                            id: owner.id.with(header),
-                            header: header.into(),
+                        owner.depth = depth;
+                        owner.rows = vec![
+                            row("Latest version on disk (ELF build ID)", "Bash fixture"),
+                            row("Capabilities", "CLI  •  Primary role: Command-line tool"),
+                        ];
+                        owner.metadata_sections = vec![crate::models::InfoMetadataSection {
+                            id: owner.id.with("aligned-script"),
+                            header: header.clone().into(),
+                            header_scope: None,
+                            field_header: Some(crate::models::InfoMetadataFieldHeader {
+                                value_range: 8..8 + name.len(),
+                                label_scope: InfoFieldScope::InstanceContext,
+                                after_row: None,
+                            }),
                             binary_is_current: current,
                             default_open: open,
-                            rows: owner.rows.clone(),
-                        })
-                        .collect();
+                            rows: vec![row("Interpreter", "Bash")],
+                            children: Vec::new(),
+                        }];
+                        let (_, documents) = tree_frame(&ctx, &data, Vec::new());
+                        let galley = &documents[0].galley;
+                        let job = &galley.job;
+                        assert!(job.text.contains(&header));
+                        assert!(!job.text.contains("Script:"));
+                        let x = |needle: &str| {
+                            let byte = job.text.find(needle).unwrap();
+                            let cursor = job.text[..byte].chars().count();
+                            galley
+                                .pos_from_cursor(egui::text::CCursor::new(cursor))
+                                .left()
+                        };
+                        let difference =
+                            (x(name) - x("CLI  •  Primary role: Command-line tool")).abs();
+                        assert!(
+                            difference < 0.8,
+                            "script value is {difference} points out of its parent column"
+                        );
+                        let label_difference = (x("Script") - x("Capabilities")).abs();
+                        assert!(
+                            label_difference < 0.8,
+                            "Script and Capabilities labels differ by {label_difference} points"
+                        );
+                        if open {
+                            let child_indent = x("Interpreter") - x("Script");
+                            assert!(
+                                (child_indent - ctx.style().spacing.indent).abs() < 0.8,
+                                "only the script details should be indented: {child_indent}"
+                            );
+                        }
+                        assert!(
+                            job.sections.iter().any(|part| {
+                                job.text[part.byte_range.clone()].trim_end() == "Script"
+                                    && part.format.color == egui::Color32::from_rgb(188, 152, 165)
+                            }),
+                            "Script label must be rose-grey, not freshness-coloured"
+                        );
+                        let expected = if current.is_none() {
+                            ctx.style().visuals.text_color()
+                        } else {
+                            expected
+                        };
+                        assert!(
+                            job.sections.iter().any(|part| {
+                                &job.text[part.byte_range.clone()] == name
+                                    && part.format.color == expected
+                            }),
+                            "only the name retains its independent comparison colour"
+                        );
+                        assert!(copy_shown_info(&data).contains(&header));
+                        let script_id =
+                            data.process_tree.as_ref().unwrap().sections[0].metadata_sections[0].id;
+                        let position = ctx
+                            .read_response(script_id.with("tree-arrow"))
+                            .unwrap()
+                            .rect
+                            .center();
+                        let event = |pressed| egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        };
+                        tree_frame(
+                            &ctx,
+                            &data,
+                            vec![egui::Event::PointerMoved(position), event(true)],
+                        );
+                        tree_frame(&ctx, &data, vec![event(false)]);
+                        let (_, documents) = tree_frame(&ctx, &data, Vec::new());
+                        let text = &documents[0].galley.job.text;
+                        assert!(text.contains("Capabilities"));
+                        assert!(text.contains(&header));
+                        assert_eq!(text.contains("Interpreter"), !open);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tmux_session_field_follows_desktop_file_without_shifting_columns_or_copy_order() {
+        for scale in [1.0, 2.0] {
+            for depth in [0, 2] {
+                for open in [false, true] {
+                    for desktop_present in [false, true] {
+                        let ctx = egui::Context::default();
+                        ctx.set_pixels_per_point(scale);
+                        let mut data = tree_info();
+                        let row = |label: &str, value: &str| InfoPopupRow {
+                            label: label.into(),
+                            scope: InfoFieldScope::Installation,
+                            value: value.into(),
+                            searched: false,
+                            separator_before: false,
+                            binary_is_current: None,
+                        };
+                        let name = "tgbackman-é";
+                        let header = format!("Session  {name}");
+                        let owner = &mut data.process_tree.as_mut().unwrap().sections[0];
+                        owner.depth = depth;
+                        owner.rows = vec![row(
+                            "Running executable image original path",
+                            "tmux-image-fixture",
+                        )];
+                        if desktop_present {
+                            owner.rows.push(row("Desktop file", "desktop-fixture"));
+                        }
+                        owner.rows.push(row("Icon path", "icon-fixture"));
+                        let session_id = owner.id.with("tmux-session-fixture");
+                        owner.metadata_sections = vec![crate::models::InfoMetadataSection {
+                            id: session_id,
+                            header: header.clone().into(),
+                            header_scope: None,
+                            field_header: Some(crate::models::InfoMetadataFieldHeader {
+                                value_range: "Session  ".len()..header.len(),
+                                label_scope: InfoFieldScope::InstanceContext,
+                                after_row: Some("Desktop file"),
+                            }),
+                            binary_is_current: None,
+                            default_open: open,
+                            rows: vec![row("Tmux role", "Client")],
+                            children: Vec::new(),
+                        }];
+                        let (_, editors) = tree_frame(&ctx, &data, Vec::new());
+                        let editor = &editors[0];
+                        let galley = &editor.galley;
+                        let job = &galley.job;
+                        assert_eq!(job.text.matches(&header).count(), 1);
+                        let session = job.text.find(&header).unwrap();
+                        let icon = job.text.find("Icon path").unwrap();
+                        if desktop_present {
+                            assert!(job.text.find("Desktop file").unwrap() < session);
+                            assert!(session < icon);
+                        } else {
+                            assert!(icon < session, "missing anchors must append the field");
+                        }
+                        assert_eq!(job.text.contains("Tmux role"), open);
+                        let x = |needle: &str| {
+                            let byte = job.text.find(needle).unwrap();
+                            galley
+                                .pos_from_cursor(egui::text::CCursor::new(
+                                    job.text[..byte].chars().count(),
+                                ))
+                                .left()
+                        };
+                        for value in ["tmux-image-fixture", "icon-fixture"] {
+                            assert!(
+                                (x(name) - x(value)).abs() < 0.8,
+                                "Session and {value} must share the original value column"
+                            );
+                        }
+                        assert!((x("Session") - x("Icon path")).abs() < 0.8);
+                        if desktop_present {
+                            assert!((x(name) - x("desktop-fixture")).abs() < 0.8);
+                        }
+                        if open {
+                            assert!(
+                                (x("Tmux role") - x("Session") - ctx.style().spacing.indent).abs()
+                                    < 0.8
+                            );
+                        }
+                        assert!(job.sections.iter().any(|part| {
+                            job.text[part.byte_range.clone()].trim_end() == "Session"
+                                && part.format.color == egui::Color32::from_rgb(188, 152, 165)
+                        }));
+                        assert!(job.sections.iter().any(|part| {
+                            &job.text[part.byte_range.clone()] == name
+                                && part.format.color == ctx.style().visuals.text_color()
+                        }));
+
+                        let expected = job.text.clone();
+                        let mut state = editor.state.clone();
+                        state
+                            .cursor
+                            .set_char_range(Some(egui::text::CCursorRange::two(
+                                egui::text::CCursor::new(0),
+                                egui::text::CCursor::new(expected.chars().count()),
+                            )));
+                        state.store(&ctx, editor.response.id);
+                        ctx.memory_mut(|memory| memory.request_focus(editor.response.id));
+                        let (output, _) = tree_frame(&ctx, &data, vec![egui::Event::Copy]);
+                        assert!(output.platform_output.commands.iter().any(|command| {
+                            matches!(command, egui::OutputCommand::CopyText(text) if text == &expected)
+                        }));
+
+                        let position = ctx
+                            .read_response(session_id.with("tree-arrow"))
+                            .unwrap()
+                            .rect
+                            .center();
+                        let event = |pressed| egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        };
+                        tree_frame(
+                            &ctx,
+                            &data,
+                            vec![egui::Event::PointerMoved(position), event(true)],
+                        );
+                        tree_frame(&ctx, &data, vec![event(false)]);
+                        let (_, editors) = tree_frame(&ctx, &data, Vec::new());
+                        let text = &editors[0].galley.job.text;
+                        assert_eq!(text.contains("Tmux role"), !open);
+                        assert!(text.contains("Icon path"));
+                        assert!(text.contains(&header));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn strikethrough_formatter_preserves_field_padding_exactly_once() {
+        let mut job = egui::text::LayoutJob::default();
+        let format = egui::TextFormat::simple(egui::FontId::monospace(14.0), egui::Color32::WHITE);
+        job.append("f\u{0336}ish\nScript  ", 0.0, format.clone());
+        job.append("pi-remote-qwen-radiance", 37.5, format);
+        let job = crate::search::render_title_strikethrough(job);
+        assert_eq!(job.text, "fish\nScript  pi-remote-qwen-radiance");
+        let padding = job
+            .sections
+            .iter()
+            .filter(|section| section.leading_space != 0.0)
+            .collect::<Vec<_>>();
+        assert_eq!(padding.len(), 1);
+        assert_eq!(padding[0].leading_space, 37.5);
+        assert!(job.text[padding[0].byte_range.clone()].starts_with("pi-remote-qwen-radiance"));
+        assert!(
+            job.sections
+                .iter()
+                .any(|section| section.format.strikethrough.width > 0.0)
+        );
+    }
+
+    #[test]
+    fn hosted_application_header_and_flat_runtime_version_have_independent_freshness() {
+        for scale in [1.0, 2.0] {
+            for (process_open, application_open) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                for application_current in [Some(true), Some(false), None] {
+                    for runtime_current in [Some(true), Some(false), None] {
+                        let ctx = egui::Context::default();
+                        ctx.set_pixels_per_point(scale);
+                        let mut data = hosted_tree_info();
+                        let owner = &mut data.process_tree.as_mut().unwrap().sections[0];
+                        owner.default_open = process_open;
+                        owner
+                            .rows
+                            .iter_mut()
+                            .find(|row| row.label == "Version")
+                            .unwrap()
+                            .binary_is_current = runtime_current;
+                        let application = &mut owner.metadata_sections[0];
+                        application.binary_is_current = application_current;
+                        application.default_open = application_open;
                         let (_, editors) = tree_frame(&ctx, &data, Vec::new());
                         assert_eq!(editors.len(), 1, "the whole tree stays selectable");
                         let job = &editors[0].galley.job;
-                        for (header, current) in [
-                            ("Application: Pi", application),
-                            ("Runtime: Node.js", runtime),
+                        for (text, current) in [
+                            ("v26.4.0", runtime_current),
+                            ("Application: Pi", application_current),
                         ] {
-                            let colour = binary_current_color(current)
-                                .unwrap_or(ctx.style().visuals.text_color());
-                            assert!(job.sections.iter().any(|section| {
-                                &job.text[section.byte_range.clone()] == header
-                                    && section.format.color == colour
-                            }));
-                            assert!(copy_shown_info(&data).contains(header));
+                            assert_eq!(job.text.contains(text), process_open);
+                            if !process_open {
+                                continue;
+                            }
+                            let colour = binary_current_color(current).unwrap_or_else(|| {
+                                if text == "v26.4.0" {
+                                    egui::Color32::WHITE
+                                } else {
+                                    ctx.style().visuals.text_color()
+                                }
+                            });
+                            assert!(
+                                job.sections.iter().any(|section| {
+                                    job.text[section.byte_range.clone()].trim_end_matches('\n')
+                                        == text
+                                        && section.format.color == colour
+                                }),
+                                "{text}: current={current:?}"
+                            );
+                            assert!(copy_shown_info(&data).contains(text));
                         }
                         assert!(!job.text.contains("Runtime: Node.js"));
                         assert_eq!(
