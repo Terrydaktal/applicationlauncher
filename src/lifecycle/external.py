@@ -16,6 +16,7 @@ import time
 import uuid
 
 import lifecycle_worker as worker
+import lifecycle_timing as update_timing
 from lifecycle_window import WindowUpdate, atomic_record, scope_fingerprint
 
 PLACEMENT_XML = """<node><interface name='com.terrydaktal.ApplicationLauncher.Placement1'>
@@ -147,6 +148,7 @@ def proc_record(pid, window_id):
         pty=pty)
 
 
+@update_timing.observed("capture_terminal")
 def capture(system, desktop, window):
     pid, identifier = window["pid"], window["id"]
     owner_process = worker.process(pid)

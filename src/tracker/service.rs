@@ -3004,6 +3004,14 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             .map_err(|err| err.to_string())?
             .serve_at(crate::lifecycle::PATH, crate::lifecycle::Service)
             .map_err(|err| err.to_string())?;
+        #[cfg(feature = "update-timings")]
+        let builder = builder
+            .serve_at(
+                crate::lifecycle::timing::PATH,
+                crate::lifecycle::timing::Service,
+            )
+            .map_err(|err| err.to_string())?;
+        let _connection = builder.build().await.map_err(|err| err.to_string())?;
         let _freshness_worker = freshness
             .start(_connection.clone())
             .map_err(|err| err.to_string())?;

@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 pub(crate) mod application_update;
+#[cfg(feature = "update-timings")]
+pub mod timing;
 
 pub const PATH: &str = "/Lifecycle";
 pub const INTERFACE: &str = "com.terrydaktal.ApplicationLauncher.Lifecycle1";
@@ -197,6 +199,10 @@ pub(crate) fn spawn_job(id: &str, mode: &str, request: &Path) -> Result<(), Stri
         .arg("--lifecycle-worker")
         .arg(mode)
         .arg(request);
+    #[cfg(feature = "update-timings")]
+    if matches!(mode, "window" | "window-external") {
+        timing::prepare_job(request);
+    }
     let output = crate::process::output_with_timeout(command, Duration::from_secs(8))
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
@@ -272,6 +278,11 @@ pub fn worker_command(mode: &str, request: &Path) -> Result<Command, String> {
         include_str!("placement.js"),
         include_str!("external.py"),
         include_str!("runner.py"),
+    );
+    #[cfg(feature = "update-timings")]
+    let code = format!(
+        "import sys,types\nt=types.ModuleType('lifecycle_timing');sys.modules[t.__name__]=t\nexec({:?},t.__dict__)\n{code}",
+        include_str!("timing.py")
     );
     // Keep the PTY on stdin for startup gates. The anonymous script file avoids
     // Linux's per-argument limit without creating writable module files.

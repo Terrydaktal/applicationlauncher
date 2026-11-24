@@ -38,16 +38,17 @@ fn private_bus_lifecycle_rejects_malformed_requests_and_callers_without_helper_o
     }
     let id = "12345678-1234-5678-9abc-123456789abc";
     let helper = format!("org.xfce.Terminal5.Update.i{}", id.replace('-', "_"));
-    let fixture = zbus::blocking::connection::Builder::session()
+    let builder = zbus::blocking::connection::Builder::session()
         .unwrap()
         .name(crate::tracker::SERVICE_NAME)
         .unwrap()
         .name(helper.as_str())
         .unwrap()
         .serve_at(PATH, Service)
-        .unwrap()
-        .build()
         .unwrap();
+    #[cfg(feature = "update-timings")]
+    let builder = builder.serve_at(timing::PATH, timing::Service).unwrap();
+    let fixture = builder.build().unwrap();
     let caller = zbus::blocking::Connection::session().unwrap();
     assert_ne!(fixture.unique_name(), caller.unique_name());
     let proxy =
@@ -57,6 +58,25 @@ fn private_bus_lifecycle_rejects_malformed_requests_and_callers_without_helper_o
         serde_json::from_str::<Value>(&capabilities).unwrap()["protocol"],
         1
     );
+    #[cfg(feature = "update-timings")]
+    {
+        let proxy = zbus::blocking::Proxy::new(
+            &caller,
+            crate::tracker::SERVICE_NAME,
+            timing::PATH,
+            timing::INTERFACE,
+        )
+        .unwrap();
+        assert!(
+            proxy
+                .call::<_, _, String>("ActivateUpdateTimings", &(301u32,))
+                .is_err()
+        );
+        let lease: String = proxy.call("ActivateUpdateTimings", &(5u32,)).unwrap();
+        let lease: Value = serde_json::from_str(&lease).unwrap();
+        assert_eq!(lease["max_ttl_seconds"], 300);
+        let _: String = proxy.call("ActivateUpdateTimings", &(0u32,)).unwrap();
+    }
     let valid_but_not_owned =
         json!({"protocol":1,"job_id":id,"window_uuid":id,"token":"a".repeat(64),"service":helper})
             .to_string();

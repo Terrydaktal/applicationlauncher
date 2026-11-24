@@ -18,6 +18,10 @@ spec = importlib.util.spec_from_file_location("lifecycle_worker", SOURCE / "work
 worker = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = worker
 spec.loader.exec_module(worker)
+spec = importlib.util.spec_from_file_location("lifecycle_timing", SOURCE / "timing.py")
+timing = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = timing
+spec.loader.exec_module(timing)
 spec = importlib.util.spec_from_file_location("lifecycle_window", SOURCE / "window.py")
 window = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = window
@@ -25,7 +29,7 @@ spec.loader.exec_module(window)
 
 
 class Coordinator(unittest.TestCase):
-    def run_job(self, fault=None, application="codex", capabilities=True, external=False):
+    def run_job(self, fault=None, application="codex", capabilities=True, external=False, timings=False, preview_scope=None, return_shell=False):
         events, statuses = [], []
         saved = dict(pid=60, start=70, image=[1, 2, 3, 4], cwd="/fixture/project", executable=f"/fixture/{application}")
         record = dict(child_pid=50, foreground_pgid=50, active=True)
@@ -50,7 +54,12 @@ class Coordinator(unittest.TestCase):
                     result = dict(original_closed=True, replacement_pid=90, replacement_window_id="new-window")
                 else: result = {}
                 return [json.dumps(dict(ok=result))]
-        with tempfile.TemporaryDirectory(prefix="lifecycle-order-") as directory, ExitStack() as patches:
+        with tempfile.TemporaryDirectory(prefix="lifecycle-order-") as root, ExitStack() as patches:
+            directory = str(Path(root) / "job")
+            Path(directory).mkdir(mode=0o700)
+            if timings:
+                window.atomic_record(Path(directory) / "timing-request.json", dict(schema_version=1,
+                    deadline_unix_ms=time.time_ns() // 1_000_000 + 120000, build_id="private-test-build"))
             patches.enter_context(patch.dict(os.environ, XDG_STATE_HOME=directory))
             patches.enter_context(patch.object(window.WindowUpdate, "capture_tabs", return_value=[tab]))
             patches.enter_context(patch.object(window.WindowUpdate, "revalidate", side_effect=lambda: events.append("revalidated")))
@@ -77,6 +86,9 @@ class Coordinator(unittest.TestCase):
             job = window.WindowUpdate(dict(helper_owner=":1.2", token="private"), system, directory, backend=backend)
             result = job.run()
             records = {path.name: json.loads(path.read_text()) for path in Path(directory).glob("*.json")}
+            if timings:
+                path = Path(root) / "timings/job.jsonl"
+                records["timing-events"] = [json.loads(line) for line in path.read_text().splitlines()]
             return result, events, statuses, records
 
     def test_shared_coordinator_verifies_before_closing_the_original_window(self):

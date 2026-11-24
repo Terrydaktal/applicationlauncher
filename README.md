@@ -750,6 +750,17 @@ The native image limit is 1 GiB per captured binary. These are restart recipes,
 not snapshots of loaded libraries, process memory, unsaved shell state or scrollback.
 Individual Fish/Codex updates deliberately select the latest installed build.
 
+
+For slow updates, an agent can directly enable opt-in scalar stage timing through
+the running daemon's same-user `LifecycleTiming1.ActivateUpdateTimings(seconds)`
+D-Bus API. No user command, tracing flag or restart is needed. Leases expire
+within 300 seconds. Private bounded JSONL files under
+`lifecycle/timings/` distinguish confirmation wait, recovery hashing/cache/copy,
+terminal discovery and window handover, with monotonic wall and CPU durations.
+See `docs/DEBUGGABILITY.md` for controls, retention, privacy and verified
+compile-time-minimal artifacts. Detailed timing is off until activated; normal
+launches retain the bounded observable baseline.
+
 Restarted Codex runs under an interactive Fish parent. Normal exit, failed exit
 and Ctrl+C return to Fish instead of closing the terminal tab. Its exact
 conversation, literal arguments (including argv[0]) and working directory remain

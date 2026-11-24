@@ -11,6 +11,7 @@ import stat
 import time
 
 import lifecycle_worker as worker
+import lifecycle_timing as update_timing
 
 
 def private_request(path):
@@ -70,6 +71,7 @@ class WindowUpdate:
         self.original_closed = False
         self.snapshot = None
         self.tabs = []
+        self.timings = update_timing.from_directory(self.directory)
 
     def remote(self, action, value=None, timeout=45000):
         if self.backend is not None:
@@ -92,6 +94,8 @@ class WindowUpdate:
             status["window_id"] = self.request["external"]["window"]["id"]
             status["owner_pid"] = self.request["external"]["window"]["pid"]
         status.update(values)
+        if self.timings is not update_timing.DISABLED:
+            status["timing"] = self.timings.status()
         atomic_record(self.directory / "status.json", status)
         self.remote("Publish", status)
 
@@ -326,8 +330,10 @@ class WindowUpdate:
     def run(self):
         try:
             self.publish("preparing", "The lifecycle backend is preparing this exact terminal update")
-            self.snapshot = self.remote("Capture")
-            self.tabs = self.capture_tabs(self.snapshot)
+            with self.timings.span("capture", route="compatibility" if self.backend else "native"):
+                self.snapshot = self.remote("Capture")
+            with self.timings.span("tab_plan"):
+                self.tabs = self.capture_tabs(self.snapshot)
             if (self.request.get("scope_fingerprint") is not None
                     and scope_fingerprint(self.tabs) != self.request["scope_fingerprint"]):
                 raise worker.Refused("The exact application/session scope changed after preview; nothing was stopped")
@@ -338,33 +344,42 @@ class WindowUpdate:
                 f"; conversation {tab['argv'][2]}" if tab["program"]["kind"] == "codex" else "") for tab in self.tabs]
             self.publish("ready", "\n".join(descriptions) + "\nOnly the terminal build is updated; application builds are preserved.",
                          preserves_processes=all(tab["program"]["kind"] == "tmux" for tab in self.tabs))
-            self.remote("AwaitConfirmation", timeout=310000)
+            with self.timings.span("confirmation_wait"):
+                self.remote("AwaitConfirmation", timeout=310000)
             with worker.operation_lock():
-                self.revalidate()
-                self.preserve_builds()
+                with self.timings.span("revalidate", attempt=1):
+                    self.revalidate()
+                with self.timings.span("preserve_builds"):
+                    self.preserve_builds()
                 atomic_record(self.directory / "restart-plan.json", dict(protocol=1, request=self.request,
                     snapshot=self.snapshot, tabs=self.tabs, scope="terminal-only; preserve running application builds"))
                 self.event("confirmed")
                 self.publish("running", "Staging the replacement terminal; original window remains open")
-                self.remote("Stage", dict(tabs=[{key: tab[key] for key in ("argv", "executable", "cwd", "active", "title", "environment") if key in tab}
-                                              for tab in self.tabs]))
-                self.revalidate()
+                with self.timings.span("stage_replacement"):
+                    self.remote("Stage", dict(tabs=[{key: tab[key] for key in ("argv", "executable", "cwd", "active", "title", "environment") if key in tab}
+                                                  for tab in self.tabs]))
+                with self.timings.span("revalidate", attempt=2):
+                    self.revalidate()
                 if (any(tab["program"]["kind"] != "tmux" for tab in self.tabs)
                         and self.snapshot.get("capabilities", {}).get("hold")):
                     self.remote("Hold")
                 for tab in self.tabs:
-                    self.stop_tab(tab)
+                    with self.timings.span("stop_application"):
+                        self.stop_tab(tab)
                 self.event("applications_stopped")
-                self.remote("Release")
+                with self.timings.span("release"):
+                    self.remote("Release")
                 self.released = True
-                self.verify_replacement()
+                with self.timings.span("verify"):
+                    self.verify_replacement()
                 if self.backend is not None:
                     # Retire old clients only after their replacement attachment
                     # is verified. The server and its pane applications stay live.
                     for tab in self.tabs:
                         if tab["program"]["kind"] == "tmux": self.stop_tab(tab, retire_tmux=True)
                 self.publish("closing", "Applications verified; handing over to the replacement window")
-                committed = self.remote("Commit")
+                with self.timings.span("commit"):
+                    committed = self.remote("Commit")
                 self.original_closed = bool(committed.get("original_closed"))
                 self.publish("complete", "Terminal updated in place; exact application sessions and running builds preserved", **committed)
                 self.event("complete")
@@ -375,7 +390,8 @@ class WindowUpdate:
             recovery_failure = None
             self.event("failed", interrupted=self.interrupted, released=self.released, error=message, failure=failure)
             try:
-                recovery = self.remote("Recover" if self.interrupted or self.released else "Discard")
+                with self.timings.span("recover"):
+                    recovery = self.remote("Recover" if self.interrupted or self.released else "Discard")
                 self.original_closed = bool(recovery.get("original_closed", self.original_closed))
             except Exception as recovery_error:
                 recovery_failure = worker.failure_details(recovery_error)
@@ -385,5 +401,6 @@ class WindowUpdate:
                 pass
             return dict(ok=False, message=message, failure=failure, recovery_failure=recovery_failure)
         finally:
+            self.timings.close()
             for descriptor in self.descriptors:
                 os.close(descriptor)
