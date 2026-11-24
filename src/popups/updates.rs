@@ -53,7 +53,16 @@ pub(super) fn show_terminal_status(ui: &mut egui::Ui, info: egui::ViewportId) {
         {
             return;
         }
+        let result = state.report.as_ref().and_then(|report| {
+            report.windows.iter().find(|row| {
+                row.window_id == status.window
+                    && matches!(row.status.as_str(), "restarted" | "failed")
+            })
+        });
         let error = state.error.clone().or_else(|| {
+            if let Some(row) = result {
+                return (row.status == "failed").then(|| row.message.clone());
+            }
             state
                 .report
                 .as_ref()
@@ -64,9 +73,11 @@ pub(super) fn show_terminal_status(ui: &mut egui::Ui, info: egui::ViewportId) {
         let message =
             error.unwrap_or_else(|| match state.report.as_ref().map(|report| report.phase) {
                 Some(TerminalUpgradePhase::Running) => "Updating this terminal in place...".into(),
-                Some(TerminalUpgradePhase::Complete) => {
-                    state.report.as_ref().unwrap().message.clone()
-                }
+                Some(TerminalUpgradePhase::Complete | TerminalUpgradePhase::Failed) => result
+                    .map_or_else(
+                        || state.report.as_ref().unwrap().message.clone(),
+                        |row| row.message.clone(),
+                    ),
                 Some(TerminalUpgradePhase::Ready) => "Starting this terminal's update...".into(),
                 _ => "Checking this terminal for an in-place update...".into(),
             });
@@ -477,5 +488,94 @@ mod tests {
         );
         assert!(!shared.lock().unwrap().update_window_on_ready);
         assert!(shared.lock().unwrap().error.is_some());
+    }
+
+    #[test]
+    fn direct_terminal_status_shows_the_exact_window_result_even_with_a_legacy_complete_summary() {
+        use applicationlauncher::tracker::{
+            TerminalUpgradePhase, TerminalUpgradeReport, TerminalUpgradeWindow,
+        };
+        for phase in [TerminalUpgradePhase::Complete, TerminalUpgradePhase::Failed] {
+            for failed in [false, true] {
+                let ctx = egui::Context::default();
+                let popup = egui::ViewportId::from_hash_of("per-window-status");
+                let detail = if failed {
+                    "Fixture running build exceeds the recovery limit; original window retained"
+                } else {
+                    "Fixture terminal replaced and application verified"
+                };
+                let mut row = TerminalUpgradeWindow {
+                    window_id: "exact-window".into(),
+                    terminal_window_uuid: String::new(),
+                    owner_pid: 0,
+                    title: "private fixture".into(),
+                    tabs: vec![],
+                    eligible: true,
+                    recommended: true,
+                    preserves_processes: false,
+                    executable: String::new(),
+                    build_id: None,
+                    sha256: String::new(),
+                    status: if failed { "failed" } else { "restarted" }.into(),
+                    message: detail.into(),
+                };
+                let mut windows = vec![row.clone()];
+                row.window_id = "unrelated-window".into();
+                row.status = "failed".into();
+                row.message = "Unrelated error".into();
+                windows.insert(0, row);
+                let shared = Arc::new(Mutex::new(TerminalMaintenanceState {
+                    open: true,
+                    info_viewport: Some(popup),
+                    scope_window: Some("exact-window".into()),
+                    report: Some(TerminalUpgradeReport {
+                        phase,
+                        windows,
+                        message: "Generic requests finished".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }));
+                bind_terminal_status(&ctx, popup, "exact-window".into(), shared, None);
+                for _ in 0..2 {
+                    status_frame(&ctx, popup, vec![]);
+                }
+                let output = status_frame(&ctx, popup, vec![]);
+                let labels: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some(text),
+                        _ => None,
+                    })
+                    .collect();
+                let result = labels
+                    .iter()
+                    .find(|text| text.galley.job.text == detail)
+                    .expect("Actual per-window result is visible");
+                assert_eq!(
+                    result
+                        .galley
+                        .job
+                        .sections
+                        .iter()
+                        .all(|section| section.format.color == egui::Color32::LIGHT_RED),
+                    failed
+                );
+                assert!(
+                    !labels
+                        .iter()
+                        .any(|text| text.galley.job.text == "Generic requests finished"
+                            || text.galley.job.text == "Unrelated error")
+                );
+                assert!(labels.iter().any(|text| text.galley.job.text == "Dismiss"));
+                assert!(
+                    output
+                        .viewport_output
+                        .keys()
+                        .all(|id| *id == egui::ViewportId::ROOT)
+                );
+            }
+        }
     }
 }

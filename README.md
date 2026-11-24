@@ -914,7 +914,9 @@ again before interruption. Open descriptors pin both the selected images and
 original native images, including deleted builds, during handover. No executable
 copies or content hashes are made. Private plans and reports contain metadata under
 `$XDG_STATE_HOME/applicationlauncher/lifecycle/<operation-id>/`, not persistent
-binary backups. These are restart recipes,
+binary backups. Failed updates report the selected window's actual error,
+not a generic completion message; bulk reports distinguish updated and failed
+windows. These are restart recipes,
 not snapshots of loaded libraries, process memory, unsaved shell state or scrollback.
 Individual Fish/Codex updates deliberately select the latest installed build.
 

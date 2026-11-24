@@ -28,6 +28,16 @@
       "tests": ["tests/test_lifecycle_recovery_builds.py::ExecutableHandover", "tests/test_lifecycle_external.py::Mapping", "tests/test_lifecycle_windows.py::Coordinator"]
     },
     {
+      "id": "AU-TERMINAL-RESULT",
+      "contract": "A refused or failed selected window never becomes a successful completed aggregate. Single-window reports include its exact error or verified success; bulk reports count selected successes and failures without counting unselected windows. Inline Show Info status displays its own window's result, including failures in legacy complete reports, in red without another modal or retry.",
+      "owner": "src/tracker/terminal_upgrade.rs and src/popups/updates.rs",
+      "tests": [
+        "private_bus_update_requests_are_delegated_once_and_ambiguous_windows_are_refused",
+        "final_report_counts_only_selected_results_and_never_calls_a_failure_complete",
+        "direct_terminal_status_shows_the_exact_window_result_even_with_a_legacy_complete_summary"
+      ]
+    },
+    {
       "id": "AU-CODEX-IDLE-WINDOW",
       "contract": "Terminal-only Codex updates use process-bound main/related-child rollout turn events instead of child-process presence. Idle sessions with persistent helpers are eligible; active turns are refused even without children. Checks repeat after confirmation/staging and immediately before interruption. Process/file changes, malformed or partial records and missing/ambiguous bounded evidence never become idle guesses. These are read-only worker checks, not GUI polling or forced interruption.",
       "owner": "src/lifecycle/window.py",

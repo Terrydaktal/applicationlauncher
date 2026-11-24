@@ -478,9 +478,50 @@ impl UpgradeWork {
                 }
             }
         }
+        self.finish();
+    }
+
+    fn finish(&self) {
         let mut job = self.job.lock().unwrap();
-        job.report.phase = TerminalUpgradePhase::Complete;
-        job.report.message = "Terminal update requests finished; per-window results describe completed or refused replacements.".into();
+        let results: Vec<_> = self
+            .targets
+            .iter()
+            .filter_map(|target| {
+                job.report
+                    .windows
+                    .iter()
+                    .find(|row| row.window_id == target.id)
+            })
+            .collect();
+        let updated = results
+            .iter()
+            .filter(|row| row.status == "restarted")
+            .count();
+        let failed = self.targets.is_empty() || updated != self.targets.len();
+        let message = if self.targets.len() == 1 {
+            match results.first() {
+                Some(row) if !failed => row.message.clone(),
+                Some(row) => format!("Terminal update failed: {}", row.message),
+                None => "Terminal update failed: the selected window has no result".into(),
+            }
+        } else {
+            format!(
+                "Updated {updated} of {} selected terminal windows; {} failed.{}",
+                self.targets.len(),
+                self.targets.len() - updated,
+                if failed {
+                    " Review the per-window errors before retrying."
+                } else {
+                    ""
+                },
+            )
+        };
+        job.report.phase = if failed {
+            TerminalUpgradePhase::Failed
+        } else {
+            TerminalUpgradePhase::Complete
+        };
+        job.report.message = message;
     }
 
     fn request(&self, target: &Target) -> Result<String, String> {
@@ -643,12 +684,17 @@ mod tests {
         }
     }
 
-    struct HelperFixture;
+    struct HelperFixture(Arc<AtomicBool>);
 
     #[zbus::interface(name = "org.xfce.Terminal.Update1")]
     impl HelperFixture {
         fn get_status(&self) -> String {
-            r#"{"phase":"complete","message":"terminal-owned update completed"}"#.into()
+            if self.0.load(Ordering::SeqCst) {
+                r#"{"phase":"failed","message":"fixture recovery build could not be preserved"}"#
+                    .into()
+            } else {
+                r#"{"phase":"complete","message":"terminal-owned update completed"}"#.into()
+            }
         }
     }
 
@@ -665,6 +711,7 @@ mod tests {
         }
         let requests = Arc::new(AtomicUsize::new(0));
         let supports_consent = Arc::new(AtomicBool::new(false));
+        let fail_update = Arc::new(AtomicBool::new(false));
         let _fixture = zbus::blocking::connection::Builder::session()
             .unwrap()
             .name("org.xfce.Terminal5.Instance.ifixup")
@@ -676,7 +723,7 @@ mod tests {
                 TerminalFixture(requests.clone(), supports_consent.clone()),
             )
             .unwrap()
-            .serve_at(UPDATE_PATH, HelperFixture)
+            .serve_at(UPDATE_PATH, HelperFixture(fail_update.clone()))
             .unwrap()
             .build()
             .unwrap();
@@ -708,6 +755,7 @@ mod tests {
         let report = registry.report(&id).unwrap();
         assert_eq!(report.phase, TerminalUpgradePhase::Complete);
         assert_eq!(report.windows[0].status, "restarted");
+        assert_eq!(report.message, "terminal-owned update completed");
         assert!(report.backup_snapshot_id.is_none());
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert!(
@@ -730,8 +778,31 @@ mod tests {
             TerminalUpgradePhase::Complete
         );
         assert_eq!(requests.load(Ordering::SeqCst), 2);
-        assert!(registry.start(&id, &[window.id], true).unwrap().is_none());
+        assert!(
+            registry
+                .start(&id, &[window.id.clone()], true)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(requests.load(Ordering::SeqCst), 2);
+        fail_update.store(true, Ordering::SeqCst);
+        let (id, prepare) = registry.begin();
+        prepare.unwrap().prepare(vec![window.clone()]);
+        registry
+            .start(&id, &[window.id.clone()], true)
+            .unwrap()
+            .unwrap()
+            .run();
+        let report = registry.report(&id).unwrap();
+        assert_eq!(report.phase, TerminalUpgradePhase::Failed);
+        assert_eq!(report.windows[0].status, "failed");
+        assert_eq!(
+            report.message,
+            "Terminal update failed: fixture recovery build could not be preserved"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert!(registry.start(&id, &[window.id], true).is_err());
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -746,6 +817,81 @@ mod tests {
         assert!(row.sha256.is_empty());
         let report = serde_json::to_value(row).unwrap();
         assert_eq!(report["sha256"], "");
+    }
+
+    #[test]
+    fn final_report_counts_only_selected_results_and_never_calls_a_failure_complete() {
+        for statuses in [
+            vec!["restarted", "restarted"],
+            vec!["restarted", "failed"],
+            vec!["failed", "failed"],
+            vec!["pending", "restarted"],
+        ] {
+            let windows: Vec<_> = statuses
+                .iter()
+                .enumerate()
+                .map(|(i, status)| TerminalUpgradeWindow {
+                    window_id: i.to_string(),
+                    terminal_window_uuid: String::new(),
+                    owner_pid: 0,
+                    title: "private fixture".into(),
+                    tabs: vec![],
+                    eligible: true,
+                    recommended: true,
+                    preserves_processes: false,
+                    executable: String::new(),
+                    build_id: None,
+                    sha256: String::new(),
+                    status: (*status).into(),
+                    message: "fixture per-window result".into(),
+                })
+                .collect();
+            let targets: Vec<_> = windows
+                .iter()
+                .map(|row| Target {
+                    id: row.window_id.clone(),
+                    owner: String::new(),
+                    uuid: String::new(),
+                    external: None,
+                    external_job: String::new(),
+                })
+                .collect();
+            let job = Arc::new(Mutex::new(Job {
+                created: Instant::now(),
+                report: TerminalUpgradeReport {
+                    phase: TerminalUpgradePhase::Running,
+                    windows,
+                    ..Default::default()
+                },
+                targets: vec![],
+            }));
+            let mut unselected = job.lock().unwrap().report.windows[0].clone();
+            unselected.window_id = "not-selected".into();
+            unselected.status = "failed".into();
+            job.lock().unwrap().report.windows.push(unselected);
+            let work = UpgradeWork {
+                job: job.clone(),
+                targets,
+            };
+            work.finish();
+            let report = job.lock().unwrap().report.clone();
+            let updated = statuses
+                .iter()
+                .filter(|status| **status == "restarted")
+                .count();
+            assert_eq!(
+                report.phase,
+                if updated == 2 {
+                    TerminalUpgradePhase::Complete
+                } else {
+                    TerminalUpgradePhase::Failed
+                }
+            );
+            assert!(report.message.starts_with(&format!(
+                "Updated {updated} of 2 selected terminal windows; {} failed.",
+                2 - updated
+            )));
+        }
     }
     #[test]
     fn delegated_update_service_is_bounded_and_cannot_target_an_arbitrary_bus_name() {
