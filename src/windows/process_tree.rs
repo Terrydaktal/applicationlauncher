@@ -21,6 +21,12 @@ const BRANCH: &str = "\u{251c}\u{2500}\u{2500} ";
 const LAST_BRANCH: &str = "\u{2514}\u{2500}\u{2500} ";
 const CONTINUATION: &str = "\u{2502}   ";
 
+mod presence;
+mod visibility;
+
+#[cfg(test)]
+mod helper_tests;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WindowProcessTreeTarget {
     id: String,
@@ -58,9 +64,30 @@ pub(crate) struct WindowProcessTreeLookup {
     pub(crate) target: WindowProcessTreeTarget,
     receiver: Receiver<Arc<ProcessTreeSnapshot>>,
     pub(crate) result: Option<Arc<ProcessTreeSnapshot>>,
+    image_loader_helpers: HashSet<ProcessIdentity>,
+    captured_owner: Option<ProcessIdentity>,
+    presence: presence::ProcessPresence,
 }
 
 impl WindowProcessTreeLookup {
+    #[cfg(test)]
+    pub(crate) fn completed(
+        target: WindowProcessTreeTarget,
+        snapshot: ProcessTreeSnapshot,
+    ) -> Self {
+        let (_, receiver) = std::sync::mpsc::sync_channel(1);
+        let mut lookup = Self {
+            target,
+            receiver,
+            result: None,
+            image_loader_helpers: HashSet::new(),
+            captured_owner: None,
+            presence: Default::default(),
+        };
+        lookup.finish_capture(Arc::new(snapshot));
+        lookup
+    }
+
     pub(crate) fn start(
         target: WindowProcessTreeTarget,
         ctx: egui::Context,
@@ -79,6 +106,37 @@ impl WindowProcessTreeLookup {
             target,
             receiver,
             result: None,
+            image_loader_helpers: HashSet::new(),
+            captured_owner: None,
+            presence: Default::default(),
+        }
+    }
+
+    fn finish_capture(&mut self, snapshot: Arc<ProcessTreeSnapshot>) {
+        self.image_loader_helpers = visibility::image_loader_helpers(&self.target, &snapshot.nodes);
+        self.captured_owner = snapshot
+            .nodes
+            .iter()
+            .find(|node| self.target.owner == Some(node.identity.pid))
+            .map(|node| node.identity);
+        self.result = Some(snapshot);
+    }
+
+    pub(crate) fn is_image_loader_helper(&self, identity: ProcessIdentity) -> bool {
+        self.image_loader_helpers.contains(&identity)
+    }
+
+    pub(crate) fn owner_has_exited(&self) -> bool {
+        self.captured_owner.is_some_and(|identity| {
+            self.result.as_ref().is_some_and(|snapshot| {
+                !snapshot.nodes.iter().any(|node| node.identity == identity)
+            })
+        })
+    }
+
+    pub(crate) fn poll_presence(&mut self, ctx: &egui::Context, viewport: egui::ViewportId) {
+        if let Some(snapshot) = &mut self.result {
+            self.presence.poll(snapshot, ctx, viewport);
         }
     }
 
@@ -87,7 +145,7 @@ impl WindowProcessTreeLookup {
             return;
         }
         match self.receiver.try_recv() {
-            Ok(document) => self.result = Some(document),
+            Ok(document) => self.finish_capture(document),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.result = Some(Arc::new(ProcessTreeSnapshot::unavailable(
                     "Process tree unavailable: collection did not complete.",
@@ -532,7 +590,7 @@ fn capture_snapshot(target: &WindowProcessTreeTarget, root: &Path) -> ProcessTre
     if incomplete {
         notice.push_str("Partial snapshot: a process exited, changed, was unreadable, or a collection limit was reached.\n");
     }
-    notice.push_str("Process tree captured when Show Info opened; threads omitted. Ancestors are shown without their unrelated children.");
+    notice.push_str("Process metadata captured when Show Info opened; exited processes are removed. Reopen to capture new processes; threads omitted. Ancestors are shown without their unrelated children.");
     #[cfg(test)]
     let text = format!("{_document}\n{notice}\n").into();
     ProcessTreeSnapshot {
@@ -1132,6 +1190,9 @@ mod tests {
             target: target(10, None),
             receiver,
             result: None,
+            image_loader_helpers: HashSet::new(),
+            captured_owner: None,
+            presence: Default::default(),
         };
         lookup.poll();
         assert!(lookup.result.is_none());

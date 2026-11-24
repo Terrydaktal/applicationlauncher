@@ -738,11 +738,44 @@ pub(crate) fn render_info_popup_contents(
     event_sender: &Sender<PopupEvent>,
 ) {
     updates::show_terminal_status(ui, popup_id);
+    render_image_loader_filter(ui, data, popup_id);
     let (_, update) = render_info_popup_scroll_area(ui, data).inner;
     if let Some(event) = updates::show(ui.ctx(), popup_id, update) {
         let _ = event_sender.send(event);
         ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
     }
+}
+
+fn image_loader_filter_id(viewport: egui::ViewportId) -> egui::Id {
+    viewport.0.with("show-image-loader-helpers")
+}
+
+pub(crate) fn show_image_loader_helpers(ctx: &egui::Context, viewport: egui::ViewportId) -> bool {
+    ctx.data(|data| {
+        data.get_temp::<bool>(image_loader_filter_id(viewport))
+            .unwrap_or(false)
+    })
+}
+
+fn render_image_loader_filter(
+    ui: &mut egui::Ui,
+    data: &InfoPopupData,
+    viewport: egui::ViewportId,
+) -> Option<egui::Response> {
+    let count = data.process_tree.as_ref()?.image_loader_helper_count;
+    if count == 0 {
+        return None;
+    }
+    let mut show = show_image_loader_helpers(ui.ctx(), viewport);
+    let response = ui.checkbox(&mut show, format!("Show image-loader helpers ({count})"))
+        .on_hover_text("Show captured image decoders and their dedicated sandbox wrappers. These processes are only hidden from this view, not stopped.");
+    if response.changed() {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(image_loader_filter_id(viewport), show));
+        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+        ui.ctx().request_repaint_of(viewport);
+    }
+    Some(response)
 }
 
 pub(crate) fn info_popup_initial_size(
@@ -795,13 +828,18 @@ pub(crate) fn info_popup_initial_size(
             // A sizing_pass changes header alignment; use the real layout without painting it.
             .invisible(),
     );
+    let filter_height =
+        render_image_loader_filter(&mut ui, &measured, egui::ViewportId(measurement_id))
+            .map_or(0.0, |response| {
+                response.rect.height() + ui.spacing().item_spacing.y
+            });
     let content = render_info_popup_scroll_area(&mut ui, &measured).content_size;
     let horizontal_scrollbar = if content.x > width - padding {
         ui.spacing().scroll.allocated_width()
     } else {
         0.0
     };
-    let fitted_height = (content.y + padding + horizontal_scrollbar)
+    let fitted_height = (content.y + filter_height + padding + horizontal_scrollbar)
         .ceil()
         .max(min_size[1]);
     let height = (fitted_height + 8.0).min(maximum.y);
@@ -860,6 +898,75 @@ pub(crate) fn show_deferred_info_popup(
 mod tests {
     use super::*;
     use crate::models::{InfoPopupRow, InfoProcessSection, InfoProcessTree};
+
+    #[test]
+    fn image_loader_filter_toggle_defaults_off_is_per_window_and_reserves_no_empty_row() {
+        for scale in [1.0, 2.0] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            let first = egui::ViewportId::from_hash_of("helper-window-a");
+            let second = egui::ViewportId::from_hash_of("helper-window-b");
+            assert!(!show_image_loader_helpers(&ctx, first));
+            assert!(!show_image_loader_helpers(&ctx, second));
+            let mut data = tree_info();
+            let mut run = |events: Vec<egui::Event>, count| {
+                data.process_tree
+                    .as_mut()
+                    .unwrap()
+                    .image_loader_helper_count = count;
+                let mut rect = None;
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(800.0, 600.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let before = ui.cursor();
+                            rect = render_image_loader_filter(ui, &data, first)
+                                .map(|response| response.rect);
+                            if count == 0 {
+                                assert_eq!(before, ui.cursor());
+                            }
+                        });
+                    },
+                );
+                rect
+            };
+            assert!(run(Vec::new(), 0).is_none());
+            let position = run(Vec::new(), 6).unwrap().center();
+            for expected in [true, false] {
+                let _ = run(
+                    vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    6,
+                );
+                let _ = run(
+                    vec![egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    6,
+                );
+                assert_eq!(show_image_loader_helpers(&ctx, first), expected);
+                assert!(!show_image_loader_helpers(&ctx, second));
+            }
+            assert!(run(Vec::new(), 0).is_none());
+        }
+    }
 
     #[test]
     fn dragging_info_background_does_not_pan_the_document() {
@@ -2362,6 +2469,7 @@ mod tests {
             rows: Vec::new(),
             process_tree: Some(InfoProcessTree {
                 notice: "Snapshot".into(),
+                image_loader_helper_count: 0,
                 sections: vec![
                     InfoProcessSection {
                         id: owner,

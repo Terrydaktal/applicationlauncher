@@ -854,6 +854,25 @@ impl WindowInfoPopup {
         }
     }
 
+    fn visible_process_nodes<'a>(
+        &self,
+        ctx: &egui::Context,
+        viewport: egui::ViewportId,
+        nodes: &'a [ProcessInfoNode],
+    ) -> Vec<&'a ProcessInfoNode> {
+        let show_helpers = crate::popups::show_image_loader_helpers(ctx, viewport);
+        nodes
+            .iter()
+            .filter(|node| {
+                show_helpers
+                    || !self
+                        .lookup
+                        .as_ref()
+                        .is_some_and(|lookup| lookup.is_image_loader_helper(node.identity))
+            })
+            .collect()
+    }
+
     fn queue_expanded_metadata<'a>(
         &self,
         ctx: &egui::Context,
@@ -2516,10 +2535,13 @@ impl App {
             .and_then(|lookup| lookup.result.as_ref());
         let mut details_ready = snapshot.is_some();
         let mut sections = Vec::new();
-        for node in snapshot
-            .into_iter()
-            .flat_map(|snapshot| snapshot.nodes.iter())
-        {
+        let visible_nodes = popup.visible_process_nodes(
+            ctx,
+            viewport_id,
+            snapshot.map_or(&[], |snapshot| snapshot.nodes.as_ref()),
+        );
+        popup.queue_expanded_metadata(ctx, viewport_id, &self.apps, visible_nodes.iter().copied());
+        for node in visible_nodes {
             let owner = window_info.pid == Some(node.identity.pid);
             let id = process_info_section_id((viewport_id, &window_info.id), node.identity);
             let open = process_info_section_is_open(ctx, id, owner);
@@ -2594,9 +2616,6 @@ impl App {
                     window_info,
                     node,
                     popup.tmux.as_ref(),
-                    snapshot
-                        .map(|snapshot| snapshot.nodes.as_ref())
-                        .unwrap_or_default(),
                 );
                 append_process_version_rows(&mut process, versions);
                 if owner {
@@ -2633,12 +2652,17 @@ impl App {
                 metadata_sections,
             });
         }
-        if !snapshot.is_some_and(|snapshot| {
-            snapshot
-                .nodes
-                .iter()
-                .any(|node| window_info.pid == Some(node.identity.pid))
-        }) {
+        if !popup
+            .lookup
+            .as_ref()
+            .is_some_and(WindowProcessTreeLookup::owner_has_exited)
+            && !snapshot.is_some_and(|snapshot| {
+                snapshot
+                    .nodes
+                    .iter()
+                    .any(|node| window_info.pid == Some(node.identity.pid))
+            })
+        {
             let identity = ProcessIdentity {
                 pid: window_info.pid.unwrap_or(0),
                 start_ticks: 0,
@@ -2690,6 +2714,13 @@ impl App {
                 rows: Vec::new(),
                 process_tree: Some(InfoProcessTree {
                     sections,
+                    image_loader_helper_count: snapshot.map_or(0, |snapshot| {
+                        snapshot.nodes.iter().filter(|node| {
+                            popup.lookup.as_ref().is_some_and(|lookup| {
+                                lookup.is_image_loader_helper(node.identity)
+                            })
+                        }).count()
+                    }),
                     notice: snapshot
                         .map(|snapshot| snapshot.notice.clone())
                         .unwrap_or_else(|| "Loading process tree...".into()),
@@ -2848,6 +2879,11 @@ impl App {
                             ctx.clone(),
                             popup.id,
                         ));
+                    }
+                    if state.updated_process.is_none()
+                        && let Some(lookup) = state.lookup.as_mut()
+                    {
+                        lookup.poll_presence(ctx, popup.id);
                     }
                     state.poll_tmux(ctx, popup.id);
                     let (data, details_ready) = self.window_info_popup_data(ctx, popup.id, state);

@@ -482,6 +482,7 @@ pub struct InfoMetadataSection {
 pub struct InfoProcessTree {
     pub sections: Vec<InfoProcessSection>,
     pub notice: Arc<str>,
+    pub image_loader_helper_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
