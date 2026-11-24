@@ -48,6 +48,33 @@
       ]
     },
     {
+      "id": "AU-INFO-MODAL-INPUT",
+      "contract": "The Show Info panel owns its update modals even in the standalone root viewport; the host must not dispatch them again in the same frame. The single-program Update button confirms a verified ready preview directly without a checkbox, including separate mouse-down/up frames at normal and high DPI and a full selectable, scrollable background tree. Loading, busy, failed, completed and invalid previews disable confirmation. Opening, closing, Escape, backdrop and default Enter never start an update.",
+      "owner": "src/app/popups.rs and src/popups/updates/program/tests.rs",
+      "tests": [
+        "program_update_button_confirms_without_a_checkbox_across_separate_frames",
+        "program_update_button_requires_a_verified_ready_preview",
+        "program_confirmation_is_clickable_over_the_full_info_tree",
+        "program_confirmation_restarts_only_the_verified_fish_or_codex_after_consent",
+        "program_cancel_escape_backdrop_and_default_enter_never_start_an_update"
+      ]
+    },
+    {
+      "id": "AU-INFO-COMPLETION",
+      "contract": "A verified successful Fish, Codex or tmux-client update closes its modal and emits exactly one scoped Info refresh. The same viewport, size, existing scroll document and unchanged process metadata remain intact while a new process snapshot is captured. Only the updated process cache entry is invalidated, late results are rejected and the replacement's native build comparison is re-probed rather than forced green. Expanded dropdown state transfers only to an unambiguous replacement in the same directory. Failures retain recovery details; dismissed progress does not steal focus, and closed/different Info viewports are not reopened or refreshed. This is a one-time explicit update, not periodic polling.",
+      "owner": "src/popups/updates/program.rs and src/app/popups.rs",
+      "tests": [
+        "successful_program_updates_close_the_modal_and_refresh_their_info_window_once",
+        "failed_busy_or_mismatched_program_reports_do_not_dismiss_or_refresh_info",
+        "completed_program_update_refreshes_the_same_info_window_and_rechecks_green_without_reloading_other_processes",
+        "completed_program_refresh_does_not_reopen_closed_or_different_info_windows_or_steal_focus_after_dismissal",
+        "updated_process_dropdown_is_not_transferred_to_an_ambiguous_replacement_or_a_different_directory",
+        "post_update_refresh_keeps_the_old_snapshot_until_the_current_target_finishes",
+        "explicit_process_refresh_discards_in_flight_results_but_retains_other_cached_processes",
+        "shell_runtime_classification_keeps_interactive_shell_freshness_and_avoids_an_unknown_application_child"
+      ]
+    },
+    {
       "id": "AU-TMUX-CLIENT",
       "contract": "Only a verified outdated local tmux client offers Update client. Per-info-window confirmation reconnects that exact PID/start identity in the same held tab using the installed binary, preserving server/socket/session identity, pane PIDs, other clients, readonly flags and the running return-shell image. Read-only previews check protocol compatibility without inspecting or restarting pane applications. Missing handoff, unsupported client modes, stale identities, changed installed binaries and unsafe effective exit-unattached/destroy-unattached settings refuse before detachment; options are never silently changed. Attach forbids auto-start and rejects another server/session at the same socket. Failed handovers retain an empty tab and reconnection plan. Cancel, opening click, default Enter, duplicate work and malformed client scope never start an update. Tests use only private sockets/buses/displays.",
       "owner": "src/lifecycle/worker.py and src/popups/updates/program.rs",

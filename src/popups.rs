@@ -1244,6 +1244,10 @@ mod tests {
             );
             assert_eq!(viewport.builder.inner_size, Some(egui::vec2(1200.0, 800.0)));
             assert_eq!(viewport.builder.resizable, Some(true));
+            assert!(std::sync::Arc::ptr_eq(
+                viewport.builder.icon.as_ref().expect("info window icon"),
+                &crate::icon::window_icon(),
+            ));
             assert_eq!(
                 viewport.builder.title.as_deref(),
                 Some(format!("Info {index}").as_str())

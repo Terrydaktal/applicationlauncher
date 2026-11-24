@@ -124,6 +124,9 @@ pub(super) fn show(
     popup_id: egui::ViewportId,
     clicked_target: Option<InfoUpdateTarget>,
 ) -> Option<PopupEvent> {
+    if let Some(completion) = program::take_completion(ctx, popup_id) {
+        return Some(completion);
+    }
     let id = popup_id.0.with("terminal-update-choice");
     if let Some(InfoUpdateTarget::Program {
         window,

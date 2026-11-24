@@ -13,6 +13,8 @@ mod development_tests;
 mod progressive_tests;
 mod python;
 #[cfg(test)]
+mod refresh_tests;
+#[cfg(test)]
 mod retained_script_tests;
 mod tmux;
 
@@ -846,6 +848,16 @@ struct WindowInfoPopup {
     lookup: Option<WindowProcessTreeLookup>,
     versions: Option<ProcessVersionCache>,
     tmux: Option<crate::windows::tmux_info::Lookup>,
+    updated_process: Option<UpdatedProcessExpansion>,
+    refresh_lookup: Option<WindowProcessTreeLookup>,
+}
+
+struct UpdatedProcessExpansion {
+    identity: ProcessIdentity,
+    application: InfoProgram,
+    expanded: bool,
+    cwd: Option<PathBuf>,
+    previous: HashSet<ProcessIdentity>,
 }
 
 impl WindowInfoPopup {
@@ -905,6 +917,83 @@ impl WindowInfoPopup {
         }
     }
 
+    fn poll_updated_process(&mut self, ctx: &egui::Context, viewport: egui::ViewportId) {
+        if self.updated_process.is_none() {
+            return;
+        }
+        let target = WindowProcessTreeTarget::for_window(&self.window);
+        let lookup = self.refresh_lookup.get_or_insert_with(|| {
+            WindowProcessTreeLookup::start(target.clone(), ctx.clone(), viewport)
+        });
+        lookup.poll();
+        if lookup.result.is_none() {
+            return;
+        }
+        if lookup.target != target {
+            self.refresh_lookup = None;
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+            return;
+        }
+        self.lookup = self.refresh_lookup.take();
+        self.tmux = None;
+        self.restore_updated_process_expansion(ctx, viewport);
+    }
+
+    fn restore_updated_process_expansion(
+        &mut self,
+        ctx: &egui::Context,
+        viewport: egui::ViewportId,
+    ) {
+        let Some(snapshot) = self
+            .lookup
+            .as_ref()
+            .and_then(|lookup| lookup.result.as_ref())
+        else {
+            return;
+        };
+        let Some(updated) = self.updated_process.take() else {
+            return;
+        };
+        if let Some(cache) = &self.versions {
+            cache.invalidate(updated.identity);
+        }
+        if !updated.expanded
+            || snapshot
+                .nodes
+                .iter()
+                .any(|node| node.identity == updated.identity)
+        {
+            return;
+        }
+        // This only restores a dropdown preference. Build status is always re-probed.
+        let mut replacements = snapshot.nodes.iter().filter(|node| {
+            !updated.previous.contains(&node.identity)
+                && updated
+                    .cwd
+                    .as_ref()
+                    .is_none_or(|cwd| node.cwd.as_ref() == Some(cwd))
+                && node
+                    .executable
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        let name = name.trim_end_matches(" (deleted)");
+                        name == updated.application.name()
+                            || (updated.application == InfoProgram::Codex
+                                && name == "codex-code-mode")
+                    })
+        });
+        if let Some(replacement) = replacements.next()
+            && replacements.next().is_none()
+        {
+            let id = process_info_section_id((viewport, &self.window.id), replacement.identity);
+            let mut state =
+                egui::collapsing_header::CollapsingState::load_with_default_open(ctx, id, false);
+            state.set_open(true);
+            state.store(ctx);
+        }
+    }
 }
 
 impl InfoTarget {
@@ -989,6 +1078,7 @@ impl InfoPopups {
                 window.lookup = None;
                 window.versions = None;
                 window.tmux = None;
+                window.refresh_lookup = None;
             }
         }
     }
@@ -997,6 +1087,56 @@ impl InfoPopups {
         let before = self.items.len();
         self.items.retain(|popup| popup.id != id);
         self.items.len() != before
+    }
+
+    fn refresh_program_info(
+        &mut self,
+        ctx: &egui::Context,
+        info: egui::ViewportId,
+        window: &str,
+        program: (ProcessIdentity, InfoProgram),
+        focus: bool,
+    ) -> bool {
+        let Some(popup) = self.items.iter_mut().find(|popup| popup.id == info) else {
+            return false;
+        };
+        let InfoTarget::Window(state) = &mut popup.target else {
+            return false;
+        };
+        if state.window.id != window {
+            return false;
+        }
+        let (identity, application) = program;
+        let snapshot = state
+            .lookup
+            .as_ref()
+            .and_then(|lookup| lookup.result.as_ref());
+        let old = snapshot
+            .and_then(|snapshot| snapshot.nodes.iter().find(|node| node.identity == identity));
+        let id = process_info_section_id((info, &state.window.id), identity);
+        state.updated_process = Some(UpdatedProcessExpansion {
+            identity,
+            application,
+            expanded: process_info_section_is_open(ctx, id, false),
+            cwd: old.and_then(|node| node.cwd.clone()),
+            previous: if old.is_some() {
+                snapshot
+                    .into_iter()
+                    .flat_map(|snapshot| snapshot.nodes.iter().map(|node| node.identity))
+                    .collect()
+            } else {
+                HashSet::new()
+            },
+        });
+        // Retain the document until its replacement is ready, rather than
+        // clamping scroll position against an empty process tree.
+        state.refresh_lookup = None;
+        if focus {
+            popup.focus_requested.store(true, Ordering::Relaxed);
+        }
+        ctx.request_repaint_of(info);
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+        true
     }
 
     pub(super) fn close_last(&mut self) {
@@ -2372,6 +2512,8 @@ impl App {
                 lookup: None,
                 versions: None,
                 tmux: None,
+                updated_process: None,
+                refresh_lookup: None,
             }),
         );
     }
@@ -2390,6 +2532,21 @@ impl App {
                 }
                 PopupEvent::CloseInfo(id) => {
                     restore_launcher_focus |= self.info_popups.close(id);
+                }
+                PopupEvent::ProgramUpdated {
+                    info,
+                    window,
+                    process,
+                    application,
+                    focus,
+                } => {
+                    self.info_popups.refresh_program_info(
+                        &self.repaint_ctx,
+                        info,
+                        &window,
+                        (process, application),
+                        focus,
+                    );
                 }
                 PopupEvent::CloseHistory => {
                     self.close_history_popup();
@@ -2541,7 +2698,10 @@ impl App {
         let snapshot = popup
             .lookup
             .as_ref()
-            .filter(|lookup| lookup.target == WindowProcessTreeTarget::for_window(window_info))
+            .filter(|lookup| {
+                popup.updated_process.is_some()
+                    || lookup.target == WindowProcessTreeTarget::for_window(window_info)
+            })
             .and_then(|lookup| lookup.result.as_ref());
         let mut details_ready = snapshot.is_some();
         let mut sections = Vec::new();
@@ -2656,7 +2816,15 @@ impl App {
                 header: node.header.clone(),
                 binary_is_current,
                 script_header: process_script_header(node, version.as_deref()),
-                update_target: process_version_update_target(window_info, node, version.as_deref()),
+                update_target: if popup
+                    .updated_process
+                    .as_ref()
+                    .is_some_and(|updated| updated.identity == node.identity)
+                {
+                    None
+                } else {
+                    process_version_update_target(window_info, node, version.as_deref())
+                },
                 default_open: owner,
                 rows,
                 metadata_sections,
@@ -2731,9 +2899,12 @@ impl App {
                             })
                         }).count()
                     }),
-                    notice: snapshot
-                        .map(|snapshot| snapshot.notice.clone())
-                        .unwrap_or_else(|| "Loading process tree...".into()),
+                    notice: if let Some(updated) = &popup.updated_process {
+                        format!("Update succeeded; refreshing {} information...", updated.application.label()).into()
+                    } else {
+                        snapshot.map(|snapshot| snapshot.notice.clone())
+                            .unwrap_or_else(|| "Loading process tree...".into())
+                    },
                 }),
             },
             details_ready,
@@ -2875,13 +3046,17 @@ impl App {
                     state
                         .versions
                         .get_or_insert_with(|| ProcessVersionCache::new(ctx.clone(), popup.id));
+                    state.poll_updated_process(ctx, popup.id);
                     let target = WindowProcessTreeTarget::for_window(&state.window);
-                    if state
-                        .lookup
-                        .as_ref()
-                        .is_none_or(|lookup| lookup.target != target && lookup.result.is_some())
+                    if state.updated_process.is_none()
+                        && state
+                            .lookup
+                            .as_ref()
+                            .is_none_or(|lookup| lookup.target != target && lookup.result.is_some())
                     {
-                        if let Some(cache) = &state.versions {
+                        if state.lookup.is_some()
+                            && let Some(cache) = &state.versions
+                        {
                             cache.reset();
                         }
                         state.lookup = Some(WindowProcessTreeLookup::start(
@@ -4747,6 +4922,8 @@ mod tests {
             lookup: None,
             versions: None,
             tmux: None,
+            updated_process: None,
+            refresh_lookup: None,
         })
     }
 

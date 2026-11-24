@@ -351,6 +351,13 @@ impl LauncherSettings {
 pub enum PopupEvent {
     CloseSettings,
     CloseInfo(eframe::egui::ViewportId),
+    ProgramUpdated {
+        info: eframe::egui::ViewportId,
+        window: String,
+        process: ProcessIdentity,
+        application: InfoProgram,
+        focus: bool,
+    },
     CloseHistory,
     UpdateTerminalWindow {
         window: String,

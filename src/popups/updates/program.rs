@@ -16,7 +16,7 @@ struct State {
     application: InfoProgram,
     open: bool,
     busy: bool,
-    accepted: bool,
+    completion_reported: bool,
     report: Option<ApplicationUpdateReport>,
     error: Option<String>,
 }
@@ -59,7 +59,7 @@ pub(super) fn open(
                 application,
                 open: true,
                 busy: false,
-                accepted: false,
+                completion_reported: false,
                 report: None,
                 error: None,
             })),
@@ -143,7 +143,6 @@ fn verified_action(state: &State) -> Result<&ApplicationUpdateAction, &str> {
 fn can_start(state: &State, id: &str) -> bool {
     state.open
         && !state.busy
-        && state.accepted
         && state.error.is_none()
         && state.report.as_ref().is_some_and(|report| {
             report.phase == TerminalUpgradePhase::Ready && report.operation_id == id
@@ -214,9 +213,6 @@ fn details(ui: &mut egui::Ui, state: &State) {
                 }
             }
         }
-        if report.phase == TerminalUpgradePhase::Complete {
-            ui.small("Reopen Show Info to capture the restarted process.");
-        }
     } else {
         ui.label("Checking this exact process; no application has been stopped.");
     }
@@ -236,30 +232,17 @@ fn dialog(ctx: &egui::Context, popup: egui::ViewportId, state: &mut State) -> Op
             .id_salt("program-update-details")
             .max_height((ctx.content_rect().height() - 140.0).max(60.0))
             .show(ui, |ui| details(ui, state));
-        let ready = !state.busy
-            && state.error.is_none()
-            && state
-                .report
-                .as_ref()
-                .is_some_and(|report| report.phase == TerminalUpgradePhase::Ready)
-            && verified_action(state).is_ok();
-        if !ready {
-            state.accepted = false;
-        }
-        let consent = ui.add_enabled(
-            ready,
-            egui::Checkbox::new(
-                &mut state.accepted,
-                "I accept restarting only this program and interrupting its current work.",
-            ),
-        );
+        let ready = state
+            .report
+            .as_ref()
+            .is_some_and(|report| can_start(state, &report.operation_id));
         ui.horizontal_wrapped(|ui| {
             let close = ui.button("Close");
             let update = ui.add_enabled(
-                ready && state.accepted,
-                egui::Button::new(format!("Update {} only", state.application.name())),
+                ready,
+                egui::Button::new(format!("Update {} only", state.application.label())),
             );
-            if ![close.id, update.id, consent.id]
+            if ![close.id, update.id]
                 .iter()
                 .any(|id| ctx.memory(|memory| memory.focused()) == Some(*id))
             {
@@ -284,6 +267,36 @@ fn dialog(ctx: &egui::Context, popup: egui::ViewportId, state: &mut State) -> Op
     }
 }
 
+pub(super) fn take_completion(
+    ctx: &egui::Context,
+    popup: egui::ViewportId,
+) -> Option<crate::models::PopupEvent> {
+    let shared = ctx.data(|data| data.get_temp::<Shared>(state_id(popup)))?;
+    let mut state = shared.lock().unwrap();
+    if state.busy
+        || state.completion_reported
+        || state.error.is_some()
+        || !state.report.as_ref().is_some_and(|report| {
+            report.phase == TerminalUpgradePhase::Complete
+                && report.selected_action.as_deref() == Some("program")
+        })
+        || verified_action(&state).is_err()
+    {
+        return None;
+    }
+    let focus = state.open;
+    state.open = false;
+    state.completion_reported = true;
+    ctx.request_repaint_of(popup);
+    Some(crate::models::PopupEvent::ProgramUpdated {
+        info: popup,
+        window: state.window.clone(),
+        process: state.process,
+        application: state.application,
+        focus,
+    })
+}
+
 pub(super) fn show(ctx: &egui::Context, popup: egui::ViewportId) -> bool {
     let Some(shared) = ctx.data(|data| data.get_temp::<Shared>(state_id(popup))) else {
         return false;
@@ -296,7 +309,6 @@ pub(super) fn show(ctx: &egui::Context, popup: egui::ViewportId) -> bool {
         let action = dialog(ctx, popup, &mut state);
         if action == Some(Action::Close) {
             state.open = false;
-            state.accepted = false;
             ctx.request_repaint();
             return true;
         }
@@ -354,7 +366,6 @@ fn request(shared: Shared, ctx: egui::Context, popup: egui::ViewportId, action: 
             }
         }
         state.busy = true;
-        state.accepted = false;
         (
             state.window.clone(),
             ProgramUpdateIdentity {
@@ -402,7 +413,8 @@ fn request(shared: Shared, ctx: egui::Context, popup: egui::ViewportId, action: 
                         state.open
                     };
                     ctx.request_repaint_of(popup);
-                    if !running || !open {
+                    // A confirmed restart still finishes when its progress dialog is dismissed.
+                    if !running || (!open && report.selected_action.as_deref() != Some("program")) {
                         break;
                     }
                     applicationlauncher::observe! { worker.set_state("polling-exact-process-update"); }

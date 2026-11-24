@@ -978,10 +978,23 @@ tmux server and other panes stay running. The preview checks only that program,
 not every session on the server. Codex resumes its exact conversation; Fish must
 be idle, with no foreground application or background jobs. Missing terminal
 handoff support, changed process identities and ambiguous conversations block
-the restart rather than targeting another process. Explicit consent is required;
-closing the dialog does not start work or cancel an already confirmed operation.
-Reopen Show Info after completion to capture the restarted process. These links
-do not build, install or download anything.
+the restart rather than targeting another process. Clicking **Update ... only**
+confirms the preview directly, without an additional checkbox. Closing the dialog
+does not start work or cancel an already confirmed operation.
+The Show Info panel renders each update modal once per frame, including in its
+standalone root window, without duplicating input handling. Opening the dialog,
+Escape and default Enter never confirm an update.
+Successful Fish, Codex and tmux-client updates close their confirmation dialog
+and refresh the same Show Info window once, without reopening or resizing it.
+The previous document stays visible while the replacement process tree is
+captured, preserving scroll position. Unchanged process metadata is reused; the
+updated process is re-inspected and turns green only when its running build is
+verified against disk. An expanded dropdown transfers to an unambiguous replacement
+process. Failures retain the dialog and recovery details. Dismissing progress does
+not cancel a confirmed restart; its eventual refresh does not steal focus, and a
+closed Info window is never reopened automatically. Interactive shells retain
+native executable freshness even though the shared resolver classifies them as
+potential script runtimes. These links do not build, install or download anything.
 
 Verified outdated local **tmux clients** have an **Update client** link. Its
 confirmation reconnects only that exact client in the same held terminal tab,

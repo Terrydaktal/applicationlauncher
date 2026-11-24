@@ -558,6 +558,14 @@ impl ProcessVersionCache {
         Self { shared }
     }
 
+    pub(crate) fn invalidate(&self, identity: ProcessIdentity) {
+        self.shared
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .invalidate(identity);
+    }
+
     pub(crate) fn reset(&self) {
         let mut state = self
             .shared
@@ -881,6 +889,57 @@ mod tests {
             assert!(Instant::now() < deadline, "path metadata did not complete");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn explicit_process_refresh_discards_in_flight_results_but_retains_other_cached_processes() {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let count = probes.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let cache = ProcessVersionCache::with_test_probe(
+            egui::Context::default(),
+            egui::ViewportId::ROOT,
+            move |identity| {
+                let value = if identity.pid == 1 {
+                    let revision = count.fetch_add(1, Ordering::SeqCst);
+                    if revision == 0 {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                    format!("updated process revision {revision}")
+                } else {
+                    "unaffected process".into()
+                };
+                ProcessVersion {
+                    version: Some(value),
+                    ..Default::default()
+                }
+            },
+        );
+        let wait = |node: &ProcessInfoNode| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(result) = cache.request(node) {
+                    break result;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        };
+        let unchanged = wait(&node(2));
+        assert!(cache.request(&node(1)).is_none());
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        cache.invalidate(node(1).identity);
+        assert!(Arc::ptr_eq(&unchanged, &cache.request(&node(2)).unwrap()));
+        assert!(cache.request(&node(1)).is_none());
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            wait(&node(1)).version.as_deref(),
+            Some("updated process revision 1")
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+        assert!(Arc::ptr_eq(&unchanged, &cache.request(&node(2)).unwrap()));
     }
 
     #[test]
