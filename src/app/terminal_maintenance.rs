@@ -296,7 +296,6 @@ fn panel(ui: &mut egui::Ui, state: &mut TerminalMaintenanceState) -> Option<Acti
                             if let Some(id) = &window.build_id {
                                 ui.small(format!("Build ID: {id}"));
                             }
-                            ui.small(format!("SHA256: {}", window.sha256));
                         }
                         ui.separator();
                     });
@@ -388,7 +387,7 @@ mod tests {
                     preserves_processes: false,
                     executable: "/fixture/xfce4-terminal".into(),
                     build_id: None,
-                    sha256: "fixture".into(),
+                    sha256: String::new(),
                     status: "ready".into(),
                     message: "fixture preview".into(),
                 }],

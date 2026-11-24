@@ -37,6 +37,8 @@ pub struct TerminalUpgradeWindow {
     pub preserves_processes: bool,
     pub executable: String,
     pub build_id: Option<String>,
+    // Legacy report key for older clients; new previews do not calculate a hash.
+    #[serde(default)]
     pub sha256: String,
     pub status: String,
     pub message: String,
@@ -730,6 +732,20 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         assert!(registry.start(&id, &[window.id], true).unwrap().is_none());
         assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn unhashed_previews_keep_the_legacy_report_key_empty_for_older_clients() {
+        let preview = serde_json::json!({
+            "window_id": "exact-window", "title": "private fixture", "tabs": [],
+            "eligible": true, "recommended": true, "preserves_processes": false,
+            "executable": "/fixture/xfce4-terminal", "build_id": null,
+            "status": "ready", "message": "Metadata-only preview"
+        });
+        let row: TerminalUpgradeWindow = serde_json::from_value(preview).unwrap();
+        assert!(row.sha256.is_empty());
+        let report = serde_json::to_value(row).unwrap();
+        assert_eq!(report["sha256"], "");
     }
     #[test]
     fn delegated_update_service_is_bounded_and_cannot_target_an_arbitrary_bus_name() {

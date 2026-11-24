@@ -1,6 +1,5 @@
 """Daemon-owned whole-window replacement, without an updater API in the old terminal."""
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -179,9 +178,9 @@ def capture(system, desktop, window, binary=None):
             raise worker.Refused("The window-to-tab mapping is ambiguous; no window was changed")
         records = matches[0]
     binary = worker.latest_binary("xfce4-terminal") if binary is None else binary
-    with open(binary, "rb") as stream: installed = hashlib.file_digest(stream, "sha256").hexdigest()
-    with open(f"/proc/{pid}/exe", "rb") as stream: running = hashlib.file_digest(stream, "sha256").hexdigest()
-    if installed == running: raise worker.Refused("This terminal already runs the current installed build")
+    installed = worker.file_identity(binary)
+    if installed[:2] == owner_process["image"][:2]:
+        raise worker.Refused("This terminal already runs the current installed build")
     environment = {}
     for entry in worker.read_limited(f"/proc/{pid}/environ", 128 * 1024).split(b"\0"):
         key, separator, value = entry.partition(b"=")
@@ -189,7 +188,7 @@ def capture(system, desktop, window, binary=None):
         if separator and name in {"DISPLAY", "WAYLAND_DISPLAY", "GDK_BACKEND", "XDG_CURRENT_DESKTOP"}:
             environment[name] = os.fsdecode(value)
     return dict(owner=owner_process, owner_bus=owner, records=records, window=actual, binary=binary, display_environment=environment,
-                installed=worker.file_identity(binary), capabilities=dict(hold=False), running_sha256=running, sha256=installed)
+                installed=installed, capabilities=dict(hold=False))
 
 
 def inspect(windows, system):
@@ -199,14 +198,14 @@ def inspect(windows, system):
         for window in windows[:512]:
             row = dict(window_id=window["id"], owner_pid=window["pid"], title=window["title"], terminal_window_uuid="",
                 tabs=[], eligible=False, recommended=False, preserves_processes=False, executable="", build_id=None,
-                sha256="", status="unsupported", message="", external=None)
+                status="unsupported", message="", external=None)
             planner = WindowUpdate({}, system, "/not-used-for-preview")
             try:
                 snapshot = capture(system, desktop, window)
                 tabs = planner.capture_tabs(snapshot)
                 row.update(eligible=True, recommended=True, tabs=[tab["cwd"] for tab in tabs],
                     preserves_processes=all(tab["program"]["kind"] == "tmux" for tab in tabs), executable=snapshot["binary"],
-                    sha256=snapshot["sha256"], status="ready", message="Daemon-managed replacement; the old terminal needs no updater API")
+                    status="ready", message="Daemon-managed replacement; the old terminal needs no updater API")
                 row["external"] = dict(window=dict(id=window["id"], pid=window["pid"], title=window["title"]),
                     owner=snapshot["owner"], records=snapshot["records"], binary=snapshot["binary"], installed=snapshot["installed"],
                     window_state=snapshot["window"], scope_fingerprint=scope_fingerprint(tabs), display_environment=snapshot["display_environment"])

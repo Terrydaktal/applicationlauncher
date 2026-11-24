@@ -90,6 +90,28 @@ def file_identity(path):
     return [metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns]
 
 
+def atomic_record(path, value):
+    path = Path(path)
+    data = json.dumps(value).encode()
+    if len(data) > LIMIT:
+        raise Refused("Lifecycle recovery metadata exceeds its bounded size limit")
+    temporary = path.with_name(path.name + ".tmp-" + str(os.getpid()))
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def terminal_environment(pid):
     result = dict.fromkeys(TERMINAL_ENVIRONMENT)
     for value in read_limited(f"/proc/{pid}/environ", 128 * 1024).split(b"\0"):
@@ -908,12 +930,12 @@ def inspect(payload, system):
     return dict(actions=actions, plans=plans, title=window["title"])
 
 
-def signature(plan):
+def plan_identity(plan):
     def strip(value):
         if isinstance(value, dict):
             result = {}
             for key, item in value.items():
-                if key in {"input", "window_title", "terminal_title", "working_directory", "arguments", "title"}:
+                if key in {"input", "window_title", "terminal_title", "working_directory", "arguments", "title", "connection_descendants"}:
                     continue
                 if key == "windows" and value.get("kind") == "tmux_server":
                     # tmux automatically renames windows; names do not change restart scope.
@@ -923,7 +945,11 @@ def signature(plan):
         if isinstance(value, list):
             return [strip(item) for item in value]
         return value
-    return hashlib.sha256(json.dumps(strip(plan), sort_keys=True).encode()).hexdigest()
+    return strip(plan)
+
+
+def signature(plan):
+    return hashlib.sha256(json.dumps(plan_identity(plan), sort_keys=True).encode()).hexdigest()
 
 
 def stop_codex(saved):

@@ -71,7 +71,6 @@ class Coordinator(unittest.TestCase):
                 return [result]
             patches.enter_context(patch.object(window.WindowUpdate, "capture_tabs", side_effect=capture))
             patches.enter_context(patch.object(window.WindowUpdate, "revalidate", side_effect=lambda: events.append("revalidated")))
-            patches.enter_context(patch.object(window.WindowUpdate, "preserve_builds", side_effect=lambda: events.append("builds-preserved")))
             def stop(target, retire_tmux=False):
                 events.append("retired-tmux-client" if retire_tmux else "stopped")
                 job.interrupted = application != "tmux"
@@ -104,6 +103,8 @@ class Coordinator(unittest.TestCase):
                 request["scope_fingerprint"] = preview_scope
             job = window.WindowUpdate(request, system, directory, backend=backend)
             result = job.run()
+            self.assertFalse((Path(directory) / "applicationlauncher/lifecycle/builds").exists(),
+                             "A terminal update archived executable contents")
             records = {path.name: json.loads(path.read_text()) for path in Path(directory).glob("*.json")}
             if timings:
                 path = Path(root) / "timings/job.jsonl"

@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import Mock, mock_open, patch
 
 from test_lifecycle_windows import SOURCE, worker, window
+from test_lifecycle_recovery_builds import forbid_image_io
 
 spec = importlib.util.spec_from_file_location("lifecycle_external", SOURCE / "external.py")
 external = importlib.util.module_from_spec(spec)
@@ -36,7 +37,7 @@ class Mapping(unittest.TestCase):
         actual = saved_window()
         desktop = Mock()
         desktop.call.side_effect = [actual, dict(windows=[actual])]
-        owner = dict(pid=50, executable="/fixture/xfce4-terminal", arguments=["xfce4-terminal"], start=60)
+        owner = dict(pid=50, executable="/fixture/xfce4-terminal", arguments=["xfce4-terminal"], start=60, image=[1, 7, 8, 9])
         record = dict(child_pid=70, window_uuid="window", active=True)
         with patch.object(worker, "process", return_value=owner), \
                 patch.object(external, "native_records", return_value=(None, None)), \
@@ -44,13 +45,31 @@ class Mapping(unittest.TestCase):
                 patch.object(worker, "latest_binary", return_value="/fixture/new-terminal"), \
                 patch.object(worker, "file_identity", return_value=[1, 2, 3, 4]), \
                 patch.object(worker, "read_limited", return_value=b"DISPLAY=:5\0WAYLAND_DISPLAY=private-wayland\0SECRET=never-save\0"), \
-                patch("builtins.open", mock_open()), \
-                patch.object(external.hashlib, "file_digest", side_effect=[Mock(hexdigest=lambda: "new"), Mock(hexdigest=lambda: "old")]):
+                patch("builtins.open", side_effect=AssertionError("Read terminal executable contents")), \
+                forbid_image_io():
             result = external.capture(object(), desktop, dict(id="window", pid=50))
         proc.assert_called_once_with(50, "window")
         self.assertEqual(result["records"], [record])
         self.assertFalse(result["capabilities"]["hold"])
         self.assertEqual(result["display_environment"], dict(DISPLAY=":5", WAYLAND_DISPLAY="private-wayland"))
+        self.assertEqual(result["installed"], [1, 2, 3, 4])
+        self.assertNotIn("sha256", result)
+        self.assertNotIn("running_sha256", result)
+
+    def test_same_installed_inode_is_refused_without_reading_the_executable(self):
+        actual = saved_window()
+        desktop = Mock()
+        desktop.call.side_effect = [actual, dict(windows=[actual])]
+        owner = dict(pid=50, executable="/fixture/xfce4-terminal", arguments=[], image=[1, 2, 3, 4])
+        with patch.object(worker, "process", return_value=owner), \
+                patch.object(external, "native_records", return_value=(None, None)), \
+                patch.object(external, "proc_record", return_value=dict(child_pid=70, active=True)), \
+                patch.object(worker, "latest_binary", return_value="/fixture/current-terminal"), \
+                patch.object(worker, "file_identity", return_value=owner["image"]), \
+                patch("builtins.open", side_effect=AssertionError("Read terminal executable contents")), \
+                forbid_image_io():
+            with self.assertRaisesRegex(worker.Refused, "already runs the current"):
+                external.capture(object(), desktop, dict(id="window", pid=50))
 
     def test_multiple_windows_without_tab_metadata_are_refused_without_guessing(self):
         actual = saved_window()

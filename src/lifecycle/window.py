@@ -1,12 +1,9 @@
 """Daemon-owned window update coordinator. Terminal helpers contain no app adapters."""
 import json
-import hashlib
-import fcntl
 import copy
 import os
 from pathlib import Path
 import signal
-import shutil
 import stat
 import time
 
@@ -28,25 +25,7 @@ def private_request(path):
 
 
 def atomic_record(path, value):
-    path = Path(path)
-    data = json.dumps(value).encode()
-    if len(data) > worker.LIMIT:
-        raise worker.Refused("Lifecycle recovery metadata exceeds its bounded size limit")
-    temporary = path.with_name(path.name + ".tmp-" + str(os.getpid()))
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    finally:
-        temporary.unlink(missing_ok=True)
+    worker.atomic_record(path, value)
 
 
 def scope_fingerprint(tabs):
@@ -58,7 +37,7 @@ def scope_fingerprint(tabs):
                            active=tab["active"], cwd=tab["cwd"], environment=tab.get("environment", {}),
                            return_shell={key: tab["return_shell"][key] for key in ("source", "image", "argv0")}
                                if "return_shell" in tab else None))
-    return worker.signature(values)
+    return worker.plan_identity(values)
 
 
 class WindowUpdate:
@@ -179,69 +158,6 @@ class WindowUpdate:
             tabs.append(tab)
         return tabs
 
-    def preserve_builds(self):
-        cache = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "applicationlauncher/lifecycle/builds"
-        cache.mkdir(mode=0o700, parents=True, exist_ok=True)
-        metadata = cache.lstat()
-        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
-            raise worker.Refused("The lifecycle recovery build cache is not private")
-        for tab in self.tabs:
-            program = tab["program"]
-            name = Path(program["process"]["executable"].removesuffix(" (deleted)")).name
-            target, fingerprint = self.preserve_image(cache, program["argv"][0], name)
-            arguments = [program["process"]["arguments"][0], *program["argv"][1:]]
-            if "return_shell" in tab:
-                shell = tab["return_shell"]
-                shell_target, shell_hash = self.preserve_image(cache, shell["executable"], "fish")
-                shell.update(recovery_executable=str(shell_target), recovery_build_sha256=shell_hash)
-                tab["recovery_argv"] = worker.fish_command(str(target), arguments, str(shell_target))
-            else:
-                tab["recovery_argv"] = [str(target), *tab["argv"][1:]]
-            tab["recovery_build_sha256"] = fingerprint
-        for parent in (cache, cache.parent):
-            descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try: os.fsync(descriptor)
-            finally: os.close(descriptor)
-
-    def preserve_image(self, cache, source, name):
-        if os.stat(source).st_size > 1024 * 1024 * 1024:
-            raise worker.Refused("The executable exceeds the 1 GiB native recovery-build limit")
-        with open(source, "rb") as stream:
-            fingerprint = hashlib.file_digest(stream, "sha256").hexdigest()
-        directory = cache / fingerprint
-        directory.mkdir(mode=0o700, exist_ok=True)
-        metadata = directory.lstat()
-        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
-            raise worker.Refused("A recovery build directory is not private")
-        target = directory / name
-        if not target.exists():
-            temporary = directory / (".capture-" + self.request["job_id"])
-            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700)
-            try:
-                with open(source, "rb") as source_file, os.fdopen(descriptor, "wb") as destination:
-                    try:
-                        # Linux FICLONE preserves bytes without coupling future writes.
-                        fcntl.ioctl(destination.fileno(), 0x40049409, source_file.fileno())
-                    except OSError:
-                        shutil.copyfileobj(source_file, destination, 1024 * 1024)
-                    destination.flush()
-                    os.fsync(destination.fileno())
-                temporary.chmod(0o500)
-                os.link(temporary, target, follow_symlinks=False)
-            finally:
-                temporary.unlink(missing_ok=True)
-        descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(descriptor, "rb") as stream:
-            metadata = os.fstat(stream.fileno())
-            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
-                    or metadata.st_mode & 0o022 or metadata.st_size > 1024 * 1024 * 1024
-                    or hashlib.file_digest(stream, "sha256").hexdigest() != fingerprint):
-                raise worker.Refused("The recovery executable does not match the captured running build")
-        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try: os.fsync(descriptor)
-        finally: os.close(descriptor)
-        return target, fingerprint
-
     def revalidate(self):
         self.remote("Preflight")
         for tab in self.tabs:
@@ -256,7 +172,7 @@ class WindowUpdate:
                 self.verify_tmux(tab["program"], active)
             else:
                 fresh = worker.program_plan(active, executable=tab["program"]["argv"][0])
-                if worker.signature(fresh) != worker.signature(tab["program"]):
+                if worker.plan_identity(fresh) != worker.plan_identity(tab["program"]):
                     raise worker.Refused("The exact application session or restart options changed")
                 if fresh["kind"] == "codex" and worker.children(active["pid"]):
                     raise worker.Refused("Codex started a tool after preview; nothing was stopped")
@@ -365,10 +281,10 @@ class WindowUpdate:
             with worker.operation_lock():
                 with self.timings.span("revalidate", attempt=1):
                     self.revalidate()
-                with self.timings.span("preserve_builds"):
-                    self.preserve_builds()
-                atomic_record(self.directory / "restart-plan.json", dict(protocol=1, request=self.request,
-                    snapshot=self.snapshot, tabs=self.tabs, scope="terminal-only; preserve running application builds"))
+                with self.timings.span("restart_plan"):
+                    atomic_record(self.directory / "restart-plan.json", dict(protocol=1, request=self.request,
+                        snapshot=self.snapshot, tabs=self.tabs, scope="terminal and supported applications; preserve tmux servers and panes",
+                        image_retention="Open descriptors during handover only; no executable backups"))
                 self.event("confirmed")
                 self.publish("running", "Staging the replacement terminal; original window remains open")
                 with self.timings.span("stage_replacement"):

@@ -51,22 +51,23 @@ class ReturnShell(unittest.TestCase):
         changed["return_shell"]["image"][1] += 1
         self.assertNotEqual(before, window.scope_fingerprint([changed]))
 
-    def test_recovery_retains_both_native_images_without_ephemeral_paths(self):
-        with tempfile.TemporaryDirectory(prefix="return-shell-builds-") as directory, patch.dict(os.environ, XDG_STATE_HOME=directory):
-            job = window.WindowUpdate(dict(job_id="private-test"), object(), directory)
-            tab = dict(argv=[], executable="/bin/sh", program=dict(argv=["/bin/true", "resume", "exact"],
-                process=dict(executable="/fixture/codex", arguments=["original-codex"])),
-                return_shell=dict(executable="/bin/sh"))
-            job.tabs = [tab]
-            job.preserve_builds()
-            shell = Path(tab["return_shell"]["recovery_executable"])
-            app = shell.parents[1] / tab["recovery_build_sha256"] / "codex"
-            self.assertEqual(shell.read_bytes(), Path("/bin/sh").read_bytes())
-            self.assertEqual(app.read_bytes(), Path("/bin/true").read_bytes())
-            self.assertEqual(tab["recovery_argv"][:3], [str(shell), "--interactive", "--init-command"])
-            self.assertIn(str(app), tab["recovery_argv"][3])
-            self.assertIn("original-codex", tab["recovery_argv"][3])
-            self.assertNotIn("/proc/", " ".join(tab["recovery_argv"]))
+    def test_return_shell_and_application_use_live_pins_not_archived_copies(self):
+        from test_lifecycle_recovery_builds import forbid_image_io
+        with tempfile.TemporaryDirectory(prefix="return-shell-pins-") as directory:
+            job = window.WindowUpdate({}, object(), directory)
+            try:
+                with forbid_image_io():
+                    app = job.pin_image("/bin/true", worker.file_identity("/bin/true"))
+                    shell = job.pin_image("/bin/sh", worker.file_identity("/bin/sh"))
+                    arguments = worker.fish_command(app, ["original-codex", "resume", "exact"], "original-fish")
+                self.assertEqual(arguments[:3], ["original-fish", "--interactive", "--init-command"])
+                self.assertIn(app, arguments[3])
+                self.assertIn("original-codex", arguments[3])
+                self.assertEqual(worker.file_identity(shell), worker.file_identity("/bin/sh"))
+                self.assertEqual(list(Path(directory).iterdir()), [])
+            finally:
+                for descriptor in job.descriptors:
+                    os.close(descriptor)
 
     def test_fish_stays_interactive_after_success_failure_and_ctrl_c(self):
         fish = Path.home() / ".local/bin/fish"

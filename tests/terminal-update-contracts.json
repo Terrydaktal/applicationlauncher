@@ -4,6 +4,26 @@
   "scope": "Confirmed daemon-owned whole-window replacement with optional stable native cooperation, including terminals without updater APIs",
   "behaviors": [
     {
+      "id": "TERMUPDATE-NO-IMAGE-IO",
+      "contract": "Both window-update paths pin executables and revalidate file, process, PTY and session identities without executable copying or hashing, or restart-scope hashing. Metadata-only recovery records remain; no durable executable backup is promised after the final holder of an unlinked image exits. Old hash-based previews refuse safely rather than bypassing scope checks.",
+      "tests": ["test_both_routes_and_native_fallback_never_copy_or_hash", "test_large_deleted_image_is_pinned_without_reading_or_copying", "test_same_installed_inode_is_refused_without_reading_the_executable", "test_scope_identity_compares_structure_without_hashing", "test_restart_records_metadata_without_copy_or_hash_stages"]
+    },
+    {
+      "id": "TERMUPDATE-RETURN-SHELL",
+      "contract": "After a non-tmux application exits, captured dedicated return shells remain alive until the replacement is verified and the original terminal is closed. Their identities and child topology are checked again before handover; new jobs refuse closure rather than being interrupted. Native interrupted recovery keeps the original tab open even if its child exits after failure.",
+      "tests": ["test_codex_return_shell_is_not_signalled_before_replacement_verification", "test_return_shell_starting_a_job_or_changing_image_blocks_handover", "test_return_shell_ignores_exited_children_waiting_to_be_reaped", "test_return_shell_permission_failure_is_not_treated_as_process_exit", "test_confirmation_names_the_exact_codex_conversation_not_fish_options", "terminal-update-wayland-codex-in-fish", "terminal-update-wayland-late-application-exit"]
+    },
+    {
+      "id": "TERMUPDATE-COMPAT-TITLE",
+      "contract": "Pinned descriptor execution may give Fish, Codex or the terminal a numeric kernel comm. Window title reconstruction resolves only those numeric names from the running executable image, including deleted images, so a restored shell is still recognised and the actual foreground program supplies the title. Custom nonnumeric process names and real numeric executable names remain intact; unreadable images retain the observed name rather than guessing from argv.",
+      "tests": [
+        "descriptor_process_names_use_the_running_image_not_the_fd_number",
+        "custom_process_names_are_preserved_without_reading_the_image",
+        "descriptor_launched_shell_finds_codex_and_keeps_its_window_title",
+        "live_terminal_dbus_foreground_program_and_title"
+      ]
+    },
+    {
       "id": "TERMUPDATE-CLIENT-01",
       "contract": "Updater service names are restricted to the terminal-owned private namespace",
       "tests": [
