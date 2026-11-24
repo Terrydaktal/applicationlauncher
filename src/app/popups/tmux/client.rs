@@ -171,7 +171,7 @@ pub(super) fn rows(
         }
     }
     let mut rows = Vec::new();
-    fields(&mut rows, "", &client, InfoFieldScope::RunningInstance, 0);
+    fields(&mut rows, "", &client, InfoFieldScope::InstanceContext, 0);
     let servers = &inventory.data["servers"];
     if !frontend_shown {
         let instances = match original["frontend"].as_str() {
@@ -187,7 +187,8 @@ pub(super) fn rows(
                     && instance["started_ticks"] == original["frontend_started_ticks"]
             });
             if let Some(instance) = matches.next().filter(|_| matches.next().is_none()) {
-                rows.push(row(
+                rows.push(scoped_row(
+                    InfoFieldScope::RunningInstance,
                     "Frontend running SHA256",
                     value("sha256", &instance["sha256"]),
                 ));

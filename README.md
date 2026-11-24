@@ -796,15 +796,21 @@ client and active pane. The server shows its listener, running/installed build
 identity, host, sizing monitor and session/client counts. Independent dropdowns
 describe every session (including detached sessions) and every attached client.
 Server properties are merged directly into its main process fields, without a
-second "Tmux server" dropdown or repeated version/outdated rows. The distinct
+second "Tmux server" dropdown or repeated version/outdated rows. Tmux role,
+listener, host, snapshot time, sizing monitor state and session/client counts
+appear together, in that order, directly after **Desktop file**. The distinct
 running and installed SHA256 hashes sit beside their respective ELF build IDs;
 the existing version comparison colours and inline Update link are unchanged.
 Capture errors remain visible in the same fields, and metadata from a different
 server PID/start-time/listener is not merged.
 The client process shows only the record matching its own PID and process start
 time, never a different attachment or the server's default active pane.
-Its connection fields are merged into the main process details, without a separate
-connection dropdown or repeated session/pane/PID fields. The four tmux/network
+Its rose-grey **Session** field shows the session name directly after **Desktop
+file**. Expand it to see the session, pane and connection details, separate from
+the process's executable and installation metadata. It starts collapsed and does
+not repeat connection fields in the main process details. Internal foreground
+build-unknown and application-outdated booleans are hidden; build evidence and
+freshness colours remain available. The four tmux/network
 socket fields replace legacy Socket, address/port and inode aliases; older records
 are normalized without confusing Unix IPC sockets with network endpoints. Frontend
 PID, versions and build evidence are omitted when that exact PID/start-time pair

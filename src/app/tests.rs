@@ -3121,7 +3121,10 @@ mod tests {
             );
             assert!(!rows.iter().any(|row| row.label == "Process desktop file"));
             if pid == 5 {
-                assert!(position("Tmux pane directory") < position("Version (ELF build ID)"));
+                assert!(
+                    !rows.iter().any(|row| row.label.starts_with("Tmux ")),
+                    "Client context belongs in its Session dropdown, not the main process rows"
+                );
             }
             if pid == 20 {
                 for client_only in [
@@ -3159,13 +3162,9 @@ mod tests {
             assert!(!rows.iter().any(|row| row.label.starts_with("Window ")
                 || row.label == "Geometry"
                 || row.label == "Applicationlauncher title"));
-            assert_eq!(rows.iter().any(|row| row.label == "Tmux session"), pid == 5);
+            assert!(!rows.iter().any(|row| row.label == "Tmux session"));
             if !active {
-                assert!(
-                    rows.iter()
-                        .filter(|row| row.label != "Tmux session")
-                        .all(|row| !row.searched)
-                );
+                assert!(rows.iter().all(|row| !row.searched));
             }
         }
     }

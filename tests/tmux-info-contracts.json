@@ -5,8 +5,18 @@
   "behaviors": [
     {
       "id": "TMUX-INFO-OWNERSHIP",
-      "contract": "The tmux server has merged server/listener properties, not the selected client's session/pane; sessions and all attached clients have separately labelled metadata groups, while the selected client's connection fields are merged into its main process fields and match its exact PID and start time",
+      "contract": "The tmux server has merged server/listener properties, not the selected client's session/pane; sessions and all attached clients have separately labelled metadata groups, while the selected client's connection fields belong to its own Session dropdown and match its exact PID and start time",
       "tests": ["process_sections_use_their_own_metadata_and_keep_tmux_fields_under_tmux", "tmux_server_information_does_not_borrow_the_selected_clients_pane_or_session", "tmux_client_information_contains_only_its_own_verified_connection", "tmux_client_inventory_never_matches_a_reused_ambiguous_or_missing_identity"]
+    },
+    {
+      "id": "TMUX-INFO-CLIENT-SESSION",
+      "contract": "A collapsed-by-default rose-grey Session field shows the client's session name directly after Desktop file. Expanding it reveals the client's tmux session, pane and connection fields without duplicating them in the main process details. Generic executable/install fields, parent value-column alignment, independent collapse state and continuous selection/copy order are preserved; a missing anchor appends the Session field instead of hiding it.",
+      "tests": ["tmux_client_session_is_an_independent_lazy_field_without_flat_connection_duplicates", "tmux_session_field_follows_desktop_file_without_shifting_columns_or_copy_order"]
+    },
+    {
+      "id": "TMUX-INFO-HIDDEN-FLAGS",
+      "contract": "Internal app_build_unknown and app_outdated booleans are not displayed at client, session or nested guest scope, regardless of their value. Raw inventory, real build evidence, frontend status and distinct sizing state are retained.",
+      "tests": ["tmux_info_hides_foreground_build_flags_at_every_scope_without_changing_inventory"]
     },
     {
       "id": "TMUX-INFO-COVERAGE",
@@ -17,6 +27,11 @@
       "id": "TMUX-INFO-DEDUP",
       "contract": "Canonical tmux/network socket fields replace legacy socket/address/port/inode aliases, session and pane identity fields appear once and frontend metadata is omitted only when its exact PID/start-time pair is already represented; unrelated equal or unknown values and distinct states are preserved",
       "tests": ["tmux_client_information_contains_only_its_own_verified_connection", "tmux_socket_aliases_fold_into_four_endpoints_without_losing_ipv6_or_unknowns", "tmux_frontend_details_are_only_omitted_for_the_exact_process_already_shown", "tmux_client_pruning_keeps_distinct_state_and_equal_but_unrelated_values"]
+    },
+    {
+      "id": "TMUX-INFO-SERVER-CONTEXT-ORDER",
+      "contract": "The server's Tmux role, Tmux listener, Host, Snapshot captured, Sizing monitor running, Session count and Client count form an ordered flat block immediately after Desktop file. Existing values, rose-grey context labels, version freshness, build metadata, session/client dropdowns and failure reporting are preserved; absent desktop anchors do not drop any fields.",
+      "tests": ["tmux_server_context_follows_desktop_file_in_order_without_changing_other_fields"]
     },
     {
       "id": "TMUX-INFO-SERVER-MERGE",
@@ -32,6 +47,11 @@
       "id": "TMUX-INFO-SAFETY",
       "contract": "Only clients --json is invoked for the exact owned socket and captured server identity; changed servers, malformed/oversized metadata and ambiguous identities are rejected, failures stay visible and no update/cleanup/attach/sizing operation runs",
       "tests": ["tmux_inventory_rejects_wrong_servers_sockets_malformed_and_oversized_records", "tmux_inventory_command_only_requests_json_for_the_exact_socket", "../tmux-mosh/tests/test_launcher_metadata.py::test_private_inventory_publishes_client_identity_flags_and_socket_pairs_without_changing_tmux"]
+    },
+    {
+      "id": "TMUX-INFO-FIELD-SCOPES",
+      "contract": "Application-specific tmux session, pane, client/server role and SSH/Mosh connection fields use rose-grey labels, including nested guest records. Generic OS process fields (PID, parent PID, start time, working directory and process command line) remain green-grey, as do running versions, hashes, build status and binary dates. Scope follows source schema keys rather than formatted labels, while installed build records retain installation labels. Values, ownership, ordering, deduplication and update actions do not change.",
+      "tests": ["tmux_instance_context_scopes_preserve_running_and_installed_build_identity", "tmux_nested_guest_context_keeps_build_fields_in_their_own_scopes"]
     }
   ]
 }

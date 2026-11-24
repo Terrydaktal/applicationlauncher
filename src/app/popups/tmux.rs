@@ -88,10 +88,14 @@ fn requested(
 }
 
 fn row(label: &str, value: String) -> InfoPopupRow {
+    scoped_row(InfoFieldScope::InstanceContext, label, value)
+}
+
+fn scoped_row(scope: InfoFieldScope, label: &str, value: String) -> InfoPopupRow {
     InfoPopupRow {
         label: label.into(),
         value,
-        scope: InfoFieldScope::RunningInstance,
+        scope,
         searched: false,
         separator_before: false,
         binary_is_current: None,
@@ -136,8 +140,6 @@ fn label(key: &str) -> String {
         "app_label" => "Foreground application",
         "app_pid" => "Foreground PID",
         "command" => "Foreground command line",
-        "app_outdated" => "Foreground application outdated",
-        "app_build_unknown" => "Foreground build unknown",
         "opsec_connection" => "Guest connection",
         "sha256" => "SHA256",
         _ => "",
@@ -169,6 +171,42 @@ fn value(key: &str, value: &Value) -> String {
     }
 }
 
+fn field_scope(key: &str, inherited: InfoFieldScope) -> InfoFieldScope {
+    if inherited == InfoFieldScope::Installation {
+        return inherited;
+    }
+    // Inventory objects mix connection context with build records, including guest clients.
+    match key {
+        "pid" | "parent_pid" | "ppid" | "started_ticks" | "cwd" | "working_directory" => {
+            InfoFieldScope::RunningInstance
+        }
+        "frontend_pid"
+        | "frontend_started_ticks"
+        | "pane_pid"
+        | "app_pid"
+        | "command"
+        | "tty"
+        | "socket" => InfoFieldScope::InstanceContext,
+        "version"
+        | "sha256"
+        | "build_id"
+        | "elf_build_id"
+        | "binary_mtime"
+        | "outdated"
+        | "build_unknown"
+        | "frontend_version"
+        | "frontend_binary_mtime"
+        | "frontend_outdated"
+        | "mosh_client_version"
+        | "mosh_client_build"
+        | "mosh_client_outdated"
+        | "app_build"
+        | "server_binary_mtime"
+        | "tmux_binary_mtime" => InfoFieldScope::RunningInstance,
+        _ => inherited,
+    }
+}
+
 fn fields(
     rows: &mut Vec<InfoPopupRow>,
     prefix: &str,
@@ -178,6 +216,10 @@ fn fields(
 ) {
     if let Some(object) = data.as_object().filter(|_| depth < 8) {
         for (key, data) in object {
+            if matches!(key.as_str(), "app_outdated" | "app_build_unknown") {
+                continue;
+            }
+            let scope = field_scope(key, scope);
             let name = if prefix.is_empty() {
                 label(key)
             } else {
@@ -188,9 +230,7 @@ fn fields(
             {
                 fields(rows, &name, data, scope, depth + 1);
             } else {
-                let mut field = row(&name, value(key, data));
-                field.scope = scope;
-                rows.push(field);
+                rows.push(scoped_row(scope, &name, value(key, data)));
             }
         }
     } else if let Some(array) = data.as_array().filter(|_| depth < 8) {
@@ -204,9 +244,7 @@ fn fields(
             );
         }
     } else {
-        let mut field = row(prefix, value("", data));
-        field.scope = scope;
-        rows.push(field);
+        rows.push(scoped_row(scope, prefix, value("", data)));
     }
 }
 
@@ -220,6 +258,8 @@ fn section(
     InfoMetadataSection {
         id,
         header: header.into(),
+        header_scope: None,
+        field_header: None,
         binary_is_current: None,
         default_open,
         rows: if process_info_section_is_open(ctx, id, default_open) {
@@ -227,6 +267,7 @@ fn section(
         } else {
             Vec::new()
         },
+        children: Vec::new(),
     }
 }
 
@@ -247,7 +288,6 @@ pub(super) fn merge_process_rows(
     window: &WindowInfo,
     node: &ProcessInfoNode,
     lookup: Option<&Lookup>,
-    shown: &[ProcessInfoNode],
 ) {
     if window
         .tmux_pane
@@ -255,8 +295,7 @@ pub(super) fn merge_process_rows(
         .is_some_and(|pane| pane.session.server_pid == node.identity.pid)
     {
         server::merge(rows, versions, window, node, lookup);
-    } else {
-        versions.extend(merge_client_rows(rows, window, node, lookup, shown));
+        server::place_context_after_desktop(rows, versions);
     }
 }
 
@@ -330,6 +369,37 @@ pub(super) fn sections(
     let Some(pane) = &window.tmux_pane else {
         return Vec::new();
     };
+    if node.identity.pid == pane.client_pid {
+        let name = inventory(lookup)
+            .ok()
+            .and_then(|inventory| {
+                inventory
+                    .client(node.identity)
+                    .and_then(|client| client["session"].as_str())
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| pane.session.session_name.clone());
+        let header = format!("Session  {name}");
+        let mut session = section(
+            ctx,
+            id.with("tmux-client-session"),
+            header.clone(),
+            false,
+            || {
+                let mut rows = connection_rows(window, node);
+                let installed = merge_client_rows(&mut rows, window, node, lookup, shown);
+                rows.extend(installed);
+                rows
+            },
+        );
+        session.field_header = Some(InfoMetadataFieldHeader {
+            value_range: "Session  ".len()..header.len(),
+            label_scope: InfoFieldScope::InstanceContext,
+            after_row: Some("Desktop file"),
+        });
+        return vec![session];
+    }
     let server = node.identity.pid == pane.session.server_pid;
     if !server {
         return Vec::new();
@@ -351,7 +421,7 @@ pub(super) fn sections(
             false,
             || {
                 let mut rows = Vec::new();
-                fields(&mut rows, "", session, InfoFieldScope::RunningInstance, 0);
+                fields(&mut rows, "", session, InfoFieldScope::InstanceContext, 0);
                 rows
             },
         ));

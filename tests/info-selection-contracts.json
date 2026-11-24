@@ -65,6 +65,145 @@
         "process_dropdowns_are_independent_and_keep_the_hierarchy_visible",
         "natural_info_height_adds_eight_pixels_to_the_actual_visible_tree"
       ]
+    },
+    {
+      "id": "INFO-LIVE-TITLES-01",
+      "contract": "Live display-title and raw-title changes, including spinner frames and the transition back to idle, immediately wake their owning native Info viewport without refetching captured metadata, waking unrelated Info windows or creating an unchanged-title repaint loop.",
+      "tests": [
+        "live_title_frames_wake_only_the_owning_info_viewport_without_refetching_metadata"
+      ]
+    },
+    {
+      "id": "INFO-HOSTING-01",
+      "contract": "Node.js, Python, Java and Electron runtime executable/version fields share their real PID section with process details and one executable path. Application or Python Script/Module is an expandable metadata child, not a process. Python and shell relationships are labelled Interpreter, while Node.js, Java and Electron retain Runtime. CPython requires the captured running image's validated CPython version-object evidence; filenames, plain version banners, environment configuration, on-disk metadata and stale process evidence cannot assert that implementation. Both relationship fields use the application-specific context label colour and never appear in the process fields. Application version colours remain independent of the interpreter/runtime version. Collapsing metadata hides that relationship but leaves executable/version details visible; old Runtime collapse states have no effect. Continuous selection, copied indentation, section spacing and isolated natural-height measurement preserve this layout at normal and high DPI.",
+      "tests": [
+        "hosted_process_and_runtime_fields_share_one_layer_without_duplicates",
+        "python_interpreter_names_use_only_captured_running_cpython_object_evidence",
+        "hosted_metadata_keeps_only_the_application_child_with_stable_independent_state",
+        "hosted_metadata_headers_compare_application_and_runtime_independently",
+        "python_and_java_application_groups_never_borrow_runtime_versions_or_packages",
+        "hosted_application_header_and_flat_runtime_version_have_independent_freshness",
+        "hosted_metadata_dropdowns_preserve_selection_copying_and_independent_state",
+        "process_tree_restores_heading_and_section_spacing_without_widening_field_rows",
+        "hosted_application_initial_height_preserves_child_collapse_state"
+      ]
+    },
+    {
+      "id": "INFO-PYTHON-SCRIPT-01",
+      "contract": "Python file-script metadata uses the same field-like Script  filename.py heading as Bash: the Script label is rose-grey, the unmodified filename including its extension aligns with the parent value column, and only the filename uses its own captured/current script comparison (Same green, Different red, missing/error/stale evidence neutral), independently of the Python interpreter's executable status. There is no colon, Script name prefix or duplicate Script name process field. Module launches retain Module name: module without fabricated filenames or file-script comparison styling; an interactive interpreter has no invented script section. The script path, distinct launch target and meaningful launch chain are deduplicated. Only evidenced source/distribution versions and package/source metadata are shown, never borrowed interpreter versions or unsupported running-version/source-change/build placeholders. Desktop fields require a real association with the script, not the interpreter. Original values, UTF-8 selection/copying, independent collapse behaviour and normal/high-DPI rendering are preserved; Node, Java and Electron headings are unchanged.",
+      "tests": [
+        "python_script_sections_preserve_filenames_and_omit_unproven_application_fields",
+        "python_module_sections_do_not_invent_script_paths_or_filename_extensions",
+        "python_script_desktop_fields_require_a_real_script_entry_not_the_runtime_entry",
+        "python_source_and_distribution_versions_are_optional_on_disk_metadata_only",
+        "python_source_checkout_does_not_invent_a_loaded_version_or_compilation_status",
+        "python_script_field_headers_align_and_colour_names_without_borrowing_runtime_status",
+        "python_script_field_heading_uses_captured_comparison_not_interpreter_freshness",
+        "python_script_fields_preserve_filenames_without_certifying_unrecorded_source",
+        "python_module_and_interactive_sections_do_not_become_script_fields"
+      ]
+    },
+    {
+      "id": "INFO-PYTHON-PROJECT-MODULES-01",
+      "owner": "Shared Python project-module evidence and Launcher Python section formatter",
+      "contract": "A Python script's Referenced project modules child dropdown is closed by default with an independent stable identity and count; incomplete analysis is indicated in the heading. Only cached backend module observations are presented, never a directory listing, installed dependency list or claim about modules loaded by the process. Original filename labels retain case and Unicode, full absolute module and referencing-file paths remain selectable/copyable, conditional references and analysis notes remain visible on expansion, and the entry file is not repeated as a module row. Evidence explicitly says Static on-disk references; not a loaded-module list. Missing context omits pending discovery; missing module evidence is Unknown rather than a successful zero, completed empty evidence states that no static project modules were found, and empty/partial incomplete evidence remains qualified. Rows and headings do not inherit native/script freshness colouring, execute source, query files during formatting or restore Source directory/Git rows. The project-module and declared-dependency dropdowns collapse independently and retain state when their parent script collapses/reopens, with continuous UTF-8 selection/copying at normal/high DPI.",
+      "tests": [
+        "python_project_module_sections_are_cached_scoped_and_closed_by_default",
+        "python_project_module_sections_distinguish_unknown_empty_and_incomplete_reports",
+        "python_project_modules_render_select_copy_and_collapse_independently_of_dependencies"
+      ]
+    },
+    {
+      "id": "INFO-PYTHON-CONTEXT-01",
+      "contract": "Python script arguments and interpreter options retain their actual argument boundaries. Virtual/Conda environment context is validated against an absolute interpreter launch path and pinned process identity, never inferred from VIRTUAL_ENV alone. Configured environment and base interpreter, installer, exact distribution entry point, declared dependencies with installed availability and disk entry-file SHA256 are passive on-disk evidence. Git source repository, revision and branch rows are omitted without changing underlying metadata discovery. Dependency sections are independently expandable cached metadata, not process branches or claims about imported modules, loaded versions or evaluated requirement markers. Redundant paths/metadata and interpreter desktop placeholders remain absent.",
+      "tests": [
+        "python_details_keep_live_context_separate_from_disk_metadata_and_do_not_claim_loaded_code",
+        "python_environment_uncertainty_qualifies_inherited_markers_without_hiding_arguments",
+        "python_dependency_section_uses_cached_evidence_and_distinguishes_missing_unknown_and_ambiguous",
+        "python_dependency_metadata_and_source_directory_are_not_repeated",
+        "python_dependency_children_follow_script_collapse_state_without_creating_a_process"
+      ]
+    },
+    {
+      "id": "INFO-METADATA-PROGRESSIVE-01",
+      "contract": "Process metadata publishes independently of the bounded build-input check. Expanding an already checked header retains its version/current-build evidence while absent detail rows show Loading rather than Unavailable. Completed native versions, source languages, configured build system and package data remain visible while only Uncompiled changes is pending. Its delayed result updates only that field, preserving concurrent package replies and previously rendered immutable snapshots. Popup reset, process revision changes, shutdown, image replacement and launcher retargets reject stale replies. Queue saturation and checker panics resolve honestly without leaving a permanent pending field or blocking later processes. Pending status remains neutral, clean recorded-input summaries green, changes red and uncertain results yellow at normal and high DPI.",
+      "tests": [
+        "blocked_source_check_publishes_metadata_and_does_not_block_another_process_or_package_reply",
+        "reset_discards_in_flight_source_reply_for_a_reopened_process",
+        "invalidation_discards_in_flight_source_reply_for_a_new_revision",
+        "closing_the_popup_never_waits_for_or_publishes_a_blocked_source_reply",
+        "full_source_queue_preserves_metadata_and_reports_unknown_instead_of_permanent_checking",
+        "pending_without_a_selected_image_reports_unknown_without_starting_source_inspection",
+        "replaced_disk_image_cannot_receive_a_stale_clean_source_result",
+        "retargeted_launcher_cannot_receive_a_stale_clean_source_result",
+        "retargeted_installed_alias_cannot_receive_a_stale_clean_source_result",
+        "panicking_source_check_reports_unknown_and_the_worker_continues",
+        "expanding_a_completed_header_retains_its_current_build_evidence_while_details_load",
+        "progressive_header_rows_keep_version_and_current_marker_while_missing_details_are_loading",
+        "progressive_source_check_rows_show_known_metadata_immediately_and_replace_only_its_pending_field",
+        "progressive_source_check_rendering_keeps_pending_neutral_and_completed_status_colours"
+      ]
+    },
+    {
+      "id": "INFO-METADATA-CACHE-01",
+      "contract": "Completed process metadata and package results remain captured until Info is reopened, the captured process/executable snapshot changes, or a successful single-program update explicitly invalidates that process. The post-update refresh reuses unrelated process metadata. Permission-denied executables and their inferred absolute-argv0 disk candidates do not trigger timed metadata/package retries. Pi's lightweight receipt updates remain independent and do not re-probe native versions or packages.",
+      "tests": [
+        "unreadable_executable_keeps_candidate_and_package_metadata_without_timed_refresh",
+        "completed_metadata_survives_elapsed_time_and_refreshes_only_for_identity_changes",
+        "completed_metadata_refreshes_for_renamed_or_deleted_path_with_same_running_inode",
+        "closing_or_resetting_one_popup_does_not_clear_another_popups_versions",
+        "expanded_pi_receipts_refresh_without_reprobing_node_or_packages"
+      ]
+    },
+    {
+      "id": "INFO-PROCESS-VISIBILITY-01",
+      "contract": "Recognised Glycin image-loader branches and their dedicated Bubblewrap wrappers are hidden by default, with a per-info-window checkbox to reveal live captured helpers. Generic or mixed sandboxes and window-owner/active/pane/client ancestor paths remain visible. Hidden helpers do not queue metadata probes. A bounded background stat-only check removes proven exits, zombies and PID reuse without recapturing version/package metadata, losing surviving children or resetting unrelated cache/expansion state. Unknown reads and lost workers retain captured entries; late results cannot prune a new capture. The notice distinguishes captured metadata from exit removal, and reopening captures new processes. No helper is killed or disabled.",
+      "tests": [
+        "image_loader_filter_hides_only_recognised_decoder_branches_and_their_wrappers",
+        "image_loader_filter_preserves_unrelated_sandboxes_mixed_branches_and_name_lookalikes",
+        "image_loader_filter_never_hides_the_owner_active_process_pane_client_or_their_ancestors",
+        "image_loader_wrapper_classification_survives_its_decoder_exiting",
+        "hidden_image_loader_branches_do_not_queue_metadata_and_revealing_them_preserves_other_cache_entries",
+        "image_loader_filter_toggle_defaults_off_is_per_window_and_reserves_no_empty_row",
+        "presence_checks_remove_only_proven_exits_zombies_and_reused_pids_without_reading_metadata",
+        "presence_checks_keep_unreadable_malformed_and_truncated_processes_as_unknown",
+        "exit_removal_promotes_surviving_children_without_changing_identity_or_captured_metadata",
+        "presence_worker_prunes_off_thread_and_keeps_an_unchanged_snapshot_between_checks",
+        "presence_checks_are_limited_to_the_captured_process_budget",
+        "presence_worker_removes_an_exited_disposable_child",
+        "late_presence_results_never_prune_a_new_capture",
+        "failed_presence_worker_keeps_metadata_and_waits_before_retrying"
+      ]
+    },
+    {
+      "id": "INFO-FIELD-ORDER-01",
+      "contract": "Every process section orders its generic fields as Process name, PID, Running executable image original path, Executable Version (ELF build ID), Command line, Working directory, Parent PID, Process start (ticks since boot). Installed metadata follows as Name, Type, Capabilities, Comment, Description, Application languages, Build system, Uncompiled changes, Latest version on disk (ELF build ID), Package, latest package versions, Root package, Launch chain, Desktop file, Icon path, omitting optional fields that do not apply and preserving source-specific labels. Successful Pacman comparisons use Latest package (in last Pacman sync); AUR and pending/failed source labels remain distinct. Source checkout is not displayed as a path row; its underlying metadata remains available for development and build checks. Captured paths, permission/unavailable explanations, values, search state, scope colours and verified build comparisons are unchanged. Script names remain in the Script metadata heading without duplication, window-only metadata stays ahead of process fields, and application-specific tmux fields stay after generic identity. Native, hosted-runtime, loading and unavailable sections share this ordering without duplicate executable fields.",
+      "tests": [
+        "process_identity_fields_follow_the_requested_order_without_changing_values",
+        "script_name_is_not_duplicated_in_process_rows",
+        "native_process_info_matches_the_requested_order_with_package_updates_and_roots",
+        "installed_application_and_process_views_share_the_same_application_fields",
+        "hosted_application_fields_follow_the_shared_installation_order",
+        "window_and_console_info_follow_the_requested_field_order_without_duplicates",
+        "hosted_process_and_runtime_fields_share_one_layer_without_duplicates",
+        "process_sections_use_their_own_metadata_and_keep_tmux_fields_under_tmux",
+        "combined_version_fields_use_the_requested_format_and_preserve_scope_and_freshness"
+      ]
+    },
+    {
+      "id": "INFO-FIELD-SCOPES-01",
+      "contract": "Only application-specific runtime context labels use rose-grey: the hosted application's Interpreter or Runtime relationship, script/launch targets, Pi's running entry point, extension roots and startup receipt, and tmux/SSH/Mosh sessions, panes, connection, activity and sizing details. Generic OS process facts (PID, parent PID, start time, working directory and process command line) stay green-grey across all applications and nested process records, alongside loaded versions and fingerprints. Window and installation categories, field values, search/status highlighting, selection and copying remain unchanged.",
+      "tests": [
+        "generic_process_fields_stay_green_scoped_across_applications",
+        "script_name_is_not_duplicated_in_process_rows",
+        "info_fields_classify_window_process_and_installed_metadata_at_the_source",
+        "hosted_metadata_keeps_only_the_application_child_with_stable_independent_state",
+        "python_and_java_application_groups_never_borrow_runtime_versions_or_packages",
+        "tmux_instance_context_scopes_preserve_running_and_installed_build_identity",
+        "tmux_nested_guest_context_keeps_build_fields_in_their_own_scopes",
+        "info_scope_colours_apply_only_to_labels_independently_of_search_and_status",
+        "info_strikethrough_preserves_divider_positions_and_cross_row_copying"
+      ]
     }
   ]
 }

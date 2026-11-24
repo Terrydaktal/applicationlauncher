@@ -22,6 +22,32 @@ fn insert_after(rows: &mut Vec<InfoPopupRow>, after: &str, field: InfoPopupRow) 
     rows.insert(position, field);
 }
 
+pub(super) fn place_context_after_desktop(
+    rows: &mut Vec<InfoPopupRow>,
+    versions: &mut Vec<InfoPopupRow>,
+) {
+    let Some(desktop) = versions.iter().position(|row| row.label == "Desktop file") else {
+        return;
+    };
+    let context = [
+        "Tmux role",
+        "Tmux listener",
+        "Host",
+        "Snapshot captured",
+        "Sizing monitor running",
+        "Session count",
+        "Client count",
+    ]
+    .into_iter()
+    .filter_map(|label| {
+        rows.iter()
+            .position(|row| row.label == label)
+            .map(|index| rows.remove(index))
+    })
+    .collect::<Vec<_>>();
+    versions.splice(desktop + 1..desktop + 1, context);
+}
+
 pub(super) fn merge(
     rows: &mut Vec<InfoPopupRow>,
     versions: &mut Vec<InfoPopupRow>,
@@ -56,7 +82,8 @@ pub(super) fn merge(
         ),
         row("Session count", inventory.sessions().len().to_string()),
         row("Client count", inventory.clients().len().to_string()),
-        row(
+        scoped_row(
+            InfoFieldScope::RunningInstance,
             "Running server binary modified",
             value(
                 "server_binary_mtime",
