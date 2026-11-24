@@ -324,8 +324,9 @@ fn request(shared: Shared, ctx: egui::Context, popup: egui::ViewportId, action: 
     let worker_shared = shared.clone();
     if let Err(error) = std::thread::Builder::new().name("tmux-server-update-client".into()).spawn(move || {
         let _guard = guard;
+        #[cfg(feature = "observability")]
         let worker = applicationlauncher::observability::register_worker("tmux-server-update-client");
-        worker.set_state("requesting-preview-or-server-update");
+        applicationlauncher::observe! { worker.set_state("requesting-preview-or-server-update"); }
         let result = (|| {
             let client = TrackerClient::connect()?;
             let mut report = match action {
@@ -346,7 +347,7 @@ fn request(shared: Shared, ctx: egui::Context, popup: egui::ViewportId, action: 
                 };
                 ctx.request_repaint_of(popup);
                 if !running || !open { break; }
-                worker.set_state("polling-daemon-progress");
+                applicationlauncher::observe! { worker.set_state("polling-daemon-progress"); }
                 std::thread::sleep(Duration::from_millis(300));
                 report = client.application_update_report(&report.operation_id)?;
             }

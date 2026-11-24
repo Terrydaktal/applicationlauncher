@@ -1017,7 +1017,7 @@ mod tests {
             assert_eq!(pane.client_pid, pid);
             assert!(pane.cwd.is_absolute());
             assert!(pane.process_pid > 0);
-            eprintln!(
+            applicationlauncher::diagnostic_log!(
                 "tmux client {pid}: session={} pane={} process={} cwd={} title={}",
                 pane.session.session_name,
                 pane.pane_id,
@@ -1684,9 +1684,10 @@ mod tests {
                 .expect("the exact live tmux client must be identified");
             assert!(valid_session(&session));
             verify_session(&session).unwrap();
-            eprintln!(
+            applicationlauncher::diagnostic_log!(
                 "terminal {pid}: captured tmux session {:?} ({})",
-                session.session_name, session.session_id
+                session.session_name,
+                session.session_id
             );
         }
     }

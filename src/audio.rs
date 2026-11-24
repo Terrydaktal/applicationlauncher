@@ -691,7 +691,7 @@ mod tests {
             .collect();
         assert_eq!(owners.len(), 1, "stream must route to exactly one window");
         assert_eq!(owners[0].pid, Some(owner));
-        eprintln!(
+        applicationlauncher::diagnostic_log!(
             "{}",
             serde_json::json!({"stream": sink.index, "audio_pid": pid, "verified_ancestors": sink.process_ancestors, "owning_window": owners[0].id, "browser_pid": owner, "metadata_resolution_us": resolution_us})
         );

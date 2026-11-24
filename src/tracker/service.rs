@@ -468,7 +468,7 @@ impl Runtime {
             .unwrap()
             .history_restore_retry_after
             .insert(id, Instant::now() + HISTORY_RESTORE_RETRY_DELAY);
-        eprintln!(
+        applicationlauncher::diagnostic_log!(
             "tracker_restore event=history_deferred history_id={id} reason={reason} retry_ms={}",
             HISTORY_RESTORE_RETRY_DELAY.as_millis()
         );
@@ -610,7 +610,9 @@ impl Runtime {
                 .get_or_insert_with(|| Instant::now() + Duration::from_secs(30));
         }
         if let Err(err) = self.set_recovery_metadata(false, false) {
-            eprintln!("Tracker failed to persist recovery decision: {err}");
+            applicationlauncher::diagnostic_log!(
+                "Tracker failed to persist recovery decision: {err}"
+            );
         }
     }
 
@@ -628,7 +630,9 @@ impl Runtime {
         }
 
         if let Err(err) = self.set_recovery_metadata(false, true) {
-            eprintln!("Tracker failed to mark recovery check in progress: {err}");
+            applicationlauncher::diagnostic_log!(
+                "Tracker failed to mark recovery check in progress: {err}"
+            );
         }
         let boot_id = self.0.state.lock().unwrap().boot_id.clone();
         let result = self
@@ -645,8 +649,8 @@ impl Runtime {
             );
         let candidate_written = match result {
             Ok(_) => {
-                crate::observability::increment(crate::observability::Counter::PersistenceWrites);
-                crate::observability::record_boundary(
+                applicationlauncher::observe! { crate::observability::increment(crate::observability::Counter::PersistenceWrites); }
+                applicationlauncher::observe! { crate::observability::record_boundary(
                     crate::replay::BoundaryKind::TrackerMutation,
                     "recovery-candidate-written",
                     &serde_json::json!({
@@ -654,11 +658,13 @@ impl Runtime {
                         "window_count": trigger.baseline_entries.len(),
                     })
                     .to_string(),
-                );
+                ); }
                 true
             }
             Err(err) => {
-                eprintln!("Tracker failed to persist recovery candidate: {err}");
+                applicationlauncher::diagnostic_log!(
+                    "Tracker failed to persist recovery candidate: {err}"
+                );
                 false
             }
         };
@@ -666,10 +672,10 @@ impl Runtime {
             self.schedule_mass_disappearance_confirmation(trigger.token);
         } else {
             let runtime = self.clone();
-            crate::observability::spawn_named("tracker-recovery-retry", move |worker| {
-                worker.set_state("waiting");
+            applicationlauncher::spawn_worker!("tracker-recovery-retry", move |worker| {
+                applicationlauncher::observe! { worker.set_state("waiting"); }
                 std::thread::sleep(Duration::from_secs(1));
-                worker.set_state("retrying");
+                applicationlauncher::observe! { worker.set_state("retrying"); }
                 runtime.persist_mass_disappearance_candidate(trigger);
             });
         }
@@ -677,10 +683,10 @@ impl Runtime {
 
     fn schedule_mass_disappearance_confirmation(&self, token: u64) {
         let runtime = self.clone();
-        crate::observability::spawn_named("tracker-mass-confirm", move |worker| {
-            worker.set_state("waiting");
+        applicationlauncher::spawn_worker!("tracker-mass-confirm", move |worker| {
+            applicationlauncher::observe! { worker.set_state("waiting"); }
             std::thread::sleep(MASS_DISAPPEARANCE_CONFIRM_DELAY);
-            worker.set_state("checking");
+            applicationlauncher::observe! { worker.set_state("checking"); }
             runtime.confirm_mass_disappearance(token);
         });
     }
@@ -744,7 +750,9 @@ impl Runtime {
             }
             drop(state);
             if let Err(err) = self.set_recovery_metadata(false, false) {
-                eprintln!("Tracker failed to clear recovery check: {err}");
+                applicationlauncher::diagnostic_log!(
+                    "Tracker failed to clear recovery check: {err}"
+                );
             }
             return;
         }
@@ -756,7 +764,9 @@ impl Runtime {
                     || attempts >= MASS_DISAPPEARANCE_MAX_CONFIRM_ATTEMPTS
             }
             Err(err) => {
-                eprintln!("Tracker recovery verification unavailable: {err}");
+                applicationlauncher::diagnostic_log!(
+                    "Tracker recovery verification unavailable: {err}"
+                );
                 attempts >= MASS_DISAPPEARANCE_MAX_CONFIRM_ATTEMPTS
             }
         };
@@ -788,9 +798,11 @@ impl Runtime {
         }
         drop(state);
         if let Err(err) = self.set_recovery_metadata(true, false) {
-            eprintln!("Tracker failed to persist recovery prompt state: {err}");
+            applicationlauncher::diagnostic_log!(
+                "Tracker failed to persist recovery prompt state: {err}"
+            );
         }
-        crate::observability::record_boundary(
+        applicationlauncher::observe! { crate::observability::record_boundary(
             crate::replay::BoundaryKind::TrackerMutation,
             "recovery-candidate-confirmed",
             &serde_json::json!({
@@ -798,7 +810,7 @@ impl Runtime {
                 "window_count": baseline_count,
             })
             .to_string(),
-        );
+        ); }
     }
 
     fn expire_snapshot_if_needed(state: &mut State) {
@@ -908,14 +920,14 @@ impl Runtime {
         } else if state.snapshot_buffer.is_some() {
             state.snapshot_durable_changed |= durable_changed;
         }
-        crate::observability::set_gauge(
+        applicationlauncher::observe! { crate::observability::set_gauge(
             crate::observability::Gauge::TrackedWindows,
             state.windows.len() + state.live_only_windows.len(),
-        );
-        crate::observability::set_gauge(
+        ); }
+        applicationlauncher::observe! { crate::observability::set_gauge(
             crate::observability::Gauge::AttentionPending,
             state.attention.len(),
-        );
+        ); }
     }
 
     fn upsert_live_only(&self, mut incoming: TrackedWindow, activated: bool) {
@@ -960,10 +972,10 @@ impl Runtime {
                 Self::publish_change(&mut state, Some(&id));
             }
         }
-        crate::observability::set_gauge(
+        applicationlauncher::observe! { crate::observability::set_gauge(
             crate::observability::Gauge::TrackedWindows,
             state.windows.len() + state.live_only_windows.len(),
-        );
+        ); }
     }
 
     fn remove(&self, id: &str) {
@@ -979,10 +991,10 @@ impl Runtime {
         }
         if state.live_only_windows.remove(id).is_some() {
             Self::publish_change(&mut state, Some(id));
-            crate::observability::set_gauge(
+            applicationlauncher::observe! { crate::observability::set_gauge(
                 crate::observability::Gauge::TrackedWindows,
                 state.windows.len() + state.live_only_windows.len(),
-            );
+            ); }
             return;
         }
         let now = Instant::now();
@@ -1020,14 +1032,14 @@ impl Runtime {
                 state.removal_burst = Some(removal_burst);
             }
         }
-        crate::observability::set_gauge(
+        applicationlauncher::observe! { crate::observability::set_gauge(
             crate::observability::Gauge::TrackedWindows,
             state.windows.len() + state.live_only_windows.len(),
-        );
-        crate::observability::set_gauge(
+        ); }
+        applicationlauncher::observe! { crate::observability::set_gauge(
             crate::observability::Gauge::AttentionPending,
             state.attention.len(),
-        );
+        ); }
         drop(state);
         if let Some(window) = removed
             && !intentional_restart
@@ -1040,7 +1052,7 @@ impl Runtime {
                 timestamp,
             )
         {
-            eprintln!("Tracker failed to append window history: {err}");
+            applicationlauncher::diagnostic_log!("Tracker failed to append window history: {err}");
         }
         if let Some(trigger) = mass_trigger {
             self.persist_mass_disappearance_candidate(trigger);
@@ -1138,18 +1150,20 @@ impl Runtime {
         if durable_changed {
             Self::mark_durable(&mut state, None);
         }
-        crate::observability::set_gauge(
+        applicationlauncher::observe! { crate::observability::set_gauge(
             crate::observability::Gauge::TrackedWindows,
             state.windows.len() + state.live_only_windows.len(),
-        );
-        crate::observability::set_gauge(
+        ); }
+        applicationlauncher::observe! { crate::observability::set_gauge(
             crate::observability::Gauge::AttentionPending,
             state.attention.len(),
-        );
+        ); }
+        #[cfg(feature = "observability")]
         let snapshot_generation = state.history_generation;
+        #[cfg(feature = "observability")]
         let window_count = state.windows.len();
         drop(state);
-        crate::observability::record_boundary(
+        applicationlauncher::observe! { crate::observability::record_boundary(
             crate::replay::BoundaryKind::WindowFeed,
             "snapshot-applied",
             &serde_json::json!({
@@ -1158,8 +1172,8 @@ impl Runtime {
                 "closed_count": closed.len(),
             })
             .to_string(),
-        );
-        crate::observability::record_boundary(
+        ); }
+        applicationlauncher::observe! { crate::observability::record_boundary(
             crate::replay::BoundaryKind::TrackerMutation,
             "history-write",
             &serde_json::json!({
@@ -1167,20 +1181,22 @@ impl Runtime {
                 "generation": snapshot_generation,
             })
             .to_string(),
-        );
+        ); }
         let database = self.0.database.lock().unwrap();
         for window in closed {
             if is_history_worthy(&window) {
+                #[cfg(feature = "diagnostic-build")]
                 let operation_id = crate::observability::next_operation_id();
+                #[cfg(feature = "diagnostic-build")]
                 let result = if crate::replay::environment_should_inject(
                     crate::replay::FaultPoint::TrackerWriteBusy,
                     operation_id,
                 ) {
-                    crate::observability::record_boundary(
+                    applicationlauncher::observe! { crate::observability::record_boundary(
                         crate::replay::BoundaryKind::FaultInjection,
                         "tracker-write-busy",
                         &serde_json::json!({ "operation_id": operation_id }).to_string(),
-                    );
+                    ); }
                     Err("fault injection: tracker write busy".to_string())
                 } else {
                     database.add_history_with_restore(
@@ -1191,8 +1207,18 @@ impl Runtime {
                         timestamp,
                     )
                 };
+                #[cfg(not(feature = "diagnostic-build"))]
+                let result = database.add_history_with_restore(
+                    &window,
+                    closed_restores
+                        .get(&window.id)
+                        .unwrap_or(&super::infer_restore_spec(&window)),
+                    timestamp,
+                );
                 if let Err(err) = result {
-                    eprintln!("Tracker failed to append snapshot closure: {err}");
+                    applicationlauncher::diagnostic_log!(
+                        "Tracker failed to append snapshot closure: {err}"
+                    );
                 }
             }
         }
@@ -1201,7 +1227,9 @@ impl Runtime {
             self.persist_mass_disappearance_candidate(trigger);
         }
         if let Err(err) = self.persist_current_if_due(true) {
-            eprintln!("Tracker failed to persist current windows: {err}");
+            applicationlauncher::diagnostic_log!(
+                "Tracker failed to persist current windows: {err}"
+            );
         }
     }
 
@@ -1238,7 +1266,7 @@ impl Runtime {
         state.recovery_write_in_flight = false;
         match result {
             Ok(_) => {
-                crate::observability::increment(crate::observability::Counter::PersistenceWrites);
+                applicationlauncher::observe! { crate::observability::increment(crate::observability::Counter::PersistenceWrites); }
                 if state.durable_generation == generation {
                     state.recovery_dirty = false;
                     state.recovery_due = None;
@@ -1291,12 +1319,12 @@ impl Runtime {
                 state.periodic_due =
                     Some(now + Duration::from_millis(PERIODIC_SNAPSHOT_INTERVAL_MS as u64));
                 state.history_generation = state.history_generation.wrapping_add(1);
-                crate::observability::increment(crate::observability::Counter::PersistenceWrites);
-                crate::observability::record(
+                applicationlauncher::observe! { crate::observability::increment(crate::observability::Counter::PersistenceWrites); }
+                applicationlauncher::observe! { crate::observability::record(
                     crate::observability::Event::new("tracker", "periodic-snapshot-saved")
                         .object(&id.to_string())
                         .reason("retention-120-five-minute-plus-120-hourly"),
-                );
+                ); }
                 Ok(())
             }
             Ok(None) => Ok(()),
@@ -1353,7 +1381,7 @@ impl Runtime {
         state.current_write_in_flight = false;
         match result {
             Ok(()) => {
-                crate::observability::increment(crate::observability::Counter::PersistenceWrites);
+                applicationlauncher::observe! { crate::observability::increment(crate::observability::Counter::PersistenceWrites); }
                 state
                     .dirty_window_ids
                     .retain(|_, revision| *revision > generation);
@@ -1390,10 +1418,10 @@ impl Runtime {
                 ..
             } = &mut *state;
             reconcile_attention_states(windows, attention, now);
-            crate::observability::set_gauge(
+            applicationlauncher::observe! { crate::observability::set_gauge(
                 crate::observability::Gauge::AttentionPending,
                 attention.len(),
-            );
+            ); }
             attention
                 .iter()
                 .filter_map(|(id, attention)| {
@@ -1404,9 +1432,9 @@ impl Runtime {
                 .collect::<Vec<_>>()
         };
         for window in targets {
-            crate::observability::increment(crate::observability::Counter::AttentionAttempts);
+            applicationlauncher::observe! { crate::observability::increment(crate::observability::Counter::AttentionAttempts); }
             let result = send_enter_to_terminal(&window);
-            crate::observability::record_boundary(
+            applicationlauncher::observe! { crate::observability::record_boundary(
                 crate::replay::BoundaryKind::Attention,
                 "send-enter",
                 &serde_json::json!({
@@ -1415,9 +1443,9 @@ impl Runtime {
                     "error": result.as_ref().err().map(ToString::to_string),
                 })
                 .to_string(),
-            );
+            ); }
             if result.is_err() {
-                crate::observability::increment(crate::observability::Counter::AttentionFailures);
+                applicationlauncher::observe! { crate::observability::increment(crate::observability::Counter::AttentionFailures); }
             }
             let mut state = self.0.state.lock().unwrap();
             if !state
@@ -1435,7 +1463,7 @@ impl Runtime {
                 }
             }
             if let Err(err) = result {
-                eprintln!(
+                applicationlauncher::diagnostic_log!(
                     "Automatic terminal Enter failed for {}: {err}",
                     window.title
                 );
@@ -1895,17 +1923,19 @@ fn dbus_bool(values: &HashMap<String, zbus::zvariant::OwnedValue>, key: &str) ->
 }
 
 fn send_enter_to_terminal(window: &TrackedWindow) -> Result<(), String> {
+    #[cfg(feature = "diagnostic-build")]
     let operation_id = crate::observability::next_operation_id();
+    #[cfg(feature = "diagnostic-build")]
     if crate::replay::environment_should_inject(
         crate::replay::FaultPoint::TerminalSendFailure,
         operation_id,
     ) {
         let error = "fault injection: terminal SendEnter failure".to_string();
-        crate::observability::record_boundary(
+        applicationlauncher::observe! { crate::observability::record_boundary(
             crate::replay::BoundaryKind::FaultInjection,
             "terminal-send-failure",
             &serde_json::json!({ "operation_id": operation_id }).to_string(),
-        );
+        ); }
         return Err(error);
     }
     let connection = zbus::blocking::connection::Builder::session()
@@ -1983,7 +2013,7 @@ fn send_enter_to_terminal(window: &TrackedWindow) -> Result<(), String> {
     let result = proxy
         .call::<_, _, ()>("SendEnter", &(tab_uuid.as_str(),))
         .map_err(|err| err.to_string());
-    crate::observability::record_boundary(
+    applicationlauncher::observe! { crate::observability::record_boundary(
         crate::replay::BoundaryKind::TerminalAction,
         "send-enter-dbus",
         &serde_json::json!({
@@ -1993,7 +2023,7 @@ fn send_enter_to_terminal(window: &TrackedWindow) -> Result<(), String> {
             "error": result.as_ref().err(),
         })
         .to_string(),
-    );
+    ); }
     result
 }
 
@@ -2018,29 +2048,31 @@ impl WindowFeed {
 
     #[zbus(name = "UpsertWindow")]
     fn upsert_window(&self, payload: &str) {
-        crate::observability::increment(crate::observability::Counter::KwinUpserts);
+        applicationlauncher::observe! { crate::observability::increment(crate::observability::Counter::KwinUpserts); }
         match serde_json::from_str(payload) {
             Ok(window) => self.0.upsert(window, false),
-            Err(err) => eprintln!("Tracker rejected KWin payload: {err}"),
+            Err(err) => {
+                applicationlauncher::diagnostic_log!("Tracker rejected KWin payload: {err}")
+            }
         }
     }
 
     #[zbus(name = "ReplaceSnapshot")]
     fn replace_snapshot(&self, payload: &str) {
-        crate::observability::increment(crate::observability::Counter::KwinSnapshots);
+        applicationlauncher::observe! { crate::observability::increment(crate::observability::Counter::KwinSnapshots); }
         let windows = match serde_json::from_str::<Vec<TrackedWindow>>(payload) {
             Ok(windows) => windows,
             Err(err) => {
-                eprintln!("Tracker rejected KWin snapshot: {err}");
+                applicationlauncher::diagnostic_log!("Tracker rejected KWin snapshot: {err}");
                 return;
             }
         };
-        crate::observability::record(
+        applicationlauncher::observe! { crate::observability::record(
             crate::observability::Event::new("kwin-feed", "replace-snapshot")
                 .object(&windows.len().to_string())
                 .reason("authoritative-resync"),
-        );
-        crate::observability::record_boundary(
+        ); }
+        applicationlauncher::observe! { crate::observability::record_boundary(
             crate::replay::BoundaryKind::WindowFeed,
             "replace-snapshot",
             &serde_json::json!({
@@ -2048,7 +2080,7 @@ impl WindowFeed {
                 "generation": self.0.history_generation(),
             })
             .to_string(),
-        );
+        ); }
         self.begin_snapshot();
         for window in windows {
             self.0.upsert(window, false);
@@ -2058,7 +2090,7 @@ impl WindowFeed {
 
     #[zbus(name = "WindowActivated")]
     fn window_activated(&self, payload: &str) {
-        crate::observability::increment(crate::observability::Counter::KwinActivations);
+        applicationlauncher::observe! { crate::observability::increment(crate::observability::Counter::KwinActivations); }
         if let Ok(window) = serde_json::from_str(payload) {
             self.0.upsert(window, true);
         }
@@ -2066,7 +2098,7 @@ impl WindowFeed {
 
     #[zbus(name = "RemoveWindow")]
     fn remove_window(&self, id: &str) {
-        crate::observability::increment(crate::observability::Counter::KwinRemovals);
+        applicationlauncher::observe! { crate::observability::increment(crate::observability::Counter::KwinRemovals); }
         self.0.remove(id);
     }
 
@@ -2211,8 +2243,9 @@ impl TrackerApi {
                     .name("application-update".into())
                     .spawn(move || {
                         let _protection = protection;
+                        #[cfg(feature = "observability")]
                         let worker = crate::observability::register_worker("application-update");
-                        worker.set_state("backing-up-and-restarting-selected-programs");
+                        applicationlauncher::observe! { worker.set_state("backing-up-and-restarting-selected-programs"); }
                         work.run();
                     })
                     .map_err(|error| error.to_string())?;
@@ -2233,8 +2266,9 @@ impl TrackerApi {
             let _ = std::thread::Builder::new()
                 .name("terminal-upgrade-preview".into())
                 .spawn(move || {
+                    #[cfg(feature = "observability")]
                     let worker = crate::observability::register_worker("terminal-upgrade-preview");
-                    worker.set_state("inspecting-terminals");
+                    applicationlauncher::observe! { worker.set_state("inspecting-terminals"); }
                     preparation.prepare(runtime.windows());
                 });
         }
@@ -2275,8 +2309,9 @@ impl TrackerApi {
                     .name("terminal-upgrade".into())
                     .spawn(move || {
                         let _protection = protection;
+                        #[cfg(feature = "observability")]
                         let worker = crate::observability::register_worker("terminal-upgrade");
-                        worker.set_state("requesting-terminal-owned-updates");
+                        applicationlauncher::observe! { worker.set_state("requesting-terminal-owned-updates"); }
                         work.run();
                     })
                     .map_err(|err| err.to_string())?;
@@ -2453,7 +2488,7 @@ impl TrackerApi {
         match set_reopen_shortcut_active(active) {
             Ok(()) => true,
             Err(err) => {
-                eprintln!(
+                applicationlauncher::diagnostic_log!(
                     "tracker_shortcut event=set_reopen_active_failed active={active} error={err}"
                 );
                 false
@@ -2572,7 +2607,7 @@ fn reopen_latest_history_entry(
     let (selected, launch_failures) =
         first_launched_history_report(candidate_ids, |id| reopen_history_entry(runtime, id));
     if let Some((id, report)) = selected {
-        eprintln!(
+        applicationlauncher::diagnostic_log!(
             "tracker_restore event=reopen_latest_selected history_id={id} scanned={} excluded={} non_window={} unsupported_terminal={} missing_ssh_arguments={} missing_tmux_session={} missing_executable={} missing_desktop={} non_launchable_desktop={} prior_launch_failures={launch_failures}",
             stats.scanned,
             stats.excluded,
@@ -2587,7 +2622,7 @@ fn reopen_latest_history_entry(
         return Ok(report);
     }
 
-    eprintln!(
+    applicationlauncher::diagnostic_log!(
         "tracker_restore event=reopen_latest_unavailable scanned={} excluded={} non_window={} unsupported_terminal={} missing_ssh_arguments={} missing_tmux_session={} missing_executable={} missing_desktop={} non_launchable_desktop={} launch_failures={launch_failures}",
         stats.scanned,
         stats.excluded,
@@ -2605,17 +2640,25 @@ fn reopen_latest_history_entry(
 fn first_launched_history_report(
     candidate_ids: impl IntoIterator<Item = i64>,
     mut reopen: impl FnMut(i64) -> Result<RestoreReport, String>,
-) -> (Option<(i64, RestoreReport)>, usize) {
-    let mut failures = 0;
+) -> (Option<(i64, RestoreReport)>, AttemptCount) {
+    let mut failures = AttemptCount::default();
     for id in candidate_ids {
         match reopen(id) {
             Ok(report) if report.launched > 0 => return (Some((id, report)), failures),
-            Ok(_) | Err(_) => failures += 1,
+            Ok(_) | Err(_) => {
+                applicationlauncher::observe! { failures += 1; }
+            }
         }
     }
     (None, failures)
 }
 
+#[cfg(feature = "observability")]
+type AttemptCount = usize;
+#[cfg(not(feature = "observability"))]
+type AttemptCount = ();
+
+#[cfg(feature = "observability")]
 #[derive(Default)]
 struct ReopenSelectionStats {
     scanned: usize,
@@ -2628,6 +2671,10 @@ struct ReopenSelectionStats {
     missing_desktop: usize,
     non_launchable_desktop: usize,
 }
+
+#[cfg(not(feature = "observability"))]
+#[derive(Default)]
+struct ReopenSelectionStats;
 
 fn reopenable_history_ids(
     history: &[HistoryEntry],
@@ -2651,17 +2698,17 @@ fn reopenable_history_ids_with(
     let candidates = history
         .iter()
         .filter_map(|entry| {
-            stats.scanned += 1;
+            applicationlauncher::observe! { stats.scanned += 1; }
             if excluded.contains(&entry.id) {
-                stats.excluded += 1;
+                applicationlauncher::observe! { stats.excluded += 1; }
                 return None;
             }
             if !is_history_worthy(&entry.window) {
-                stats.non_window += 1;
+                applicationlauncher::observe! { stats.non_window += 1; }
                 return None;
             }
             if let Some(reason) = unavailable_reason(&entry.restore) {
-                match reason {
+                applicationlauncher::observe! { match reason {
                     super::restore::LaunchUnavailableCode::UnsupportedTerminalKind => {
                         stats.unsupported_terminal += 1;
                     }
@@ -2680,7 +2727,7 @@ fn reopenable_history_ids_with(
                     super::restore::LaunchUnavailableCode::NonLaunchableDesktopEntry => {
                         stats.non_launchable_desktop += 1;
                     }
-                }
+                } }
                 return None;
             }
             Some(entry.id)
@@ -2713,6 +2760,7 @@ pub fn run_tracker_daemon() -> Result<(), String> {
     let boot_id = read_boot_id();
     let previous_boot = database.meta("boot_id")?.unwrap_or_default();
     let same_boot = previous_boot == boot_id;
+    #[cfg(feature = "observability")]
     let new_boot = !previous_boot.is_empty() && previous_boot != boot_id;
     let previous_clean = database.meta("clean_shutdown")?.as_deref() == Some("true");
     let recovery_snapshot_exists = database.snapshot_kind_exists(RECOVERY_KIND)?;
@@ -2816,15 +2864,15 @@ pub fn run_tracker_daemon() -> Result<(), String> {
         database: Mutex::new(database),
         terminal_upgrades: Mutex::new(super::terminal_upgrade::UpgradeRegistry::default()),
     }));
-    crate::observability::set_gauge(
+    applicationlauncher::observe! { crate::observability::set_gauge(
         crate::observability::Gauge::TrackedWindows,
         runtime.0.state.lock().unwrap().windows.len(),
-    );
-    crate::observability::record(
+    ); }
+    applicationlauncher::observe! { crate::observability::record(
         crate::observability::Event::new("tracker", "state-loaded")
             .reason(if new_boot { "new-boot" } else { "same-boot" })
             .transition("database", "runtime"),
-    );
+    ); }
 
     if auto_enter_enabled {
         let due = Instant::now() + Duration::from_secs(5);
@@ -2848,32 +2896,40 @@ pub fn run_tracker_daemon() -> Result<(), String> {
     }
 
     let recovery_runtime = runtime.clone();
-    crate::observability::spawn_named("tracker-persistence", move |worker| {
-        worker.set_state("waiting");
+    applicationlauncher::spawn_worker!("tracker-persistence", move |worker| {
+        applicationlauncher::observe! { worker.set_state("waiting"); }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
                 std::thread::sleep(Duration::from_millis(250));
                 if let Err(err) = recovery_runtime.write_recovery_if_due(false) {
-                    eprintln!("Tracker failed to write recovery snapshot: {err}");
+                    applicationlauncher::diagnostic_log!(
+                        "Tracker failed to write recovery snapshot: {err}"
+                    );
                 }
                 if let Err(err) = recovery_runtime.persist_current_if_due(false) {
-                    eprintln!("Tracker failed to persist current windows: {err}");
+                    applicationlauncher::diagnostic_log!(
+                        "Tracker failed to persist current windows: {err}"
+                    );
                 }
                 if let Err(err) = recovery_runtime.write_periodic_if_due(Instant::now(), now_ms()) {
-                    eprintln!("Tracker failed to write periodic snapshot: {err}");
+                    applicationlauncher::diagnostic_log!(
+                        "Tracker failed to write periodic snapshot: {err}"
+                    );
                 }
             }
         }));
         if result.is_err() {
-            crate::observability::increment(crate::observability::Counter::WorkerPanics);
-            eprintln!("Tracker persistence worker panicked; restarting daemon");
+            applicationlauncher::observe! { crate::observability::increment(crate::observability::Counter::WorkerPanics); }
+            applicationlauncher::diagnostic_log!(
+                "Tracker persistence worker panicked; restarting daemon"
+            );
             std::process::exit(1);
         }
     });
 
     let attention_runtime = runtime.clone();
-    crate::observability::spawn_named("tracker-attention", move |worker| {
-        worker.set_state("waiting");
+    applicationlauncher::spawn_worker!("tracker-attention", move |worker| {
+        applicationlauncher::observe! { worker.set_state("waiting"); }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
                 std::thread::sleep(Duration::from_millis(250));
@@ -2881,26 +2937,32 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             }
         }));
         if result.is_err() {
-            crate::observability::increment(crate::observability::Counter::WorkerPanics);
-            eprintln!("Tracker attention worker panicked; restarting daemon");
+            applicationlauncher::observe! { crate::observability::increment(crate::observability::Counter::WorkerPanics); }
+            applicationlauncher::diagnostic_log!(
+                "Tracker attention worker panicked; restarting daemon"
+            );
             std::process::exit(1);
         }
     });
 
     let reconciliation_runtime = runtime.clone();
-    crate::observability::spawn_named("tracker-reconcile", move |worker| {
-        worker.set_state("waiting");
+    applicationlauncher::spawn_worker!("tracker-reconcile", move |worker| {
+        applicationlauncher::observe! { worker.set_state("waiting"); }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
                 if let Err(err) = reconciliation_runtime.reconcile_stale_kwin_windows() {
-                    eprintln!("Tracker KWin window reconciliation failed: {err}");
+                    applicationlauncher::diagnostic_log!(
+                        "Tracker KWin window reconciliation failed: {err}"
+                    );
                 }
                 std::thread::sleep(KWIN_RECONCILIATION_INTERVAL);
             }
         }));
         if result.is_err() {
-            crate::observability::increment(crate::observability::Counter::WorkerPanics);
-            eprintln!("Tracker KWin reconciliation worker panicked; restarting daemon");
+            applicationlauncher::observe! { crate::observability::increment(crate::observability::Counter::WorkerPanics); }
+            applicationlauncher::diagnostic_log!(
+                "Tracker KWin reconciliation worker panicked; restarting daemon"
+            );
             std::process::exit(1);
         }
     });
@@ -2911,8 +2973,8 @@ pub fn run_tracker_daemon() -> Result<(), String> {
         signal_hook::consts::SIGINT,
     ])
     .map_err(|err| err.to_string())?;
-    crate::observability::spawn_named("tracker-signals", move |worker| {
-        worker.set_state("waiting");
+    applicationlauncher::spawn_worker!("tracker-signals", move |worker| {
+        applicationlauncher::observe! { worker.set_state("waiting"); }
         if signals.forever().next().is_some() {
             let recovery_ok = shutdown_runtime.write_recovery_if_due(true).is_ok();
             let current_ok = shutdown_runtime.persist_current_if_due(true).is_ok();
@@ -2930,7 +2992,7 @@ pub fn run_tracker_daemon() -> Result<(), String> {
 
     pollster::block_on(async move {
         let freshness = crate::freshness::Service::default();
-        let _connection = zbus::connection::Builder::session()
+        let builder = zbus::connection::Builder::session()
             .map_err(|err| err.to_string())?
             .name(SERVICE_NAME)
             .map_err(|err| err.to_string())?
@@ -2941,15 +3003,12 @@ pub fn run_tracker_daemon() -> Result<(), String> {
             .serve_at(crate::freshness::PATH, freshness.clone())
             .map_err(|err| err.to_string())?
             .serve_at(crate::lifecycle::PATH, crate::lifecycle::Service)
-            .map_err(|err| err.to_string())?
-            .build()
-            .await
             .map_err(|err| err.to_string())?;
         let _freshness_worker = freshness
             .start(_connection.clone())
             .map_err(|err| err.to_string())?;
         if let Err(err) = super::install::ensure_kwin_feed_installed() {
-            eprintln!("Tracker could not install the KWin feed: {err}");
+            applicationlauncher::diagnostic_log!("Tracker could not install the KWin feed: {err}");
         }
         super::install::start_kwin_feed_watchdog();
         std::future::pending::<()>().await;
@@ -4053,9 +4112,11 @@ mod tests {
             });
 
         assert_eq!(candidates, [1]);
-        assert_eq!(stats.scanned, 2);
-        assert_eq!(stats.missing_desktop, 1);
-        assert_eq!(stats.excluded, 0);
+        applicationlauncher::observe! {
+            assert_eq!(stats.scanned, 2);
+            assert_eq!(stats.missing_desktop, 1);
+            assert_eq!(stats.excluded, 0);
+        }
     }
 
     #[test]
@@ -4081,8 +4142,10 @@ mod tests {
         let (candidates, stats) = reopenable_history_ids_with(&history, &excluded, 3, |_| None);
 
         assert_eq!(candidates, [6, 5, 4]);
-        assert_eq!(stats.scanned, 5);
-        assert_eq!(stats.excluded, 2);
+        applicationlauncher::observe! {
+            assert_eq!(stats.scanned, 5);
+            assert_eq!(stats.excluded, 2);
+        }
     }
 
     #[test]
@@ -4099,7 +4162,7 @@ mod tests {
 
         assert_eq!(attempts, [3, 2, 1]);
         assert_eq!(selected.map(|(id, _)| id), Some(1));
-        assert_eq!(failures, 2);
+        applicationlauncher::observe! { assert_eq!(failures, 2); }
     }
 
     #[test]

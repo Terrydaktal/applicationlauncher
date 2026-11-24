@@ -787,10 +787,10 @@ impl App {
         let (_terminal_action_tx, terminal_action_rx) = std::sync::mpsc::channel();
         let (auto_enter_update_sender, auto_enter_update_receiver) =
             std::sync::mpsc::sync_channel(1);
-        applicationlauncher::observability::spawn_named("auto-enter-settings", move |worker| {
-            worker.set_state("waiting");
+        applicationlauncher::spawn_worker!("auto-enter-settings", move |worker| {
+            applicationlauncher::observe! { worker.set_state("waiting"); }
             'worker: while let Ok(mut enabled) = auto_enter_update_receiver.recv() {
-                worker.set_state("updating");
+                applicationlauncher::observe! { worker.set_state("updating"); }
                 loop {
                     while let Ok(latest) = auto_enter_update_receiver.try_recv() {
                         enabled = latest;
@@ -811,7 +811,7 @@ impl App {
                         }
                     }
                 }
-                worker.set_state("waiting");
+                applicationlauncher::observe! { worker.set_state("waiting"); }
             }
         });
         let (popup_event_tx, popup_event_rx) = std::sync::mpsc::channel();
@@ -821,8 +821,8 @@ impl App {
         let kwin_window_feed_repaint_ctx = cc.egui_ctx.clone();
         let kwin_window_feed_inbox = Arc::clone(&window_feed_inbox);
         let kwin_window_feed_frame_cpu = Arc::clone(&last_frame_cpu_micros);
-        applicationlauncher::observability::spawn_named("kwin-feed-setup", move |worker| {
-            worker.set_state("connecting");
+        applicationlauncher::spawn_worker!("kwin-feed-setup", move |worker| {
+            applicationlauncher::observe! { worker.set_state("connecting"); }
             let result = setup_kwin_window_feed(
                 kwin_window_feed_inbox,
                 kwin_window_feed_repaint_ctx,
@@ -831,8 +831,8 @@ impl App {
             let _ = kwin_window_feed_setup_tx.send(result);
         });
 
-        applicationlauncher::observability::spawn_named("tracker-status", move |worker| {
-            worker.set_state("connecting");
+        applicationlauncher::spawn_worker!("tracker-status", move |worker| {
+            applicationlauncher::observe! { worker.set_state("connecting"); }
             for _ in 0..30 {
                 if let Ok(client) = applicationlauncher::tracker::TrackerClient::connect()
                     && let Ok(status) = client.status()

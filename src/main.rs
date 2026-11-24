@@ -1,7 +1,9 @@
 use eframe::egui;
 use std::time::Instant;
 
+#[cfg(feature = "observability")]
 use applicationlauncher::diagnostic_capture::{CaptureOptions, capture_auto, run_debug_doctor};
+#[cfg(feature = "observability")]
 use applicationlauncher::observability::{self, Component};
 
 const PRODUCT_METADATA_TEXT: &str = concat!(
@@ -68,6 +70,7 @@ use popups::*;
 mod diagnostics;
 use diagnostics::*;
 
+#[cfg(feature = "observability")]
 fn print_help() {
     println!(
         r#"NAME
@@ -188,6 +191,13 @@ AUTHORS
     );
 }
 
+#[cfg(not(feature = "observability"))]
+fn print_help() {
+    println!(
+        "applicationlauncher [--close-on-blur] [--theme THEME]\n\n  -h, --help  Show this help\n  --version   Show the product version\n  --build-id  Show the exact build identity\n\nThis release-minimal artifact contains no optional diagnostic control or recording."
+    );
+}
+
 fn main() -> eframe::Result {
     mod app_version_runtime {
         include!(concat!(
@@ -206,12 +216,13 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
+    #[cfg(feature = "diagnostic-build")]
     if let Some(position) = args
         .iter()
         .position(|argument| argument == "--diagnostic-probe")
     {
         observability::initialize(Component::Gui);
-        install_panic_hook();
+        observability::install_panic_hook(Component::Gui);
         let probe = args.get(position + 1).map(String::as_str).ok_or_else(|| {
             eframe::Error::AppCreation("--diagnostic-probe requires a kind".into())
         })?;
@@ -222,9 +233,10 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
+    #[cfg(feature = "observability")]
     if args.iter().any(|argument| argument == "debug-doctor") {
-        observability::initialize(Component::Test);
-        observability::install_panic_hook(Component::Test);
+        applicationlauncher::observe! { observability::initialize(Component::Test); }
+        applicationlauncher::observe! { observability::install_panic_hook(Component::Test); }
         match run_debug_doctor() {
             Ok((path, report)) => {
                 println!("Debug doctor report written to {}", path.display());
@@ -248,6 +260,7 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
+    #[cfg(feature = "observability")]
     if let Some(position) = args.iter().position(|argument| argument == "replay") {
         let input = args.get(position + 1).ok_or_else(|| {
             eframe::Error::AppCreation("replay requires a ring file or diagnostic bundle".into())
@@ -268,9 +281,10 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
+    #[cfg(feature = "observability")]
     if let Some(position) = args.iter().position(|argument| argument == "--diagnose") {
-        observability::initialize(Component::Test);
-        observability::install_panic_hook(Component::Test);
+        applicationlauncher::observe! { observability::initialize(Component::Test); }
+        applicationlauncher::observe! { observability::install_panic_hook(Component::Test); }
         if let Some(mode) = args.get(position + 1)
             && !mode.starts_with('-')
             && mode != "auto"
@@ -307,8 +321,9 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
+    #[cfg(feature = "observability")]
     observability::initialize(Component::Gui);
-    install_panic_hook();
+    applicationlauncher::observe! { install_panic_hook(); }
 
     if args.len() >= 7 && args[1] == "--draw-border" {
         let tx: f32 = args[2].parse().unwrap_or(0.0);
@@ -429,6 +444,7 @@ fn main() -> eframe::Result {
             return Ok(());
         }
     };
+    #[cfg(feature = "observability")]
     let _diagnostic_server = match observability::start_diagnostic_server(Component::Gui) {
         Ok(server) => Some(server),
         Err(err) => {
@@ -436,6 +452,7 @@ fn main() -> eframe::Result {
             None
         }
     };
+    #[cfg(feature = "observability")]
     let _gui_worker = observability::register_worker("gui-main");
 
     let mut close_on_blur = false;
@@ -481,8 +498,8 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let repaint_ctx = cc.egui_ctx.clone();
-            observability::spawn_named("gui-control", move |worker| {
-                worker.set_state("accepting");
+            applicationlauncher::spawn_worker!("gui-control", move |worker| {
+                applicationlauncher::observe! { worker.set_state("accepting"); }
                 for stream in listener.incoming() {
                     match stream {
                         Ok(stream) => {

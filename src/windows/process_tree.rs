@@ -68,8 +68,8 @@ impl WindowProcessTreeLookup {
     ) -> Self {
         let (tx, receiver) = std::sync::mpsc::sync_channel(1);
         let request = target.clone();
-        applicationlauncher::observability::spawn_named("window-process-tree", move |worker| {
-            worker.set_state("capturing");
+        applicationlauncher::spawn_worker!("window-process-tree", move |worker| {
+            applicationlauncher::observe! { worker.set_state("capturing"); }
             let document = capture_snapshot(&request, Path::new("/proc"));
             let _ = tx.send(Arc::from(document));
             ctx.request_repaint_of(egui::ViewportId::ROOT);
@@ -1163,7 +1163,10 @@ mod tests {
             .map(|pid| pid.parse().unwrap());
         let started = Instant::now();
         let document = capture(&target(pid, active), Path::new("/proc"));
-        eprintln!("Capture duration: {:?}\n{document}", started.elapsed());
+        applicationlauncher::diagnostic_log!(
+            "Capture duration: {:?}\n{document}",
+            started.elapsed()
+        );
         assert!(document.contains(&format!("(pid {pid}) [window owner]")));
         assert!(!document.starts_with("Process tree unavailable"));
     }

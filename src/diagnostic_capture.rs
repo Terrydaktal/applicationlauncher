@@ -1,6 +1,8 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -17,6 +19,75 @@ const MAX_ENDPOINT_CANDIDATES: usize = 32;
 const MAX_DIAGNOSTIC_TARGETS: usize = 4;
 const MAX_CHECKSUM_FILES: usize = 256;
 const MAX_CHECKSUM_DEPTH: usize = 8;
+const MAX_RETAINED_CAPTURES: usize = 8;
+const CAPTURE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+fn capture_retention_lease(root: &Path) -> Result<std::fs::File, String> {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(root.join(".retention.lock"))
+        .map_err(|error| error.to_string())?;
+    let metadata = lock.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err("Diagnostic retention lock is not private".into());
+    }
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err("Another diagnostic collection is in progress; no evidence was removed".into());
+    }
+    let mut completed = Vec::new();
+    let mut unfinished = 0;
+    for (index, entry) in std::fs::read_dir(root)
+        .map_err(|error| error.to_string())?
+        .enumerate()
+    {
+        if index >= 128 {
+            return Err("Diagnostic retention scan exceeded 128 entries".into());
+        }
+        let entry = entry.map_err(|error| error.to_string())?;
+        if !entry.file_name().to_string_lossy().starts_with("capture-")
+            || !entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_dir()
+        {
+            continue;
+        }
+        if !entry.path().join("manifest.sha256").is_file() {
+            unfinished += 1;
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|value| value.modified())
+            .map_err(|error| error.to_string())?;
+        if modified.elapsed().is_ok_and(|age| age > CAPTURE_RETENTION) {
+            std::fs::remove_dir_all(entry.path()).map_err(|error| error.to_string())?;
+        } else {
+            completed.push((modified, entry.path()));
+        }
+    }
+    completed.sort();
+    while unfinished + completed.len() >= MAX_RETAINED_CAPTURES {
+        if completed.is_empty() {
+            return Err(
+                "Unfinished captures fill the retention budget; retain or remove them explicitly"
+                    .into(),
+            );
+        }
+        let (_, path) = completed.remove(0);
+        std::fs::remove_dir_all(path).map_err(|error| error.to_string())?;
+    }
+    Ok(lock)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct CaptureOptions {
@@ -119,6 +190,7 @@ pub fn capture_auto(options: CaptureOptions) -> Result<PathBuf, String> {
 
     let capture_root = observability::state_dir().join("diagnostics");
     observability::ensure_private_directory(&capture_root)?;
+    let _retention_lease = capture_retention_lease(&capture_root)?;
     let capture_dir = capture_root.join(format!(
         "capture-{}-{}-{}",
         now_ms(),
@@ -1069,6 +1141,7 @@ pub fn validate_archived_build(
     ))
 }
 
+#[cfg(feature = "diagnostic-build")]
 pub fn run_internal_probe(kind: &str) -> Result<(), String> {
     match kind {
         "panic" => panic!("intentional diagnostic panic probe"),
@@ -1085,7 +1158,8 @@ pub fn run_internal_probe(kind: &str) -> Result<(), String> {
                 libc::sigemptyset(&mut signals);
                 libc::sigaddset(&mut signals, libc::SIGSEGV);
                 libc::pthread_sigmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut());
-                libc::kill(libc::getpid(), libc::SIGSEGV);
+                // A process-directed signal could reach a worker after _exit wins.
+                libc::raise(libc::SIGSEGV);
                 libc::_exit(128 + libc::SIGSEGV);
             }
             #[cfg(not(unix))]
@@ -1154,6 +1228,38 @@ fn process_cpu_time_us() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_retention_is_bounded_and_does_not_remove_unfinished_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "launcher-retention-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for index in 0..10 {
+            let directory = root.join(format!("capture-{index}"));
+            std::fs::create_dir(&directory).unwrap();
+            if index != 0 {
+                std::fs::write(directory.join("manifest.sha256"), "completed").unwrap();
+            }
+        }
+        let lease = capture_retention_lease(&root).unwrap();
+        assert!(root.join("capture-0").exists());
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            MAX_RETAINED_CAPTURES
+        );
+        assert!(
+            capture_retention_lease(&root)
+                .unwrap_err()
+                .contains("in progress")
+        );
+        drop(lease);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn redaction_removes_likely_credentials_but_preserves_diagnostics() {

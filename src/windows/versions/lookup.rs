@@ -311,7 +311,7 @@ impl ProcessVersionCache {
         applicationlauncher::observability::spawn_named("process-info-versions", move |worker| {
             // Header checks and expanded metadata share a bounded worker; idle queues sleep.
             loop {
-                worker.set_state("waiting-for-process-info-request");
+                applicationlauncher::observe! { worker.set_state("waiting-for-package-request"); }
                 let request = {
                     let (mutex, wake) = &*worker_shared;
                     let mut state = mutex.lock().unwrap_or_else(|error| error.into_inner());

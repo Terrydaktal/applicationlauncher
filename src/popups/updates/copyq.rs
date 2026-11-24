@@ -209,9 +209,10 @@ fn request(
         .name("copyq-service-update".into())
         .spawn(move || {
             let _guard = guard;
+            #[cfg(feature = "observability")]
             let worker =
                 applicationlauncher::observability::register_worker("copyq-service-update");
-            worker.set_state("restarting-user-autostart-service");
+            applicationlauncher::observe! { worker.set_state("restarting-user-autostart-service"); }
             let result = execute(process);
             if let Ok(mut state) = result_state.lock() {
                 state.result = Some(result);

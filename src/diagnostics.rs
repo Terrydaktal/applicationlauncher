@@ -65,9 +65,9 @@ pub(crate) fn handle_launcher_control_connection(
     ui_event_tx: &Sender<UiEvent>,
     repaint_ctx: &egui::Context,
 ) {
-    applicationlauncher::observability::increment(
+    applicationlauncher::observe! { applicationlauncher::observability::increment(
         applicationlauncher::observability::Counter::GuiControlRequests,
-    );
+    ); }
     let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
     let mut request = [0_u8; CONTROL_REQUEST_LIMIT];
     let request_len = stream.read(&mut request).unwrap_or(0);
@@ -81,13 +81,13 @@ pub(crate) fn handle_launcher_control_connection(
             let _ = stream.write_all(b"shutdown-requested\n");
         }
         "focus-source-changes-pending" => {
-            applicationlauncher::observability::increment(
+            applicationlauncher::observe! { applicationlauncher::observability::increment(
                 applicationlauncher::observability::Counter::FocusRequests,
-            );
-            applicationlauncher::observability::record(
+            ); }
+            applicationlauncher::observe! { applicationlauncher::observability::record(
                 applicationlauncher::observability::Event::new("gui-control", "focus")
                     .reason("source-changes-pending"),
-            );
+            ); }
             let _ = ui_event_tx.send(UiEvent::FocusLauncher {
                 source_changes_pending: true,
                 symbols_unarchived: false,
@@ -96,9 +96,9 @@ pub(crate) fn handle_launcher_control_connection(
             let _ = stream.write_all(b"focus-requested\n");
         }
         "focus-symbols-unarchived" => {
-            applicationlauncher::observability::increment(
+            applicationlauncher::observe! { applicationlauncher::observability::increment(
                 applicationlauncher::observability::Counter::FocusRequests,
-            );
+            ); }
             let _ = ui_event_tx.send(UiEvent::FocusLauncher {
                 source_changes_pending: false,
                 symbols_unarchived: true,
@@ -107,9 +107,9 @@ pub(crate) fn handle_launcher_control_connection(
             let _ = stream.write_all(b"focus-requested\n");
         }
         "focus-deployment-warnings" => {
-            applicationlauncher::observability::increment(
+            applicationlauncher::observe! { applicationlauncher::observability::increment(
                 applicationlauncher::observability::Counter::FocusRequests,
-            );
+            ); }
             let _ = ui_event_tx.send(UiEvent::FocusLauncher {
                 source_changes_pending: true,
                 symbols_unarchived: true,
@@ -118,13 +118,13 @@ pub(crate) fn handle_launcher_control_connection(
             let _ = stream.write_all(b"focus-requested\n");
         }
         _ => {
-            applicationlauncher::observability::increment(
+            applicationlauncher::observe! { applicationlauncher::observability::increment(
                 applicationlauncher::observability::Counter::FocusRequests,
-            );
-            applicationlauncher::observability::record(
+            ); }
+            applicationlauncher::observe! { applicationlauncher::observability::record(
                 applicationlauncher::observability::Event::new("gui-control", "focus")
                     .reason("launcher-trigger"),
-            );
+            ); }
             let _ = ui_event_tx.send(UiEvent::FocusLauncher {
                 source_changes_pending: false,
                 symbols_unarchived: false,
@@ -166,15 +166,11 @@ pub(crate) fn launcher_state_dir() -> PathBuf {
     ))
 }
 
-pub(crate) fn write_stderr_line(message: &str) {
-    let mut stderr = std::io::stderr().lock();
-    let _ = writeln!(stderr, "{message}");
-}
-
+#[cfg(feature = "observability")]
 pub(crate) fn install_panic_hook() {
-    applicationlauncher::observability::install_panic_hook(
+    applicationlauncher::observe! { applicationlauncher::observability::install_panic_hook(
         applicationlauncher::observability::Component::Gui,
-    );
+    ); }
 }
 
 #[cfg(test)]

@@ -77,10 +77,12 @@ pub(crate) fn resolve_window_icon(
         );
     }
 
+    #[cfg(feature = "observability")]
     let candidate_evidence = candidates.clone();
     let resolved = candidates
         .into_iter()
         .find_map(|candidate| find_icon(theme, &candidate));
+    #[cfg(feature = "observability")]
     if applicationlauncher::observability::mode()
         == applicationlauncher::observability::RuntimeMode::RuntimeActivated
     {
@@ -88,14 +90,14 @@ pub(crate) fn resolve_window_icon(
             .as_ref()
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_else(|| "generic-wayland-fallback".to_string());
-        applicationlauncher::observability::record_decision(
+        applicationlauncher::observe! { applicationlauncher::observability::record_decision(
             "icon-resolution",
             &decision,
             &candidate_evidence
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-        );
+        ); }
     }
     resolved
 }

@@ -332,9 +332,10 @@ fn request(shared: Shared, ctx: egui::Context, popup: egui::ViewportId, action: 
         .name("single-program-update-client".into())
         .spawn(move || {
             let _guard = guard;
+            #[cfg(feature = "observability")]
             let worker =
                 applicationlauncher::observability::register_worker("single-program-update-client");
-            worker.set_state("requesting-exact-process-update");
+            applicationlauncher::observe! { worker.set_state("requesting-exact-process-update"); }
             let result = (|| {
                 let client = TrackerClient::connect()?;
                 let mut report = match action {
@@ -362,7 +363,7 @@ fn request(shared: Shared, ctx: egui::Context, popup: egui::ViewportId, action: 
                     if !running || !open {
                         break;
                     }
-                    worker.set_state("polling-exact-process-update");
+                    applicationlauncher::observe! { worker.set_state("polling-exact-process-update"); }
                     std::thread::sleep(Duration::from_millis(300));
                     report = client.application_update_report(&report.operation_id)?;
                 }

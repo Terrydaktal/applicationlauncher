@@ -165,14 +165,14 @@ impl Lookup {
         pending.insert(target.clone(), weak.clone());
         drop(pending);
         let request = target.clone();
-        applicationlauncher::observability::spawn_named("tmux-info", move |worker| {
-            worker.set_state("waiting-for-inventory");
+        applicationlauncher::spawn_worker!("tmux-info", move |worker| {
+            applicationlauncher::observe! { worker.set_state("waiting-for-inventory"); }
             // Share in-flight work per server and serialize collectors across servers.
             let _permit = COLLECTOR.lock().unwrap_or_else(|error| error.into_inner());
             if weak.strong_count() == 0 {
                 return;
             }
-            worker.set_state("collecting-read-only-tmux-mosh-inventory");
+            applicationlauncher::observe! { worker.set_state("collecting-read-only-tmux-mosh-inventory"); }
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| collect(&request)))
                     .unwrap_or_else(

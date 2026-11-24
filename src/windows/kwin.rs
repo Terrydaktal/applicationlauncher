@@ -207,10 +207,11 @@ pub(crate) fn build_window_info(
         last_activated_at_ms: None,
         activation_sequence: 0,
     };
+    #[cfg(feature = "observability")]
     if applicationlauncher::observability::mode()
         == applicationlauncher::observability::RuntimeMode::RuntimeActivated
     {
-        applicationlauncher::observability::record_decision(
+        applicationlauncher::observe! { applicationlauncher::observability::record_decision(
             "window-identity",
             window_info.class.as_str(),
             &[
@@ -222,7 +223,7 @@ pub(crate) fn build_window_info(
                     .and_then(|path| path.to_str())
                     .unwrap_or(""),
             ],
-        );
+        ); }
     }
     Some(window_info)
 }
@@ -243,7 +244,9 @@ pub(crate) fn setup_kwin_window_feed(
                 match applicationlauncher::tracker::TrackerClient::connect() {
                     Ok(connected) => client = Some(connected),
                     Err(err) => {
-                        eprintln!("Application Launcher tracker connection lost: {err}");
+                        applicationlauncher::diagnostic_log!(
+                            "Application Launcher tracker connection lost: {err}"
+                        );
                         std::thread::sleep(TRACKER_WINDOW_FEED_RECONNECT_DELAY);
                         continue;
                     }
@@ -320,7 +323,9 @@ pub(crate) fn setup_kwin_window_feed(
                     }
                 }
                 Err(err) => {
-                    eprintln!("Application Launcher tracker connection lost: {err}");
+                    applicationlauncher::diagnostic_log!(
+                        "Application Launcher tracker connection lost: {err}"
+                    );
                     last_generation = u64::MAX;
                     last_run_id = None;
                     client = None;
@@ -363,7 +368,7 @@ fn ensure_tracker_ready() -> Result<(), String> {
         }
         if restart_attempts < TRACKER_BUILD_RESTART_LIMIT {
             restart_attempts += 1;
-            eprintln!(
+            applicationlauncher::diagnostic_log!(
                 "Application Launcher tracker compatibility check failed; restarting daemon (attempt {restart_attempts}/{TRACKER_BUILD_RESTART_LIMIT}): {last_error}"
             );
             if let Err(err) = applicationlauncher::tracker::restart_tracker_service() {
@@ -543,14 +548,14 @@ pub(crate) fn get_open_windows_with_snapshot_mode(
     ) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("Failed to execute kdotool search: {:?}", e);
+            applicationlauncher::diagnostic_log!("Failed to execute kdotool search: {:?}", e);
             return None;
         }
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
-        eprintln!(
+        applicationlauncher::diagnostic_log!(
             "kdotool window search failed with {}: {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
@@ -588,7 +593,7 @@ pub(crate) fn get_open_windows_with_snapshot_mode(
         match applicationlauncher::process::output_with_timeout(cmd, Duration::from_secs(5)) {
             Ok(o) => o,
             Err(e) => {
-                eprintln!(
+                applicationlauncher::diagnostic_log!(
                     "Failed to execute chained kdotool metadata command: {:?}",
                     e
                 );
@@ -597,7 +602,7 @@ pub(crate) fn get_open_windows_with_snapshot_mode(
         };
 
     if !meta_output.status.success() {
-        eprintln!(
+        applicationlauncher::diagnostic_log!(
             "kdotool window metadata query failed with {}: {}",
             meta_output.status,
             String::from_utf8_lossy(&meta_output.stderr).trim()

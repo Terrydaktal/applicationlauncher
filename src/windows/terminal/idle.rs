@@ -491,10 +491,10 @@ pub(crate) fn stop_idle_codex() -> Result<String, String> {
     };
     let report = run_batch(&mut backend, deadline)?;
     let message = report.to_string();
-    applicationlauncher::observability::record(
+    applicationlauncher::observe! { applicationlauncher::observability::record(
         applicationlauncher::observability::Event::new("terminal", "stop-idle-codex")
             .reason(&message),
-    );
+    ); }
     Ok(message)
 }
 

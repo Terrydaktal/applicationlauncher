@@ -144,7 +144,7 @@ impl TrackerDatabase {
             ) {
                 (Ok(window), Ok(restore)) => entries.push((window, restore)),
                 (window_result, restore_result) => {
-                    eprintln!(
+                    applicationlauncher::diagnostic_log!(
                         "Ignoring corrupt current window {id}; it remains available for recovery: {window_result:?}, {restore_result:?}"
                     );
                 }
@@ -305,7 +305,7 @@ impl TrackerDatabase {
         match parsed {
             Ok(entry) => Ok(Some(entry)),
             Err(err) => {
-                eprintln!(
+                applicationlauncher::diagnostic_log!(
                     "Ignoring corrupt history entry {id}; it remains available for recovery: {err}"
                 );
                 Ok(None)
@@ -347,7 +347,7 @@ impl TrackerDatabase {
             match parsed {
                 Ok(entry) => history.push(entry),
                 Err(err) => {
-                    eprintln!(
+                    applicationlauncher::diagnostic_log!(
                         "Ignoring corrupt history entry {id}; it remains available for recovery: {err}"
                     );
                 }
@@ -571,7 +571,7 @@ impl TrackerDatabase {
             ) {
                 (Ok(window), Ok(restore)) => windows.push((window, restore)),
                 (window_result, restore_result) => {
-                    eprintln!(
+                    applicationlauncher::diagnostic_log!(
                         "Ignoring corrupt snapshot row {id}/{ordinal}; it remains available for recovery: {window_result:?}, {restore_result:?}"
                     );
                 }

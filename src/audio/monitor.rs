@@ -57,13 +57,13 @@ impl AudioInbox {
 pub(crate) fn start_audio_monitor(ctx: egui::Context) -> Arc<AudioInbox> {
     let inbox = Arc::new(AudioInbox::default());
     let target = Arc::downgrade(&inbox);
-    applicationlauncher::observability::spawn_named("audio-monitor", move |worker| {
+    applicationlauncher::spawn_worker!("audio-monitor", move |worker| {
         let mut backoff = Duration::from_secs(1);
         let mut last_error = None;
         while target.strong_count() > 0 {
-            worker.set_state("connecting-playback-monitors");
+            applicationlauncher::observe! { worker.set_state("connecting-playback-monitors"); }
             let result = Engine::connect(None).and_then(|mut engine| {
-                worker.set_state("monitoring-playback-samples");
+                applicationlauncher::observe! { worker.set_state("monitoring-playback-samples"); }
                 let mut previous: Option<AudioCacheUpdate> = None;
                 let mut published = Instant::now() - PUBLISH_INTERVAL;
                 while target.strong_count() > 0 {
@@ -89,12 +89,12 @@ pub(crate) fn start_audio_monitor(ctx: egui::Context) -> Arc<AudioInbox> {
             });
             if let Err(reason) = result {
                 if last_error != Some(reason) {
-                    eprintln!(
+                    applicationlauncher::diagnostic_log!(
                         "Playback visualization unavailable: {reason}; retrying without capture fallback"
                     );
                     last_error = Some(reason);
                 }
-                worker.set_state("playback-monitor-retry");
+                applicationlauncher::observe! { worker.set_state("playback-monitor-retry"); }
                 publish(
                     &target,
                     &ctx,

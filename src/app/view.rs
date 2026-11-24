@@ -116,13 +116,13 @@ pub(super) fn search_bar(
 
 impl eframe::App for App {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
-        applicationlauncher::observability::sample_gui_frame(input);
+        applicationlauncher::observe! { applicationlauncher::observability::sample_gui_frame(input); }
         let ignored = self.ime_input_filter.filter(input);
         if ignored != 0 {
-            applicationlauncher::observability::add(
+            applicationlauncher::observe! { applicationlauncher::observability::add(
                 applicationlauncher::observability::Counter::IgnoredIdleImeEvents,
                 ignored as u64,
-            );
+            ); }
         }
     }
 
@@ -262,7 +262,7 @@ impl eframe::App for App {
                         self.terminal_metadata_retry_not_before = Some(
                             Instant::now() + Duration::from_secs(TERMINAL_METADATA_RETRY_SECS),
                         );
-                        crate::diagnostics::write_stderr_line(&format!(
+                        applicationlauncher::diagnostic_line!(&format!(
                             "Could not refresh XFCE4 Terminal metadata: {err}"
                         ));
                     }
@@ -302,7 +302,7 @@ impl eframe::App for App {
                     ctx.request_repaint();
                 }
                 Err(err) => {
-                    crate::diagnostics::write_stderr_line(&format!(
+                    applicationlauncher::diagnostic_line!(&format!(
                         "Falling back to kdotool window polling: {err}"
                     ));
                     self.terminal_action_message = Some((
@@ -374,10 +374,10 @@ impl eframe::App for App {
             Some(Ok(apps)) => {
                 if self.apps != apps {
                     self.apps = apps;
-                    applicationlauncher::observability::set_gauge(
+                    applicationlauncher::observe! { applicationlauncher::observability::set_gauge(
                         applicationlauncher::observability::Gauge::InstalledApps,
                         self.apps.len(),
-                    );
+                    ); }
                     self.app_search_documents = self.apps.iter().map(app_search_document).collect();
                     self.apps_generation = self.apps_generation.wrapping_add(1);
                     self.refresh_app_audio_routing();
@@ -408,10 +408,10 @@ impl eframe::App for App {
                     match result {
                         LoadResult::AppsSuccess(apps) => {
                             self.apps = apps;
-                            applicationlauncher::observability::set_gauge(
+                            applicationlauncher::observe! { applicationlauncher::observability::set_gauge(
                                 applicationlauncher::observability::Gauge::InstalledApps,
                                 self.apps.len(),
-                            );
+                            ); }
                             self.app_search_documents =
                                 self.apps.iter().map(app_search_document).collect();
                             self.apps_generation = self.apps_generation.wrapping_add(1);
@@ -819,6 +819,7 @@ impl eframe::App for App {
                         }
                     }
 
+                    #[cfg(feature = "observability")]
                     if search_query_changed
                         && has_search_query
                         && applicationlauncher::observability::mode()
@@ -840,11 +841,11 @@ impl eframe::App for App {
                             }
                         );
                         let evidence = first_match.into_iter().collect::<Vec<_>>();
-                        applicationlauncher::observability::record_search_decision(
+                        applicationlauncher::observe! { applicationlauncher::observability::record_search_decision(
                             &search_query,
                             &decision,
                             &evidence,
-                        );
+                        ); }
                     }
 
                     let show_run_in_terminal_action = self.mode == LauncherMode::Windows
@@ -2758,13 +2759,13 @@ impl eframe::App for App {
                                         let report = client.restore_recovery()?;
                                         client.wait_for_restore_report(report)
                                     }) {
-                                    Ok(report) => crate::diagnostics::write_stderr_line(&format!(
+                                    Ok(report) => applicationlauncher::diagnostic_line!(&format!(
                                         "Recovery restore: {} matched, {} launched, {} failures",
                                         report.matched,
                                         report.launched,
                                         report.failures.len()
                                     )),
-                                    Err(err) => crate::diagnostics::write_stderr_line(&format!(
+                                    Err(err) => applicationlauncher::diagnostic_line!(&format!(
                                         "Recovery restore failed: {err}"
                                     )),
                                 }

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
-use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use crate::replay::{self, BoundaryKind, BoundaryRecord, DecisionRecord};
 
@@ -29,6 +29,8 @@ pub const PRODUCTION_BINARY_SIZE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEBUG_ARTIFACT_SIZE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 pub const DIAGNOSTIC_CAPTURE_BUDGET_SECS: u64 = 45;
 pub const DIAGNOSTIC_OUTPUT_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_EVENTS_PER_SECOND: u32 = 1000;
+pub const MAX_PERSISTENT_WRITE_BYTES: u64 = 64 * 1024 * 1024;
 
 const DIAGNOSTIC_REQUEST_LIMIT: usize = 1024;
 const DEBUG_ATTACH_TIMEOUT: Duration = Duration::from_secs(60);
@@ -89,10 +91,11 @@ pub enum Counter {
     WorkerPanics,
     FlightRecorderDrops,
     IgnoredIdleImeEvents,
+    FlightRecorderOverwrites,
 }
 
 impl Counter {
-    const COUNT: usize = 15;
+    const COUNT: usize = 16;
     const ALL: [(Self, &'static str); Self::COUNT] = [
         (Self::DiagnosticRequests, "diagnostic_requests"),
         (Self::DiagnosticFailures, "diagnostic_failures"),
@@ -109,6 +112,7 @@ impl Counter {
         (Self::WorkerPanics, "worker_panics"),
         (Self::FlightRecorderDrops, "flight_recorder_drops"),
         (Self::IgnoredIdleImeEvents, "ignored_idle_ime_events"),
+        (Self::FlightRecorderOverwrites, "flight_recorder_overwrites"),
     ];
 }
 
@@ -386,6 +390,9 @@ pub struct WorkerSnapshot {
 struct BoundedFlightRecorder {
     capacity: usize,
     events: VecDeque<FlightEvent>,
+    sequence: u64,
+    rate_second: u64,
+    rate_count: u32,
 }
 
 impl BoundedFlightRecorder {
@@ -395,6 +402,9 @@ impl BoundedFlightRecorder {
             // Minimal mode never records, so defer the bounded allocation until
             // the first observable or runtime-activated event.
             events: VecDeque::new(),
+            sequence: 0,
+            rate_second: 0,
+            rate_count: 0,
         }
     }
 
@@ -411,6 +421,18 @@ impl BoundedFlightRecorder {
     fn snapshot(&self) -> Vec<FlightEvent> {
         self.events.iter().cloned().collect()
     }
+
+    fn admit(&mut self, second: u64) -> bool {
+        if self.rate_second != second {
+            self.rate_second = second;
+            self.rate_count = 0;
+        }
+        if self.rate_count >= MAX_EVENTS_PER_SECOND {
+            return false;
+        }
+        self.rate_count += 1;
+        true
+    }
 }
 
 struct State {
@@ -419,11 +441,11 @@ struct State {
     configured_mode: AtomicU8,
     mode: AtomicU8,
     instance_id: u64,
-    sequence: AtomicU64,
-    operation_sequence: AtomicU64,
     worker_sequence: AtomicU64,
     counters: [AtomicU64; Counter::COUNT],
     gauges: [AtomicI64; Gauge::COUNT],
+    high_water: [AtomicI64; Gauge::COUNT],
+    categories: Categories,
     events: Mutex<BoundedFlightRecorder>,
     workers: Mutex<BTreeMap<u64, WorkerSnapshot>>,
     diagnostic_token: AtomicU64,
@@ -440,11 +462,15 @@ impl State {
             configured_mode: AtomicU8::new(configured_mode as u8),
             mode: AtomicU8::new(configured_mode as u8),
             instance_id: process_instance_id(),
-            sequence: AtomicU64::new(0),
-            operation_sequence: AtomicU64::new(0),
             worker_sequence: AtomicU64::new(0),
             counters: std::array::from_fn(|_| AtomicU64::new(0)),
             gauges: std::array::from_fn(|_| AtomicI64::new(0)),
+            high_water: std::array::from_fn(|_| AtomicI64::new(0)),
+            categories: Categories::from_value(
+                std::env::var("APPLICATIONLAUNCHER_DIAGNOSTIC_CATEGORIES")
+                    .ok()
+                    .as_deref(),
+            ),
             events: Mutex::new(BoundedFlightRecorder::new(FLIGHT_RECORDER_CAPACITY)),
             workers: Mutex::new(BTreeMap::new()),
             diagnostic_token: AtomicU64::new(0),
@@ -478,6 +504,38 @@ fn configured_mode() -> RuntimeMode {
     }
 }
 
+#[derive(Clone, Copy, Serialize)]
+struct Categories {
+    baseline: bool,
+    stderr: bool,
+    update_timings: bool,
+}
+
+impl Categories {
+    fn from_value(value: Option<&str>) -> Self {
+        let enabled =
+            |name| value.is_none_or(|value| value.split(',').any(|item| item.trim() == name));
+        Self {
+            baseline: enabled("baseline"),
+            stderr: enabled("stderr"),
+            update_timings: enabled("update-timings"),
+        }
+    }
+
+    fn enabled(self, category: &str) -> bool {
+        match category {
+            "baseline" => self.baseline,
+            "stderr" => self.stderr,
+            "update-timings" => self.update_timings,
+            _ => false,
+        }
+    }
+}
+
+pub fn category_enabled(category: &str) -> bool {
+    mode() != RuntimeMode::Minimal && state().categories.enabled(category)
+}
+
 pub fn initialize(component: Component) {
     let state = state();
     let _ = state.component.set(component);
@@ -490,7 +548,7 @@ pub fn initialize(component: Component) {
             Ordering::Release,
         );
     }
-    if state.configured_mode.load(Ordering::Acquire) != RuntimeMode::Minimal as u8 {
+    if category_enabled("baseline") {
         let _ = state
             .persistent
             .get_or_init(|| start_persistent_recorder(component));
@@ -521,7 +579,7 @@ pub fn enable_observable_for_doctor() {
 }
 
 pub fn next_operation_id() -> u64 {
-    state().operation_sequence.fetch_add(1, Ordering::Relaxed) + 1
+    crate::operation::next_id()
 }
 
 /// Numeric-only measurements while an independent diagnostic capture is active.
@@ -535,38 +593,51 @@ pub fn sample_gui_frame(input: &egui::RawInput) {
 }
 
 pub fn increment(counter: Counter) {
-    if mode() == RuntimeMode::Minimal {
+    if !category_enabled("baseline") {
         return;
     }
     state().counters[counter as usize].fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn add(counter: Counter, value: u64) {
-    if mode() == RuntimeMode::Minimal {
+    if !category_enabled("baseline") {
         return;
     }
     state().counters[counter as usize].fetch_add(value, Ordering::Relaxed);
 }
 
 pub fn set_gauge(gauge: Gauge, value: usize) {
-    if mode() == RuntimeMode::Minimal {
+    if !category_enabled("baseline") {
         return;
     }
-    state().gauges[gauge as usize].store(value.min(i64::MAX as usize) as i64, Ordering::Relaxed);
+    let value = value.min(i64::MAX as usize) as i64;
+    state().gauges[gauge as usize].store(value, Ordering::Relaxed);
+    state().high_water[gauge as usize].fetch_max(value, Ordering::Relaxed);
 }
 
 pub fn record(event: Event<'_>) -> Option<u64> {
-    if mode() == RuntimeMode::Minimal {
+    if !category_enabled("baseline") {
         return None;
     }
 
     let state = state();
-    let sequence = state.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+    let Ok(mut recorder) = state.events.try_lock() else {
+        state.counters[Counter::FlightRecorderDrops as usize].fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let monotonic_us = elapsed_us(state.started);
+    let second = monotonic_us / 1_000_000;
+    if !recorder.admit(second) {
+        state.counters[Counter::FlightRecorderDrops as usize].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    recorder.sequence += 1;
+    let sequence = recorder.sequence;
     let thread = std::thread::current();
     let entry = FlightEvent {
         instance_id: state.instance_id,
         sequence,
-        monotonic_us: elapsed_us(state.started),
+        monotonic_us,
         unix_time_ms: now_ms(),
         thread_id: truncate_field(&format!("{:?}", thread.id())),
         thread_name: truncate_field(thread.name().unwrap_or("unnamed")),
@@ -584,11 +655,11 @@ pub fn record(event: Event<'_>) -> Option<u64> {
         boundary: event.boundary,
         decision: event.decision,
     };
-    state
-        .events
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(entry.clone());
+    if recorder.events.len() == recorder.capacity {
+        state.counters[Counter::FlightRecorderOverwrites as usize].fetch_add(1, Ordering::Relaxed);
+    }
+    recorder.push(entry.clone());
+    drop(recorder);
     if let Some(persistent) = state.persistent.get() {
         if persistent
             .sender
@@ -647,6 +718,37 @@ pub fn record_search_decision(query: &str, decision: &str, evidence: &[&str]) ->
 struct PersistentRecorder {
     sender: SyncSender<PersistentMessage>,
     path: PathBuf,
+    health: std::sync::Arc<PersistentHealth>,
+}
+
+#[derive(Default)]
+struct PersistentHealth {
+    status: AtomicU8,
+    bytes: AtomicU64,
+    first_errno: AtomicI64,
+}
+
+impl PersistentHealth {
+    fn failed(&self, error: std::io::Error) {
+        self.status.store(2, Ordering::Relaxed);
+        let _ = self.first_errno.compare_exchange(
+            0,
+            i64::from(error.raw_os_error().unwrap_or(-1)),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        let status = match self.status.load(Ordering::Relaxed) {
+            0 => "opening",
+            1 => "healthy",
+            2 => "unavailable",
+            _ => "budget-exhausted",
+        };
+        serde_json::json!({"status":status, "attempted_bytes":self.bytes.load(Ordering::Relaxed),
+            "first_errno":self.first_errno.load(Ordering::Relaxed), "lifetime_write_budget":MAX_PERSISTENT_WRITE_BYTES})
+    }
 }
 
 enum PersistentMessage {
@@ -658,35 +760,69 @@ fn start_persistent_recorder(component: Component) -> PersistentRecorder {
     let path = persistent_trace_path(component);
     let (sender, receiver) = mpsc::sync_channel::<PersistentMessage>(64);
     let writer_path = path.clone();
-    let _ = std::thread::Builder::new()
+    let health = std::sync::Arc::new(PersistentHealth::default());
+    let writer_health = health.clone();
+    let spawned = std::thread::Builder::new()
         .name(format!("trace-writer-{}", component.as_str()))
-        .spawn(move || persistent_trace_writer(&writer_path, receiver));
-    PersistentRecorder { sender, path }
+        .spawn(move || persistent_trace_writer(&writer_path, receiver, &writer_health));
+    if let Err(error) = spawned {
+        health.failed(error);
+    }
+    PersistentRecorder {
+        sender,
+        path,
+        health,
+    }
 }
 
-fn persistent_trace_writer(path: &Path, receiver: mpsc::Receiver<PersistentMessage>) {
+fn persistent_trace_writer(
+    path: &Path,
+    receiver: mpsc::Receiver<PersistentMessage>,
+    health: &PersistentHealth,
+) {
     let worker = register_worker("flight-recorder-writer");
     worker.set_state("opening");
     let Some(parent) = path.parent() else {
         return;
     };
     if ensure_private_directory(parent).is_err() {
+        health.failed(std::io::Error::from_raw_os_error(libc::EPERM));
         return;
     }
-    let Ok(file) = OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .mode(0o600)
-        .open(path)
-    else {
-        return;
+        .open(path);
+    let file = match file {
+        Ok(file) => file,
+        Err(error) => {
+            health.failed(error);
+            return;
+        }
     };
-    #[cfg(unix)]
-    let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-    let _ =
-        file.set_len((replay::PERSISTENT_RING_SLOT_BYTES * replay::PERSISTENT_RING_SLOTS) as u64);
+    let valid = file.metadata().is_ok_and(|metadata| {
+        metadata.is_file()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.nlink() == 1
+            && metadata.mode() & 0o077 == 0
+    });
+    if !valid {
+        health.failed(std::io::Error::from_raw_os_error(libc::EPERM));
+        return;
+    }
+    if let Err(error) =
+        file.set_len((replay::PERSISTENT_RING_SLOT_BYTES * replay::PERSISTENT_RING_SLOTS) as u64)
+    {
+        health.failed(error);
+        return;
+    }
+    health.status.store(1, Ordering::Relaxed);
     worker.set_state("writing");
+    let mut written = 0_u64;
     while let Ok(message) = receiver.recv() {
         match message {
             PersistentMessage::Event(event) => {
@@ -696,20 +832,33 @@ fn persistent_trace_writer(path: &Path, receiver: mpsc::Receiver<PersistentMessa
                 let Some(header) = replay::encode_ring_header(event.sequence, &payload) else {
                     continue;
                 };
+                let bytes = (payload.len() + header.len()) as u64;
+                if written.saturating_add(bytes) > MAX_PERSISTENT_WRITE_BYTES {
+                    health.status.store(3, Ordering::Relaxed);
+                    increment(Counter::FlightRecorderDrops);
+                    continue;
+                }
+                written += bytes;
+                health.bytes.store(written, Ordering::Relaxed);
                 let offset = replay::ring_slot_offset(event.sequence);
-                if write_all_at(
+                if let Err(error) = write_all_at(
                     &file,
                     &payload,
                     offset + replay::PERSISTENT_RING_HEADER_BYTES as u64,
-                )
-                .is_err()
-                {
+                ) {
+                    health.failed(error);
+                    increment(Counter::FlightRecorderDrops);
                     continue;
                 }
-                let _ = write_all_at(&file, &header, offset);
+                if let Err(error) = write_all_at(&file, &header, offset) {
+                    health.failed(error);
+                    increment(Counter::FlightRecorderDrops);
+                }
             }
             PersistentMessage::Flush(acknowledgement) => {
-                let _ = file.sync_data();
+                if let Err(error) = file.sync_data() {
+                    health.failed(error);
+                }
                 let _ = acknowledgement.send(());
             }
         }
@@ -748,7 +897,7 @@ pub struct WorkerGuard {
 
 impl WorkerGuard {
     pub fn set_state(&self, worker_state: &str) {
-        if !self.registered || mode() == RuntimeMode::Minimal {
+        if !self.registered || !category_enabled("baseline") {
             return;
         }
         let state = state();
@@ -779,7 +928,7 @@ impl Drop for WorkerGuard {
 }
 
 pub fn register_worker(name: &str) -> WorkerGuard {
-    if mode() == RuntimeMode::Minimal {
+    if !category_enabled("baseline") {
         return WorkerGuard {
             id: 0,
             registered: false,
@@ -861,16 +1010,38 @@ pub struct RuntimeSnapshot {
     uptime_ms: u64,
     counters: BTreeMap<&'static str, u64>,
     gauges: BTreeMap<&'static str, i64>,
+    high_water: BTreeMap<&'static str, i64>,
+    categories: Categories,
     gui_frame_statistics: GuiFrameStatisticsSnapshot,
     workers: Vec<WorkerSnapshot>,
     events: Vec<FlightEvent>,
     persistent_trace: Option<String>,
+    persistent_sink: Option<serde_json::Value>,
     enabled_fault_points: Vec<&'static str>,
     budgets: Budgets,
+    consistency: &'static str,
+    unavailable_subsystems: Vec<&'static str>,
 }
 
 pub fn runtime_snapshot() -> RuntimeSnapshot {
     let state = state();
+    let mut unavailable_subsystems = Vec::new();
+    let workers = state
+        .workers
+        .try_lock()
+        .map(|workers| workers.values().cloned().collect())
+        .unwrap_or_else(|_| {
+            unavailable_subsystems.push("workers");
+            Vec::new()
+        });
+    let events = state
+        .events
+        .try_lock()
+        .map(|events| events.snapshot())
+        .unwrap_or_else(|_| {
+            unavailable_subsystems.push("events");
+            Vec::new()
+        });
     RuntimeSnapshot {
         schema_version: 1,
         component: state
@@ -902,24 +1073,37 @@ pub fn runtime_snapshot() -> RuntimeSnapshot {
             .iter()
             .map(|(gauge, name)| (*name, state.gauges[*gauge as usize].load(Ordering::Relaxed)))
             .collect(),
-        gui_frame_statistics: state.gui_frame_statistics.snapshot(),
-        workers: state
-            .workers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .cloned()
+        high_water: Gauge::ALL
+            .iter()
+            .map(|(gauge, name)| {
+                (
+                    *name,
+                    state.high_water[*gauge as usize].load(Ordering::Relaxed),
+                )
+            })
             .collect(),
-        events: state
-            .events
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .snapshot(),
+        categories: state.categories,
+        gui_frame_statistics: state.gui_frame_statistics.snapshot(),
+        workers,
+        events,
         persistent_trace: state
             .persistent
             .get()
             .map(|recorder| recorder.path.display().to_string()),
-        enabled_fault_points: crate::replay::FaultPlan::from_environment().enabled_points(),
+        persistent_sink: state
+            .persistent
+            .get()
+            .map(|recorder| recorder.health.snapshot()),
+        enabled_fault_points: {
+            #[cfg(feature = "diagnostic-build")]
+            {
+                crate::replay::FaultPlan::from_environment().enabled_points()
+            }
+            #[cfg(not(feature = "diagnostic-build"))]
+            {
+                Vec::new()
+            }
+        },
         budgets: Budgets {
             observable_cpu_ppm: OBSERVABLE_CPU_BUDGET_PPM,
             event_p99_latency_ns: EVENT_P99_LATENCY_BUDGET_NS,
@@ -931,6 +1115,8 @@ pub fn runtime_snapshot() -> RuntimeSnapshot {
             flight_recorder_events: FLIGHT_RECORDER_CAPACITY,
             named_workers: MAX_NAMED_WORKERS,
         },
+        consistency: "best-effort",
+        unavailable_subsystems,
     }
 }
 
@@ -1071,6 +1257,7 @@ fn handle_diagnostic_connection(mut stream: std::os::unix::net::UnixStream) {
     let request = std::str::from_utf8(&request[..request_len])
         .unwrap_or_default()
         .trim();
+    #[cfg(feature = "diagnostic-build")]
     if replay::environment_faults_enabled()
         && replay::environment_should_inject(
             replay::FaultPoint::DiagnosticResponseDelay,
@@ -1144,10 +1331,13 @@ fn handle_diagnostic_connection(mut stream: std::os::unix::net::UnixStream) {
 fn authorize_debugger(pid: u32) -> Result<u64, String> {
     set_debugger(pid)?;
     let token = state().diagnostic_token.fetch_add(1, Ordering::AcqRel) + 1;
-    state().gui_frame_statistics.reset();
-    state()
-        .mode
-        .store(RuntimeMode::RuntimeActivated as u8, Ordering::Release);
+    // External stack permission does not override the optional-recording veto.
+    if category_enabled("baseline") {
+        state().gui_frame_statistics.reset();
+        state()
+            .mode
+            .store(RuntimeMode::RuntimeActivated as u8, Ordering::Release);
+    }
     record(
         Event::new("diagnostics", "activated")
             .object(&pid.to_string())
@@ -1556,6 +1746,120 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn categories_are_fixed_and_explicit_empty_disables_every_category() {
+        let all = Categories::from_value(None);
+        assert!(all.enabled("baseline") && all.enabled("stderr") && all.enabled("update-timings"));
+        let selected = Categories::from_value(Some("update-timings, unknown"));
+        assert!(selected.enabled("update-timings"));
+        assert!(!selected.enabled("baseline") && !selected.enabled("unknown"));
+        assert!(!Categories::from_value(Some("")).enabled("stderr"));
+    }
+
+    #[test]
+    fn rate_limit_is_hard_and_resets_without_unbounded_state() {
+        let mut recorder = BoundedFlightRecorder::new(3);
+        for _ in 0..MAX_EVENTS_PER_SECOND {
+            assert!(recorder.admit(10));
+        }
+        assert!(!recorder.admit(10));
+        assert!(recorder.admit(11));
+        assert_eq!(recorder.rate_count, 1);
+    }
+
+    #[test]
+    fn contended_recording_and_snapshots_never_wait_for_the_recorder() {
+        let events = state().events.lock().unwrap();
+        let workers = state().workers.lock().unwrap();
+        let before =
+            state().counters[Counter::FlightRecorderDrops as usize].load(Ordering::Relaxed);
+        assert!(record(Event::new("test", "contended")).is_none());
+        let snapshot = runtime_snapshot();
+        assert!(snapshot.unavailable_subsystems.contains(&"events"));
+        assert!(snapshot.unavailable_subsystems.contains(&"workers"));
+        assert!(snapshot.events.is_empty() && snapshot.workers.is_empty());
+        assert!(
+            state().counters[Counter::FlightRecorderDrops as usize].load(Ordering::Relaxed)
+                > before
+        );
+        drop((events, workers));
+    }
+
+    #[test]
+    fn global_and_category_disable_do_not_evaluate_observer_arguments() {
+        const CHILD: &str = "APPLICATIONLAUNCHER_LAZY_OBSERVER_TEST";
+        if std::env::var(CHILD).as_deref() == Ok("1") {
+            let mut evaluated = false;
+            applicationlauncher::observe! { evaluated = true; }
+            applicationlauncher::diagnostic_log!("{}", {
+                evaluated = true;
+                "secret"
+            });
+            assert!(!evaluated);
+            let previous_mode = mode();
+            let token = authorize_debugger(std::process::id()).unwrap();
+            assert_eq!(mode(), previous_mode);
+            assert!(revoke_debugger(token));
+            return;
+        }
+        for (mode, categories) in [
+            ("off", "baseline,stderr,update-timings"),
+            ("observable", ""),
+        ] {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "observability::tests::global_and_category_disable_do_not_evaluate_observer_arguments"])
+                .env(CHILD, "1")
+                .env("APPLICATIONLAUNCHER_DIAGNOSTICS", mode)
+                .env("APPLICATIONLAUNCHER_DIAGNOSTIC_CATEGORIES", categories)
+                .output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn high_water_does_not_fall_with_the_live_gauge() {
+        set_gauge(Gauge::InstalledApps, 17);
+        set_gauge(Gauge::InstalledApps, 2);
+        let snapshot = runtime_snapshot();
+        assert!(snapshot.high_water["installed_apps"] >= 17);
+    }
+
+    #[test]
+    fn persistent_sink_reports_the_first_os_error_without_replacing_it() {
+        let health = PersistentHealth::default();
+        health.failed(std::io::Error::from_raw_os_error(libc::ENOSPC));
+        health.failed(std::io::Error::from_raw_os_error(libc::EIO));
+        let snapshot = health.snapshot();
+        assert_eq!(snapshot["status"], "unavailable");
+        assert_eq!(snapshot["first_errno"], libc::ENOSPC);
+    }
+
+    #[test]
+    fn persistent_writer_refuses_a_symlink_without_touching_its_target() {
+        let directory = std::env::temp_dir().join(format!(
+            "launcher-private-ring-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = directory.join("private-data");
+        std::fs::write(&target, b"keep this data").unwrap();
+        let link = directory.join("ring");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(sender);
+        let health = PersistentHealth::default();
+        persistent_trace_writer(&link, receiver, &health);
+        assert_eq!(health.snapshot()["status"], "unavailable");
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep this data");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     fn test_event(sequence: u64, value: &str) -> FlightEvent {
         FlightEvent {

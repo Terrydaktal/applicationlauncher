@@ -371,17 +371,19 @@ class WindowUpdate:
                 return dict(ok=True, message="Terminal update completed and verified")
         except Exception as error:
             message = str(error)
-            self.event("failed", interrupted=self.interrupted, released=self.released, error=message)
+            failure = worker.failure_details(error)
+            recovery_failure = None
+            self.event("failed", interrupted=self.interrupted, released=self.released, error=message, failure=failure)
             try:
                 recovery = self.remote("Recover" if self.interrupted or self.released else "Discard")
                 self.original_closed = bool(recovery.get("original_closed", self.original_closed))
-            except Exception:
-                pass
+            except Exception as recovery_error:
+                recovery_failure = worker.failure_details(recovery_error)
             try:
                 self.publish("failed", message + "; original window retained when possible; inspect recovery records before retrying")
             except Exception:
                 pass
-            return dict(ok=False, message=message)
+            return dict(ok=False, message=message, failure=failure, recovery_failure=recovery_failure)
         finally:
             for descriptor in self.descriptors:
                 os.close(descriptor)

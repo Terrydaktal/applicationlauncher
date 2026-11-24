@@ -752,15 +752,16 @@ pub(crate) fn render_idle_codex_action(
         if let Err(err) = std::thread::Builder::new()
             .name("stop-idle-codex".into())
             .spawn(move || {
+                #[cfg(feature = "observability")]
                 let worker = applicationlauncher::observability::register_worker("stop-idle-codex");
-                worker.set_state("checking-idle-sessions");
+                applicationlauncher::observe! { worker.set_state("checking-idle-sessions"); }
                 job.message = match crate::windows::terminal::idle::stop_idle_codex() {
                     Ok(message) => message,
                     Err(error) => format!("Idle Codex action failed: {error}"),
                 };
             })
         {
-            crate::diagnostics::write_stderr_line(&format!(
+            applicationlauncher::diagnostic_line!(&format!(
                 "Could not start idle Codex action: {err}"
             ));
         }

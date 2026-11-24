@@ -389,8 +389,8 @@ fn kdotool_running() -> bool {
 }
 
 pub(crate) fn start_kwin_feed_watchdog() {
-    crate::observability::spawn_named("kwin-feed-watchdog", |worker| {
-        worker.set_state("watching");
+    applicationlauncher::spawn_worker!("kwin-feed-watchdog", |worker| {
+        applicationlauncher::observe! { worker.set_state("watching"); }
         let mut state = KwinFeedWatchdogState::default();
         loop {
             std::thread::sleep(KWIN_FEED_WATCHDOG_POLL_INTERVAL);
@@ -399,15 +399,17 @@ pub(crate) fn start_kwin_feed_watchdog() {
             if state.should_recover(Instant::now(), loaded, scripting_busy) {
                 match recover_kwin_feed() {
                     Ok(()) => {
-                        crate::observability::increment(
+                        applicationlauncher::observe! { crate::observability::increment(
                             crate::observability::Counter::KwinFeedRecoveries,
-                        );
-                        crate::observability::record(
+                        ); }
+                        applicationlauncher::observe! { crate::observability::record(
                             crate::observability::Event::new("kwin-feed", "recovered")
                                 .reason("watchdog-observed-missing"),
-                        );
+                        ); }
                     }
-                    Err(err) => eprintln!("Tracker KWin feed watchdog failed: {err}"),
+                    Err(err) => applicationlauncher::diagnostic_log!(
+                        "Tracker KWin feed watchdog failed: {err}"
+                    ),
                 }
             }
         }

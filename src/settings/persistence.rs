@@ -35,9 +35,10 @@ impl Writer {
             .name("settings-writer".into())
             .spawn(move || {
                 let _lifecycle = Lifecycle(Arc::clone(&worker_state));
+                #[cfg(feature = "observability")]
                 let worker = applicationlauncher::observability::register_worker("settings-writer");
                 loop {
-                    worker.set_state("waiting");
+                    applicationlauncher::observe! { worker.set_state("waiting"); }
                     let (path, bytes) = {
                         let mut state =
                             worker_state.0.lock().unwrap_or_else(|err| err.into_inner());
@@ -61,7 +62,7 @@ impl Writer {
                         state.writing = true;
                         (path, bytes)
                     };
-                    worker.set_state("atomic-write");
+                    applicationlauncher::observe! { worker.set_state("atomic-write"); }
                     let result = write(&path, &bytes);
                     let mut state = worker_state.0.lock().unwrap_or_else(|err| err.into_inner());
                     match result {
@@ -69,7 +70,10 @@ impl Writer {
                             state.errors.remove(&path);
                         }
                         Err(err) => {
-                            eprintln!("Could not save {}: {err}", path.display());
+                            applicationlauncher::diagnostic_log!(
+                                "Could not save {}: {err}",
+                                path.display()
+                            );
                             state.errors.insert(path, err.to_string());
                         }
                     }
@@ -147,7 +151,7 @@ pub(crate) fn queue_write(path: PathBuf, content: String) {
         })
     });
     if let Err(err) = writer.submit(path, content.into_bytes()) {
-        eprintln!("Could not queue settings: {err}");
+        applicationlauncher::diagnostic_log!("Could not queue settings: {err}");
     }
 }
 
@@ -155,7 +159,7 @@ pub(crate) fn flush_writes() {
     if let Some(writer) = WRITER.get()
         && let Err(err) = writer.flush()
     {
-        eprintln!("Could not flush settings: {err}");
+        applicationlauncher::diagnostic_log!("Could not flush settings: {err}");
     }
 }
 

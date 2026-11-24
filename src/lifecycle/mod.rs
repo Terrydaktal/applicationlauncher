@@ -312,7 +312,7 @@ pub(crate) fn inspect_external_windows(
     let directory = state_dir().join(format!(
         "preview-{}-{}",
         std::process::id(),
-        crate::observability::next_operation_id()
+        crate::operation::next_id()
     ));
     private_directory(&directory)?;
     let result = (|| {

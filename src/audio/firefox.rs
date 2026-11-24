@@ -69,13 +69,13 @@ pub(crate) fn start_firefox_audio_bridge(ctx: egui::Context) -> Arc<FirefoxAudio
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .map(|path| path.join("applicationlauncher-firefox-audio"));
-    applicationlauncher::observability::spawn_named("firefox-audio-bridge", move |worker| {
+    applicationlauncher::spawn_worker!("firefox-audio-bridge", move |worker| {
         let mut previous = Arc::new(Vec::new());
         let notify = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         let notify = (notify >= 0).then(|| unsafe { OwnedFd::from_raw_fd(notify) });
         // One latest-state slot; polling ends when the GUI drops its receiver.
         while target.strong_count() > 0 {
-            worker.set_state("reading-firefox-audio-ownership");
+            applicationlauncher::observe! { worker.set_state("reading-firefox-audio-ownership"); }
             let current = directory
                 .as_ref()
                 .map(|path| read_processes(path))
@@ -95,7 +95,7 @@ pub(crate) fn start_firefox_audio_bridge(ctx: egui::Context) -> Arc<FirefoxAudio
                     ctx.request_repaint();
                 }
             }
-            worker.set_state("waiting-for-firefox-audio-change");
+            applicationlauncher::observe! { worker.set_state("waiting-for-firefox-audio-change"); }
             wait_for_snapshot(notify.as_ref(), directory.as_deref());
         }
     });

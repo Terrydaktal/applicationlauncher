@@ -668,7 +668,7 @@ mod tests {
             super::super::executable_identity(&original),
             super::super::executable_identity(&pinned.metadata().unwrap())
         );
-        eprintln!(
+        applicationlauncher::diagnostic_log!(
             "retained desktop={} name={} latest installation remains independent; no executable started",
             association.desktop_file_path.display(),
             association.name
@@ -1148,7 +1148,7 @@ mod tests {
                 .as_deref()
                 .is_some_and(|description| !description.contains("Local custom tool"))
         );
-        eprintln!(
+        applicationlauncher::diagnostic_log!(
             "{}",
             serde_json::json!({
                 "executable": info.executable,
@@ -1163,7 +1163,10 @@ mod tests {
             })
         );
         if std::env::var_os("APPLICATIONLAUNCHER_TEST_APPLICATION_PACKAGE_QUERY").is_some() {
-            eprintln!("available_package={:?}", info.query_package_version());
+            applicationlauncher::diagnostic_log!(
+                "available_package={:?}",
+                info.query_package_version()
+            );
         }
     }
 }

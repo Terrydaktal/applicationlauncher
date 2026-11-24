@@ -95,6 +95,7 @@ impl FaultPlan {
         }
     }
 
+    #[cfg(any(test, feature = "diagnostic-build"))]
     pub fn from_environment() -> Self {
         if std::env::var("APPLICATIONLAUNCHER_ALLOW_FAULT_INJECTION").as_deref() != Ok("1") {
             return Self::default();
@@ -121,14 +122,17 @@ impl FaultPlan {
     }
 }
 
+#[cfg(feature = "diagnostic-build")]
 static ENVIRONMENT_FAULT_PLAN: std::sync::OnceLock<FaultPlan> = std::sync::OnceLock::new();
 
+#[cfg(feature = "diagnostic-build")]
 pub fn environment_should_inject(point: FaultPoint, ordinal: u64) -> bool {
     ENVIRONMENT_FAULT_PLAN
         .get_or_init(FaultPlan::from_environment)
         .should_inject(point, ordinal)
 }
 
+#[cfg(feature = "diagnostic-build")]
 pub fn environment_faults_enabled() -> bool {
     !ENVIRONMENT_FAULT_PLAN
         .get_or_init(FaultPlan::from_environment)

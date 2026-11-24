@@ -20,13 +20,13 @@ def run(mode, path):
         try:
             external.gate(request)
         except Exception as error:
-            atomic_record(Path(path).with_suffix(".error.json"), dict(error=str(error), traceback=traceback.format_exc()))
+            atomic_record(Path(path).with_suffix(".error.json"), dict(error=str(error), failure=worker.failure_details(error), traceback=traceback.format_exc()))
             raise
         return
     result = None
     try:
         fields = worker.read_limited("/proc/self/stat", 16384).decode().rsplit(")", 1)[1].split()
-        atomic_record(directory / "worker.json", dict(pid=os.getpid(), start=int(fields[19])))
+        atomic_record(directory / "worker.json", dict(pid=os.getpid(), start=int(fields[19]), uid=os.getuid()))
         if mode == "window":
             result = WindowUpdate(request, worker.System(), directory).run()
         elif mode == "window-external":
@@ -41,7 +41,8 @@ def run(mode, path):
         else:
             raise worker.Refused("Unknown lifecycle operation mode")
     except Exception as error:
-        result = dict(ok=False, message=str(error) + "; private recovery records retained; do not retry blindly")
+        result = dict(ok=False, message=str(error) + "; private recovery records retained; do not retry blindly",
+                      failure=worker.failure_details(error))
         print(traceback.format_exc(), file=sys.stderr)
     finally:
         if result is not None:

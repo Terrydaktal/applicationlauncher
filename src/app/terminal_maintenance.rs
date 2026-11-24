@@ -923,8 +923,9 @@ fn request(shared: Arc<Mutex<TerminalMaintenanceState>>, ctx: egui::Context, act
     if let Err(error) = std::thread::Builder::new().name("terminal-maintenance-client".into()).spawn(move || {
         let shared = worker_shared;
         let _guard = guard;
+        #[cfg(feature = "observability")]
         let worker = applicationlauncher::observability::register_worker("terminal-maintenance-client");
-        worker.set_state("requesting-preview-or-restart");
+        applicationlauncher::observe! { worker.set_state("requesting-preview-or-restart"); }
         let result = (|| {
             let client = TrackerClient::connect()?;
             let mut report = match action {
@@ -955,7 +956,7 @@ fn request(shared: Arc<Mutex<TerminalMaintenanceState>>, ctx: egui::Context, act
                     continue;
                 }
                 if !running || !open { break; }
-                worker.set_state("polling-daemon-progress");
+                applicationlauncher::observe! { worker.set_state("polling-daemon-progress"); }
                 std::thread::sleep(Duration::from_millis(300));
                 report = client.terminal_upgrade_report(&report.operation_id)?;
             }

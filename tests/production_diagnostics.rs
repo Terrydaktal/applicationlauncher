@@ -1,3 +1,5 @@
+#![cfg(feature = "diagnostic-build")]
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
@@ -56,12 +58,18 @@ fn panic_probe_writes_a_private_symbolizable_report() {
 fn native_crash_probe_is_contained_and_observable() {
     let root = test_root("native-crash");
     std::fs::create_dir_all(&root).unwrap();
-    let status = Command::new(binary())
-        .args(["--diagnostic-probe", "native-crash"])
-        .env("XDG_STATE_HOME", &root)
-        .status()
-        .unwrap();
-    assert_eq!(status.signal(), Some(libc::SIGSEGV));
+    for attempt in 0..8 {
+        let status = Command::new(binary())
+            .args(["--diagnostic-probe", "native-crash"])
+            .env("XDG_STATE_HOME", &root)
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGSEGV),
+            "native crash attempt {attempt} exited as {status}"
+        );
+    }
     let _ = std::fs::remove_dir_all(root);
 }
 

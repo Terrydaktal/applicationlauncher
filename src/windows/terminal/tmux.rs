@@ -90,11 +90,11 @@ impl TmuxMonitor {
     pub(crate) fn new(ctx: egui::Context, theme: String) -> Self {
         let shared: Arc<(Mutex<State>, Condvar)> = Arc::default();
         let worker_state = Arc::clone(&shared);
-        applicationlauncher::observability::spawn_named("tmux-live-panes", move |worker| {
+        applicationlauncher::spawn_worker!("tmux-live-panes", move |worker| {
             let mut previous = HashMap::new();
             let mut successes = HashMap::new();
             let mut reader = LiveTmuxReader::default();
-            worker.set_state("waiting");
+            applicationlauncher::observe! { worker.set_state("waiting"); }
             loop {
                 let started = Instant::now();
                 let targets = {
@@ -110,7 +110,7 @@ impl TmuxMonitor {
                     }
                     state.targets.clone()
                 };
-                worker.set_state("checking-terminal-foreground");
+                applicationlauncher::observe! { worker.set_state("checking-terminal-foreground"); }
                 let mut stats = HashMap::new();
                 let clients: HashMap<_, _> = targets
                     .iter()
@@ -125,7 +125,7 @@ impl TmuxMonitor {
                     .collect::<HashSet<_>>()
                     .into_iter()
                     .collect();
-                worker.set_state("reading-tmux-panes");
+                applicationlauncher::observe! { worker.set_state("reading-tmux-panes"); }
                 let panes = reader.capture(&pids);
                 let now = Instant::now();
                 let mut current = HashMap::new();
@@ -199,7 +199,7 @@ impl TmuxMonitor {
                     POLL_INTERVAL
                 };
                 let delay = interval.saturating_sub(started.elapsed());
-                worker.set_state("waiting");
+                applicationlauncher::observe! { worker.set_state("waiting"); }
                 let _ = wake.wait_timeout(state, delay);
             }
         });
@@ -806,7 +806,7 @@ mod tests {
                         Some(metadata.pane.client_pid)
                     );
                     assert!(!window.title.contains("tmux new-session"));
-                    eprintln!(
+                    applicationlauncher::diagnostic_log!(
                         "window_owner={:?} client={} session={} raw_title={:?} title={}",
                         window.pid,
                         metadata.pane.client_pid,

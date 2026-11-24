@@ -155,12 +155,12 @@ impl AppInfoPopup {
             let ctx = ctx.clone();
             let (tx, rx) = std::sync::mpsc::sync_channel(3);
             // At most three updates; local details never wait for a package registry.
-            applicationlauncher::observability::spawn_named("app-info", move |worker| {
+            applicationlauncher::spawn_worker!("app-info", move |worker| {
                 use crate::windows::versions::ApplicationInfoUpdate;
                 if cancelled.load(Ordering::Acquire) {
                     return;
                 }
-                worker.set_state("resolving-installed-application");
+                applicationlauncher::observe! { worker.set_state("resolving-installed-application"); }
                 let metadata = crate::windows::versions::inspect_application(&exec, &desktop_file);
                 if cancelled.load(Ordering::Acquire)
                     || tx
@@ -174,7 +174,7 @@ impl AppInfoPopup {
                 if cancelled.load(Ordering::Acquire) {
                     return;
                 }
-                worker.set_state("checking-available-package-version");
+                applicationlauncher::observe! { worker.set_state("checking-available-package-version"); }
                 if let Some(version) = metadata.query_package_version()
                     && !cancelled.load(Ordering::Acquire)
                 {
@@ -185,7 +185,7 @@ impl AppInfoPopup {
                 if cancelled.load(Ordering::Acquire) {
                     return;
                 }
-                worker.set_state("checking-available-npm-version");
+                applicationlauncher::observe! { worker.set_state("checking-available-npm-version"); }
                 if let Some(version) = metadata.query_npm_version()
                     && !cancelled.load(Ordering::Acquire)
                 {

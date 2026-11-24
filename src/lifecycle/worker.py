@@ -38,6 +38,23 @@ class Refused(Exception):
     pass
 
 
+def failure_details(error):
+    """Required recovery result: preserve the first typed cause, without payloads."""
+    code = ("policy-refused" if isinstance(error, Refused) else
+            "timeout" if isinstance(error, (TimeoutError, subprocess.TimeoutExpired)) else
+            "io" if isinstance(error, OSError) else
+            "invalid-input" if isinstance(error, (ValueError, KeyError, TypeError)) else
+            "internal")
+    causes, seen = [], set()
+    current = error
+    while current is not None and id(current) not in seen and len(causes) < 8:
+        seen.add(id(current))
+        causes.append(dict(kind=type(current).__name__[:64],
+                           errno=current.errno if isinstance(current, OSError) else None))
+        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
+    return dict(schema_version=1, code=code, causes=causes, truncated=current is not None)
+
+
 @contextmanager
 def operation_lock():
     base = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "applicationlauncher/lifecycle"

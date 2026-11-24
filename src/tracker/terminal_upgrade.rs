@@ -96,7 +96,7 @@ impl UpgradeRegistry {
         let id = format!(
             "terminal-request-{}-{}",
             super::now_ms(),
-            crate::observability::next_operation_id()
+            crate::operation::next_id()
         );
         let job = Arc::new(Mutex::new(Job {
             created: Instant::now(),

@@ -316,7 +316,7 @@ mod tests {
             }
         }
         let elapsed = started.elapsed().as_secs_f64();
-        eprintln!(
+        applicationlauncher::diagnostic_log!(
             "32 streams x 20 seconds of PCM analysed in {elapsed:.3}s; {:.3}% of one core per real-time stream (analysis only)",
             elapsed / 640.0 * 100.0
         );

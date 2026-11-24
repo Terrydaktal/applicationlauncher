@@ -438,10 +438,10 @@ impl App {
                 self.rebuild_window_search_documents();
             }
             self.seed_window_icon_cache();
-            applicationlauncher::observability::set_gauge(
+            applicationlauncher::observe! { applicationlauncher::observability::set_gauge(
                 applicationlauncher::observability::Gauge::GuiWindows,
                 self.windows.len(),
-            );
+            ); }
             self.missing_window_counts.clear();
             self.windows_generation = self.windows_generation.wrapping_add(1);
             self.refresh_window_audio_cache();
@@ -533,10 +533,10 @@ impl App {
             .collect::<Vec<_>>();
         self.windows = merged;
         self.tmux_monitor.sync_windows(&self.windows);
-        applicationlauncher::observability::set_gauge(
+        applicationlauncher::observe! { applicationlauncher::observability::set_gauge(
             applicationlauncher::observability::Gauge::GuiWindows,
             self.windows.len(),
-        );
+        ); }
         self.seed_window_icon_cache();
         self.update_cached_windows_without_rerank(&cache_updates);
         if search_changed {
@@ -572,10 +572,10 @@ impl App {
             self.deferred_window_feed_events.extend(events);
             self.deferred_window_feed_events =
                 coalesce_window_feed_events(std::mem::take(&mut self.deferred_window_feed_events));
-            applicationlauncher::observability::set_gauge(
+            applicationlauncher::observe! { applicationlauncher::observability::set_gauge(
                 applicationlauncher::observability::Gauge::PendingFeedEvents,
                 self.deferred_window_feed_events.len(),
-            );
+            ); }
             return;
         }
 
@@ -585,19 +585,20 @@ impl App {
             deferred.extend(events);
             events = deferred;
         }
-        applicationlauncher::observability::set_gauge(
+        applicationlauncher::observe! { applicationlauncher::observability::set_gauge(
             applicationlauncher::observability::Gauge::PendingFeedEvents,
             0,
-        );
+        ); }
         let events = coalesce_window_feed_events(events);
         let mut events = events;
+        #[cfg(feature = "diagnostic-build")]
         if applicationlauncher::replay::environment_faults_enabled() {
             let fault_operation = applicationlauncher::observability::next_operation_id();
             if applicationlauncher::replay::environment_should_inject(
                 applicationlauncher::replay::FaultPoint::WindowFeedDrop,
                 fault_operation,
             ) {
-                applicationlauncher::observability::record_boundary(
+                applicationlauncher::observe! { applicationlauncher::observability::record_boundary(
                     applicationlauncher::replay::BoundaryKind::FaultInjection,
                     "window-feed-drop",
                     &serde_json::json!({
@@ -605,14 +606,14 @@ impl App {
                         "event_count": events.len(),
                     })
                     .to_string(),
-                );
+                ); }
                 return;
             }
             if applicationlauncher::replay::environment_should_inject(
                 applicationlauncher::replay::FaultPoint::WindowFeedDuplicate,
                 fault_operation,
             ) {
-                applicationlauncher::observability::record_boundary(
+                applicationlauncher::observe! { applicationlauncher::observability::record_boundary(
                     applicationlauncher::replay::BoundaryKind::FaultInjection,
                     "window-feed-duplicate",
                     &serde_json::json!({
@@ -620,7 +621,7 @@ impl App {
                         "event_count": events.len(),
                     })
                     .to_string(),
-                );
+                ); }
                 events.extend(events.clone());
             }
         }
@@ -789,10 +790,10 @@ impl App {
 
         if changed {
             self.tmux_monitor.sync_windows(&self.windows);
-            applicationlauncher::observability::set_gauge(
+            applicationlauncher::observe! { applicationlauncher::observability::set_gauge(
                 applicationlauncher::observability::Gauge::GuiWindows,
                 self.windows.len(),
-            );
+            ); }
             self.update_cached_windows_without_rerank(&cache_updates);
             if search_changed {
                 self.schedule_window_search_refresh();
@@ -1018,8 +1019,8 @@ impl App {
         let window_tx = self.window_sender.clone();
         let ctx = ctx.clone();
 
-        applicationlauncher::observability::spawn_named("window-poll", move |worker| {
-            worker.set_state("polling");
+        applicationlauncher::spawn_worker!("window-poll", move |worker| {
+            applicationlauncher::observe! { worker.set_state("polling"); }
             let mut rapid_poll_count = 0;
             loop {
                 if rapid_polling_thread.load(std::sync::atomic::Ordering::SeqCst) {

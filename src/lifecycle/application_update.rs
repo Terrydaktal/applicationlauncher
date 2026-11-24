@@ -151,7 +151,7 @@ impl Registry {
         let id = format!(
             "application-update-{}-{}",
             crate::tracker::now_ms(),
-            crate::observability::next_operation_id()
+            crate::operation::next_id()
         );
         let job = Arc::new(Mutex::new(Job {
             created: Instant::now(),
@@ -639,7 +639,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "launcher-update-backup-test-{}-{}",
             std::process::id(),
-            crate::observability::next_operation_id()
+            crate::operation::next_id()
         ));
         std::fs::create_dir(&root).unwrap();
         let path = root.join("plan.json");

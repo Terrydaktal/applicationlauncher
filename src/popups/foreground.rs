@@ -64,14 +64,14 @@ pub(crate) fn request(id: ViewportId) {
     }
     // Winit's Wayland focus_window is a no-op. Run only on explicit reactivation,
     // with one worker and one latest-wins pending target, never during rendering.
-    applicationlauncher::observability::spawn_named("window-focus", move |worker| {
+    applicationlauncher::spawn_worker!("window-focus", move |worker| {
         let kdotool = applicationlauncher::process::kdotool_path();
         drain_requests(requests, |id| {
-            worker.set_state(if id == ViewportId::ROOT {
+            applicationlauncher::observe! { worker.set_state(if id == ViewportId::ROOT {
                 "raising-launcher-window"
             } else {
                 "raising-info-window"
-            });
+            }); }
             let activated = activate_with(std::process::id(), id, |arguments| {
                 let mut command = Command::new(&kdotool);
                 command.args(arguments);
@@ -83,10 +83,10 @@ pub(crate) fn request(id: ViewportId) {
                 output.status.success().then_some(output.stdout)
             });
             if !activated {
-                applicationlauncher::observability::record(
+                applicationlauncher::observe! { applicationlauncher::observability::record(
                     applicationlauncher::observability::Event::new("window-focus", "failed")
                         .reason("target-absent-ambiguous-or-activation-failed"),
-                );
+                ); }
             }
         });
     });
