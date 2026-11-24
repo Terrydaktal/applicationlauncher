@@ -41,6 +41,99 @@ def scope_fingerprint(tabs):
     return worker.plan_identity(values)
 
 
+def codex_rollout_idle(stream, size, budget):
+    header = stream.readline(min(budget, 1024 * 1024) + 1)
+    if len(header) > min(budget, 1024 * 1024) or not header.endswith(b"\n"):
+        raise ValueError("Incomplete rollout header")
+    identity, parent = worker.rollout_session_identity(json.loads(header))
+    start = max(len(header), size - min(budget - len(header), 1024 * 1024))
+    if start > len(header):
+        stream.seek(start - 1)
+        partial = stream.read(1) != b"\n"
+    else:
+        stream.seek(start)
+        partial = False
+    data = stream.read(size - start)
+    if data and not data.endswith(b"\n"):
+        raise ValueError("Codex is still publishing its activity")
+    lines = data.splitlines()
+    if partial:
+        lines = lines[1:]
+    idle = True if start == len(header) else None
+    for line in reversed(lines):
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise ValueError("Invalid activity record")
+        payload = row.get("payload")
+        if row.get("type") != "event_msg" or not isinstance(payload, dict):
+            continue
+        event = payload.get("type")
+        if event in {"task_started", "turn_started", "user_message"}:
+            idle = False
+            break
+        if event in {"task_complete", "turn_complete", "turn_aborted"}:
+            idle = True
+            break
+    return identity, parent, idle, len(header) + len(data)
+
+
+def require_idle_codex(program, proc_root=Path("/proc")):
+    if program["kind"] != "codex":
+        return
+    saved = program["process"]
+    unknown = "Codex activity could not be verified; retry when it is idle"
+    try:
+        if not worker.same_process(saved) or worker.session_id(saved) != program["argv"][2]:
+            raise ValueError("Codex identity changed")
+        deadline, budget, rollouts, stamps = time.monotonic() + 1, 8 * 1024 * 1024, {}, []
+        def stamp(value):
+            return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+        for index, entry in enumerate((proc_root / str(saved["pid"]) / "fd").iterdir()):
+            if index >= 512 or time.monotonic() > deadline:
+                raise ValueError("Activity inspection exceeded its bounds")
+            try:
+                target = Path(os.readlink(entry).removesuffix(" (deleted)"))
+                if not target.name.startswith("rollout-") or target.suffix != ".jsonl":
+                    continue
+                descriptor = os.open(entry, os.O_RDONLY | os.O_NONBLOCK)
+            except FileNotFoundError:
+                continue
+            with os.fdopen(descriptor, "rb") as stream:
+                before = os.fstat(stream.fileno())
+                if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                        or before.st_mode & 0o022 or budget <= 0 or len(rollouts) >= 64):
+                    raise ValueError("Unsafe or excessive rollout metadata")
+                identity, parent, idle, used = codex_rollout_idle(stream, before.st_size, budget)
+                after = os.fstat(stream.fileno())
+            if stamp(before) != stamp(after):
+                raise ValueError("Activity changed during inspection")
+            observed = (parent, idle, stamp(after))
+            if identity in rollouts and rollouts[identity] != observed:
+                raise ValueError("Conflicting rollout activity")
+            rollouts[identity] = observed
+            stamps.append((entry, stamp(after)))
+            budget -= used
+        root = program["argv"][2]
+        if root not in rollouts or rollouts[root][0] is not None:
+            raise ValueError("No process-bound main conversation")
+        for identity, (parent, idle, _) in rollouts.items():
+            seen, cursor = set(), identity
+            while cursor != root:
+                if cursor in seen or cursor not in rollouts:
+                    raise ValueError("Incomplete child-agent lineage")
+                seen.add(cursor)
+                cursor = rollouts[cursor][0]
+            if idle is None:
+                raise ValueError("No bounded turn-state evidence")
+        if (not worker.same_process(saved) or time.monotonic() > deadline
+                or any(stamp(os.stat(entry)) != expected for entry, expected in stamps)):
+            raise ValueError("Codex activity changed during inspection")
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise worker.Refused(unknown) from error
+    if any(not value[1] for value in rollouts.values()):
+        raise worker.Refused("Codex is working on a turn or tool; finish or cancel it before updating this terminal")
+
+
 class WindowUpdate:
     def __init__(self, request, system, directory, backend=None):
         self.request, self.system, self.directory = request, system, Path(directory)
@@ -144,8 +237,7 @@ class WindowUpdate:
                     server=server, session=session, session_name=name, created=str(client["session_created"]), client=client)
             else:
                 program = worker.program_plan(active, executable=pinned)
-                if program["kind"] == "codex" and worker.children(active["pid"]):
-                    raise worker.Refused("Codex has running child processes; finish or cancel its tools before updating this terminal")
+                require_idle_codex(program)
             worker.require_dedicated_tree(root, active, program)
             ancestors, cursor = [], active
             for _ in range(32):
@@ -196,8 +288,7 @@ class WindowUpdate:
                 fresh = worker.program_plan(active, executable=tab["program"]["argv"][0])
                 if worker.plan_identity(fresh) != worker.plan_identity(tab["program"]):
                     raise worker.Refused("The exact application session or restart options changed")
-                if fresh["kind"] == "codex" and worker.children(active["pid"]):
-                    raise worker.Refused("Codex started a tool after preview; nothing was stopped")
+                require_idle_codex(fresh)
             worker.require_dedicated_tree(root, active, tab["program"])
             if "return_shell" in tab:
                 shell = tab["return_shell"]
@@ -218,6 +309,7 @@ class WindowUpdate:
 
     def stop_tab(self, tab, retire_tmux=False):
         program = tab["program"]
+        require_idle_codex(program)
         if program["kind"] == "tmux":
             if not retire_tmux: return
             saved = program["process"]

@@ -33,6 +33,7 @@ class ReturnShell(unittest.TestCase):
                 patch.object(worker, "process", return_value=shell), \
                 patch.object(worker, "children", return_value=[]), \
                 patch.object(worker, "program_plan", return_value=program), \
+                patch.object(window, "require_idle_codex"), \
                 patch.object(worker, "require_dedicated_tree"), \
                 patch.object(worker, "terminal_environment", return_value={}), \
                 patch.object(worker, "latest_binary", side_effect=lambda name: f"/fixture/latest-{name}"), \

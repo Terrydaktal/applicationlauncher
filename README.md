@@ -918,6 +918,15 @@ binary backups. These are restart recipes,
 not snapshots of loaded libraries, process memory, unsaved shell state or scrollback.
 Individual Fish/Codex updates deliberately select the latest installed build.
 
+Window updates require Codex to be idle, not child-process-free. The backend
+reads bounded turn-state events from that exact process's open main and related
+child-agent rollouts; persistent code-mode and MCP helpers do not by themselves
+block an update. Active turns, including model work with no child process, are
+refused. Activity is checked during planning, after confirmation and staging,
+and immediately before interruption. Changed process/file identities, partial
+records, missing or ambiguous activity evidence remain explanatory refusals,
+never guesses that an application is idle. This check does not signal Codex or
+poll in the GUI.
 
 For slow updates, an agent can directly enable opt-in scalar stage timing through
 the running daemon's same-user `LifecycleTiming1.ActivateUpdateTimings(seconds)`
