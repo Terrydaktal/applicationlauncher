@@ -37,26 +37,25 @@ fn desktop_exists(path: &Path) -> Option<bool> {
     }
 }
 
-/// Worker-only fallback when the launcher's application list supplied no usable
-/// desktop candidate. Names/classes never establish this association.
-pub(super) fn associate_installed_desktop(launch: &mut ApplicationLaunch) {
-    if launch.desktop_entry.is_some() {
+/// Reuse worker discovery while independently verifying the exact current route.
+pub(super) fn associate_installed_desktop_from_matches(
+    launch: &mut ApplicationLaunch,
+    image: &File,
+    matches: &[(PathBuf, program_metadata::desktop::Entry)],
+) {
+    if launch.desktop_entry.is_some() || matches.len() != 1 {
         return;
     }
-    let Some(executable) = launch.executable.as_ref() else {
-        return;
-    };
-    let Ok(mut matches) = program_metadata::desktop::launch_matches(
-        executable,
-        std::time::Instant::now() + std::time::Duration::from_millis(500),
+    let path = &matches[0].0;
+    // Reuse discovery, not stale fields: bind the current Exec to this image.
+    let Ok(Some(entry)) = program_metadata::desktop::launch_match_pinned(
+        path,
+        image,
+        std::time::Instant::now() + std::time::Duration::from_millis(200),
     ) else {
         return;
     };
-    if matches.len() != 1 {
-        return;
-    }
-    let (path, entry) = matches.remove(0);
-    launch.desktop_entry = app_info_from_current_desktop(path, entry);
+    launch.desktop_entry = app_info_from_current_desktop(path.clone(), entry);
     if launch.desktop_entry.is_some() {
         launch.desktop_exists = Some(true);
     }
@@ -139,6 +138,7 @@ pub(crate) struct ApplicationInfo {
     pub(crate) metadata: ProgsMetadata,
     pub(crate) version: Option<String>,
     pub(crate) version_reason: Option<String>,
+    pub(crate) version_issue: Option<program_metadata::executable::MetadataIssue>,
     pub(crate) installed_metadata: Option<program_metadata::interpreted::InstalledVersion>,
     pub(crate) package: Option<String>,
     pub(crate) package_target: Option<PackageTarget>,
@@ -334,6 +334,11 @@ pub(crate) fn inspect_application(exec: &str, desktop_file: &Path) -> Applicatio
                 .map(|version| version.version.clone())
                 .or(version.version);
             result.version_reason = result.version.is_none().then_some(version.reason).flatten();
+            result.version_issue = result
+                .version
+                .is_none()
+                .then_some(version.reason_kind)
+                .flatten();
         }
         Err(reason) => result.version_reason = Some(reason),
     }
@@ -350,6 +355,7 @@ pub(crate) fn inspect_application(exec: &str, desktop_file: &Path) -> Applicatio
             chain: result.chain,
             resolution: "Unknown (launch chain changed during inspection; reopen Show Info)".into(),
             version_reason: Some("launch chain changed during inspection; reopen Show Info".into()),
+            version_issue: Some(program_metadata::executable::MetadataIssue::Changed),
             launcher_installation: result.launcher_installation,
             launcher_metadata: result.launcher_metadata,
             ..Default::default()

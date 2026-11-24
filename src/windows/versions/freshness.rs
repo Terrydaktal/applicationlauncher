@@ -1,11 +1,119 @@
 //! Presentation adapter for the shared, passive artifact-specific build inspector.
 use std::fs::File;
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use program_metadata::build_status::{self, artifact::ArtifactStamp};
 
+pub(super) const PENDING: &str = "Checking recorded build inputs…";
+const CHANGED: &str = "Unknown (on-disk executable or launch path changed during inspection)";
+
+/// Keeps the selected image and all of its publishing aliases alive while the
+/// metadata worker moves on. No build inspection runs when creating this job.
+pub(crate) struct Check {
+    binary: File,
+    stamp: Option<ArtifactStamp>,
+    selection: Selection,
+    launcher: Option<program_metadata::launch::PathResolution>,
+}
+
+enum Selection {
+    Installed(super::installation::InstalledExecutable),
+    Candidate(program_metadata::launch::PathResolution),
+}
+
+impl std::fmt::Debug for Check {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SourceCheck")
+            .field("path", &self.path())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Check {
+    pub(super) fn installed(
+        installed: super::installation::InstalledExecutable,
+        binary: File,
+        launcher: Option<program_metadata::launch::PathResolution>,
+    ) -> Self {
+        Self::new(Selection::Installed(installed), binary, launcher)
+    }
+
+    pub(super) fn candidate(
+        resolved: program_metadata::launch::PathResolution,
+        binary: File,
+    ) -> Self {
+        Self::new(Selection::Candidate(resolved), binary, None)
+    }
+
+    pub(super) fn with_expected_stamp(mut self, stamp: ArtifactStamp) -> Self {
+        self.stamp = Some(stamp);
+        self
+    }
+
+    fn new(
+        selection: Selection,
+        binary: File,
+        launcher: Option<program_metadata::launch::PathResolution>,
+    ) -> Self {
+        let stamp = binary
+            .metadata()
+            .ok()
+            .map(|metadata| ArtifactStamp::from_metadata(&metadata));
+        Self {
+            binary,
+            stamp,
+            selection,
+            launcher,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        match &self.selection {
+            Selection::Installed(installed) => &installed.path,
+            Selection::Candidate(resolved) => &resolved.path,
+        }
+    }
+
+    pub(super) fn unchanged(&self) -> bool {
+        let Ok(metadata) = self.binary.metadata() else {
+            return false;
+        };
+        self.stamp == Some(ArtifactStamp::from_metadata(&metadata))
+            && std::fs::metadata(self.path())
+                .is_ok_and(|metadata| self.stamp == Some(ArtifactStamp::from_metadata(&metadata)))
+            && self
+                .launcher
+                .as_ref()
+                .is_none_or(|launcher| launcher.unchanged())
+            && match &self.selection {
+                Selection::Installed(installed) => installed.unchanged(&metadata),
+                Selection::Candidate(resolved) => resolved.unchanged(),
+            }
+    }
+
+    pub(super) fn inspect(&self) -> String {
+        self.validated(|| inspect_changes(self.path(), &self.binary, true))
+    }
+
+    pub(super) fn validated(&self, inspect: impl FnOnce() -> String) -> String {
+        if !self.unchanged() {
+            return CHANGED.into();
+        }
+        let result = inspect();
+        if self.unchanged() {
+            result
+        } else {
+            CHANGED.into()
+        }
+    }
+}
+
 pub(super) fn uncompiled_changes(executable: &Path, binary: &File) -> String {
+    inspect_changes(executable, binary, false)
+}
+
+fn inspect_changes(executable: &Path, binary: &File, background: bool) -> String {
     let Ok(before) = binary
         .metadata()
         .map(|metadata| ArtifactStamp::from_metadata(&metadata))
@@ -13,11 +121,17 @@ pub(super) fn uncompiled_changes(executable: &Path, binary: &File) -> String {
         return "Unknown (selected executable cannot be inspected)".into();
     };
     let checkout = super::installation::source_checkout_root(executable);
-    let report = build_status::inspect_artifact(
-        executable,
-        checkout.as_deref(),
-        Instant::now() + Duration::from_millis(1500),
-    );
+    let report = if background {
+        // Only the dedicated source-check worker opts into the longer artifact
+        // allowance; synchronous callers retain their existing strict deadline.
+        build_status::inspect_artifact_background(executable, checkout.as_deref())
+    } else {
+        build_status::inspect_artifact(
+            executable,
+            checkout.as_deref(),
+            std::time::Instant::now() + std::time::Duration::from_millis(1500),
+        )
+    };
     if report.artifact_stamp != Some(before)
         || !binary
             .metadata()
@@ -36,6 +150,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use std::time::UNIX_EPOCH;
 
     struct Fixture(PathBuf);

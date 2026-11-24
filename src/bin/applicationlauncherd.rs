@@ -1,12 +1,10 @@
-const PRODUCT_METADATA_TEXT: &str = concat!(
-    "PROGRAM-METADATA-V1\napplicationlauncherd\n",
-    env!("CARGO_PKG_VERSION"),
-    "\nservice\n"
-);
-#[used]
-#[unsafe(link_section = ".program_metadata")]
-static PRODUCT_METADATA: [u8; PRODUCT_METADATA_TEXT.len()] =
-    applicationlauncher::metadata_bytes(PRODUCT_METADATA_TEXT);
+program_metadata::embed_metadata! {
+    static PRODUCT_METADATA = {
+        product: "applicationlauncherd",
+        version: env!("CARGO_PKG_VERSION"),
+        capabilities: "service",
+    };
+}
 
 fn main() {
     mod app_version_runtime {
@@ -16,7 +14,7 @@ fn main() {
         ));
     }
     app_version_runtime::handle_cli();
-    std::hint::black_box(&PRODUCT_METADATA);
+    program_metadata::producer::retain(&PRODUCT_METADATA);
     if std::env::args().nth(1).as_deref() == Some("--build-info") {
         println!("{}", applicationlauncher::BUILD_INFO);
         return;

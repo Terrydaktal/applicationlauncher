@@ -255,6 +255,7 @@ struct InstalledApplicationFields<'a> {
     chain: Option<&'a [PathBuf]>,
     version: Option<&'a str>,
     version_reason: Option<&'a str>,
+    version_issue: Option<program_metadata::executable::MetadataIssue>,
     installed_metadata: Option<&'a program_metadata::interpreted::InstalledVersion>,
     build_id: Option<&'a str>,
     build_id_reason: Option<&'a str>,
@@ -398,9 +399,16 @@ fn installed_application_rows(
                     None => version.to_owned(),
                 })
                 .or_else(|| {
-                    fields
-                        .version_reason
-                        .map(|reason| format!("Unavailable ({reason})"))
+                    (fields.version_reason.is_some() || fields.package.is_some()).then(|| {
+                        program_metadata::version_display::VersionDisplay::executable(
+                            None,
+                            fields.version_issue,
+                            fields.version_reason,
+                            fields.package,
+                            program_metadata::version_display::VersionScope::OnDisk,
+                        )
+                        .text
+                    })
                 }),
         ),
         (
@@ -563,6 +571,7 @@ fn application_info_rows(state: &AppInfoPopup) -> Vec<InfoPopupRow> {
             chain: details.map(|info| info.chain.as_slice()),
             version: details.and_then(|info| info.version.as_deref()),
             version_reason: details.and_then(|info| info.version_reason.as_deref()),
+            version_issue: details.and_then(|info| info.version_issue),
             installed_metadata: details.and_then(|info| info.installed_metadata.as_ref()),
             build_id: details.and_then(|info| info.build_id.as_deref()),
             build_id_reason: details.and_then(|info| info.build_id_reason.as_deref()),
@@ -759,10 +768,9 @@ pub(super) fn process_version_rows(
                 if let Some(reason) = version.and_then(|version| version.running_unavailable) {
                     format!("Unavailable ({reason})")
                 } else if label == "version"
-                    && let Some(reason) =
-                        version.and_then(|version| version.version_reason.as_deref())
+                    && let Some(display) = &missing_version_display
                 {
-                    format!("Unavailable ({reason})")
+                    display.text.clone()
                 } else if label == "ELF build ID"
                     && let Some(reason) =
                         version.and_then(|version| version.build_id_reason.as_deref())
@@ -776,7 +784,10 @@ pub(super) fn process_version_rows(
         separator_before: false,
         binary_is_current: if label == "ELF build ID"
             && value.is_some_and(|value| !value.trim().is_empty())
-        {
+            && !missing_version_display.as_ref().is_some_and(|display| {
+                display.evidence
+                    == program_metadata::version_display::DisplayEvidence::InstalledPackage
+            }) {
             version
                 .filter(|version| version.running_unavailable.is_none())
                 .and_then(|version| version.running_latest_binary)
@@ -810,6 +821,7 @@ pub(super) fn process_version_rows(
             chain: launch.map(|launch| launch.chain.as_slice()),
             version: version.and_then(|version| version.latest_version.as_deref()),
             version_reason: version.and_then(|version| version.latest_version_reason.as_deref()),
+            version_issue: version.and_then(|version| version.latest_version_issue),
             installed_metadata: version
                 .and_then(|version| version.application_installed_metadata.as_ref()),
             build_id: version.and_then(|version| version.latest_build_id.as_deref()),
@@ -2836,6 +2848,73 @@ mod tests {
     }
 
     #[test]
+    fn package_derived_fallback_is_not_a_running_version_or_green_equality() {
+        use crate::windows::versions::ProcessVersion;
+        let result = ProcessVersion {
+            package: Some("lsyncd 2.3.1-9".into()),
+            version_reason: Some(
+                "No verified noninteractive version switch for this program".into(),
+            ),
+            latest_version_reason: Some("No unambiguous passive product version".into()),
+            build_id: Some("same-native-image".into()),
+            latest_build_id: Some("same-native-image".into()),
+            running_latest_binary: Some(true),
+            ..Default::default()
+        };
+        let rows = process_version_rows("Application", Some(&result), false);
+        for label in [VERSION_FIELD_LABEL, LATEST_VERSION_FIELD_LABEL] {
+            let row = rows.iter().find(|row| row.label == label).unwrap();
+            assert!(
+                row.value.starts_with("Package-derived: lsyncd 2.3.1-9"),
+                "{}",
+                row.value
+            );
+            assert!(row.value.contains("version unverified"), "{}", row.value);
+            assert_eq!(
+                row.binary_is_current, None,
+                "package metadata cannot certify a product version"
+            );
+        }
+        assert!(result.version.is_none() && result.latest_version.is_none());
+        assert_eq!(
+            result.running_latest_binary,
+            Some(true),
+            "independent ELF identity is retained"
+        );
+    }
+
+    #[test]
+    fn installed_application_package_fallback_is_qualified_without_upstream_or_source_borrowing() {
+        let InfoTarget::App(mut popup) = app("/test/tool.desktop") else {
+            unreachable!()
+        };
+        popup.metadata = Some(crate::windows::versions::ApplicationInfo {
+            native: Some(true),
+            package: Some("installed-tool 1.2-7".into()),
+            version_reason: Some("No unambiguous passive product version".into()),
+            version_issue: Some(program_metadata::executable::MetadataIssue::Unrecognized),
+            ..Default::default()
+        });
+        let rows = application_info_rows(&popup);
+        let version = rows
+            .iter()
+            .find(|row| row.label == LATEST_VERSION_FIELD_LABEL)
+            .unwrap();
+        assert!(
+            version
+                .value
+                .starts_with("Package-derived: installed-tool 1.2-7")
+        );
+        assert!(
+            version
+                .value
+                .contains("executable product version unverified")
+        );
+        assert_eq!(version.binary_is_current, None);
+        assert!(popup.metadata.as_ref().unwrap().version.is_none());
+    }
+
+    #[test]
     fn unsupported_version_reasons_reach_info_without_becoming_version_values() {
         use crate::windows::versions::ProcessVersion;
         let result = ProcessVersion {
@@ -2849,14 +2928,14 @@ mod tests {
                 .find(|row| row.label == VERSION_FIELD_LABEL)
                 .unwrap()
                 .value,
-            "Unavailable (Pinned ELF has no recognized product banner) (Unavailable)"
+            "Unavailable (no supported executable version evidence was recognized; Pinned ELF has no recognized product banner) (Unavailable)"
         );
         assert_eq!(
             rows.iter()
                 .find(|row| row.label == LATEST_VERSION_FIELD_LABEL)
                 .unwrap()
                 .value,
-            "Unavailable (Selected payload metadata is unsupported) (Unavailable)"
+            "Unavailable (this version metadata format is not supported; Selected payload metadata is unsupported) (Unavailable)"
         );
         assert!(result.version.is_none() && result.latest_version.is_none());
     }

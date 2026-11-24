@@ -135,6 +135,12 @@
       "environment": ["APPLICATIONLAUNCHER_TEST_FISH_PID", "APPLICATIONLAUNCHER_TEST_FISH_START_TICKS"]
     },
     {
+      "id": "METADATA-LOCAL-HISTORICAL-01",
+      "contract": "The generic opt-in process acceptance consumes an independently captured exact PID/start identity, product, running/current physical paths, version reports and full ELF build IDs. A freshly verified indexed local source installation plus protected exact producer evidence permits only an audited historical-safe query of the pinned older image. Running and current installation observations remain distinct through the Launcher adapter; current metadata cannot substitute for missing running evidence. The process identity and both physical image observations remain unchanged. The test never writes grants, inventory, permissions, source/build records or application files, and never rebuilds or restarts the selected application.",
+      "tests": ["trusted_historical_process_keeps_independent_running_and_current_image_evidence"],
+      "environment": ["APPLICATIONLAUNCHER_TEST_HISTORICAL_PROCESS_JSON"]
+    },
+    {
       "id": "METADATA-NATIVE-COMPONENT-01",
       "contract": "CopyQ's complete Qt-object version and Mousepad's private-library version come from the shared passive reader, not executing GUI applications or borrowing source/package versions. Running Mousepad libraries require independent process-mapping proof, installed tiles use disk context, and neither a shared main image nor its build ID proves required components current. Component queries bypass the main-only inner cache and cannot reuse on-disk results as process evidence.",
       "tests": ["private_version_components_are_independent_of_the_main_executable_build", "installed_mousepad_and_copyq_versions_use_shared_passive_product_evidence", "running_mousepad_and_copyq_keep_old_versions_separate_from_current_published_builds"],
@@ -188,7 +194,7 @@
     },
     {
       "id": "METADATA-CORE-10",
-      "contract": "Native browser freshness accepts a verified current desktop-entry wrapper chain in addition to published binary aliases. Headers and the running Version (ELF build ID) share the verified comparison, while the on-disk version always stays neutral. Unknown, inaccessible, missing/stale desktop, unrelated wrapper and retained-only identities also stay neutral. Collapsed checks remain cached, background-only and free of package lookups.",
+      "contract": "Native browser freshness accepts a verified current desktop-entry wrapper chain in addition to published binary aliases. Headers and the running Executable Version (ELF build ID) share the verified comparison, while the on-disk version always stays neutral. Unknown, inaccessible, missing/stale desktop, unrelated wrapper and retained-only identities also stay neutral. Collapsed checks remain cached, background-only and free of package lookups.",
       "tests": ["browser_wrappers_verify_the_current_desktop_target_for_header_and_elf_colours", "browser_headers_and_running_versions_are_coloured_but_disk_versions_stay_neutral", "only_running_version_carries_freshness_without_a_separate_status_row", "on_disk_versions_stay_neutral_for_all_build_ids_and_comparisons", "collapsed_header_checks_are_cached_without_package_lookups_and_expand_on_demand"]
     },
     {

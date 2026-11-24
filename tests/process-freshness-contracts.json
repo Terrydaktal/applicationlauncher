@@ -24,6 +24,11 @@
       "tests": ["requests_only_enqueue_bounded_versioned_cache_entries"]
     },
     {
+      "id": "PROCESS-FRESHNESS-06",
+      "contract": "A new PID restarted from a retained older executable is compared against its verified current published installation, even when the terminal reports the retained image as its launch path. Publication associations are bounded and expire; stable launch symlinks are resolved again on inspection, and unrelated candidates remain unknown.",
+      "tests": ["retained_binary_restart_keeps_the_published_installation_comparison"]
+    },
+    {
       "id": "PROCESS-FRESHNESS-05",
       "contract": "The release service integrates with terminal process selection, independent host/application markers, replacement, rollback, tab switching, runtime children and tmux active panes on an isolated bus.",
       "tests": ["xfce4-terminal:terminal-application-monitor", "xfce4-terminal:terminal-copy"],

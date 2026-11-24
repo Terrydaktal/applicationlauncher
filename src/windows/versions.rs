@@ -13,16 +13,23 @@ use std::time::{Duration, Instant};
 
 mod application;
 mod available;
+mod collection;
+#[cfg(test)]
+mod descriptor_tests;
+mod development;
 mod freshness;
 mod installation;
 mod lookup;
 mod node;
 mod npm;
 mod pi;
+#[cfg(test)]
+mod probe_reuse_tests;
 mod script;
 
 pub(crate) use application::{
-    ApplicationInfo, ApplicationInfoUpdate, ApplicationLaunch, inspect_application,
+    ApplicationInfo, ApplicationInfoUpdate, ApplicationLaunch, DesktopFileSearch,
+    inspect_application,
 };
 #[cfg(test)]
 pub(crate) use available::PackageVersionSource;
@@ -30,8 +37,8 @@ pub(crate) use available::PackageVersionSource;
 pub(crate) use available::fixture as available_package_fixture;
 pub(crate) use available::{AvailablePackageVersion, PackageTarget};
 pub(crate) use installation::ProgsMetadata;
-pub(crate) use lookup::PI_RECEIPT_REFRESH;
 pub(crate) use lookup::ProcessVersionCache;
+pub(crate) use lookup::{PI_RECEIPT_REFRESH, SCRIPT_METADATA_REFRESH};
 pub(crate) use node::NodeApplication;
 pub(crate) use npm::NpmTarget;
 pub(crate) use pi::{BuildStatus as PiBuildStatus, PiBuildEvidence};
@@ -78,9 +85,13 @@ pub(crate) struct ProcessVersion {
     pub(crate) application_npm_target: Option<NpmTarget>,
     pub(crate) application_latest_npm_version: Option<String>,
     pub(crate) version: Option<String>,
+    pub(crate) version_source: Option<program_metadata::executable::VersionSource>,
+    pub(crate) runtime_version: Option<program_metadata::runtime::RuntimeVersion>,
     pub(crate) version_reason: Option<String>,
+    pub(crate) version_issue: Option<program_metadata::executable::MetadataIssue>,
     pub(crate) latest_version: Option<String>,
     pub(crate) latest_version_reason: Option<String>,
+    pub(crate) latest_version_issue: Option<program_metadata::executable::MetadataIssue>,
     pub(crate) package_target: Option<PackageTarget>,
     pub(crate) latest_package_version: Option<AvailablePackageVersion>,
     pub(crate) npm_target: Option<NpmTarget>,
@@ -131,7 +142,10 @@ impl ProcessVersion {
     fn discard_running_metadata(&mut self, reason: &'static str) {
         self.running_unavailable = Some(reason);
         self.version = None;
+        self.version_source = None;
+        self.runtime_version = None;
         self.version_reason = None;
+        self.version_issue = None;
         self.build_id = None;
         self.build_id_reason = None;
         self.running_latest_binary = None;
@@ -158,7 +172,9 @@ impl ProcessVersion {
 #[derive(Clone, Debug, Default)]
 struct ExecutableVersion {
     version: Option<String>,
+    source: Option<program_metadata::executable::VersionSource>,
     reason: Option<String>,
+    reason_kind: Option<program_metadata::executable::MetadataIssue>,
     build_id: Option<String>,
     build_id_reason: Option<String>,
     components: Vec<program_metadata::executable::ExecutableComponent>,
@@ -289,8 +305,10 @@ fn probe_executable_context(
         }
     };
     let result = ExecutableVersion {
+        source: metadata.version.as_ref().map(|version| version.source),
         version: metadata.version.map(|version| version.value),
         reason: metadata.reason,
+        reason_kind: metadata.reason_kind,
         build_id: metadata.build_id,
         build_id_reason: metadata
             .build_id_issue
@@ -348,6 +366,7 @@ fn probe_on_disk_candidate(
     target: &ProcessVersionTarget,
     identity_is_current: impl Fn() -> bool,
     details: bool,
+    defer_source_check: bool,
 ) -> ProcessVersion {
     let unavailable = target
         .launch_context
@@ -403,6 +422,7 @@ fn probe_on_disk_candidate(
         );
         result.latest_version = metadata.version.map(|version| version.value);
         result.latest_version_reason = metadata.reason;
+        result.latest_version_issue = metadata.reason_kind;
         result.latest_build_id = metadata.build_id;
         result.latest_build_id_reason = metadata
             .build_id_issue
@@ -422,6 +442,8 @@ fn probe_on_disk_candidate(
                 .is_some_and(|proof| proof.unchanged(&file))
             {
                 "Not applicable (package-managed installation)".into()
+            } else if defer_source_check {
+                freshness::PENDING.into()
             } else {
                 freshness::uncompiled_changes(&resolved.path, &file)
             },
@@ -458,11 +480,67 @@ fn probe_on_disk_candidate(
         result.package = None;
         result.package_target = None;
     }
+    if result.uncompiled_changes.as_deref() == Some(freshness::PENDING) {
+        result.source_check = Some(std::sync::Arc::new(
+            freshness::Check::candidate(resolved, file).with_expected_stamp(stamp),
+        ));
+    }
     result
 }
 
 fn probe_build_id(file: &File) -> Option<String> {
     program_metadata::executable::elf_build_id(file)
+}
+
+fn running_executable_version(
+    file: &File,
+    runtime: Option<&program_metadata::runtime::RuntimeVersion>,
+    fallback: impl FnOnce() -> ExecutableVersion,
+) -> ExecutableVersion {
+    if let Some(version) = runtime {
+        let build_id = probe_build_id(file);
+        ExecutableVersion {
+            version: Some(version.value.clone()),
+            source: Some(program_metadata::executable::VersionSource::RunningApplicationApi),
+            build_id_reason: build_id
+                .is_none()
+                .then(|| "No GNU build ID was embedded".into()),
+            build_id,
+            ..Default::default()
+        }
+    } else {
+        fallback()
+    }
+}
+
+fn disk_executable_version(
+    running: &ExecutableVersion,
+    same_observation: bool,
+    inspect: impl FnOnce() -> ExecutableVersion,
+) -> ExecutableVersion {
+    use program_metadata::executable::VersionSource;
+    // Reuse exact main-image evidence within this lookup, not cached authority.
+    // Process APIs and private-library observations remain independent probes.
+    if same_observation
+        && running.version.is_some()
+        && running.reason_kind.is_none()
+        && !running.components_required
+        && running.components.is_empty()
+        && matches!(
+            running.source,
+            Some(
+                VersionSource::ElfProductMetadata
+                    | VersionSource::ElfProductBanner
+                    | VersionSource::TrustedSystemProbe
+                    | VersionSource::TrustedLocalProbe
+                    | VersionSource::VerifiedInstallationProbe
+            )
+        )
+    {
+        running.clone()
+    } else {
+        inspect()
+    }
 }
 
 fn installed_application_metadata(
@@ -479,11 +557,19 @@ fn probe_version(target: &ProcessVersionTarget) -> ProcessVersion {
     probe_version_checked(target, || true)
 }
 
+#[cfg(test)]
 fn probe_version_checked(
     target: &ProcessVersionTarget,
     identity_is_current: impl Fn() -> bool,
 ) -> ProcessVersion {
     probe_process_checked(target, identity_is_current, true)
+}
+
+fn probe_version_deferred(
+    target: &ProcessVersionTarget,
+    identity_is_current: impl Fn() -> bool,
+) -> ProcessVersion {
+    probe_process_with_source_policy(target, identity_is_current, true, true)
 }
 
 fn probe_header_checked(
@@ -498,8 +584,17 @@ fn probe_process_checked(
     identity_is_current: impl Fn() -> bool,
     details: bool,
 ) -> ProcessVersion {
+    probe_process_with_source_policy(target, identity_is_current, details, false)
+}
+
+fn probe_process_with_source_policy(
+    target: &ProcessVersionTarget,
+    identity_is_current: impl Fn() -> bool,
+    details: bool,
+    defer_source_check: bool,
+) -> ProcessVersion {
     if target.launch_context.executable_unavailable.is_some() {
-        return probe_on_disk_candidate(target, identity_is_current, details);
+        return probe_on_disk_candidate(target, identity_is_current, details, defer_source_check);
     }
     let clean_path = clean_executable(&target.executable);
     let path = PathBuf::from(format!("/proc/{}/exe", target.pid));
@@ -593,15 +688,60 @@ fn probe_process_checked(
             }
         }
     };
+    // A direct server self-report is stronger than executing another image.
+    // Discovery is by this PID's owned listening descriptor, not TMUX/PATH or a
+    // window's associated server: an attached tmux client is a distinct image.
+    let runtime_version = if details && name == "tmux" && identity_is_current() {
+        running.as_ref().ok().and_then(|(file, _)| {
+            let mut stat = String::new();
+            File::open(format!("/proc/{}/stat", target.pid))
+                .ok()?
+                .take(16_385)
+                .read_to_string(&mut stat)
+                .ok()?;
+            if stat.len() > 16_384 {
+                return None;
+            }
+            let ticks = stat
+                .rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(19)?
+                .parse()
+                .ok()?;
+            program_metadata::runtime::tmux_server_version(
+                target.pid,
+                ticks,
+                file,
+                Instant::now() + Duration::from_millis(500),
+            )
+            .ok()
+            .flatten()
+        })
+    } else {
+        None
+    };
     let running_info = running
         .as_ref()
-        .map(|(file, _)| inspect(file, &clean_path, ExecutableContext::Process(target.pid)))
+        .map(|(file, _)| {
+            running_executable_version(file, runtime_version.as_ref(), || {
+                inspect(file, &clean_path, ExecutableContext::Process(target.pid))
+            })
+        })
         .unwrap_or_default();
     let latest_info = latest.as_ref().map(|file| {
         let path = installed
             .as_ref()
             .map_or(clean_path.as_path(), |installed| installed.path.as_path());
-        inspect(file, path, ExecutableContext::OnDisk)
+        let same_observation = path == clean_path
+            && running.as_ref().is_ok_and(|(_, image)| {
+                latest_identity
+                    .as_ref()
+                    .is_some_and(|disk| executable_identity(image) == executable_identity(disk))
+            });
+        disk_executable_version(&running_info, same_observation, || {
+            inspect(file, path, ExecutableContext::OnDisk)
+        })
     });
     // Header checks remain cheap: do not parse Electron payloads or scan native
     // marker bytes until details expand. Adjacent resources make whole-app
@@ -694,62 +834,128 @@ fn probe_process_checked(
         }
         return result;
     }
-    let uncompiled_changes = match (&installed, &latest) {
-        (Some(_), Some(_)) if package_image_is_current() => {
-            "Not applicable (package-managed installation)".to_owned()
-        }
-        (Some(installed), Some(_)) if installation::uv_runtime(&installed.path).is_some() => {
-            "Not applicable (prebuilt uv-managed runtime)".to_owned()
-        }
-        (Some(installed), Some(file)) => freshness::uncompiled_changes(&installed.path, file),
-        (None, _) => "Unknown (installed executable aliases identify different builds)".to_owned(),
-        _ => "Unknown (on-disk binary unavailable)".to_owned(),
-    };
-    let disk_path = installed
-        .as_ref()
-        .map(|installed| installed.path.as_path())
-        .unwrap_or(&clean_path);
-    let package = package_image
-        .as_ref()
-        .filter(|_| package_image_is_current())
-        .map(|proof| proof.package.clone())
-        .or_else(|| installed_package(disk_path));
-    let (installation, progs_metadata) =
-        installation::inspect_with_owner(disk_path, package.as_deref());
-    let package_target = available::target(disk_path, package.as_deref());
-    let npm_target = npm::target(
-        disk_path,
-        latest_info
-            .as_ref()
-            .and_then(|info| info.version.as_deref()),
+    let (uncompiled_changes, disk) = collection::with_source_check(
+        defer_source_check
+            && latest.is_some()
+            && installed.as_ref().is_some_and(|installed| {
+                !package_image_is_current() && installation::uv_runtime(&installed.path).is_none()
+            }),
+        || match (&installed, &latest) {
+            (Some(_), Some(_)) if package_image_is_current() => {
+                "Not applicable (package-managed installation)".to_owned()
+            }
+            (Some(installed), Some(_)) if installation::uv_runtime(&installed.path).is_some() => {
+                "Not applicable (prebuilt uv-managed runtime)".to_owned()
+            }
+            (Some(installed), Some(file)) => freshness::uncompiled_changes(&installed.path, file),
+            (None, _) => {
+                "Unknown (installed executable aliases identify different builds)".to_owned()
+            }
+            _ => "Unknown (on-disk binary unavailable)".to_owned(),
+        },
+        || {
+            let disk_path = installed
+                .as_ref()
+                .map(|installed| installed.path.as_path())
+                .unwrap_or(&clean_path);
+            let package = package_image
+                .as_ref()
+                .filter(|_| package_image_is_current())
+                .map(|proof| proof.package.clone())
+                .or_else(|| installed_package(disk_path));
+            let installation::InstallationDetails {
+                label: installation,
+                metadata: progs_metadata,
+                desktops,
+            } = installation::inspect_with_owner_details(disk_path, package.as_deref());
+            let package_target = program_metadata::package::availability_target_with_desktops(
+                disk_path,
+                package.as_deref(),
+                &desktops,
+            );
+            let npm_target = npm::target(
+                disk_path,
+                latest_info
+                    .as_ref()
+                    .and_then(|info| info.version.as_deref()),
+            );
+            let launch = desktop_launch().unwrap_or_else(|| {
+                application::process_launch(&clean_path, installed.as_ref(), None)
+            });
+            let launch_target_verified = launch_target_verified(Some(&launch));
+            let runtime_launcher = captured_launcher
+                .as_ref()
+                .filter(|_| runtime_name(name).is_some());
+            let mut launch = if let Some(resolved) = runtime_launcher {
+                ApplicationLaunch {
+                    executable: Some(resolved.path.clone()),
+                    chain: resolved.chain.clone(),
+                    identification: "Current runtime launcher from captured argv[0]; the original process launch route is not proven".into(),
+                    desktop_image: latest_identity.as_ref().map(executable_identity),
+                    ..Default::default()
+                }
+            } else {
+                launch
+            };
+            if runtime_name(name).is_none() {
+                if let Some(file) = latest.as_ref() {
+                    application::associate_installed_desktop_from_matches(
+                        &mut launch,
+                        file,
+                        &desktops,
+                    );
+                }
+                if let Ok((file, _)) = running.as_ref() {
+                    application::associate_running_desktop(
+                        &mut launch,
+                        file,
+                        target.application_entry.as_ref(),
+                    );
+                }
+            }
+            collection::DiskDetails {
+                package,
+                installation,
+                progs_metadata,
+                package_target,
+                npm_target,
+                launch,
+                launch_target_verified,
+            }
+        },
     );
-    let launch = desktop_launch()
-        .unwrap_or_else(|| application::process_launch(&clean_path, installed.as_ref(), None));
-    let launch_target_verified = launch_target_verified(Some(&launch));
+    let collection::DiskDetails {
+        package,
+        installation,
+        progs_metadata,
+        package_target,
+        npm_target,
+        launch,
+        launch_target_verified,
+    } = disk;
     let runtime_launcher = captured_launcher
         .as_ref()
         .filter(|_| runtime_name(name).is_some());
-    let mut launch = runtime_launcher.as_ref().map_or(launch, |resolved| ApplicationLaunch {
-        executable: Some(resolved.path.clone()),
-        chain: resolved.chain.clone(),
-        identification: "Current runtime launcher from captured argv[0]; the original process launch route is not proven".into(),
-        ..Default::default()
-    });
-    if runtime_name(name).is_none() {
-        application::associate_installed_desktop(&mut launch);
-        if let Ok((file, _)) = running.as_ref() {
-            application::associate_running_desktop(
-                &mut launch,
-                file,
-                target.application_entry.as_ref(),
-            );
-        }
-    }
+    let latest_version_issue =
+        if installed_metadata_error.is_some() || installed_application_metadata.is_some() {
+            None
+        } else {
+            latest_info.as_ref().and_then(|info| info.reason_kind)
+        };
     let mut result = ProcessVersion {
+        details_pending: false,
+        source_check: None,
+        development: None,
+        latest_development: None,
+        application_development: None,
         running_unavailable: running.as_ref().err().copied(),
         runtime_name: runtime_name(name),
         application: None,
         script_application: None,
+        script_details: None,
+        script_details_error: None,
+        python_context: None,
+        python_context_error: None,
         application_installed_metadata: installed_application_metadata.clone(),
         application_metadata_error: installed_metadata_error.clone(),
         application_assets_unverified: false,
@@ -761,7 +967,10 @@ fn probe_process_checked(
         application_npm_target: None,
         application_latest_npm_version: None,
         version: running_info.version,
+        version_source: running_info.source,
+        runtime_version,
         version_reason: running_info.reason,
+        version_issue: running_info.reason_kind,
         latest_version: if installed_metadata_error.is_some() {
             None
         } else {
@@ -777,6 +986,7 @@ fn probe_process_checked(
                 latest_info.as_ref().and_then(|info| info.reason.clone())
             }
         }),
+        latest_version_issue,
         package_target,
         latest_package_version: None,
         npm_target,
@@ -853,11 +1063,12 @@ fn probe_process_checked(
     if let Some(disk) = latest_identity
         && !installed
             .as_ref()
-            .is_some_and(|installed| installed.unchanged(&disk))
+            .is_some_and(|installed| installed.unchanged(disk))
     {
         result.latest_version = None;
         result.application_installed_metadata = None;
         result.latest_version_reason = Some("on-disk binary changed during inspection".into());
+        result.latest_version_issue = Some(program_metadata::executable::MetadataIssue::Changed);
         result.latest_build_id = None;
         result.latest_build_id_reason = Some("On-disk binary changed during inspection".into());
         result.package = None;
@@ -918,6 +1129,145 @@ fn probe_process_checked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_runtime_version_precedes_executable_queries_without_replacing_build_identity() {
+        let file = File::open("/proc/self/exe").unwrap();
+        let report = program_metadata::runtime::RuntimeVersion {
+            value: "tmux 3.7c-fork0.2.2-2".into(),
+            token: "3.7c-fork0.2.2-2".into(),
+            pid: 4123,
+            start_ticks: 5678,
+            socket: "/private/tmux.sock".into(),
+        };
+        let result = running_executable_version(&file, Some(&report), || {
+            panic!("a successful direct API must not start a redundant executable version query")
+        });
+        assert_eq!(result.version.as_deref(), Some("tmux 3.7c-fork0.2.2-2"));
+        assert_eq!(
+            result.source,
+            Some(program_metadata::executable::VersionSource::RunningApplicationApi)
+        );
+        assert_eq!(result.build_id, probe_build_id(&file));
+        let mut process = ProcessVersion {
+            version: result.version,
+            version_source: result.source,
+            runtime_version: Some(report),
+            build_id: result.build_id,
+            latest_version: Some("tmux 3.8-new-disk-build".into()),
+            python_context: Some(Default::default()),
+            python_context_error: Some("previous inspection failed".into()),
+            ..Default::default()
+        };
+        process.discard_running_metadata("process identity changed");
+        assert!(
+            process.version.is_none()
+                && process.version_source.is_none()
+                && process.runtime_version.is_none()
+                && process.python_context.is_none()
+                && process.python_context_error.is_none()
+        );
+        assert_eq!(
+            process.latest_version.as_deref(),
+            Some("tmux 3.8-new-disk-build")
+        );
+    }
+
+    #[test]
+    fn missing_runtime_endpoint_preserves_exact_client_executable_evidence() {
+        let file = File::open("/proc/self/exe").unwrap();
+        let expected = "tmux 3.7c-distinct-client-build";
+        let result = running_executable_version(&file, None, || ExecutableVersion {
+            version: Some(expected.into()),
+            source: Some(program_metadata::executable::VersionSource::ElfProductBanner),
+            ..Default::default()
+        });
+        assert_eq!(result.version.as_deref(), Some(expected));
+        assert_eq!(
+            result.source,
+            Some(program_metadata::executable::VersionSource::ElfProductBanner)
+        );
+    }
+
+    #[test]
+    #[ignore = "read-only direct tmux server acceptance; requires PROGRAM_METADATA_TMUX_SERVER_PID, _START_TICKS, _VERSION; optional APPLICATIONLAUNCHER_TEST_TMUX_CLIENT_PID proves clients never borrow the server's version"]
+    fn live_tmux_server_uses_direct_runtime_api_and_keeps_clients_separate() {
+        let pid = std::env::var("PROGRAM_METADATA_TMUX_SERVER_PID")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let start_ticks = std::env::var("PROGRAM_METADATA_TMUX_SERVER_START_TICKS")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let expected = std::env::var("PROGRAM_METADATA_TMUX_SERVER_VERSION").unwrap();
+        let image = std::fs::metadata(format!("/proc/{pid}/exe")).unwrap();
+        let current = || {
+            crate::windows::process_tree::process_identity_is_current(
+                crate::models::ProcessIdentity { pid, start_ticks },
+                Some((image.dev(), image.ino())),
+            )
+        };
+        let result = probe_version_checked(
+            &ProcessVersionTarget {
+                pid,
+                executable: std::fs::read_link(format!("/proc/{pid}/exe")).unwrap(),
+                launch_context: ProcessLaunchContext::default(),
+                program: Some("tmux: server".into()),
+                application_entry: None,
+                window_declared_entry: false,
+            },
+            current,
+        );
+        assert_eq!(
+            result.version.as_deref(),
+            Some(expected.as_str()),
+            "{result:?}"
+        );
+        assert_eq!(
+            result.version_source,
+            Some(program_metadata::executable::VersionSource::RunningApplicationApi),
+            "{result:?}"
+        );
+        let direct = result.runtime_version.as_ref().unwrap();
+        assert_eq!((direct.pid, direct.start_ticks), (pid, start_ticks));
+        assert_eq!(
+            result.build_id,
+            probe_build_id(&File::open(format!("/proc/{pid}/exe")).unwrap())
+        );
+        assert!(current());
+        applicationlauncher::diagnostic_log!(
+            "Launcher direct runtime: pid={pid}, source={:?}, running={:?}, installed={:?}, server endpoint={}",
+            result.version_source,
+            result.version,
+            result.latest_version,
+            direct.socket.display()
+        );
+        if let Some(client) = std::env::var("APPLICATIONLAUNCHER_TEST_TMUX_CLIENT_PID")
+            .ok()
+            .map(|value| value.parse::<i32>().unwrap())
+        {
+            assert_ne!(client, pid);
+            let client = probe_version(&ProcessVersionTarget {
+                pid: client,
+                executable: std::fs::read_link(format!("/proc/{client}/exe")).unwrap(),
+                launch_context: ProcessLaunchContext::default(),
+                program: Some("tmux: client".into()),
+                application_entry: None,
+                window_declared_entry: false,
+            });
+            assert!(client.runtime_version.is_none(), "{client:?}");
+            assert_ne!(
+                client.version_source,
+                Some(program_metadata::executable::VersionSource::RunningApplicationApi)
+            );
+            applicationlauncher::diagnostic_log!(
+                "Distinct client keeps its own executable evidence: {:?}, {:?}",
+                client.version,
+                client.version_source
+            );
+        }
+    }
 
     fn wait_for_fixture_argv0(child: &mut std::process::Child, expected: &Path) {
         // posix_spawn/vfork may release the parent before /proc/PID/cmdline
@@ -1625,7 +1975,7 @@ int main(int argc, char **argv) {{
         assert_eq!(result.latest_version, expected.version);
         assert_eq!(result.latest_build_id, expected.build_id);
         assert_eq!(result.running_latest_binary, Some(false));
-        eprintln!(
+        applicationlauncher::diagnostic_log!(
             "{}",
             serde_json::json!({"pid":pid,"running_version":result.version,"latest_installed_version":result.latest_version,"running_build_id":result.build_id,"latest_build_id":result.latest_build_id,"running_latest_binary":result.running_latest_binary})
         );
@@ -1974,7 +2324,7 @@ int main(int argc, char **argv) {{
             Some(expected),
             "{application:?}"
         );
-        eprintln!(
+        applicationlauncher::diagnostic_log!(
             "native process and ApplicationInfo compilation status: exact package image=N/A; identical unmanaged true copy is not N/A; no wrapper or unmanaged image executed"
         );
     }
@@ -2089,9 +2439,11 @@ int main(int argc, char **argv) {{
         assert_eq!(stale.latest_version, process.latest_version, "{stale:?}");
         assert!(current() && proof.unchanged(&file));
         assert!(child.0.try_wait().unwrap().is_none());
-        eprintln!(
+        applicationlauncher::diagnostic_log!(
             "owned cat: running={:?}; disk={:?}; package={:?}; compilation=N/A; stale process retains only disk evidence",
-            process.version, process.latest_version, process.package
+            process.version,
+            process.latest_version,
+            process.package
         );
     }
 
@@ -2144,7 +2496,7 @@ int main(int argc, char **argv) {{
         assert!(result.version.is_none() && result.build_id.is_none());
         let latest_package = available::query(result.package_target.as_ref().unwrap()).display();
         assert!(latest_package.contains("/bubblewrap "), "{latest_package}");
-        eprintln!(
+        applicationlauncher::diagnostic_log!(
             "installation={:?}; package={:?}; description={:?}; capabilities={:?}; disk_version={:?}; disk_build_id={:?}; latest_package={latest_package}; running_unavailable={:?}",
             result.installation,
             result.package,
@@ -2506,7 +2858,7 @@ int main(int argc, char **argv) {{
                 current(),
                 "{program} fixture process changed during inspection"
             );
-            eprintln!(
+            applicationlauncher::diagnostic_log!(
                 "{program}: running={:?} latest={:?} running_id={:?} latest_id={:?} current={:?}",
                 result.version,
                 result.latest_version,
@@ -2576,9 +2928,140 @@ int main(int argc, char **argv) {{
             current(),
             "the reported Fish process changed during inspection"
         );
-        eprintln!(
+        applicationlauncher::diagnostic_log!(
             "fish: running={:?} latest={:?} running_id={:?} latest_id={:?}",
-            result.version, result.latest_version, result.build_id, result.latest_build_id
+            result.version,
+            result.latest_version,
+            result.build_id,
+            result.latest_build_id
+        );
+    }
+
+    #[test]
+    #[ignore = "requires independent PID/start/product/path/version/full-build-ID oracle in APPLICATIONLAUNCHER_TEST_HISTORICAL_PROCESS_JSON; never changes grants, inventory, permissions or applications"]
+    fn trusted_historical_process_keeps_independent_running_and_current_image_evidence() {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Case {
+            pid: i32,
+            start_ticks: u64,
+            product: String,
+            running_path: PathBuf,
+            running_version: String,
+            running_build_id: String,
+            latest_path: PathBuf,
+            latest_version: String,
+            latest_build_id: String,
+        }
+        let text = std::env::var("APPLICATIONLAUNCHER_TEST_HISTORICAL_PROCESS_JSON")
+            .expect("explicit independent process and installed-image oracle required");
+        assert!(text.len() <= 16 * 1024);
+        let case: Case = serde_json::from_str(&text).expect("complete exact-image oracle schema");
+        assert!(case.pid > 0 && case.start_ticks > 0);
+        assert!(case.product.len() <= 64 && !case.product.is_empty());
+        assert!(
+            case.product
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+        );
+        assert!(case.running_path.is_absolute() && case.latest_path.is_absolute());
+        for id in [&case.running_build_id, &case.latest_build_id] {
+            assert!((16..=128).contains(&id.len()));
+            assert!(id.len().is_multiple_of(2));
+            assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+        assert_ne!(case.running_build_id, case.latest_build_id);
+        assert_ne!(case.running_version, case.latest_version);
+        let identity = crate::models::ProcessIdentity {
+            pid: case.pid,
+            start_ticks: case.start_ticks,
+        };
+        let proc_path = PathBuf::from(format!("/proc/{}/exe", case.pid));
+        let executable = std::fs::read_link(&proc_path).unwrap();
+        assert_eq!(clean_executable(&executable), case.running_path);
+        let pinned = std::fs::metadata(&proc_path).unwrap();
+        let current = || {
+            crate::windows::process_tree::process_identity_is_current(
+                identity,
+                Some((pinned.dev(), pinned.ino())),
+            )
+        };
+        assert!(current(), "fixture process changed or PID was reused");
+        let disk_identity = |metadata: &std::fs::Metadata| {
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.len(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        };
+        let disk_before = disk_identity(&std::fs::metadata(&case.latest_path).unwrap());
+        assert_ne!((pinned.dev(), pinned.ino()), (disk_before.0, disk_before.1));
+        let target = ProcessVersionTarget {
+            pid: case.pid,
+            executable,
+            launch_context: ProcessLaunchContext::default(),
+            program: Some(case.product),
+            application_entry: None,
+            window_declared_entry: false,
+        };
+        let result = probe_version_checked(&target, current);
+        assert_eq!(result.running_unavailable, None, "{result:?}");
+        assert_eq!(
+            result.version.as_deref(),
+            Some(case.running_version.as_str()),
+            "{result:?}"
+        );
+        assert_eq!(
+            result.build_id.as_deref(),
+            Some(case.running_build_id.as_str()),
+            "{result:?}"
+        );
+        assert_eq!(
+            result.latest_version.as_deref(),
+            Some(case.latest_version.as_str()),
+            "{result:?}"
+        );
+        assert_eq!(
+            result.latest_build_id.as_deref(),
+            Some(case.latest_build_id.as_str()),
+            "{result:?}"
+        );
+        assert_eq!(
+            result.version_source,
+            Some(program_metadata::executable::VersionSource::VerifiedInstallationProbe),
+            "the retained running version must have its own exact-image query evidence: {result:?}"
+        );
+        assert_eq!(result.running_latest_binary, Some(false), "{result:?}");
+        assert_eq!(result.process_build_is_current(), Some(false), "{result:?}");
+        assert_eq!(
+            result
+                .launch
+                .as_ref()
+                .and_then(|launch| launch.executable.as_deref()),
+            Some(case.latest_path.as_path()),
+            "latest metadata must follow the independently identified installation: {result:?}"
+        );
+        assert!(current(), "fixture process changed during inspection");
+        assert_eq!(
+            clean_executable(&std::fs::read_link(&proc_path).unwrap()),
+            case.running_path
+        );
+        assert_eq!(
+            disk_identity(&std::fs::metadata(&case.latest_path).unwrap()),
+            disk_before
+        );
+        eprintln!(
+            "historical pid={}: running={:?} latest={:?} running_id={:?} latest_id={:?} current={:?}",
+            case.pid,
+            result.version,
+            result.latest_version,
+            result.build_id,
+            result.latest_build_id,
+            result.process_build_is_current()
         );
     }
 
@@ -2675,7 +3158,7 @@ int main(int argc, char **argv) {{
                 None
             );
             assert!(current() && package.unchanged(&disk));
-            eprintln!(
+            applicationlauncher::diagnostic_log!(
                 "pid={} native_package={:?} header_current={:?}; no application or wrapper executed",
                 identity.pid,
                 package.package,
@@ -2785,9 +3268,10 @@ int main(int argc, char **argv) {{
             cmdline_before
         );
         assert!(current(), "the original SSH tunnel must remain untouched");
-        eprintln!(
+        applicationlauncher::diagnostic_log!(
             "version={:?}; installation={:?}; capabilities={capabilities}; original PID/start/image unchanged",
-            process.version, process.installation
+            process.version,
+            process.installation
         );
     }
 
@@ -2870,9 +3354,10 @@ int main(int argc, char **argv) {{
             Some(&expected_root),
             std::time::Instant::now() + std::time::Duration::from_millis(1500),
         );
-        eprintln!(
+        applicationlauncher::diagnostic_log!(
             "recorded input evidence: {:?}; {}",
-            report.newer_files, report.explanation
+            report.newer_files,
+            report.explanation
         );
         assert_eq!(report.missing_count, 1);
         if let Some(newer) = std::env::var_os("APPLICATIONLAUNCHER_TEST_CODEX_HOST_NEWER_INPUT") {
@@ -2894,7 +3379,7 @@ int main(int argc, char **argv) {{
             assert!(changes.contains("0 newer · 1 missing"), "{changes}");
         }
         assert!(current());
-        eprintln!(
+        applicationlauncher::diagnostic_log!(
             "version={:?}; disk={:?}; type={:?}; source={:?}; changes={changes}",
             result.version,
             result.latest_version,
@@ -2997,7 +3482,7 @@ int main(int argc, char **argv) {{
             python_start,
             None
         ));
-        eprintln!(
+        applicationlauncher::diagnostic_log!(
             "uv={:?}; Python={:?}; source={}; attribution={:?}; description={:?}; capabilities={:?}",
             uv.version,
             python.version,
@@ -3023,6 +3508,9 @@ int main(int argc, char **argv) {{
             upstream: Option<String>,
             #[serde(default)]
             no_newer: bool,
+            installation: Option<String>,
+            uncompiled_display: Option<String>,
+            description_contains: Option<String>,
         }
         let cases: Vec<Case> = serde_json::from_str(
             &std::env::var("APPLICATIONLAUNCHER_TEST_SHARED_METADATA_JSON")
@@ -3117,11 +3605,12 @@ int main(int argc, char **argv) {{
                 std::fs::read(format!("/proc/{}/cmdline", case.pid)).unwrap(),
                 command_line
             );
-            eprintln!(
-                "pid={}: running={:?}; disk={:?}; roles={:?}; inputs={:?}; current={:?}; original process unchanged",
+            applicationlauncher::diagnostic_log!(
+                "pid={}: running={:?}; disk={:?}; installation={:?}; roles={:?}; inputs={:?}; current={:?}; original process unchanged",
                 case.pid,
                 process.version,
                 process.latest_version,
+                process.installation,
                 process.progs_metadata.capabilities,
                 process.uncompiled_changes,
                 process.process_build_is_current()
@@ -3158,7 +3647,7 @@ int main(int argc, char **argv) {{
                     Some(version.build_id.as_ref() == Some(latest))
                 );
             }
-            eprintln!(
+            applicationlauncher::diagnostic_log!(
                 "pid={pid} version={:?} latest={:?} running_latest={:?} uncompiled_changes={:?} package={:?} build_id={:?} latest_build_id={:?}",
                 version.version,
                 version.latest_version,
@@ -3168,16 +3657,17 @@ int main(int argc, char **argv) {{
                 version.build_id,
                 version.latest_build_id
             );
-            eprintln!(
+            applicationlauncher::diagnostic_log!(
                 "runtime={:?} application={:?} npm_target={:?} application_npm_target={:?}",
                 version.runtime_name,
                 version.application,
                 version.npm_target,
                 version.application_npm_target
             );
-            eprintln!(
+            applicationlauncher::diagnostic_log!(
                 "current_launch={:?} hosted_launch={:?}",
-                version.launch, version.application_launch
+                version.launch,
+                version.application_launch
             );
         }
     }

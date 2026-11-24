@@ -15,6 +15,7 @@ pub const PATH: &str = "/Freshness";
 pub const INTERFACE: &str = "com.terrydaktal.ApplicationLauncher.Freshness1";
 const POLL: Duration = Duration::from_secs(2);
 const LEASE: Duration = Duration::from_secs(60);
+const INSTALLATION_RECHECK: Duration = Duration::from_secs(30);
 const LIMIT: usize = 512;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
@@ -146,9 +147,45 @@ struct Inspector {
     images: HashMap<Image, Option<String>>,
     disks: HashMap<PathBuf, (ArtifactStamp, Option<String>)>,
     approved: HashMap<Target, Image>,
+    installations: HashMap<Image, InstallationRoute>,
+}
+
+struct InstallationRoute {
+    checked: Instant,
+    launcher: Option<PathBuf>,
+    ambiguous: bool,
 }
 
 impl Inspector {
+    fn published_route(&mut self, running: &Image, file: &File) -> &InstallationRoute {
+        if self.installations.len() >= LIMIT && !self.installations.contains_key(running) {
+            self.installations.clear();
+        }
+        if self
+            .installations
+            .get(running)
+            .is_none_or(|route| route.checked.elapsed() >= INSTALLATION_RECHECK)
+        {
+            let installed = program_metadata::installation::installed_process_executable(
+                running.pid,
+                &running.executable,
+                file,
+            );
+            self.installations.insert(
+                running.clone(),
+                InstallationRoute {
+                    checked: Instant::now(),
+                    launcher: installed
+                        .as_ref()
+                        .filter(|installed| installed.is_published())
+                        .map(|installed| installed.launcher().to_owned()),
+                    ambiguous: installed.is_none(),
+                },
+            );
+        }
+        &self.installations[running]
+    }
+
     fn inspect(&mut self, target: &Target) -> Report {
         self.try_inspect(target)
             .unwrap_or_else(|reason| Report::unknown(target, reason))
@@ -172,10 +209,18 @@ impl Inspector {
             .clone()
             .ok_or("The running image has no qualified ELF build ID")?;
 
-        let launch = if target.launch_path.is_empty() {
-            program_metadata::installation::installed_executable(&running.executable)
-                .filter(|installed| installed.is_published())
-                .map(|installed| installed.path)
+        let direct_image =
+            target.launch_path.is_empty() || Path::new(&target.launch_path) == running.executable;
+        let association = self.published_route(&running, &file);
+        if direct_image && association.ambiguous {
+            return Err("The current published installation is ambiguous".into());
+        }
+        let published = association.launcher.clone();
+        // A retained image is not the current installation. Resolve its verified
+        // publication again for a new PID, even when the terminal supplied the image path.
+        let launch = if direct_image {
+            published
+                .clone()
                 .unwrap_or_else(|| running.executable.clone())
         } else {
             PathBuf::from(&target.launch_path)
@@ -204,9 +249,14 @@ impl Inspector {
         }
         let stamp = ArtifactStamp::from_metadata(&metadata);
         let same_file = running.dev == metadata.dev() && running.ino == metadata.ino();
+        let published_target = published
+            .as_ref()
+            .and_then(|path| fs::canonicalize(path).ok())
+            .is_some_and(|path| path == disk_path);
         if self.approved.get(target) != Some(&running)
             && !same_file
             && disk_path != running.executable
+            && !published_target
         {
             return Err("The launch path was not verified against the running image".into());
         }
@@ -252,7 +302,12 @@ impl Inspector {
             } else {
                 Status::Outdated
             },
-            reason: "Compared pinned running and current local ELF images".into(),
+            reason: if published_target {
+                "Compared pinned running image with the verified published installation"
+            } else {
+                "Compared pinned running and current local ELF images"
+            }
+            .into(),
             start_time: running.start,
             image_dev: running.dev,
             image_ino: running.ino,
@@ -437,6 +492,7 @@ impl Service {
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::process::CommandExt;
     use std::process::{Child, Command};
 
     struct Fixture {
@@ -518,6 +574,91 @@ mod tests {
         assert_eq!(same_native_build(Some("a"), None, false), None);
         assert_eq!(same_native_build(Some("a"), Some("a"), false), Some(true));
         assert_eq!(same_native_build(Some("a"), Some("b"), false), Some(false));
+    }
+
+    #[test]
+    fn retained_binary_restart_keeps_the_published_installation_comparison() {
+        if std::env::var_os("FRESHNESS_PUBLISHED_RESTART_TEST").is_none() {
+            let cache = std::env::temp_dir()
+                .join(format!("freshness-published-cache-{}", std::process::id()));
+            fs::create_dir_all(&cache).unwrap();
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "freshness::tests::retained_binary_restart_keeps_the_published_installation_comparison", "--nocapture"])
+                .env("FRESHNESS_PUBLISHED_RESTART_TEST", "1")
+                .env("XDG_CACHE_HOME", &cache)
+                .status().unwrap();
+            fs::remove_dir_all(cache).unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let mut fixture = Fixture::new();
+        let old = fixture.root.join("old/codex");
+        let latest = fixture.root.join("latest/codex");
+        let launch = fixture.root.join("bin/codex");
+        for path in [&old, &latest, &launch] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        fs::copy(fixture.root.join("one"), &old).unwrap();
+        fs::copy(fixture.root.join("two"), &latest).unwrap();
+        symlink(&old, &launch).unwrap();
+        let inventory =
+            PathBuf::from(std::env::var_os("XDG_CACHE_HOME").unwrap()).join("progs/scan-v1.json");
+        fs::create_dir_all(inventory.parent().unwrap()).unwrap();
+        fs::write(
+            &inventory,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 4, "scan": {"apps": [{
+                    "name": "codex", "origin": "Local", "install_role": "Standalone",
+                    "state": {"binary": true, "fork": true},
+                    "binaries": [{"name": "codex", "path": launch, "target": old}]
+                }]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fixture.child.kill().unwrap();
+        fixture.child.wait().unwrap();
+        fixture.child = Command::new(&launch).arg0("codex").spawn().unwrap();
+        let first = image(fixture.child.id()).unwrap().0;
+        fixture.target = Target {
+            pid: first.pid,
+            start_time: first.start,
+            image_dev: first.dev,
+            image_ino: first.ino,
+            launch_path: launch.to_str().unwrap().into(),
+        };
+        let mut inspector = Inspector::default();
+        assert_eq!(inspector.inspect(&fixture.target).status, Status::Current);
+        let next = fixture.root.join("next-published");
+        symlink(&latest, &next).unwrap();
+        fs::rename(next, &launch).unwrap();
+        assert_eq!(inspector.inspect(&fixture.target).status, Status::Outdated);
+
+        let pinned = File::open(format!("/proc/{}/exe", fixture.child.id())).unwrap();
+        use std::os::fd::AsRawFd;
+        let pinned_path = format!("/proc/{}/fd/{}", std::process::id(), pinned.as_raw_fd());
+        fixture.child.kill().unwrap();
+        fixture.child.wait().unwrap();
+        fixture.child = Command::new(pinned_path).arg0("codex").spawn().unwrap();
+        let restarted = image(fixture.child.id()).unwrap().0;
+        assert_eq!((first.dev, first.ino), (restarted.dev, restarted.ino));
+        fixture.target = Target {
+            pid: restarted.pid,
+            start_time: restarted.start,
+            image_dev: restarted.dev,
+            image_ino: restarted.ino,
+            launch_path: old.to_str().unwrap().into(),
+        };
+        let mut inspector = Inspector::default();
+        let report = inspector.inspect(&fixture.target);
+        assert_eq!(report.status, Status::Outdated, "{report:?}");
+        assert_eq!(report.running_build_id.as_deref(), Some("11111111"));
+        assert_eq!(report.current_build_id.as_deref(), Some("22222222"));
+        fixture.target.launch_path = launch.to_str().unwrap().into();
+        assert_eq!(inspector.inspect(&fixture.target).status, Status::Outdated);
+        fixture.target.launch_path = fixture.root.join("two").to_str().unwrap().into();
+        assert_eq!(inspector.inspect(&fixture.target).status, Status::Unknown);
     }
 
     #[test]
