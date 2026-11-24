@@ -125,6 +125,23 @@ pub(crate) struct ProcessVersion {
 }
 
 impl ProcessVersion {
+    /// Module lists describe one guarded on-disk source snapshot, not loaded
+    /// code. Revalidate only on the worker before publishing; paint stays I/O-free.
+    fn discard_changed_python_modules(&mut self) {
+        let Some(context) = self.python_context.as_mut() else {
+            return;
+        };
+        if context
+            .project_modules
+            .as_ref()
+            .is_some_and(|modules| !modules.observations_current())
+        {
+            context.project_modules = None;
+            context.notes.push(
+                "Referenced project modules changed during inspection; awaiting refresh".into(),
+            );
+        }
+    }
 
     /// A script descriptor can change while its interpreter remains the same
     /// process. Invalidate only metadata attributed through that descriptor.

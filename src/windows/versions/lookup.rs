@@ -13,6 +13,18 @@ const MAX_PENDING: usize = 16;
 const MAX_RESULTS: usize = 512;
 const CANDIDATE_REFRESH: Duration = Duration::from_secs(10);
 pub(crate) const PI_RECEIPT_REFRESH: Duration = Duration::from_secs(2);
+pub(crate) const SCRIPT_METADATA_REFRESH: Duration = Duration::from_secs(2);
+#[cfg(test)]
+mod development_tests;
+#[cfg(test)]
+mod scheduling_tests;
+mod script_refresh;
+#[cfg(test)]
+mod script_tests;
+#[cfg(test)]
+mod source_check_tests;
+mod source_checks;
+use script_refresh::Snapshot as ScriptSnapshot;
 
 struct Request {
     generation: u64,
@@ -51,6 +63,7 @@ struct PackageRequest {
     identity: ProcessIdentity,
     target: PackageLookup,
     application: bool,
+    descriptor: Option<program_metadata::interpreted::script::DescriptorSource>,
 }
 
 struct ReceiptRequest {
@@ -59,6 +72,7 @@ struct ReceiptRequest {
     identity: ProcessIdentity,
     executable_identity: Option<(u64, u64)>,
     application: super::NodeApplication,
+    development: Option<program_metadata::development::Metadata>,
     program: String,
     desktop_entry: Option<crate::models::AppInfo>,
 }
@@ -101,6 +115,9 @@ struct State {
     receipts: VecDeque<ReceiptRequest>,
     receipt_pending: HashSet<ProcessIdentity>,
     receipt_checked: HashMap<ProcessIdentity, Instant>,
+    script_checked: HashMap<ProcessIdentity, Instant>,
+    script_snapshots: HashMap<ProcessIdentity, ScriptSnapshot>,
+    script_pending: HashSet<ProcessIdentity>,
     results: HashMap<ProcessIdentity, Option<Arc<ProcessVersion>>>,
     detailed: HashSet<ProcessIdentity>,
 }
@@ -376,6 +393,15 @@ impl ProcessVersionCache {
                                             identity: request.identity,
                                             target,
                                             application,
+                                            descriptor: application
+                                                .then(|| {
+                                                    version
+                                                        .script_application
+                                                        .as_ref()?
+                                                        .descriptor
+                                                        .clone()
+                                                })
+                                                .flatten(),
                                         });
                                     } else {
                                         let result = "Unavailable (package lookup queue full; close and reopen Show Info to retry)".into();
@@ -418,6 +444,9 @@ impl ProcessVersionCache {
         state.receipts.clear();
         state.receipt_pending.clear();
         state.receipt_checked.clear();
+        state.script_checked.clear();
+        state.script_snapshots.clear();
+        state.script_pending.clear();
         state.results.clear();
         state.active_revisions.clear();
         state.metadata_checked.clear();
@@ -546,6 +575,9 @@ impl ProcessVersionCache {
                     identity: node.identity,
                     executable_identity: node.executable_identity,
                     application: application.clone(),
+                    development: result
+                        .as_ref()
+                        .and_then(|version| version.application_development.clone()),
                     program: node.name.clone(),
                     desktop_entry: result
                         .as_ref()
@@ -592,6 +624,8 @@ impl ProcessVersionCache {
             executable_identity: node.executable_identity,
             executable_snapshot: ExecutableSnapshot::of(node),
             include_packages,
+            cwd: node.cwd.clone(),
+            script_refresh: None,
             target: ProcessVersionTarget {
                 pid: node.identity.pid,
                 executable: executable.clone(),

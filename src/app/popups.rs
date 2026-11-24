@@ -2484,6 +2484,20 @@ impl App {
                 // Visible Pi headers refresh local receipts, never ELF or package probes.
                 ctx.request_repaint_after(crate::windows::versions::PI_RECEIPT_REFRESH);
             }
+            if open
+                && version.as_ref().is_some_and(|version| {
+                    version.runtime_name == Some("Python")
+                        && version.python_context.is_some()
+                        && version
+                            .script_application
+                            .as_ref()
+                            .is_some_and(|script| script.entry_point.is_some())
+                })
+            {
+                // Wake only visible source inspectors. The worker checks cheap
+                // graph observations first; paint never opens project files.
+                ctx.request_repaint_after(crate::windows::versions::SCRIPT_METADATA_REFRESH);
+            }
             let binary_is_current = version
                 .as_deref()
                 .and_then(|version| version.process_header_is_current());

@@ -32,6 +32,16 @@ worker against current terminal D-Bus records and KWin windows; it requires the
 exact terminal PID and window UUID and refuses ambiguous or closed targets. An
 older running launcher GUI must be restarted once to acquire this control command.
 
+Python script details include a closed-by-default **Referenced project modules**
+section, separate from **Declared dependencies**. It lists statically referenced
+local project files using their original filenames and full paths, including
+conditional references and the files that refer to them. The list describes
+current on-disk source, not modules loaded by the running interpreter. Incomplete
+analysis is labelled and explains unresolved references; unavailable inspection is
+distinct from a completed scan finding no local modules. Expanding, selecting,
+copying and collapsing these cached details does not execute Python or rescan the
+filesystem, and the rows do not imply freshness or a running version.
+
 ## Shared program metadata
 
 Keep `../program-metadata` alongside this checkout, just like `../fuzzy-rank`.
