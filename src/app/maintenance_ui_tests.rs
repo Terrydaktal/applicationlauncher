@@ -5,6 +5,23 @@ use std::sync::{Arc, Mutex};
 use crate::models::{IdleCodexActionState, LauncherSettings, SettingsWindowState};
 
 #[test]
+fn application_context_menus_offer_progs_for_both_panel_layouts_and_modes() {
+    let view = include_str!("view.rs");
+    let application_menus: Vec<_> = view
+        .split("if ui.button(\"Show info\").clicked() {")
+        .skip(1)
+        .filter(|menu| menu.trim_start().starts_with("self.open_app_info_popup("))
+        .collect();
+    assert_eq!(application_menus.len(), 4);
+    assert_eq!(view.matches("ui.button(\"Show in Progs\")").count(), 4);
+    for menu in application_menus {
+        let following_actions = menu.split_once("ui.close();").unwrap().1;
+        assert!(following_actions.contains("ui.button(\"Show in Progs\")"));
+        assert!(following_actions.contains("show_app_in_progs(app);"));
+    }
+}
+
+#[test]
 fn window_context_menu_starts_with_show_info_and_labels_close_as_close_window() {
     let view = include_str!("view.rs");
     let menu = view

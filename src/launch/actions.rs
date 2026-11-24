@@ -34,6 +34,25 @@ pub(crate) fn launch_app(exec: &str) {
     });
 }
 
+pub(crate) fn show_app_in_progs(app: &AppInfo) {
+    let desktop_file = app.desktop_file_path.clone();
+    std::thread::spawn(move || {
+        let command = progs_command(&desktop_file);
+        if let Err(error) = applicationlauncher::process::spawn_and_reap(command) {
+            applicationlauncher::diagnostic_log!("Could not open application in Progs: {error}");
+        }
+    });
+}
+
+fn progs_command(desktop_file: &Path) -> Command {
+    let executable = applicationlauncher::process::executable_path("progs")
+        .unwrap_or_else(|| PathBuf::from("progs"));
+    let mut command = Command::new(executable);
+    command.arg("--show-desktop-file").arg(desktop_file);
+    scrub_command_env(&mut command);
+    command
+}
+
 pub(crate) fn launch_terminal_cd(target: &str) {
     let target = target.trim();
     if target.is_empty() {
@@ -525,6 +544,30 @@ pub(crate) fn launch_desktop_entry(desktop_file_path: &Path) -> bool {
     cmd.env_remove("VIRTUAL_ENV");
     cmd.env_remove("UV_ACTIVE");
     applicationlauncher::process::spawn_and_reap(cmd).is_ok()
+}
+
+#[cfg(test)]
+mod progs_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn progs_opens_the_exact_desktop_file_without_shell_interpretation() {
+        let desktop_file = Path::new("/tmp/John's apps/$(not-a-command); browser.desktop");
+        let command = progs_command(desktop_file);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [OsStr::new("--show-desktop-file"), desktop_file.as_os_str()]
+        );
+        assert!(Path::new(command.get_program()).ends_with("progs"));
+        for name in ["PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "UV_ACTIVE"] {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == name && value.is_none())
+            );
+        }
+    }
 }
 
 #[cfg(test)]

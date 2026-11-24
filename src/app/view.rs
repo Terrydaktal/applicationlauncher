@@ -1353,6 +1353,10 @@ impl eframe::App for App {
                                                 self.open_app_info_popup(ctx, app.clone());
                                                 ui.close();
                                             }
+                                            if ui.button("Show in Progs").clicked() {
+                                                show_app_in_progs(app);
+                                                ui.close();
+                                            }
                                         });
 
                                         if is_selected && scroll_to_selected {
@@ -2080,6 +2084,10 @@ impl eframe::App for App {
                                                         self.open_app_info_popup(ctx, app.clone());
                                                         ui.close();
                                                     }
+                                                    if ui.button("Show in Progs").clicked() {
+                                                        show_app_in_progs(app);
+                                                        ui.close();
+                                                    }
                                                 }
                                                 LauncherMode::Windows => {
                                                     let win = &filtered_windows[index];
@@ -2353,6 +2361,10 @@ impl eframe::App for App {
                                                                     self.open_app_info_popup(ctx, app.clone());
                                                                     ui.close();
                                                                 }
+                                                                if ui.button("Show in Progs").clicked() {
+                                                                    show_app_in_progs(app);
+                                                                    ui.close();
+                                                                }
 		                                                    });
 			                                                    if response.clicked() || response.middle_clicked() {
 		                                                                self.active_pane = ActivePane::Apps;
@@ -2508,6 +2520,10 @@ impl eframe::App for App {
 		                                                    self.open_app_info_popup(ctx, app.clone());
 		                                                    ui.close();
 		                                                }
+                                                                if ui.button("Show in Progs").clicked() {
+                                                                    show_app_in_progs(app);
+                                                                    ui.close();
+                                                                }
 		                                                });
 		                                                if response.clicked() || response.middle_clicked() {
 		                                                    if response.clicked() {
