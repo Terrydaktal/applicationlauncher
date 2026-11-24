@@ -188,19 +188,12 @@ impl App {
                     Duration::from_secs(3),
                 );
 
-                // If we got geometry, spawn the border overlay process
-                if let Some((x, y, w, h)) = geom {
-                    if let Ok(current_exe) = std::env::current_exe() {
-                        let mut overlay = Command::new(current_exe);
-                        overlay.args([
-                            "--draw-border",
-                            &x.to_string(),
-                            &y.to_string(),
-                            &w.to_string(),
-                            &h.to_string(),
-                            &id_clone,
-                        ]);
-                        let _ = applicationlauncher::process::spawn_and_reap(overlay);
+                if let Some(geometry) = geom {
+                    let overlay = border_overlay_command(geometry, &id_clone);
+                    if let Err(error) = applicationlauncher::process::spawn_and_reap(overlay) {
+                        applicationlauncher::diagnostic_log!(
+                            "Could not show activation border for window {id_clone}: {error}"
+                        );
                     }
                 }
             });
@@ -225,5 +218,104 @@ impl App {
             });
         }
         ctx.request_repaint();
+    }
+}
+
+fn border_overlay_command((x, y, width, height): (f32, f32, f32, f32), id: &str) -> Command {
+    // Pin the running image across rebuilds. /proc/self/exe would name systemd-run.
+    let mut command = Command::new(format!("/proc/{}/exe", std::process::id()));
+    command.args([
+        "--draw-border",
+        &x.to_string(),
+        &y.to_string(),
+        &width.to_string(),
+        &height.to_string(),
+        id,
+    ]);
+    command
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn activation_border_uses_the_launcher_pid_and_preserves_its_arguments() {
+        let command = border_overlay_command((1.5, -2.0, 800.25, 600.0), "{window id}");
+        assert_eq!(
+            command.get_program(),
+            OsStr::new(&format!("/proc/{}/exe", std::process::id()))
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["--draw-border", "1.5", "-2", "800.25", "600", "{window id}"].map(OsStr::new)
+        );
+    }
+
+    #[test]
+    fn activation_border_survives_replaced_launcher_binary() {
+        const CHILD: &str = "APPLICATIONLAUNCHER_BORDER_REEXEC_TEST";
+        const TEST: &str =
+            "app::commands::tests::activation_border_survives_replaced_launcher_binary";
+
+        if let Some(path) = std::env::var_os(CHILD).map(PathBuf::from) {
+            assert_eq!(fs::read_link("/proc/self/exe").unwrap(), path);
+            fs::remove_file(path).unwrap();
+            let deleted_path = std::env::current_exe().unwrap();
+            let error = Command::new(deleted_path)
+                .arg("--list")
+                .output()
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+
+            let overlay = border_overlay_command((1.0, 2.0, 800.0, 600.0), "{window}");
+            // A different intermediary executable catches accidental /proc/self/exe use.
+            let mut probe = Command::new("/bin/sh");
+            probe
+                .args(["-c", "exec \"$1\" --list", "border-helper-probe"])
+                .arg(overlay.get_program());
+            let output =
+                applicationlauncher::process::output_with_timeout(probe, Duration::from_secs(3))
+                    .unwrap();
+            assert!(output.status.success(), "{:?}", output.stderr);
+            assert!(String::from_utf8_lossy(&output.stdout).contains(TEST));
+            return;
+        }
+
+        struct Directory(PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let directory = Directory(std::env::temp_dir().join(format!(
+            "applicationlauncher-border-reexec-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
+        fs::create_dir(&directory.0).unwrap();
+        let executable = fs::canonicalize(&directory.0).unwrap().join("launcher");
+        fs::copy("/proc/self/exe", &executable).unwrap();
+        let mut child = Command::new(&executable);
+        child
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, &executable);
+        let output =
+            applicationlauncher::process::output_with_timeout(child, Duration::from_secs(8))
+                .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 }
