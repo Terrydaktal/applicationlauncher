@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "scope": "Application Launcher logo and desktop integration",
+  "behaviors": [
+    {
+      "id": "DESKTOP-ICON-01",
+      "owner": "src/icon.rs",
+      "contract": "The main Wayland application ID, desktop file basename and theme icon name are applicationlauncher. The desktop entry launches the existing command without changing activation behavior.",
+      "tests": ["icon::tests::desktop_entry_matches_wayland_identity_and_installed_icon_name"],
+      "manual": "Install the desktop entry and SVG as user XDG application and hicolor icon symlinks; refresh the desktop database; import the bundled KWin rule after existing user rules and reconfigure KWin. Confirm launcher and subwindow icons without changing unique native focus identities."
+    },
+    {
+      "id": "DESKTOP-ICON-02",
+      "owner": "src/icon.rs, src/main.rs, src/popups.rs, src/app",
+      "contract": "Every launcher-owned native viewport carries the same valid, cached 128px RGBA logo and a launcher-family app ID. Existing root and unique info foreground identities are preserved. Native icon pixels are used on supporting platforms; KDE Wayland uses the desktop-file rule instead.",
+      "profiles": ["default", "diagnostic-build", "release-minimal"],
+      "tests": [
+        "native_options_tests::launcher_window_has_a_dedicated_native_icon",
+        "icon::tests::logo_is_decoded_once_and_shared_between_windows",
+        "popups::tests::native_info_viewports_focus_once_and_close_only_their_own_identity",
+        "popups::foreground::tests",
+        "app::window_branding_tests"
+      ]
+    },
+    {
+      "id": "DESKTOP-ICON-03",
+      "owner": "src/assets/applicationlauncher.kwinrule",
+      "contract": "The KWin rule changes only desktop identity for the exact main and PID/viewport-specific launcher app-ID family; unrelated applications and native window classes, focus and geometry are unaffected. Existing user rule order is preserved during installation.",
+      "tests": ["tests/test_desktop_integration.py"],
+      "manual": "Check the installed rule is appended after existing user rules, its fields match the bundled rule, the desktop entry/icon resolve, and KWin reconfiguration succeeds without restarting applications."
+    }
+  ]
+}

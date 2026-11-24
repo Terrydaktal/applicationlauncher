@@ -710,9 +710,8 @@ pub(crate) fn show_deferred_info_popup(
     focus_requested: Arc<AtomicBool>,
     event_sender: Sender<PopupEvent>,
 ) {
-    let builder = egui::ViewportBuilder::default()
+    let builder = crate::icon::viewport(viewport_id)
         .with_title(data.title.clone())
-        .with_app_id(foreground::app_id(std::process::id(), viewport_id))
         .with_inner_size(inner_size)
         .with_min_inner_size(min_inner_size)
         .with_resizable(true)

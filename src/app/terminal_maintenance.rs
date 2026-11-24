@@ -116,7 +116,7 @@ impl App {
         let shared = self.terminal_maintenance.clone();
         ctx.show_viewport_deferred(
             egui::ViewportId::from_hash_of(POPUP_ID),
-            egui::ViewportBuilder::default()
+            crate::icon::viewport(egui::ViewportId::from_hash_of(POPUP_ID))
                 .with_title("Update Terminal Windows")
                 .with_inner_size([820.0, 620.0])
                 .with_min_inner_size([560.0, 380.0])

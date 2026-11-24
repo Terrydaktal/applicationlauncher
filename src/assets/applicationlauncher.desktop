@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Application Launcher
+Comment=Find, switch and inspect application windows
+Exec=applicationlauncher
+Icon=applicationlauncher
+Terminal=false
+Categories=Utility;
+Keywords=launcher;windows;switcher;
+StartupWMClass=applicationlauncher

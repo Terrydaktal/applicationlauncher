@@ -1494,18 +1494,19 @@ impl App {
             self.settings_popup_applied_revision = revision;
         }
 
-        let builder = egui::ViewportBuilder::default()
-            .with_title("Launcher Settings")
-            .with_inner_size([
-                (SETTINGS_VIEWPORT_SIZE[0] + 20.0) * viewport_scale_factor,
-                (SETTINGS_VIEWPORT_SIZE[1] + 80.0) * viewport_scale_factor,
-            ])
-            .with_min_inner_size([
-                SETTINGS_VIEWPORT_MIN_SIZE[0] * viewport_scale_factor,
-                SETTINGS_VIEWPORT_MIN_SIZE[1] * viewport_scale_factor,
-            ])
-            .with_resizable(true)
-            .with_always_on_top();
+        let builder =
+            crate::icon::viewport(egui::ViewportId::from_hash_of("launcher_settings_popup"))
+                .with_title("Launcher Settings")
+                .with_inner_size([
+                    (SETTINGS_VIEWPORT_SIZE[0] + 20.0) * viewport_scale_factor,
+                    (SETTINGS_VIEWPORT_SIZE[1] + 80.0) * viewport_scale_factor,
+                ])
+                .with_min_inner_size([
+                    SETTINGS_VIEWPORT_MIN_SIZE[0] * viewport_scale_factor,
+                    SETTINGS_VIEWPORT_MIN_SIZE[1] * viewport_scale_factor,
+                ])
+                .with_resizable(true)
+                .with_always_on_top();
         let event_sender = self.popup_event_sender.clone();
         ctx.show_viewport_deferred(
             egui::ViewportId::from_hash_of("launcher_settings_popup"),

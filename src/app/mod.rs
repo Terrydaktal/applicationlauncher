@@ -10,6 +10,8 @@ pub(crate) mod terminal_maintenance;
 #[cfg(test)]
 mod tests;
 mod view;
+#[cfg(test)]
+mod window_branding_tests;
 use eframe::egui;
 pub(crate) use helpers::{
     effective_list_row_height, filtered_search_cache_key, grid_move_down, grid_move_up, inset_rect,
@@ -535,7 +537,7 @@ impl App {
             return;
         };
         let event_sender = self.popup_event_sender.clone();
-        let builder = egui::ViewportBuilder::default()
+        let builder = crate::icon::viewport(egui::ViewportId::from_hash_of("launcher_history_popup"))
             .with_title("Window History and Sessions")
             .with_inner_size([760.0, 620.0])
             .with_min_inner_size([560.0, 420.0])

@@ -574,6 +574,28 @@ The compiled binary can still be run directly when an automatic freshness check 
 ./target/release/applicationlauncher
 ```
 
+### Launcher icon
+
+`src/assets/applicationlauncher.svg` is the launch-grid logo shared by native
+windows and desktop integration. KDE Wayland resolves the main window's stable
+`applicationlauncher` app ID through `applicationlauncher.desktop`; setting native
+window icon pixels alone is not supported by this Wayland backend. Symlink
+`src/assets/applicationlauncher.desktop` into `~/.local/share/applications/` and
+the SVG into `~/.local/share/icons/hicolor/scalable/apps/`, retaining their
+filenames, then run `kbuildsycoca6`. The desktop entry uses the existing
+`applicationlauncher` command, which must be on the desktop session's PATH.
+
+All launcher-owned native windows use the same branded viewport builder, including
+Show Info, Settings, History, terminal maintenance and the border overlay. The
+unique Show Info app IDs remain unchanged to preserve exact-window focus.
+On KDE Wayland, import `src/assets/applicationlauncher.kwinrule` in System
+Settings → Window Management → Window Rules after installing the desktop entry
+and icon. This narrowly scoped rule maps only the launcher's exact app-ID family
+to that desktop entry. It changes desktop/icon attribution, not the window class,
+focus, geometry or other applications. Append it after existing rules so earlier
+user overrides keep their priority, then reconfigure KWin; application restarts
+are not required to apply the rule to already matching windows.
+
 ## Settings and Data Files
 
 The launcher writes its runtime data to:

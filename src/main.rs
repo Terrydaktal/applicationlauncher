@@ -22,6 +22,7 @@ use std::os::unix::fs::PermissionsExt;
 mod models;
 use models::*;
 mod config;
+mod icon;
 mod ranking_model;
 use config::*;
 mod audio;
@@ -49,12 +50,8 @@ fn launcher_native_options(width: f32, height: f32, title: &str) -> eframe::Nati
         ..Default::default()
     };
     eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+        viewport: icon::viewport(egui::ViewportId::ROOT)
             .with_title(title)
-            .with_app_id(popups::foreground::app_id(
-                std::process::id(),
-                egui::ViewportId::ROOT,
-            ))
             .with_decorations(false)
             .with_transparent(true)
             .with_always_on_top()
@@ -360,7 +357,7 @@ fn main() -> eframe::Result {
         let local_y = ty - my;
 
         let options = eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default()
+            viewport: icon::viewport(egui::ViewportId::from_hash_of("launcher_border_overlay"))
                 .with_title("Border Overlay")
                 .with_decorations(false)
                 .with_transparent(true)
@@ -555,5 +552,15 @@ mod native_options_tests {
             options.viewport.app_id.as_deref(),
             Some("applicationlauncher")
         );
+    }
+
+    #[test]
+    fn launcher_window_has_a_dedicated_native_icon() {
+        let options = launcher_native_options(800.0, 600.0, "Applicationlauncher");
+        let icon = options.viewport.icon.expect("launcher icon is missing");
+        assert_eq!((icon.width, icon.height), (128, 128));
+        assert_eq!(icon.rgba.len(), 128 * 128 * 4);
+        assert_eq!(&icon.rgba[..4], &[0, 0, 0, 0]);
+        assert!(icon.rgba.chunks_exact(4).any(|pixel| pixel[3] == 255));
     }
 }

@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>Application Launcher</title>
+  <defs>
+    <linearGradient id="launch" x1="24" y1="104" x2="104" y2="24" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2dd4bf"/>
+      <stop offset="1" stop-color="#38bdf8"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="#11232c"/>
+  <g fill="url(#launch)">
+    <rect x="24" y="24" width="28" height="28" rx="6"/>
+    <rect x="24" y="76" width="28" height="28" rx="6"/>
+    <rect x="76" y="76" width="28" height="28" rx="6"/>
+  </g>
+  <path d="M73 25h30v30M101 27 67 61" fill="none" stroke="url(#launch)" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
