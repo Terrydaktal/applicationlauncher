@@ -334,6 +334,7 @@ pub(crate) struct App {
     start_time: Instant,
     search_focus_until: Option<Instant>,
     close_on_blur: bool,
+    info_only_host: crate::window_info_request::InfoOnlyHost,
     force_theme: Option<String>,
     loading: bool,
     receiver: Option<std::sync::mpsc::Receiver<LoadResult>>,
@@ -881,6 +882,7 @@ impl App {
             start_time: now,
             search_focus_until: Some(now + Duration::from_millis(1200)),
             close_on_blur,
+            info_only_host: Default::default(),
             force_theme,
             loading: false,
             receiver: None,
@@ -999,7 +1001,15 @@ impl App {
         app
     }
 
+    pub(crate) fn start_info_only(&mut self) {
+        self.info_only_host.enabled = true;
+        self.search_focus_until = None;
+    }
+
     fn save_window_size(&self) {
+        if self.info_only_host.enabled {
+            return;
+        }
         if let Ok(home) = std::env::var("HOME") {
             let dir = PathBuf::from(format!("{}/.config/applicationlauncher", home));
             let path = dir.join("window_size.txt");

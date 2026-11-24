@@ -140,7 +140,10 @@ impl eframe::App for App {
         }
         // Track window size changes in memory
         let current_size = ctx.viewport_rect().size();
-        if (current_size.x - self.width).abs() > 1.0 || (current_size.y - self.height).abs() > 1.0 {
+        if !self.info_only_host.enabled
+            && ((current_size.x - self.width).abs() > 1.0
+                || (current_size.y - self.height).abs() > 1.0)
+        {
             self.width = current_size.x;
             self.height = current_size.y;
         }
@@ -166,6 +169,14 @@ impl eframe::App for App {
                 UiEvent::ShutdownLauncher => {
                     shutdown_requested = true;
                 }
+                UiEvent::ShowWindowInfoRequested => self.info_only_host.request_started(),
+                UiEvent::ShowWindowInfo(result) => {
+                    self.info_only_host.request_finished();
+                    match result {
+                        Ok(window) => self.open_window_info_popup(ctx, window),
+                        Err(error) => self.open_info_error_popup(ctx, error),
+                    }
+                }
             }
         }
         if shutdown_requested {
@@ -174,6 +185,7 @@ impl eframe::App for App {
         }
 
         if focus_requested {
+            self.reveal_launcher_from_info(ctx);
             handled_focus_launcher = true;
             self.info_popups.cancel_focus_requests();
             if let Some((source_pending, symbols_unarchived)) = deployment_warnings {
@@ -513,6 +525,10 @@ impl eframe::App for App {
             } else {
                 ctx.request_repaint_after(deadline.saturating_duration_since(now));
             }
+        }
+
+        if self.show_info_only(ctx) {
+            return;
         }
 
         // Focus loss auto-close

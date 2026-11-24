@@ -2,6 +2,20 @@
 
 `applicationlauncher` is a Rust GUI launcher and persistent window-session tracker for KDE Plasma on Wayland. The GUI combines searchable open windows and installed applications. The companion `applicationlauncherd` process records window activation and closure history, maintains crash-recovery, five-minute, hourly and named snapshots, and can restore missing windows without closing unrelated work.
 
+## Window info requests
+
+XFCE Terminal's **Show Info** menu uses
+`applicationlauncher --show-terminal-info PID WINDOW_UUID` to open the existing
+window-information panel. A new process uses its main window for the info panel,
+not the launcher, and exits when it closes; an existing launcher is neither raised
+nor hidden. This works on native Wayland without relying on unsupported window
+hiding. The normal launcher shortcut can open the launcher while retaining the
+information panel as a separate window. Request failures also use an information
+window, never the launcher search window. Resolution happens in a background
+worker against current terminal D-Bus records and KWin windows; it requires the
+exact terminal PID and window UUID and refuses ambiguous or closed targets. An
+older running launcher GUI must be restarted once to acquire this control command.
+
 ## Shared program metadata
 
 Keep `../program-metadata` alongside this checkout, just like `../fuzzy-rank`.

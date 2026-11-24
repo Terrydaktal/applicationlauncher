@@ -1,5 +1,5 @@
 use eframe::egui;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
@@ -69,11 +69,16 @@ pub(crate) fn handle_launcher_control_connection(
         applicationlauncher::observability::Counter::GuiControlRequests,
     ); }
     let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
-    let mut request = [0_u8; CONTROL_REQUEST_LIMIT];
-    let request_len = stream.read(&mut request).unwrap_or(0);
-    let request = std::str::from_utf8(&request[..request_len])
-        .unwrap_or_default()
-        .trim();
+    let mut request = Vec::new();
+    if BufReader::new((&mut stream).take(CONTROL_REQUEST_LIMIT as u64 + 1))
+        .read_until(b'\n', &mut request)
+        .is_err()
+        || request.len() > CONTROL_REQUEST_LIMIT
+    {
+        let _ = stream.write_all(b"error: invalid or oversized request\n");
+        return;
+    }
+    let request = std::str::from_utf8(&request).unwrap_or_default().trim();
     match request {
         "shutdown" => {
             let _ = ui_event_tx.send(UiEvent::ShutdownLauncher);
@@ -116,6 +121,21 @@ pub(crate) fn handle_launcher_control_connection(
             });
             repaint_ctx.request_repaint();
             let _ = stream.write_all(b"focus-requested\n");
+        }
+        request if request.starts_with("show-terminal-info") => {
+            match crate::window_info_request::TerminalInfoRequest::from_control(request) {
+                Ok(request) => {
+                    crate::window_info_request::request_info(
+                        request,
+                        ui_event_tx.clone(),
+                        repaint_ctx.clone(),
+                    );
+                    let _ = stream.write_all(b"info-requested\n");
+                }
+                Err(error) => {
+                    let _ = writeln!(stream, "error: {error}");
+                }
+            }
         }
         _ => {
             applicationlauncher::observe! { applicationlauncher::observability::increment(
@@ -178,6 +198,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn malformed_info_request_does_not_focus_an_unrelated_window() {
+        let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        client
+            .write_all(b"show-terminal-info 42 not-a-uuid\n")
+            .unwrap();
+        let (events, received) = std::sync::mpsc::channel();
+        handle_launcher_control_connection(server, &events, &egui::Context::default());
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("error:"));
+        assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn control_requests_are_framed_across_socket_reads() {
+        let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let sender = std::thread::spawn(move || {
+            client.write_all(b"foc").unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            client.write_all(b"us\n").unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            assert_eq!(response, "focus-requested\n");
+        });
+        let (events, received) = std::sync::mpsc::channel();
+        handle_launcher_control_connection(server, &events, &egui::Context::default());
+        assert!(matches!(
+            received.recv().unwrap(),
+            UiEvent::FocusLauncher { .. }
+        ));
+        sender.join().unwrap();
+    }
+
+    #[test]
     fn focus_control_request_carries_source_change_state() {
         for (request, expected_source, expected_symbols) in [
             ("focus\n", false, false),
@@ -199,7 +253,7 @@ mod tests {
                     assert_eq!(source_changes_pending, expected_source);
                     assert_eq!(symbols_unarchived, expected_symbols);
                 }
-                UiEvent::ShutdownLauncher => panic!("focus request became a shutdown request"),
+                _ => panic!("focus request became a different UI request"),
             }
         }
     }

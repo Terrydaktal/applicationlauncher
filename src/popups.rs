@@ -6,7 +6,7 @@ mod tree;
 mod updates;
 
 const PROCESS_TREE_INDENT: f32 = 12.0;
-const INFO_POPUP_MARGIN: i8 = 16;
+pub(crate) const INFO_POPUP_MARGIN: i8 = 16;
 use std::sync::mpsc::Sender;
 use std::sync::{
     Arc,

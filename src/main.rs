@@ -38,7 +38,12 @@ use search::*;
 mod app;
 use app::{App, BorderOverlay, get_monitors, load_window_size};
 
-fn launcher_native_options(width: f32, height: f32, title: &str) -> eframe::NativeOptions {
+fn launcher_native_options(
+    width: f32,
+    height: f32,
+    title: &str,
+    info_only: bool,
+) -> eframe::NativeOptions {
     let wgpu_options = eframe::egui_wgpu::WgpuConfiguration {
         // FIFO can block the only GUI thread indefinitely while KWin or the
         // NVIDIA driver holds every swapchain image. Mailbox keeps the newest
@@ -51,11 +56,15 @@ fn launcher_native_options(width: f32, height: f32, title: &str) -> eframe::Nati
     };
     eframe::NativeOptions {
         viewport: icon::viewport(egui::ViewportId::ROOT)
-            .with_title(title)
-            .with_decorations(false)
+            .with_title(if info_only { "Show Info" } else { title })
+            .with_decorations(info_only)
             .with_transparent(true)
             .with_always_on_top()
-            .with_inner_size([width, height])
+            .with_inner_size(if info_only {
+                [1000.0, 700.0]
+            } else {
+                [width, height]
+            })
             .with_resizable(true),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options,
@@ -66,6 +75,7 @@ mod popups;
 use popups::*;
 mod diagnostics;
 use diagnostics::*;
+mod window_info_request;
 
 #[cfg(feature = "observability")]
 fn print_help() {
@@ -91,6 +101,10 @@ OPTIONS
 
     --theme <THEME>
         Force a specific icon theme (default: automatically detected).
+
+    --show-terminal-info <PID> <WINDOW_UUID>
+        Open only Show Info for one XFCE Terminal window, starting an info-only
+        GUI or forwarding to its existing instance. Refuse ambiguous targets.
 
     --diagnose
         Alias for --diagnose auto.
@@ -384,6 +398,8 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
+    let terminal_info = window_info_request::TerminalInfoRequest::from_args(&args)
+        .map_err(|error| eframe::Error::AppCreation(error.into()))?;
     let mode = LauncherMode::Windows;
     let source_changes_pending = std::env::var_os("APPLICATIONLAUNCHER_SOURCE_CHANGES_PENDING")
         .is_some_and(|value| value == "1");
@@ -415,7 +431,14 @@ fn main() -> eframe::Result {
                 (false, true) => "focus-symbols-unarchived\n",
                 (false, false) => "focus\n",
             };
-            if send_launcher_control_request(&socket_path, focus_request, false).is_ok() {
+            if let Some(request) = &terminal_info {
+                if request
+                    .forward_to(&socket_path)
+                    .map_err(|error| eframe::Error::AppCreation(error.into()))?
+                {
+                    return Ok(());
+                }
+            } else if send_launcher_control_request(&socket_path, focus_request, false).is_ok() {
                 // The owning GUI serializes activation after pending popup focus work.
                 return Ok(());
             }
@@ -483,6 +506,7 @@ fn main() -> eframe::Result {
                     std::process::exit(1);
                 }
             }
+            "--show-terminal-info" => i += 3,
             _ => {
                 eprintln!("Error: Unknown argument: {}", args[i]);
                 print_help();
@@ -495,13 +519,21 @@ fn main() -> eframe::Result {
 
     let title = LAUNCHER_WINDOW_TITLE;
 
-    let options = launcher_native_options(width, height, title);
+    let info_only = terminal_info.is_some();
+    let options = launcher_native_options(width, height, title, info_only);
 
     let result = eframe::run_native(
         title,
         options,
         Box::new(move |cc| {
             let repaint_ctx = cc.egui_ctx.clone();
+            if let Some(request) = terminal_info {
+                window_info_request::request_info(
+                    request,
+                    ui_event_tx.clone(),
+                    repaint_ctx.clone(),
+                );
+            }
             applicationlauncher::spawn_worker!("gui-control", move |worker| {
                 applicationlauncher::observe! { worker.set_state("accepting"); }
                 for stream in listener.incoming() {
@@ -514,7 +546,7 @@ fn main() -> eframe::Result {
                 }
             });
 
-            Ok(Box::new(App::new(
+            let mut app = App::new(
                 cc,
                 close_on_blur,
                 force_theme,
@@ -523,7 +555,11 @@ fn main() -> eframe::Result {
                 source_changes_pending,
                 symbols_unarchived,
                 ui_event_rx,
-            )))
+            );
+            if info_only {
+                app.start_info_only();
+            }
+            Ok(Box::new(app))
         }),
     );
     settings::flush_writes();
@@ -536,7 +572,7 @@ mod native_options_tests {
 
     #[test]
     fn launcher_uses_non_blocking_pipelined_presentation() {
-        let options = launcher_native_options(800.0, 600.0, "test");
+        let options = launcher_native_options(800.0, 600.0, "test", false);
         assert_eq!(options.renderer, eframe::Renderer::Wgpu);
         assert_eq!(
             options.wgpu_options.present_mode,
@@ -547,7 +583,7 @@ mod native_options_tests {
 
     #[test]
     fn main_window_has_a_stable_native_identity_independent_of_its_title() {
-        let options = launcher_native_options(800.0, 600.0, "Applicationlauncher");
+        let options = launcher_native_options(800.0, 600.0, "Applicationlauncher", false);
         assert_eq!(
             options.viewport.app_id.as_deref(),
             Some("applicationlauncher")
@@ -556,11 +592,24 @@ mod native_options_tests {
 
     #[test]
     fn launcher_window_has_a_dedicated_native_icon() {
-        let options = launcher_native_options(800.0, 600.0, "Applicationlauncher");
+        let options = launcher_native_options(800.0, 600.0, "Applicationlauncher", false);
         let icon = options.viewport.icon.expect("launcher icon is missing");
         assert_eq!((icon.width, icon.height), (128, 128));
         assert_eq!(icon.rgba.len(), 128 * 128 * 4);
         assert_eq!(&icon.rgba[..4], &[0, 0, 0, 0]);
         assert!(icon.rgba.chunks_exact(4).any(|pixel| pixel[3] == 255));
+    }
+
+    #[test]
+    fn info_only_startup_uses_an_information_window_not_a_launcher() {
+        let options = launcher_native_options(800.0, 600.0, "Applicationlauncher", true);
+        assert_eq!(options.viewport.title.as_deref(), Some("Show Info"));
+        assert_eq!(options.viewport.decorations, Some(true));
+        let normal = launcher_native_options(800.0, 600.0, "Applicationlauncher", false);
+        assert_eq!(
+            normal.viewport.title.as_deref(),
+            Some("Applicationlauncher")
+        );
+        assert_eq!(normal.viewport.decorations, Some(false));
     }
 }

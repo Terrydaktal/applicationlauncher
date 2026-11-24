@@ -129,6 +129,8 @@ pub enum UiEvent {
         symbols_unarchived: bool,
     },
     ShutdownLauncher,
+    ShowWindowInfoRequested,
+    ShowWindowInfo(Result<WindowInfo, String>),
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

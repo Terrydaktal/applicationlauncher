@@ -125,6 +125,7 @@ impl InfoPopup {
 enum InfoTarget {
     Window(WindowInfoPopup),
     App(AppInfoPopup),
+    Error(String),
 }
 
 struct AppInfoPopup {
@@ -603,6 +604,7 @@ impl InfoTarget {
             (Self::App(left), Self::App(right)) => {
                 left.app.desktop_file_path == right.app.desktop_file_path
             }
+            (Self::Error(left), Self::Error(right)) => left == right,
             _ => false,
         }
     }
@@ -653,6 +655,32 @@ impl InfoPopups {
             initial_size_ready: false,
         });
         Ok(id)
+    }
+
+    fn open_in_root(&mut self, target: InfoTarget) -> Result<egui::ViewportId, &'static str> {
+        let id = self.open(target)?;
+        if self.items.len() == 1 {
+            self.items[0].id = egui::ViewportId::ROOT;
+            return Ok(egui::ViewportId::ROOT);
+        }
+        Ok(id)
+    }
+
+    fn detach_root(&mut self) {
+        if let Some(popup) = self
+            .items
+            .iter_mut()
+            .find(|popup| popup.id == egui::ViewportId::ROOT)
+        {
+            popup.id =
+                egui::ViewportId::from_hash_of(("launcher-root-info-migration", self.next_id));
+            popup.focus_requested.store(false, Ordering::Relaxed);
+            if let InfoTarget::Window(window) = &mut popup.target {
+                window.lookup = None;
+                window.versions = None;
+                window.tmux = None;
+            }
+        }
     }
 
     fn close(&mut self, id: egui::ViewportId) -> bool {
@@ -1382,7 +1410,12 @@ impl App {
             .items
             .iter()
             .any(|popup| popup.target.same_target(&target));
-        match self.info_popups.open(target) {
+        let opened = if self.info_only_host.enabled {
+            self.info_popups.open_in_root(target)
+        } else {
+            self.info_popups.open(target)
+        };
+        match opened {
             Ok(id) => {
                 // Wake an existing minimized viewport; a new viewport also focuses on its first frame.
                 if !ctx.embed_viewports() {
@@ -1452,7 +1485,7 @@ impl App {
                 }
             }
         }
-        if restore_launcher_focus && self.info_popups.is_empty() {
+        if restore_launcher_focus && self.info_popups.is_empty() && !self.info_only_host.enabled {
             self.start_time = Instant::now();
             self.repaint_ctx
                 .send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
@@ -1812,9 +1845,66 @@ impl App {
         }
     }
 
+    pub(super) fn open_info_error_popup(&mut self, ctx: &egui::Context, error: String) {
+        self.open_info_popup(ctx, InfoTarget::Error(error));
+    }
+
+    pub(super) fn reveal_launcher_from_info(&mut self, ctx: &egui::Context) {
+        if !self.info_only_host.enabled {
+            return;
+        }
+        self.info_popups.detach_root();
+        self.info_only_host.enabled = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(LAUNCHER_WINDOW_TITLE.into()));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::Vec2::ZERO));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            self.width,
+            self.height,
+        )));
+    }
+
+    pub(super) fn show_info_only(&mut self, ctx: &egui::Context) -> bool {
+        if !self.info_only_host.enabled {
+            return false;
+        }
+
+        // Winit cannot hide native Wayland windows. Render the information panel
+        // in the root itself instead of creating a second, invisible parent.
+        if !self
+            .info_popups
+            .items
+            .iter()
+            .any(|popup| popup.id == egui::ViewportId::ROOT)
+        {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.heading("Show Info");
+                ui.label("Loading window information...");
+                ui.spinner();
+            });
+        }
+        // The info panel owns its update modals, including this root viewport.
+        self.show_info_popups(ctx);
+        self.show_terminal_maintenance(ctx);
+        let has_popups = !self.info_popups.is_empty()
+            || self.terminal_maintenance_is_open()
+            || crate::popups::window_update_dialog_is_open(ctx);
+        if self.info_only_host.can_exit(has_popups) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape))
+            && !crate::popups::window_update_dialog_is_open(ctx)
+            && !self.terminal_maintenance_is_open()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        true
+    }
+
     pub(super) fn show_info_popups(&mut self, ctx: &egui::Context) {
         let mut popups = std::mem::take(&mut self.info_popups.items);
         popups.retain_mut(|popup| {
+            let previous_size = popup.initial_size;
             let (data, size, min_size) = match &mut popup.target {
                 InfoTarget::Window(state) => {
                     if let Some(current) = self
@@ -1859,7 +1949,45 @@ impl App {
                     let min_size = [520.0_f32.min(size[0]), 360.0_f32.min(size[1])];
                     (data, size, min_size)
                 }
+                InfoTarget::Error(message) => (
+                    InfoPopupData {
+                        title: "Show Info".into(),
+                        heading: "Could not open window information".into(),
+                        subtitle: message.clone(),
+                        scroll_sensitivity: self.info_scroll_sensitivity,
+                        rows: Vec::new(),
+                        process_tree: None,
+                    },
+                    [560.0, 200.0],
+                    [320.0, 160.0],
+                ),
             };
+            if popup.id == egui::ViewportId::ROOT && self.info_only_host.enabled {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(data.title.clone()));
+                if previous_size.is_none() || previous_size != popup.initial_size {
+                    popup.initial_size = Some(size);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(min_size.into()));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size.into()));
+                }
+                if popup.focus_requested.swap(false, Ordering::Relaxed) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 248))
+                            .inner_margin(egui::Margin::same(crate::popups::INFO_POPUP_MARGIN)),
+                    )
+                    .show(ctx, |ui| {
+                        crate::popups::render_info_popup_contents(
+                            ui,
+                            &data,
+                            popup.id,
+                            &self.popup_event_sender,
+                        );
+                    });
+                return true;
+            }
             if !ctx.embed_viewports() {
                 show_deferred_info_popup(
                     ctx,
@@ -3664,6 +3792,52 @@ mod tests {
         data.rows.clear();
         assert_eq!(measure(true, &data), loaded);
         assert_eq!(measure(false, &data), loaded);
+    }
+
+    #[test]
+    fn info_only_root_is_reused_and_can_move_to_a_child_when_opening_the_launcher() {
+        let mut popups = InfoPopups::default();
+        assert_eq!(
+            popups.open_in_root(window("first")).unwrap(),
+            egui::ViewportId::ROOT
+        );
+        assert_eq!(
+            popups.open_in_root(window("first")).unwrap(),
+            egui::ViewportId::ROOT
+        );
+        assert_eq!(popups.items.len(), 1);
+        let second = popups.open_in_root(window("second")).unwrap();
+        assert_ne!(second, egui::ViewportId::ROOT);
+        popups.detach_root();
+        assert_eq!(popups.items.len(), 2);
+        assert!(
+            popups
+                .items
+                .iter()
+                .all(|popup| popup.id != egui::ViewportId::ROOT)
+        );
+        assert_eq!(popups.open(window("second")).unwrap(), second);
+        let first = popups.open(window("first")).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(popups.items.len(), 2);
+    }
+
+    #[test]
+    fn failed_info_requests_reuse_an_error_viewer_without_replacing_other_targets() {
+        let mut popups = InfoPopups::default();
+        let error = popups
+            .open_in_root(InfoTarget::Error("Window closed".into()))
+            .unwrap();
+        assert_eq!(error, egui::ViewportId::ROOT);
+        assert_eq!(
+            popups
+                .open_in_root(InfoTarget::Error("Window closed".into()))
+                .unwrap(),
+            error
+        );
+        let other = popups.open_in_root(window("still-open")).unwrap();
+        assert_ne!(other, error);
+        assert_eq!(popups.items.len(), 2);
     }
 
     #[test]
